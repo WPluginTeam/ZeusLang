@@ -323,6 +323,99 @@ with (new Resource()) [&res] {
 }
 ```
 
+# LLVM编译
+## 类型标注
+类型标注确认语法：
+```
+let a: int = 123; // 显式标注，但是编译器能自动推断
+let a = 123; // 这种也可以正确推断
+
+let b = Obj1+Obj2*Obj3; // 系统会自动做operator推断类型，出错时编译期报错
+```
+关于函数的类型标注：
+```
+func add(a: int, b: int) -> int {
+    return a+b;
+}
+```
+函数的**参数**必须进行类型标注才会实现静态编译，否则会使用ZeusVM的动态模式，可以提供更高的灵活性，但是带来一定的性能开销。
+
+使用```@static```修饰符强制函数静态编译检查:
+```
+@static
+func add(a: int, b: int) -> int {
+    return a+b;
+}
+```
+使用```@static```后函数会被强制检查类型和返回值是否能够正确编译为LLVM IR，但这不会检查函数内部的类型的动态性。
+
+## 类
+在编译为llvm IR时，Zeus的类会被编译为纯llvm IR结构：
+```
+class Test {
+    using &this;
+
+    func test() {
+        print("test");
+    }
+}
+```
+
+## 生命周期
+Zeus对象的生命周期在编译为LLVM IR后目前为用户自行管理，需要通过```delete```关键字手动释放对象的内存：
+```
+var obj = new Test();
+obj.test();
+
+delete obj; // 手动释放对象内存
+```
+释放内存前会调用对象的析构函数，如果对象没有定义析构函数，则不会调用。
+
+## 复制捕获语义
+在编译为LLVM IR时，Zeus的复制捕获语义增加了范围：
+```
+var globalInt = 123;
+
+func get_int() -> &int {
+    return globalInt;
+}
+```
+这里返回的是全局 cell 的引用，不是函数内局部变量。VM 可以通过 cell 引用表示它；LLVM AOT 目前还没有把全局 `int`/`bool` cell 转成稳定原生地址的 lowering，因此这个例子暂不能作为 LLVM 已支持全局标量引用返回的证明。
+```
+func get_obj() -> &Test {
+    return new Test();
+}
+var obj = get_obj();
+```
+引用返回支持恒定稳定的对象返回，而不稳定的例如```return 123;```的值类型返回是不被允许使用```-> &T```的。因为引用语义需要一个明确的稳定生命周期。
+
+```
+func get_int() -> int {
+    return 123;
+}
+```
+这是正常标注了函数的返回类型为int。在编译为LLVM IR时，编译器会检查，如果无显式的返回类型标注，那么根据```return```语句是否存在来推断为两种类型：nil 或 任意动态类型。
+
+## Zeus 调用 C++ 函数
+Zeus 提供了调用 C++ 函数的能力，需要通过```decl```声明C++函数的前面，和```@native```修饰函数来源：
+```
+@native(...)
+decl func cpp_function_get_int(k: int) -> int;
+```
+声明了一个C++函数cpp_function_get_int，参数为int类型，返回值为int类型。
+
+```
+@native(...)
+decl func cpp_function_get_cached_string(k: int) -> &string;
+```
+声明了一个C++函数cpp_function_get_cached_string，参数为int类型，返回值为string类型的引用。
+引用在此会指向C++函数返回的string对象的生命周期，Zeus不会自动管理声明周期。
+```
+@native(...)
+decl func cpp_function_get_cached_string(k: int) -> string;
+```
+通过将返回值显式定义为不带引用的string类型， Zeus会复制该string，且Zeus会自动管理该string的生命周期。
+
 ## Zeus C++
 
 使用:
