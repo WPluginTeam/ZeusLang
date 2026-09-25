@@ -18,8 +18,6 @@ inline bool isDynamicOperator(VMOperator op) {
         case VMOperator::LIST_LOAD_ELEM:
         case VMOperator::LIST_STORE_ELEM:
         case VMOperator::DICT_BUILD:
-        case VMOperator::DICT_ITER_INIT:
-        case VMOperator::DICT_ITER_NEXT:
         case VMOperator::DICT_KEYS_BUILD:
         case VMOperator::DICT_LOAD_VALUE:
         case VMOperator::DICT_STORE_VALUE:
@@ -43,6 +41,14 @@ inline void appendLLVMDeclarations(std::string& out) {
     out += "declare ptr @zeus_dict_iter_begin(ptr)\n";
     out += "declare i32 @zeus_dict_iter_next(ptr, ptr, ptr)\n";
     out += "declare void @zeus_dynamic_iter_release(ptr)\n";
+    out += "declare void @zeus_value_array_build(ptr, i64, ptr)\n";
+    out += "declare void @zeus_value_dict_build(ptr, i64, ptr)\n";
+    out += "declare void @zeus_value_array_length(ptr, ptr)\n";
+    out += "declare void @zeus_value_array_load(ptr, ptr, ptr)\n";
+    out += "declare void @zeus_value_array_store(ptr, ptr, ptr, ptr)\n";
+    out += "declare void @zeus_value_dict_keys(ptr, ptr)\n";
+    out += "declare void @zeus_value_dict_load(ptr, ptr, ptr)\n";
+    out += "declare void @zeus_value_dict_store(ptr, ptr, ptr, ptr)\n";
 }
 
 } // namespace ZeusLLVM::DynamicABI

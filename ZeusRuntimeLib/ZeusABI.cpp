@@ -14,6 +14,7 @@
 
 #include "ZeusABIInternal.hpp"
 #include "ZeusDynamicBinaryABI.hpp"
+#include "ZeusDynamicMemberABI.hpp"
 
 #include "ZeusVariant.hpp"
 #include "ZeusVMUtils.hpp"
@@ -223,6 +224,51 @@ ZeusBox* nullBox() {
 
 bool isStringValue(const LexerType::Value& v) {
     return std::holds_alternative<std::string>(v.data);
+}
+
+void printUniversalValue(const ZeusType::UniversalVariant& value) {
+    if (std::holds_alternative<std::string>(value)) {
+        std::cout << std::get<std::string>(value);
+    } else if (std::holds_alternative<LexerType::Value>(value)) {
+        const auto& literal = std::get<LexerType::Value>(value);
+        if (std::holds_alternative<std::string>(literal.data)) {
+            std::cout << std::get<std::string>(literal.data);
+        } else {
+            std::cout << literal.toString();
+        }
+    } else {
+        std::cout << ZeusVMUtils::valueToDebugString(value);
+    }
+}
+
+struct OwnedZeusValue {
+    ZeusValue value{};
+
+    OwnedZeusValue() { zeus_value_init_nil(&value); }
+    ~OwnedZeusValue() { zeus_value_release(&value); }
+};
+
+void printDynamicValue(const ZeusValue* value) {
+    if (!value) dynamicValuePanic("null value pointer while printing");
+
+    const bool isLLVMClass = value->tag == ZEUS_VALUE_TAG_BOXED &&
+        value->flags == ZEUS_VALUE_FLAG_OWNS_BOX &&
+        isLLVMClassValue(valueReference(value));
+    if (isLLVMClass) {
+        OwnedZeusValue stringified;
+        if (zeus_value_try_dynamic_member_call(
+                &stringified.value, value, "toString", 0, nullptr)) {
+            const ZeusStringView* rendered =
+                zeus_value_intern_string_view(&stringified.value);
+            std::cout.write(rendered->data,
+                            static_cast<std::streamsize>(rendered->length));
+            return;
+        }
+    }
+
+    std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> boxed(
+        zeus_value_to_box(value), &zeus_box_release);
+    printUniversalValue(boxed->v);
 }
 
 } // namespace
@@ -471,7 +517,36 @@ const ZeusStringView* zeus_value_intern_string_view(const ZeusValue* value) {
         dynamicValuePanic("expected an owned string value for native string-view ABI");
     }
 
-    const auto* text = stringUniversalValue(valueReference(value)->v);
+    const auto* box = valueReference(value);
+    const auto* classHandle = std::get_if<ZeusType::LLVMClassHandle>(&box->v);
+    if (classHandle) {
+        if (!classHandle->state || classHandle->state->typeName != "String") {
+            dynamicValuePanic("boxed class is not a native string or String object");
+        }
+
+        OwnedZeusValue rendered;
+        if (!zeus_value_try_dynamic_member_call(
+                &rendered.value, value, "toString", 0, nullptr)) {
+            dynamicValuePanic("String object has no registered toString method");
+        }
+        if (rendered.value.tag != ZEUS_VALUE_TAG_STRING &&
+            rendered.value.tag != ZEUS_VALUE_TAG_BOXED) {
+            dynamicValuePanic("String.toString must return a string value");
+        }
+
+        const auto* renderedText = stringUniversalValue(
+            valueReference(&rendered.value)->v);
+        if (!renderedText) {
+            dynamicValuePanic("String.toString returned a non-string value");
+        }
+        try {
+            return internNativeString(*renderedText);
+        } catch (...) {
+            dynamicValuePanic("failed to intern String object contents");
+        }
+    }
+
+    const auto* text = stringUniversalValue(box->v);
     if (!text) dynamicValuePanic("boxed value is not a string");
 
     try {
@@ -679,9 +754,8 @@ void zeus_value_pop(ZeusValue* out) {
 
 void zeus_value_print(const ZeusValue* value) {
     try {
-        ZeusBox* box = zeus_value_to_box(value);
-        zeus_print(box);
-        zeus_box_release(box);
+        printDynamicValue(value);
+        std::cout << '\n';
     } catch (...) {
         dynamicValuePanic("failed to print dynamic value");
     }
@@ -695,22 +769,7 @@ void zeus_value_print_many(int32_t argc, const ZeusValue* const* values) {
     try {
         for (int32_t i = 0; i < argc; ++i) {
             if (i > 0) std::cout << ' ';
-
-            std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> box(
-                zeus_value_to_box(values[i]), &zeus_box_release);
-            const auto& value = box->v;
-            if (std::holds_alternative<std::string>(value)) {
-                std::cout << std::get<std::string>(value);
-            } else if (std::holds_alternative<LexerType::Value>(value)) {
-                const auto& literal = std::get<LexerType::Value>(value);
-                if (std::holds_alternative<std::string>(literal.data)) {
-                    std::cout << std::get<std::string>(literal.data);
-                } else {
-                    std::cout << literal.toString();
-                }
-            } else {
-                std::cout << ZeusVMUtils::valueToDebugString(value);
-            }
+            printDynamicValue(values[i]);
         }
         std::cout << '\n';
     } catch (...) {

@@ -2,9 +2,14 @@
 
 #include "ZeusDynamicABI.hpp"
 #include "ZeusABIInternal.hpp"
+#include "ZeusVMUtils.hpp"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -89,11 +94,64 @@ std::string keyString(const ZeusType::UniversalVariant& value) {
         return std::get<bool>(value) ? "true" : "false";
     }
 
+    if (const auto* handle =
+            std::get_if<ZeusType::LLVMClassHandle>(&value)) {
+        if (handle->state && handle->state->typeName == "String") {
+            ZeusBox boxedString;
+            boxedString.v = value;
+
+            ZeusValue dynamicString{};
+            zeus_value_init_nil(&dynamicString);
+            std::unique_ptr<ZeusValue, decltype(&zeus_value_release)> ownedString(
+                &dynamicString, &zeus_value_release);
+            zeus_value_from_box(ownedString.get(), &boxedString);
+
+            const ZeusStringView* view =
+                zeus_value_intern_string_view(ownedString.get());
+            if (!view || view->length >
+                    static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+                throw std::length_error("String dictionary key is too large");
+            }
+            return std::string(
+                view->data ? view->data : "",
+                static_cast<size_t>(view->length));
+        }
+    }
+
     return "<obj>";
+}
+
+int arrayIndex(const ZeusType::UniversalVariant& value) {
+    int64_t integer = 0;
+    if (!ZeusVMUtils::tryGetInt64(value, integer)) return 0;
+    if (integer < std::numeric_limits<int>::min() ||
+        integer > std::numeric_limits<int>::max()) {
+        throw std::overflow_error("Value too large for array index");
+    }
+    return static_cast<int>(integer);
 }
 
 void consume(ZeusBox* box) {
     delete box;
+}
+
+using OwnedZeusBox = std::unique_ptr<ZeusBox, decltype(&zeus_box_release)>;
+
+[[noreturn]] void valueContainerPanic(const char* message) {
+    std::fprintf(stderr, "[ZeusValue container ABI] %s\n", message);
+    std::abort();
+}
+
+OwnedZeusBox boxFromValue(const ZeusValue* value) {
+    if (!value) valueContainerPanic("null dynamic value argument");
+    return OwnedZeusBox(zeus_value_to_box(value), &zeus_box_release);
+}
+
+void writeValueFromBox(ZeusValue* out, ZeusBox* box) {
+    if (!out) valueContainerPanic("null dynamic value result");
+    OwnedZeusBox owned(box, &zeus_box_release);
+    zeus_value_init_nil(out);
+    zeus_value_from_box(out, owned.get());
 }
 
 struct ZeusDynamicIteratorImpl {
@@ -166,6 +224,9 @@ ZeusBox* zeus_array_load(const ZeusBox* array, int64_t index) {
 }
 
 ZeusBox* zeus_dict_load(const ZeusBox* dict, const ZeusBox* key) {
+    if (getArray(dict) && key) {
+        return zeus_array_load(dict, arrayIndex(key->v));
+    }
     const ZeusType::Object* object = getDict(dict);
     if (!object || !object->impl || !key) return makeNullBox();
 
@@ -204,6 +265,11 @@ ZeusBox* zeus_array_store(ZeusBox* array, int64_t index, ZeusBox* value) {
 }
 
 ZeusBox* zeus_dict_store(ZeusBox* dict, ZeusBox* key, ZeusBox* value) {
+    if (getArray(dict) && key) {
+        const int index = arrayIndex(key->v);
+        consume(key);
+        return zeus_array_store(dict, index, value);
+    }
     ZeusType::Object* target = getDict(dict);
     ZeusType::UniversalVariant stored = value ? value->v : nullVariant();
 
@@ -275,4 +341,189 @@ int32_t zeus_dict_iter_next(
 
 void zeus_dynamic_iter_release(ZeusDynamicIterator* iterator) {
     delete iterator;
+}
+
+void zeus_value_array_build(
+    ZeusValue* out,
+    int64_t count,
+    const ZeusValue* const* values
+) {
+    if (!out) valueContainerPanic("null array build output");
+    zeus_value_init_nil(out);
+    if (count < 0 || (count > 0 && !values)) {
+        valueContainerPanic("invalid array build arguments");
+    }
+
+    try {
+        std::vector<OwnedZeusBox> ownedValues;
+        std::vector<ZeusBox*> rawValues;
+        ownedValues.reserve(static_cast<size_t>(count));
+        rawValues.reserve(static_cast<size_t>(count));
+        for (int64_t i = 0; i < count; ++i) {
+            ownedValues.push_back(boxFromValue(values[i]));
+            rawValues.push_back(ownedValues.back().get());
+        }
+        for (auto& value : ownedValues) value.release();
+        writeValueFromBox(out, zeus_array_build(count, rawValues.data()));
+    } catch (...) {
+        valueContainerPanic("failed to build dynamic array");
+    }
+}
+
+void zeus_value_dict_build(
+    ZeusValue* out,
+    int64_t pairCount,
+    const ZeusValue* const* keyValues
+) {
+    if (!out) valueContainerPanic("null dictionary build output");
+    zeus_value_init_nil(out);
+    if (pairCount < 0 ||
+        static_cast<uint64_t>(pairCount) >
+            static_cast<uint64_t>(std::numeric_limits<size_t>::max() / 2) ||
+        (pairCount > 0 && !keyValues)) {
+        valueContainerPanic("invalid dictionary build arguments");
+    }
+
+    try {
+        const size_t valueCount = static_cast<size_t>(pairCount) * 2;
+        std::vector<OwnedZeusBox> ownedValues;
+        std::vector<ZeusBox*> rawValues;
+        ownedValues.reserve(valueCount);
+        rawValues.reserve(valueCount);
+        for (size_t i = 0; i < valueCount; ++i) {
+            ownedValues.push_back(boxFromValue(keyValues[i]));
+            rawValues.push_back(ownedValues.back().get());
+        }
+        for (auto& value : ownedValues) value.release();
+        writeValueFromBox(out, zeus_dict_build(pairCount, rawValues.data()));
+    } catch (...) {
+        valueContainerPanic("failed to build dynamic dictionary");
+    }
+}
+
+void zeus_value_array_length(ZeusValue* out, const ZeusValue* array) {
+    if (!out) valueContainerPanic("null array length output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedArray = boxFromValue(array);
+        zeus_value_init_i64(out, zeus_array_length(boxedArray.get()));
+    } catch (...) {
+        valueContainerPanic("failed to read dynamic array length");
+    }
+}
+
+void zeus_value_array_load(
+    ZeusValue* out,
+    const ZeusValue* array,
+    const ZeusValue* index
+) {
+    if (!out || !index) valueContainerPanic("null array load argument");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedArray = boxFromValue(array);
+        OwnedZeusBox boxedIndex = boxFromValue(index);
+        const ZeusType::Array* target = getArray(boxedArray.get());
+        if (!target || !target->impl) {
+            zeus_value_init_i64(out, 0);
+            return;
+        }
+        const int arrayElement = arrayIndex(boxedIndex->v);
+        if (arrayElement < 0 ||
+            static_cast<size_t>(arrayElement) >= target->impl->data.size()) {
+            // LIST_LOAD_ELEM shares ZeusVMUtils::arrayRead semantics: an
+            // invalid element read produces numeric zero.
+            zeus_value_init_i64(out, 0);
+            return;
+        }
+        writeValueFromBox(out, zeus_array_load(boxedArray.get(), arrayElement));
+    } catch (...) {
+        valueContainerPanic("failed to read dynamic array element");
+    }
+}
+
+void zeus_value_array_store(
+    ZeusValue* out,
+    const ZeusValue* array,
+    const ZeusValue* index,
+    const ZeusValue* value
+) {
+    if (!out || !index) valueContainerPanic("null array store argument");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedArray = boxFromValue(array);
+        OwnedZeusBox boxedIndex = boxFromValue(index);
+        OwnedZeusBox boxedValue = boxFromValue(value);
+        writeValueFromBox(
+            out, zeus_array_store(boxedArray.get(),
+                                  arrayIndex(boxedIndex->v),
+                                  boxedValue.release())
+        );
+    } catch (...) {
+        valueContainerPanic("failed to write dynamic array element");
+    }
+}
+
+void zeus_value_dict_keys(ZeusValue* out, const ZeusValue* dict) {
+    if (!out) valueContainerPanic("null dictionary keys output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedDict = boxFromValue(dict);
+        writeValueFromBox(out, zeus_dict_keys(boxedDict.get()));
+    } catch (...) {
+        valueContainerPanic("failed to build dynamic dictionary keys");
+    }
+}
+
+void zeus_value_dict_load(
+    ZeusValue* out,
+    const ZeusValue* dict,
+    const ZeusValue* key
+) {
+    if (!out) valueContainerPanic("null dictionary load output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedDict = boxFromValue(dict);
+        OwnedZeusBox boxedKey = boxFromValue(key);
+        if (getArray(boxedDict.get())) {
+            int64_t rawIndex = 0;
+            if (!ZeusVMUtils::tryGetInt64(boxedKey->v, rawIndex)) {
+                valueContainerPanic("DICT_LOAD_VALUE array index must be an integer");
+            }
+            if (rawIndex < std::numeric_limits<int>::min() ||
+                rawIndex > std::numeric_limits<int>::max()) {
+                valueContainerPanic("DICT_LOAD_VALUE array index is outside int range");
+            }
+            const int index = static_cast<int>(rawIndex);
+            const ZeusType::Array* target = getArray(boxedDict.get());
+            if (!target->impl || index < 0 ||
+                static_cast<size_t>(index) >= target->impl->data.size()) {
+                valueContainerPanic("DICT_LOAD_VALUE array index is out of bounds");
+            }
+        }
+        writeValueFromBox(out, zeus_dict_load(boxedDict.get(), boxedKey.get()));
+    } catch (...) {
+        valueContainerPanic("failed to read dynamic dictionary value");
+    }
+}
+
+void zeus_value_dict_store(
+    ZeusValue* out,
+    const ZeusValue* dict,
+    const ZeusValue* key,
+    const ZeusValue* value
+) {
+    if (!out) valueContainerPanic("null dictionary store output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedDict = boxFromValue(dict);
+        OwnedZeusBox boxedKey = boxFromValue(key);
+        OwnedZeusBox boxedValue = boxFromValue(value);
+        writeValueFromBox(
+            out,
+            zeus_dict_store(
+                boxedDict.get(), boxedKey.release(), boxedValue.release())
+        );
+    } catch (...) {
+        valueContainerPanic("failed to write dynamic dictionary value");
+    }
 }

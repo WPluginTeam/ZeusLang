@@ -47,14 +47,16 @@ struct TypeImplementation {
     TypeCategory category;
     bool immutable;
     bool inheritable;
+    bool dynamicStringification = false;
 };
 
 inline const std::vector<ImplementationModule>& implementationModules() {
     static const std::vector<ImplementationModule> modules = {
         {"ZeusBuiltins.exception", true, false, false, ImportTrigger::Always, -1},
         {"ZeusBuiltins.namespace", true, false, false, ImportTrigger::Always, -1},
-        {"ZeusBuiltins.list", true, false, true, ImportTrigger::Always, 1},
+        {"ZeusBuiltins.list", true, true, true, ImportTrigger::Always, 1},
         {"ZeusBuiltins.string", true, true, true, ImportTrigger::Always, 0},
+        {"ZeusBuiltins.dict", true, true, true, ImportTrigger::Always, 2},
         {"ZeusBuiltins.io", true, false, false, ImportTrigger::Always, -1},
         {"ZeusBuiltins.byte", true, false, true, ImportTrigger::BytesLiteral, 2}
     };
@@ -63,9 +65,10 @@ inline const std::vector<ImplementationModule>& implementationModules() {
 
 inline const std::vector<TypeImplementation>& typeImplementations() {
     static const std::vector<TypeImplementation> types = {
-        {"String", {}, "ZeusBuiltins.string", TypeCategory::Opaque, false, true},
+        {"String", {}, "ZeusBuiltins.string", TypeCategory::Opaque, false, true, true},
         {"string", {"str"}, "ZeusBuiltins.string", TypeCategory::String, true, false},
         {"Array", {"list", "array"}, "ZeusBuiltins.list", TypeCategory::List, false, true},
+        {"Dict", {}, "ZeusBuiltins.dict", TypeCategory::Opaque, false, true, true},
         {"Byte", {}, "ZeusBuiltins.byte", TypeCategory::Opaque, true, true},
         {"bytes", {}, "ZeusBuiltins.byte", TypeCategory::Bytes, true, false}
     };

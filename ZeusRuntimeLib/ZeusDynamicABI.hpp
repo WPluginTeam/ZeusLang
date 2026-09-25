@@ -44,6 +44,44 @@ int32_t zeus_dict_iter_next(
 
 void zeus_dynamic_iter_release(ZeusDynamicIterator* iterator);
 
+// ZeusValue-facing container ABI used by LLVM lowering. Arguments are borrowed;
+// returned values are initialized by these functions. The current storage
+// implementation adapts to the shared VM container representation internally.
+void zeus_value_array_build(
+    ZeusValue* out,
+    int64_t count,
+    const ZeusValue* const* values
+);
+void zeus_value_dict_build(
+    ZeusValue* out,
+    int64_t pair_count,
+    const ZeusValue* const* key_values
+);
+void zeus_value_array_length(ZeusValue* out, const ZeusValue* array);
+void zeus_value_array_load(
+    ZeusValue* out,
+    const ZeusValue* array,
+    const ZeusValue* index
+);
+void zeus_value_array_store(
+    ZeusValue* out,
+    const ZeusValue* array,
+    const ZeusValue* index,
+    const ZeusValue* value
+);
+void zeus_value_dict_keys(ZeusValue* out, const ZeusValue* dict);
+void zeus_value_dict_load(
+    ZeusValue* out,
+    const ZeusValue* dict,
+    const ZeusValue* key
+);
+void zeus_value_dict_store(
+    ZeusValue* out,
+    const ZeusValue* dict,
+    const ZeusValue* key,
+    const ZeusValue* value
+);
+
 #ifdef __cplusplus
 }
 #endif
