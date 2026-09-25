@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include "./ZeusParser/LexerParser.hpp"
 #include "./ZeusParser/TreeParser.hpp"
+#include "./ZeusTyping/TypeChecker.hpp"
 #ifdef ZEUS_DEBUG_FILE_CHANNEL
 #undef ZEUS_DEBUG_FILE_CHANNEL
 #endif
@@ -127,8 +128,12 @@ namespace ZeusCompile {
         auto t1 = std::chrono::steady_clock::now();
         std::vector<TreeParser::NodeAndBlock> ast = TreeParser::parse(tokens);
         auto t2 = std::chrono::steady_clock::now();
+        ZeusTypeInfer::TypeChecker returnTypeChecker(ast);
+        returnTypeChecker.check(ZeusTypeInfer::TypeCheckOptions::llvm());
         IRGen::IRGenerator irGen;
         irGen.strictDecl = strictDecl;
+        irGen.inferredFunctionReturnTypes =
+            returnTypeChecker.getInferredFunctionReturnTypes();
         irGen.parse(ast);
         auto t3 = std::chrono::steady_clock::now();
 

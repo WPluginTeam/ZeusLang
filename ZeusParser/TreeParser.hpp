@@ -58,6 +58,7 @@ namespace TreeParser {
         std::vector<std::string> overloadedOps;    // 重载的运算符列表(如 "+", "-", "[]")
         // 仅用于 IF：存放 if( ... ) 的条件表达式 token 序列
         std::vector<Token> conditionTokens;
+        bool isElseBranch = false;
         std::vector<std::variant<Node, std::unique_ptr<CodeBlock>>> nodes;
 
         bool isCaptureAll = false;
@@ -253,11 +254,12 @@ namespace TreeParser {
                             auto *ifBlock = std::get<std::unique_ptr<CodeBlock>>(lastVariant).get();
                             
                             // 沿着 else 分支找到最内层的 IF
-                            while (ifBlock && ifBlock->type == CodeBlockType::IF && ifBlock->nodes.size() >= 2) {
+                            while (ifBlock && ifBlock->type == CodeBlockType::IF && !ifBlock->nodes.empty()) {
                                 auto &elseVariant = ifBlock->nodes.back();
                                 if (std::holds_alternative<std::unique_ptr<CodeBlock>>(elseVariant)) {
                                     auto *innerBlock = std::get<std::unique_ptr<CodeBlock>>(elseVariant).get();
-                                    if (innerBlock && innerBlock->type == CodeBlockType::IF) {
+                                    if (innerBlock && innerBlock->isElseBranch &&
+                                        innerBlock->type == CodeBlockType::IF) {
                                         ifBlock = innerBlock;
                                         continue;
                                     }
@@ -268,6 +270,7 @@ namespace TreeParser {
                             if (ifBlock && ifBlock->type == CodeBlockType::IF) {
                                 auto elseBlock = makeBlock();
                                 elseBlock->type = CodeBlockType::BLOCK;
+                                elseBlock->isElseBranch = true;
                                 
                                 CodeBlock* elsePtr = elseBlock.get();
                                 ifBlock->nodes.push_back(std::move(elseBlock));
@@ -523,6 +526,7 @@ namespace TreeParser {
                             // 创建单语句 IF CodeBlock
                             auto newBlock = makeBlock();
                             newBlock->type = CodeBlockType::IF;
+                            newBlock->isElseBranch = isElseIf;
                             
                             // 提取 if 条件表达式
                             bool seenIf = false;
@@ -568,11 +572,12 @@ namespace TreeParser {
                                     auto *prevIfBlock = std::get<std::unique_ptr<CodeBlock>>(lastVariant).get();
                                     
                                     // 沿着 else 分支找到最内层的 IF（没有 else 的那个）
-                                    while (prevIfBlock && prevIfBlock->type == CodeBlockType::IF && prevIfBlock->nodes.size() >= 2) {
+                                    while (prevIfBlock && prevIfBlock->type == CodeBlockType::IF && !prevIfBlock->nodes.empty()) {
                                         auto &elseVariant = prevIfBlock->nodes.back();
                                         if (std::holds_alternative<std::unique_ptr<CodeBlock>>(elseVariant)) {
                                             auto *innerBlock = std::get<std::unique_ptr<CodeBlock>>(elseVariant).get();
-                                            if (innerBlock && innerBlock->type == CodeBlockType::IF) {
+                                            if (innerBlock && innerBlock->isElseBranch &&
+                                                innerBlock->type == CodeBlockType::IF) {
                                                 prevIfBlock = innerBlock;
                                                 continue;
                                             }
@@ -1615,6 +1620,7 @@ namespace TreeParser {
                             if (std::get<LexerType::Keyword>(tk).name == "else") { isElseBlock = true; break; }
                         }
                     }
+                    newBlock->isElseBranch = isElseBlock;
 
                     // 检测是否 catch 块：当前收集的 stack 中包含关键字 catch 且上一兄弟是 TRY
                     bool isCatchBlock = false;
@@ -1698,10 +1704,12 @@ namespace TreeParser {
                             // 修复：检查 IF 块是否已经有 else 分支
                             // else 分支必须是最后一个节点，且是 CodeBlock 类型
                             bool alreadyHasElse = false;
-                            if (ifBlock && ifBlock->type == CodeBlockType::IF && ifBlock->nodes.size() >= 2) {
+                            if (ifBlock && ifBlock->type == CodeBlockType::IF && !ifBlock->nodes.empty()) {
                                 const auto& lastNode = ifBlock->nodes.back();
                                 if (std::holds_alternative<std::unique_ptr<CodeBlock>>(lastNode)) {
-                                    alreadyHasElse = true;
+                                    const auto* elseBranch =
+                                        std::get<std::unique_ptr<CodeBlock>>(lastNode).get();
+                                    alreadyHasElse = elseBranch != nullptr && elseBranch->isElseBranch;
                                 }
                             }
                             

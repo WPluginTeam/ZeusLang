@@ -9,6 +9,7 @@
 
 #include "TypeInfer.hpp"
 #include "../ZeusParser/AstElementView.hpp"
+#include "../ZeusBuiltins/BuiltinRegistry.hpp"
 
 namespace ZeusTypeInfer {
 
@@ -55,7 +56,9 @@ namespace ZeusTypeInfer {
         static TypeCheckOptions strictLLVM() {
             TypeCheckOptions options = llvm();
             options.requireExplicitFunctionParameterTypes = true;
-            options.requireExplicitFunctionReturnTypes = true;
+            // Return types may be inferred from the function body. The checker
+            // rejects a dynamic/ambiguous result for @static functions below.
+            options.requireExplicitFunctionReturnTypes = false;
             // Locals may omit annotations when their initializer is inferable;
             // rejectUnknownExpressions still rejects unresolved dynamic values.
             options.requireExplicitVariableTypes = false;
@@ -70,9 +73,11 @@ namespace ZeusTypeInfer {
         struct FunctionContext {
             std::string name;
             InferredType expectedReturn = InferredType::Unknown;
-            InferredType inferredReturn = InferredType::Unknown;
+            TypeRef inferredReturnType;
+            bool hasInferredReturnType = false;
+            bool inferredReturnIsDynamic = false;
+            bool sawUnknownReturnType = false;
             bool hasReturn = false;
-            bool dynamicReturn = false;
             bool expectedReturnIsReference = false;
             std::string expectedReturnTypeName;
         };
@@ -85,6 +90,7 @@ namespace ZeusTypeInfer {
         std::unordered_map<std::string, std::unordered_map<std::string, std::string>> classFields;
         std::unordered_map<std::string, std::string> classReceiverAliases;
         std::unordered_map<std::string, std::string> operatorReturnTypes;
+        std::unordered_map<TreeParser::NodeId, std::string> inferredFunctionReturnTypes;
 
         void collectClassNames(
             const std::vector<TreeParser::NodeAndBlock>& blockNodes
@@ -533,6 +539,17 @@ namespace ZeusTypeInfer {
             return true;
         }
 
+        static bool isSubscriptAssignmentTarget(
+            const std::vector<LexerType::Token>& tokens,
+            size_t end
+        ) {
+            if (end == 0 || !isOperator(tokens[end - 1], "]")) return false;
+            for (size_t i = 0; i < end; ++i) {
+                if (isOperator(tokens[i], "[")) return true;
+            }
+            return false;
+        }
+
         static std::vector<LexerType::Token> returnExpression(
             const TreeParser::Node& statement
         ) {
@@ -642,6 +659,12 @@ namespace ZeusTypeInfer {
                     break;
                 }
             }
+            if (isSubscriptAssignmentTarget(statement.tokens, equalIndex)) {
+                // Container elements are dynamic ZeusValue slots. Assigning
+                // one must not be type-checked as rebinding the container
+                // variable itself (for example list -> int on arr[0] = 1).
+                return;
+            }
             if (equalIndex >= 3 && isOperator(statement.tokens[1], ".")) {
                 const std::vector<LexerType::Token> target(
                     statement.tokens.begin(), statement.tokens.begin() + equalIndex
@@ -689,6 +712,66 @@ namespace ZeusTypeInfer {
                 "变量 " + name,
                 options
             );
+        }
+
+        static bool allPathsReturn(
+            const std::vector<TreeParser::NodeAndBlock>& blockNodes
+        ) {
+            auto sequenceReturns = [](
+                auto&& self,
+                auto&& blockReturns,
+                const std::vector<TreeParser::NodeAndBlock>& statements,
+                bool skipElseBranches
+            ) -> bool {
+                for (const auto& element : statements) {
+                    if (std::holds_alternative<TreeParser::Node>(element)) {
+                        if (std::get<TreeParser::Node>(element).type == NodeType::RETURN_STMT) {
+                            return true;
+                        }
+                        continue;
+                    }
+
+                    const auto& nested = std::get<std::unique_ptr<TreeParser::CodeBlock>>(element);
+                    if (!nested || nested->type == CodeBlockType::FUNC ||
+                        nested->type == CodeBlockType::CLASS ||
+                        (skipElseBranches && nested->isElseBranch)) {
+                        continue;
+                    }
+                    if (nested->type == CodeBlockType::IF &&
+                        blockReturns(blockReturns, self, *nested)) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            auto blockReturns = [](
+                auto&& self,
+                auto&& sequenceReturns,
+                const TreeParser::CodeBlock& block
+            ) -> bool {
+                if (block.type != CodeBlockType::IF) {
+                    return sequenceReturns(sequenceReturns, self, block.nodes, false);
+                }
+
+                const TreeParser::CodeBlock* elseBranch = nullptr;
+                for (const auto& element : block.nodes) {
+                    if (!std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(element)) {
+                        continue;
+                    }
+                    const auto& nested = std::get<std::unique_ptr<TreeParser::CodeBlock>>(element);
+                    if (!nested || !nested->isElseBranch) continue;
+                    if (elseBranch != nullptr) return false;
+                    elseBranch = nested.get();
+                }
+                if (elseBranch == nullptr ||
+                    !sequenceReturns(sequenceReturns, self, block.nodes, true)) {
+                    return false;
+                }
+                return self(self, sequenceReturns, *elseBranch);
+            };
+
+            return sequenceReturns(sequenceReturns, blockReturns, blockNodes, false);
         }
 
         void checkReturn(
@@ -787,9 +870,9 @@ namespace ZeusTypeInfer {
                 return;
             }
 
-            if (function->dynamicReturn) return;
-
             if (actualType == InferredType::Unknown) {
+                function->inferredReturnIsDynamic = true;
+                function->sawUnknownReturnType = true;
                 if (options.rejectUnknownExpressions) {
                     addDiagnostic(
                         nodeIndex,
@@ -800,18 +883,16 @@ namespace ZeusTypeInfer {
                 return;
             }
 
-            if (function->inferredReturn == InferredType::Unknown) {
-                function->inferredReturn = actualType;
+            if (!function->hasInferredReturnType) {
+                function->inferredReturnType = actualInfo.type;
+                function->hasInferredReturnType = true;
                 return;
             }
 
-            if (!canAssign(function->inferredReturn, actualType)) {
-                addDiagnostic(
-                    nodeIndex,
-                    TypeCheckSeverity::Error,
-                    "函数 " + function->name + " 存在不一致的返回值类型: 需要 " +
-                    typeName(function->inferredReturn) + ", 实际是 " + typeName(actualType)
-                );
+            if (function->inferredReturnType != actualInfo.type) {
+                // Unannotated functions can return heterogeneous values through
+                // the dynamic ZeusValue ABI instead of making this a type error.
+                function->inferredReturnIsDynamic = true;
             }
         }
 
@@ -915,7 +996,6 @@ namespace ZeusTypeInfer {
             }
 
             bool hasReturnAnnotation = !block.returnTypeName.empty();
-            function.dynamicReturn = !hasReturnAnnotation;
             function.expectedReturnIsReference = parseTypeRef(
                 block.returnTypeName
             ).isReference;
@@ -927,7 +1007,6 @@ namespace ZeusTypeInfer {
                     "函数 " + block.funcName + " 必须显式声明返回类型"
                 );
             }
-
             if (hasReturnAnnotation) {
                 function.expectedReturn = parseDeclaredType(block.returnTypeName);
                 if (function.expectedReturn == InferredType::Unknown) {
@@ -941,10 +1020,36 @@ namespace ZeusTypeInfer {
 
             checkBlock(block.nodes, std::move(environment), nodeIndex, functionOptions, &function);
 
-            if (!hasReturnAnnotation && !function.hasReturn) {
-                function.expectedReturn = InferredType::Nil;
-                function.inferredReturn = InferredType::Nil;
-                function.dynamicReturn = false;
+            if (!hasReturnAnnotation) {
+                if (!function.hasReturn) {
+                    function.inferredReturnType = TypeRef(InferredType::Nil);
+                    function.hasInferredReturnType = true;
+                } else if (!function.inferredReturnIsDynamic &&
+                           function.hasInferredReturnType &&
+                           function.inferredReturnType.kind != InferredType::Nil &&
+                           !allPathsReturn(block.nodes)) {
+                    // A conditional return may fall through to implicit nil.
+                    // Keep that function on the dynamic ABI unless nil is the
+                    // only possible result.
+                    function.inferredReturnIsDynamic = true;
+                }
+
+                if (!function.inferredReturnIsDynamic &&
+                    function.hasInferredReturnType &&
+                    block.id != TreeParser::InvalidNodeId) {
+                    inferredFunctionReturnTypes[block.id] =
+                        function.inferredReturnType.toIRTypeName();
+                }
+
+                if (functionOptions.rejectUnknownExpressions && function.hasReturn &&
+                    function.inferredReturnIsDynamic && !function.sawUnknownReturnType) {
+                    addDiagnostic(
+                        nodeIndex,
+                        TypeCheckSeverity::Error,
+                        "@static 函数 " + block.funcName +
+                        " 的返回类型无法唯一推断为静态类型"
+                    );
+                }
             }
 
             if (function.expectedReturn != InferredType::Unknown &&
@@ -1007,6 +1112,7 @@ namespace ZeusTypeInfer {
 
         bool check(const TypeCheckOptions& options = TypeCheckOptions::dynamic()) {
             diagnostics.clear();
+            inferredFunctionReturnTypes.clear();
             rootOptions = options;
             classNames.clear();
             classFields.clear();
@@ -1057,6 +1163,11 @@ namespace ZeusTypeInfer {
 
         TypeInfo getTypeInfoByIndex(int nodeIndex) const {
             return inferer.getTypeInfoByIndex(nodeIndex);
+        }
+
+        const std::unordered_map<TreeParser::NodeId, std::string>&
+        getInferredFunctionReturnTypes() const {
+            return inferredFunctionReturnTypes;
         }
     };
 

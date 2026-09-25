@@ -4,6 +4,7 @@
 
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "../ZeusParser/TreeType.hpp"
@@ -321,7 +322,8 @@ namespace IRGen {
     //   [4] 普通参数数量
     //   [5..] 参数类型名（空表示该参数使用 ZeusValue* ABI）
     static IRType::IRInstr makeFunctionSignatureAnnotation(
-        const TreeParser::CodeBlock& codeBlock
+        const TreeParser::CodeBlock& codeBlock,
+        const std::string& inferredReturnType = std::string()
     ) {
         IRType::IRInstr annotation;
         annotation.op = VMOperator::IR_ANNOTATION;
@@ -332,10 +334,14 @@ namespace IRGen {
             signatureName = IRScope::currentPackageName + "." + signatureName;
         }
         annotation.args.push_back(signatureName);
-        const std::string declaredReturnType = codeBlock.returnTypeName.empty() &&
-                !TreeParser::hasExplicitReturnStatement(codeBlock.nodes)
-            ? "nil"
-            : codeBlock.returnTypeName;
+        std::string declaredReturnType = codeBlock.returnTypeName;
+        if (declaredReturnType.empty()) {
+            if (!inferredReturnType.empty()) {
+                declaredReturnType = inferredReturnType;
+            } else if (!TreeParser::hasExplicitReturnStatement(codeBlock.nodes)) {
+                declaredReturnType = "nil";
+            }
+        }
         const std::string returnTypeName = _canonicalIRTypeName(declaredReturnType);
         annotation.args.push_back(returnTypeName);
         annotation.args.push_back(LexerType::Value(0));
@@ -2832,7 +2838,25 @@ void parseVarAssignStmt(
                         else if (sym == "]") { depth--; if (depth == 0) { closePos = i; break; } }
                     }
                 }
-                if (closePos < exprTokens.size()) rhsStartsWithSameSub = true;
+                if (closePos < exprTokens.size() &&
+                    std::get<LexerType::Keyword>(exprTokens[0]).name == varName &&
+                    closePos - 2 == keyTokens.size()) {
+                    rhsStartsWithSameSub = true;
+                    for (size_t i = 0; i < keyTokens.size(); ++i) {
+                        const auto& lhsKeyToken = keyTokens[i];
+                        const auto& rhsKeyToken = exprTokens[i + 2];
+                        if (lhsKeyToken.index() != rhsKeyToken.index() ||
+                            std::visit([](const auto& token) {
+                                return token.toString();
+                            }, lhsKeyToken) !=
+                            std::visit([](const auto& token) {
+                                return token.toString();
+                            }, rhsKeyToken)) {
+                            rhsStartsWithSameSub = false;
+                            break;
+                        }
+                    }
+                }
             }
             if (rhsStartsWithSameSub) {
                 // 简单拆分：subscriptReadTokens (+ 余下 remainderTokens)
@@ -3340,6 +3364,7 @@ namespace IRGen {
             std::vector<IRType::IRInstr>* funcSink = nullptr; // 内部：当处于函数体生成阶段时，子节点的 IR 将汇聚到该 sink
             std::vector<std::string> globalNamesByIndex; // index -> name
             std::vector<std::string> returnReferenceTypeStack;
+            std::unordered_map<TreeParser::NodeId, std::string> inferredFunctionReturnTypes;
 
             // --- Forward Declaration Helpers (Refactored) ---
             FuncProto* findProto(const std::string& name) {
@@ -4463,6 +4488,26 @@ namespace IRGen {
                             IRType::ClassFieldDefault defaultValue;
                             if (!field.defaultIR.empty()) {
                                 if (field.defaultIR.size() == 1 &&
+                                    (field.defaultIR.front().op == VMOperator::LIST_BUILD ||
+                                     field.defaultIR.front().op == VMOperator::DICT_BUILD) &&
+                                    !field.defaultIR.front().args.empty() &&
+                                    std::holds_alternative<LexerType::Value>(
+                                        field.defaultIR.front().args.front()) &&
+                                    std::holds_alternative<ZeusType::BigInteger>(
+                                        std::get<LexerType::Value>(
+                                            field.defaultIR.front().args.front()).data)) {
+                                    int64_t elementCount = -1;
+                                    const auto& countValue = std::get<ZeusType::BigInteger>(
+                                        std::get<LexerType::Value>(
+                                            field.defaultIR.front().args.front()).data);
+                                    if (countValue.tryToInt64(elementCount) && elementCount == 0) {
+                                        defaultValue.kind = field.defaultIR.front().op == VMOperator::LIST_BUILD
+                                            ? IRType::ClassFieldDefaultKind::EmptyArray
+                                            : IRType::ClassFieldDefaultKind::EmptyDict;
+                                    } else {
+                                        defaultValue.kind = IRType::ClassFieldDefaultKind::Unsupported;
+                                    }
+                                } else if (field.defaultIR.size() == 1 &&
                                     field.defaultIR.front().op == VMOperator::PUSH &&
                                     !field.defaultIR.front().args.empty() &&
                                     std::holds_alternative<LexerType::Value>(
@@ -5148,7 +5193,12 @@ namespace IRGen {
                 // FUNC_BEGIN 必须保持 chunk 首指令，标注紧随其后，避免破坏
                 // VM/编译器现有的函数块识别逻辑。
                 const size_t signatureAnnotationIndex = funcIR.size();
-                funcIR.push_back(makeFunctionSignatureAnnotation(codeBlock));
+                std::string inferredReturnType;
+                const auto inferredReturn = inferredFunctionReturnTypes.find(codeBlock.id);
+                if (inferredReturn != inferredFunctionReturnTypes.end()) {
+                    inferredReturnType = inferredReturn->second;
+                }
+                funcIR.push_back(makeFunctionSignatureAnnotation(codeBlock, inferredReturnType));
 
                 if (strictDecl && funcSink == nullptr && !codeBlock.funcName.empty()) {
                     for (auto & fp : collected) {

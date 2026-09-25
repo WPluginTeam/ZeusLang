@@ -66,6 +66,8 @@ namespace IRType {
         Boolean,
         String,
         Null,
+        EmptyArray,
+        EmptyDict,
         Unsupported
     };
 
