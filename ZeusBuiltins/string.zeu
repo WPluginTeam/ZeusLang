@@ -143,7 +143,11 @@ class String {
 
     // 返回字符串表示
     func toString() {
-        return this;
+        return this.value;
+    }
+
+    func nativeString() -> string {
+        return this.value;
     }
 
     // 检查字符串是否为空

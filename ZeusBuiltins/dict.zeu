@@ -1,0 +1,127 @@
+using original;
+
+@native("zeus_value_has_dynamic_member")
+decl func __dict_has_to_string(value, method);
+
+func __dict_normalize_string(key: String) -> string {
+    return key.nativeString();
+}
+
+func __dict_normalize_key(key) {
+    if (type(key) == "String") return __dict_normalize_string(key);
+    if (type(key) == "string") return key;
+    return __builtin_str(key);
+}
+
+func __dict_text(value) -> string {
+    if (type(value) == "String") return __dict_normalize_string(value);
+    if (type(value) == "string") return value;
+    if (__dict_has_to_string(value, "toString")) {
+        let text = value.toString();
+        if (type(text) == "String") return __dict_normalize_string(text);
+        if (type(text) == "string") return text;
+        return __builtin_str(text);
+    }
+    return __builtin_str(value);
+}
+
+func __dict_format(data, keys, index: int, count: int) -> string {
+    if (index >= count) return "";
+    let key = keys[index];
+    let value = data[key];
+    if (index + 1 >= count) {
+        return __dict_text(key) + ": " + __dict_text(value);
+    }
+    return __dict_text(key) + ": " + __dict_text(value) + ", " +
+        __dict_format(data, keys, index + 1, count);
+}
+
+class Dict {
+    using &this;
+
+    let data = {};
+
+    func init() {
+        this.data = {};
+    }
+
+    func set(key, value) {
+        let normalizedKey = __dict_normalize_key(key);
+        this.data[normalizedKey] = value;
+        return this;
+    }
+
+    func get(key) {
+        let normalizedKey = __dict_normalize_key(key);
+        return this.data[normalizedKey];
+    }
+
+    func hasKey(key) {
+        let targetKey = __dict_normalize_key(key);
+        for (this.data) [&entryKey: &entryValue] {
+            if (__dict_normalize_key(entryKey) == targetKey) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    func keys() {
+        let result = [];
+        for (this.data) [&entryKey: &entryValue] {
+            __array_push(result, entryKey);
+        }
+        return result;
+    }
+
+    func values() {
+        let result = [];
+        for (this.data) [&entryKey: &entryValue] {
+            __array_push(result, entryValue);
+        }
+        return result;
+    }
+
+    func items() {
+        let result = [];
+        for (this.data) [&entryKey: &entryValue] {
+            __array_push(result, [entryKey, entryValue]);
+        }
+        return result;
+    }
+
+    func length() {
+        return len(this.keys());
+    }
+
+    func deleteKey(key) {
+        let targetKey = __dict_normalize_key(key);
+        __dict_delete(this.data, targetKey);
+        return this;
+    }
+
+    func clear() {
+        this.data = {};
+        return this;
+    }
+
+    func copy() {
+        let result = new Dict();
+        result.data = __dict_clone(this.data);
+        return result;
+    }
+
+    func toString() -> string {
+        return "{" + __dict_format(this.data, this.keys(), 0, this.length()) + "}";
+    }
+
+    func operator[[]=](key, value) {
+        let normalizedKey = __dict_normalize_key(key);
+        this.data[normalizedKey] = value;
+    }
+
+    func operator[[]](key) {
+        let normalizedKey = __dict_normalize_key(key);
+        return this.data[normalizedKey];
+    }
+}

@@ -462,6 +462,22 @@ class VM {
                 ZEUS_DEBUG_PRINT("[__loadglobal] name='%s' index=%d -> %s", 
                     name.c_str(), index, ZeusVMUtils::valueToDebugString(ret).c_str());
             }
+            else if (ctx.desc->name == "__dict_clone") {
+                ret = ZeusBuiltins::builtin_dict_clone(args);
+                ZeusGC::retainVariantDeep(*this, ret);
+            }
+            else if (ctx.desc->name == "__dict_delete") {
+                if (args.size() != 2) {
+                    throw std::runtime_error("__dict_delete expects 2 arguments");
+                }
+                const std::string key = ZeusBuiltins::getDictKeyString(args[1]);
+                if (!ZeusBuiltins::getMutableDictData(args[0])) {
+                    throw std::runtime_error("__dict_delete: first argument must be a dictionary");
+                }
+                if (!ZeusBuiltins::takeDictValue(args[0], key, ret)) {
+                    ret = ZeusType::Variant(ZeusType::Null());
+                }
+            }
             else if (ctx.desc->name == "hasKey") {
                 // hasKey(dict, key) -> bool
                 // 检查字典是否包含指定的键
@@ -1048,6 +1064,78 @@ class VM {
         }
         
         return nullptr;
+    }
+
+    std::string dictionaryKeyString(
+        const ZeusType::UniversalVariant& value
+    ) {
+        auto primitiveString = [](const ZeusType::UniversalVariant& candidate,
+                                  std::string& result) -> bool {
+            if (const auto* literal =
+                    std::get_if<LexerType::Value>(&candidate)) {
+                if (const auto* text = std::get_if<std::string>(&literal->data)) {
+                    result = *text;
+                    return true;
+                }
+                if (const auto* integer =
+                        std::get_if<ZeusType::BigInteger>(&literal->data)) {
+                    result = integer->toString();
+                    return true;
+                }
+                if (const auto* decimal =
+                        std::get_if<ZeusType::BigDecimal>(&literal->data)) {
+                    result = decimal->toString();
+                    return true;
+                }
+                if (const auto* boolean = std::get_if<bool>(&literal->data)) {
+                    result = *boolean ? "true" : "false";
+                    return true;
+                }
+            }
+
+            if (const auto* text = std::get_if<std::string>(&candidate)) {
+                result = *text;
+                return true;
+            }
+            if (const auto* integer =
+                    std::get_if<ZeusType::BigInteger>(&candidate)) {
+                result = integer->toString();
+                return true;
+            }
+            if (const auto* decimal =
+                    std::get_if<ZeusType::BigDecimal>(&candidate)) {
+                result = decimal->toString();
+                return true;
+            }
+            if (const auto* boolean = std::get_if<bool>(&candidate)) {
+                result = *boolean ? "true" : "false";
+                return true;
+            }
+            if (const auto* character = std::get_if<char>(&candidate)) {
+                result.assign(1, *character);
+                return true;
+            }
+            return false;
+        };
+
+        std::string result;
+        if (primitiveString(value, result)) return result;
+
+        if (const auto* handle = std::get_if<ZeusType::ObjectHandle>(&value)) {
+            auto* object = getValidObject(*handle);
+            if (object) {
+                auto* classInfo = getClass(object->classId);
+                if (classInfo && classInfo->name == "String") {
+                    const auto field = object->values.find("value");
+                    if (field != object->values.end() &&
+                        primitiveString(field->second, result)) {
+                        return result;
+                    }
+                }
+            }
+        }
+
+        return "<obj>";
     }
     
     // 辅助函数：获取原型（优先使用共享系统）
@@ -2113,10 +2201,10 @@ class VM {
 
     void pushLoadedCellValue(Cell* cell) {
         auto value = loadCellValue(cell);
-        ZeusGC::retainVariantIfObject(*this, value);
-        if (std::holds_alternative<ZeusType::ClosureHandle>(value)) {
-            retainClosure(std::get<ZeusType::ClosureHandle>(value).id);
-        }
+        // StackWithOwner releases Variant and NamedArg contents deeply. Match
+        // that ownership contract here so nested objects/closures loaded from
+        // a cell gain the corresponding references before the stack owns them.
+        ZeusGC::retainVariantDeep(*this, value);
         stack.push_back(std::move(value));
     }
 
@@ -4761,24 +4849,7 @@ class VM {
                     auto &keyVar = tmp[need - 1 - (i * 2)];
                     auto &valVar = tmp[need - 2 - (i * 2)];
 
-                    std::string keyStr;
-                    if (std::holds_alternative<LexerType::Value>(keyVar)) {
-                        const auto &kv = std::get<LexerType::Value>(keyVar);
-                        if (std::holds_alternative<ZeusType::BigInteger>(kv.data)) keyStr = std::get<ZeusType::BigInteger>(kv.data).toString();
-                        else if (std::holds_alternative<ZeusType::BigDecimal>(kv.data)) keyStr = std::get<ZeusType::BigDecimal>(kv.data).toString();
-                        else if (std::holds_alternative<std::string>(kv.data)) keyStr = std::get<std::string>(kv.data);
-                        else if (std::holds_alternative<bool>(kv.data)) keyStr = std::get<bool>(kv.data) ? "true" : "false";
-                    } else if (std::holds_alternative<std::string>(keyVar)) {
-                        keyStr = std::get<std::string>(keyVar);
-                    } else if (std::holds_alternative<ZeusType::BigInteger>(keyVar)) {
-                        keyStr = std::get<ZeusType::BigInteger>(keyVar).toString();
-                    } else if (std::holds_alternative<ZeusType::BigDecimal>(keyVar)) {
-                        keyStr = std::get<ZeusType::BigDecimal>(keyVar).toString();
-                    } else if (std::holds_alternative<bool>(keyVar)) {
-                        keyStr = std::get<bool>(keyVar) ? "true" : "false";
-                    } else {
-                        keyStr = "<obj>"; // 非标准键，使用占位字符串
-                    }
+                    const std::string keyStr = dictionaryKeyString(keyVar);
                     auto it = (*objData).data.find(keyStr);
                     if (it == (*objData).data.end()) {
                         (*objData).order.push_back(keyStr); // 记录键的插入顺序
@@ -4880,15 +4951,7 @@ class VM {
                     }
                     else if (std::holds_alternative<ZeusType::Object>(dv)) {
                         // 对象访问：使用字符串键
-                        std::string keyStr;
-                        if (std::holds_alternative<LexerType::Value>(keyVar)) {
-                            const auto &kv = std::get<LexerType::Value>(keyVar);
-                            if (std::holds_alternative<std::string>(kv.data)) keyStr = std::get<std::string>(kv.data);
-                            else if (std::holds_alternative<ZeusType::BigInteger>(kv.data)) keyStr = std::get<ZeusType::BigInteger>(kv.data).toString();
-                            else if (std::holds_alternative<ZeusType::BigDecimal>(kv.data)) keyStr = std::get<ZeusType::BigDecimal>(kv.data).toString();
-                            else if (std::holds_alternative<bool>(kv.data)) keyStr = std::get<bool>(kv.data)?"true":"false";
-                        } else if (std::holds_alternative<std::string>(keyVar)) keyStr = std::get<std::string>(keyVar);
-                        
+                        const std::string keyStr = dictionaryKeyString(keyVar);
                             const ZeusType::Object &obj = std::get<ZeusType::Object>(dv);
                             if (obj.impl) {
                                 auto it = obj.impl->data.find(keyStr);
@@ -4995,22 +5058,16 @@ class VM {
                     }
                     else if (std::holds_alternative<ZeusType::Object>(dv)) {
                         // 对象写入：使用字符串键
-                        std::string keyStr;
-                        if (std::holds_alternative<LexerType::Value>(keyVar)) {
-                            const auto &kv = std::get<LexerType::Value>(keyVar);
-                            if (std::holds_alternative<std::string>(kv.data)) keyStr = std::get<std::string>(kv.data);
-                            else if (std::holds_alternative<ZeusType::BigInteger>(kv.data)) keyStr = std::get<ZeusType::BigInteger>(kv.data).toString();
-                            else if (std::holds_alternative<ZeusType::BigDecimal>(kv.data)) keyStr = std::get<ZeusType::BigDecimal>(kv.data).toString();
-                            else if (std::holds_alternative<bool>(kv.data)) keyStr = std::get<bool>(kv.data)?"true":"false";
-                        } else if (std::holds_alternative<std::string>(keyVar)) keyStr = std::get<std::string>(keyVar);
-                        
+                        const std::string keyStr = dictionaryKeyString(keyVar);
                         ZeusType::Object &obj = std::get<ZeusType::Object>(dv);
                         if (obj.impl) {
                             auto it2 = obj.impl->data.find(keyStr);
+                            ZeusGC::retainVariantDeep(*this, newVal);
                             if (it2 == obj.impl->data.end()) {
                                 obj.impl->order.push_back(keyStr);
                                 obj.impl->data[keyStr] = newVal;
                             } else {
+                                ZeusGC::releaseVariantDeep(*this, it2->second);
                                 it2->second = newVal;
                             }
                         }

@@ -14,6 +14,7 @@
 
 // 数组操作
 #include "array.hpp"
+#include "dict.hpp"
 
 // 字节数组操作
 #include "bytes.hpp"
@@ -69,6 +70,9 @@ namespace ZeusBuiltins {
         
         // 调试
         registerDebugBuiltins();
+
+        // Keep legacy native function IDs stable; append new dictionary ABI last.
+        registerDictBuiltins();
     }
 
 } // namespace ZeusBuiltins

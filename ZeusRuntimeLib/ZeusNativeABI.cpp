@@ -2,6 +2,8 @@
 
 #include "ZeusABIInternal.hpp"
 #include "../ZeusBuiltins/BuiltinNativeABI.hpp"
+#include "../ZeusRunner/ZeusBuiltins/array.hpp"
+#include "../ZeusRunner/ZeusBuiltins/dict.hpp"
 #include "../ZeusRunner/ZeusBuiltins/type.hpp"
 #include "../ZeusRunner/ZeusBuiltins/strings.hpp"
 
@@ -26,6 +28,8 @@ void initializeStandaloneBuiltins() {
     std::call_once(initialized, [] {
         ZeusBuiltins::registerTypeBuiltins();
         ZeusBuiltins::registerStringBuiltins();
+        ZeusBuiltins::registerArrayBuiltins();
+        ZeusBuiltins::registerDictBuiltins();
     });
 }
 

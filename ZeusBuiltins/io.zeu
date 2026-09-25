@@ -4,16 +4,26 @@
 // Helper function to convert value to native string
 func _toStr(val) {
     using original {
-        if (type(val) == "string") {
+        var valType = type(val);
+        if (valType == "string") {
             return val;
-        } else if (type(val) == "String") {
+        } else if (valType == "String") {
             return val.value;
         } else {
-            var converted = str(val);
-            if (type(converted) == "String") {
-                return converted.value;
-            } else {
-                return converted;
+            try {
+                var converted = val.toString();
+                if (type(converted) == "String") {
+                    return converted.value;
+                } else {
+                    return converted;
+                }
+            } catch (e) {
+                var converted = str(val);
+                if (type(converted) == "String") {
+                    return converted.value;
+                } else {
+                    return converted;
+                }
             }
         }
     }
