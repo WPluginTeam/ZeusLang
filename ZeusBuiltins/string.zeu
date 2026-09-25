@@ -1,0 +1,287 @@
+
+using original;
+
+// LLVM-native bindings for the dynamic string helpers. The VM resolves these
+// names through its existing builtin registry; LLVM calls the matching C ABI
+// wrappers with ZeusValue arguments/results.
+@native("zeus_string_builtin_str")
+decl func __builtin_str(value);
+
+@native("zeus_string_builtin_type")
+decl func type(value);
+
+@native("zeus_string_builtin_len")
+decl func len(value);
+
+@native("zeus_string_get")
+decl func __str_get(value, index);
+
+@native("zeus_string_slice")
+decl func __str_slice(value, start, end);
+
+@native("zeus_string_index")
+decl func __str_index(value, substring);
+
+@native("zeus_string_rindex")
+decl func __str_rindex(value, substring);
+
+@native("zeus_string_replace")
+decl func __str_replace(value, old, replacement);
+
+@native("zeus_string_split")
+decl func __str_split(value, separator);
+
+@native("zeus_string_startswith")
+decl func __str_startswith(value, prefix);
+
+@native("zeus_string_endswith")
+decl func __str_endswith(value, suffix);
+
+@native("zeus_string_lower")
+decl func __str_lower(value);
+
+@native("zeus_string_upper")
+decl func __str_upper(value);
+
+@native("zeus_string_count")
+decl func __str_count(value, substring);
+
+class String {
+    using &this;
+
+    let value = "";
+
+    func init(value="") {
+        this.value = value;
+    }
+
+    // 获取字符串长度
+    func length() {
+        return len(this.value);
+    }
+
+    // 字符串连接（+操作符）
+    func operator[+](other) {
+        var otherStr = "";
+
+        if (type(other) == "String") {
+            otherStr = other.value;
+        } else {
+            otherStr = __builtin_str(other);
+        }
+
+        var resultStr = this.value + otherStr;
+        return new String(resultStr);
+    }
+
+    // 字符串重复（*操作符）
+    func operator[*](count) {
+        var result = "";
+        var i = 0;
+
+        for (i < count) {
+            result = result + this.value;
+            i = i + 1;
+        }
+
+        return new String(result);
+    }
+
+    // 字符串比较（== 操作符）
+    func operator[==](other) {
+        if (type(other) == "String") {
+            return this.value == other.value;
+        } else {
+            return this.value == other;
+        }
+    }
+
+    // 字符串比较（!= 操作符）
+    func operator[!=](other) {
+        if (type(other) == "String") {
+            return this.value != other.value;
+        } else {
+            return this.value != other;
+        }
+    }
+
+    // 字符串比较（< 操作符）
+    func operator[<](other) {
+        if (type(other) == "String") {
+            return this.value < other.value;
+        } else {
+            return this.value < other;
+        }
+    }
+
+    // 字符串比较（<= 操作符）
+    func operator[<=](other) {
+        if (type(other) == "String") {
+            return this.value <= other.value;
+        } else {
+            return this.value <= other;
+        }
+    }
+
+    // 字符串比较（> 操作符）
+    func operator[>](other) {
+        if (type(other) == "String") {
+            return this.value > other.value;
+        } else {
+            return this.value > other;
+        }
+    }
+
+    // 字符串比较（>= 操作符）
+    func operator[>=](other) {
+        if (type(other) == "String") {
+            return this.value >= other.value;
+        } else {
+            return this.value >= other;
+        }
+    }
+
+    // 返回字符串表示
+    func toString() {
+        return this;
+    }
+
+    // 检查字符串是否为空
+    func isEmpty() {
+        return len(this.value) == 0;
+    }
+
+    // 创建一个新的 String 实例
+    func clone() {
+        return new String(this.value);
+    }
+
+    // ===== 字符串操作方法 =====
+
+    // 获取指定索引处的字符
+    func get(index) {
+        return __str_get(this.value, index);
+    }
+
+    // 字符串切片 [start, end)
+    func slice(start, end) {
+        return new String(__str_slice(this.value, start, end));
+    }
+
+    // 查找子字符串首次出现位置
+    func index(substring) {
+        var sub = substring;
+
+        if (type(substring) == "String") {
+            sub = substring.value;
+        }
+
+        return __str_index(this.value, sub);
+    }
+
+    // 查找子字符串最后出现位置
+    func rindex(substring) {
+        var sub = substring;
+
+        if (type(substring) == "String") {
+            sub = substring.value;
+        }
+
+        return __str_rindex(this.value, sub);
+    }
+
+    // 替换所有子字符串
+    func replace(old, replacement) {
+        var oldStr = old;
+        var newStr = replacement;
+
+        if (type(old) == "String") {
+            oldStr = old.value;
+        }
+
+        if (type(replacement) == "String") {
+            newStr = replacement.value;
+        }
+
+        return new String(__str_replace(this.value, oldStr, newStr));
+    }
+
+    // 分割字符串
+    func split(separator) {
+        var sep = separator;
+
+        if (type(separator) == "String") {
+            sep = separator.value;
+        }
+
+        return __str_split(this.value, sep);
+    }
+
+    // 检查字符串是否以prefix开头
+    func startswith(prefix) {
+        var pre = prefix;
+
+        if (type(prefix) == "String") {
+            pre = prefix.value;
+        }
+
+        return __str_startswith(this.value, pre);
+    }
+
+    // 检查字符串是否以suffix结尾
+    func endswith(suffix) {
+        var suf = suffix;
+
+        if (type(suffix) == "String") {
+            suf = suffix.value;
+        }
+
+        return __str_endswith(this.value, suf);
+    }
+
+    // 转换为小写
+    func lower() {
+        return new String(__str_lower(this.value));
+    }
+
+    // 转换为大写
+    func upper() {
+        return new String(__str_upper(this.value));
+    }
+
+    // 计算子字符串出现次数
+    func count(substring) {
+        var sub = substring;
+
+        if (type(substring) == "String") {
+            sub = substring.value;
+        }
+
+        return __str_count(this.value, sub);
+    }
+}
+
+// str() - 全局函数：将任意类型转换为 String 对象
+// 替代 __builtin_str 提供对象包装
+func str(obj) {
+    var t = type(obj);
+    
+    // 如果已经是 String 对象，直接返回
+    if (t == "String") {
+        return obj;
+    }
+    
+    // 对于对象，尝试调用 toString() 方法或 [str] 运算符
+    if (t == "object") {
+        // 尝试 toString() 方法
+        try {
+            return obj.toString();
+        } catch (e) {
+            // 如果没有 toString()，使用内置转换并包装
+            return new String(__builtin_str(obj));
+        }
+    }
+    
+    // 对于基础类型，使用内置转换并包装为 String
+    return new String(__builtin_str(obj));
+}

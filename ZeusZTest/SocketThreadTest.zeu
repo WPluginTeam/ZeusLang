@@ -1,0 +1,94 @@
+import ZeusBuiltins.thread [&];
+import ZeusBuiltins.socket [&];
+
+
+var server = new socket.Socket();
+server.bind("0.0.0.0", 8081);
+server.listen(1000);
+
+func remove(th) {
+    // print("Will remove:", th);
+    delete th;
+}
+
+class ClientRes {
+    let client = nil;
+    let thread = nil;
+
+    using &this;
+    
+    func init (client) {
+        this.client = client;
+        this.thread = new thread.Thread(this.handle);
+        this.thread.start();
+    }
+
+    func handle () {
+        let data = this.client.recv(1024);
+        if (len(data) == 0) {
+            break;
+        }
+        this.client.send(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n
+        <html>
+        <title>WDNMD</title>
+        <h1> Hello world!</h1>
+        </html>\r\n\r\n");
+        this.client.close();
+        // print("Connection finished");
+    }
+
+    func operator[~] () {
+        //print("~ClientRes on thread", __thread_current_id());
+        // 必须显式调用 thread.join() 来清理线程资源
+        if (this.thread != nil) {
+            this.thread.join();
+            // this.thread.target = nil;
+            // this.thread.args = nil;
+            // this.thread.name = nil;
+            // this.thread = nil;
+        }
+        if (this.client != nil) {
+            this.client.close();
+            // this.client = nil;
+        }
+    }
+}
+
+func tryToAccept(counter) {
+    let client = server.accept();
+    let res = new ClientRes(client);
+    
+    // 每100个请求输出一次状态
+    
+    if (counter % 100 == 0) {
+        print("=== Request:", counter, "Memory:", __get_memory_usage(), "MB, Threads:", __thread_count(), "===" );
+        __gc_stats();
+        __closure_stats();
+        __vm_stats();
+       // __leak_summary();
+    }
+
+    // 调用端不再保留对 ClientRes 的引用，避免额外引用计数
+    delete res;
+}
+
+func main () {
+    let counter = 0;
+    for (true) {
+        if (counter >= 1000) {
+            break;
+        }
+        counter = counter + 1;
+        tryToAccept(counter);
+    }
+    
+    // 等待线程完成
+    print("Waiting for threads...");
+    // join_all 在部分平台上可能抛出“no such process”，这里忽略
+    print("All threads finished");
+    __gc_stats();
+    __dump_oldest_cells(20);
+}
+
+main();
+

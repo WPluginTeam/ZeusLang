@@ -1,0 +1,70 @@
+
+// File module for Zeus built-in functions
+// Created: 2025/12/5 by Himpq
+
+class File {
+    using &this;
+
+    func init (path, mode="r") {
+        using original {
+            var pathStr = path;
+            var modeStr = mode;
+            
+            if (type(path) == "String") {
+                pathStr = path.value;
+            }
+            
+            if (type(mode) == "String") {
+                modeStr = mode.value;
+            }
+            
+            this.path = path;
+            this.mode = mode;
+            this.handle = __file_open(pathStr, modeStr);
+        }
+    }
+
+    func write (data) {
+        using original {
+            if (type(data) == "Byte") {
+                // Mode could be String wrapper or basic string
+                var modeVal = this.mode;
+                
+                if (type(this.mode) == "String") {
+                    modeVal = this.mode.value;
+                }
+                
+                // For now, just write the data
+                // Binary mode validation can be enhanced later
+                __file_write(this.handle, data.data);
+            } else {
+                __file_write(this.handle, data);
+            }
+        }
+    }
+
+    func read (size=-1) {
+        return __file_read(this.handle, size);
+    }
+
+    func close () {
+        __file_close(this.handle);
+    }
+
+    func seek (offset, whence=0) {
+        __file_seek(this.handle, offset, whence);
+    }
+
+    func operator[with] () {
+
+    }
+
+    func operator[~with] () {
+        this.close();
+    }
+
+    func operator[~] () {
+        print("[Warning] Close file automatically in destructor.", this.path);
+        this.close();
+    }
+}

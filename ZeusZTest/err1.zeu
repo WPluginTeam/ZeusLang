@@ -1,0 +1,15 @@
+
+
+import ZeusBuiltins.time [&];
+print("What can i say?!");
+print("This is a test file with an error!");
+
+func raise() {
+    throw new Exception("This is a custom error message!"+type(Exception));
+}
+
+try {
+    raise();
+} catch (&e) {
+    print("We Catch it:", e.getMessage());
+}

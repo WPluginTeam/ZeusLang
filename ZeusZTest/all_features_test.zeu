@@ -1,0 +1,310 @@
+// Zeus full feature smoke/regression script
+// Run:
+//   Zeus.exe ZeusZTest/all_features_test.zeu
+// Optional:
+//   Zeus.exe --strict-decl ZeusZTest/all_features_test.zeu
+
+import ZeusBuiltins.time [&tm];
+
+var PASS = 0;
+var FAIL = 0;
+
+func ok(name, cond) {
+    if (cond) {
+        PASS = PASS + 1;
+        print("[PASS]", name);
+    } else {
+        FAIL = FAIL + 1;
+        print("[FAIL]", name);
+    }
+}
+
+func section(name) {
+    print("");
+    print("====", name, "====");
+}
+
+// ---------- Forward declaration ----------
+decl func forward_sum(a, b);
+
+func call_forward() {
+    return forward_sum(2, 3);
+}
+
+func forward_sum(a, b) {
+    return a + b;
+}
+
+// ---------- Functions ----------
+func add_default(a, b = 2, c = 3) {
+    return a + b + c;
+}
+
+func count_args(*args) {
+    return len(args);
+}
+
+func pick_any(**kwargs) {
+    for (kwargs) [k: v] {
+        return v;
+    }
+    return nil;
+}
+
+func make_ref_counter(start) {
+    let x = start;
+    func inc(delta) [&x] {
+        x = x + delta;
+        return x;
+    }
+    return inc;
+}
+
+func make_copy_capture() {
+    let x = 7;
+    func f() [x] {
+        return x;
+    }
+    x = 100;
+    return f;
+}
+
+// ---------- Classes ----------
+class Box {
+    using &this;
+    let value = 0;
+
+    func init(v) {
+        this.value = v;
+    }
+
+    func get() {
+        return this.value;
+    }
+
+    func add(n) {
+        this.value = this.value + n;
+        return this;
+    }
+
+    func static make(v) {
+        return new Box(v);
+    }
+
+    func operator[+] (other) {
+        return new Box(this.value + other.value);
+    }
+
+    func operator[==] (other) {
+        return this.value == other.value;
+    }
+
+    func operator[[]] (k) {
+        if (k == "value") {
+            return this.value;
+        }
+        return nil;
+    }
+
+    func operator[[]=] (k, v) {
+        if (k == "value") {
+            this.value = v;
+        }
+        return nil;
+    }
+
+    func operator[~] () {
+        print("[INFO] Box destructor called, value =", this.value);
+    }
+}
+
+class ScopedResource {
+    using &this;
+    let opened = false;
+
+    func operator[with] () {
+        this.opened = true;
+        print("[INFO] enter with");
+        return nil;
+    }
+
+    func operator[~with] () {
+        this.opened = false;
+        print("[INFO] exit with");
+        return nil;
+    }
+
+    func isOpen() {
+        return this.opened;
+    }
+}
+
+shared class SharedBox {
+    using &this;
+    let value = 0;
+
+    func init(v) {
+        this.value = v;
+    }
+
+    func get() {
+        return this.value;
+    }
+}
+
+func raise_error() {
+    throw new Exception("boom from raise_error");
+}
+
+func main() {
+    section("import");
+    ok("namespace import [&alias] works", len(tm.asctime()) > 0);
+
+    section("literals and operators");
+    let i = 42;
+    let f = 3.5;
+    let s = "line1\nline2";
+    let b = true;
+    let n = nil;
+
+    ok("int literal", i == 42);
+    ok("float arithmetic", f + 0.5 == 4.0);
+    ok("string escape", type(s) == "String" or type(s) == "string");
+    ok("bool literal", b == true);
+    ok("nil literal", n == nil);
+    ok("logic and", (true and false) == false);
+    ok("logic or", (false or true) == true);
+    ok("comparison >=", 5 >= 5);
+    ok("modulus", 10 % 3 == 1);
+
+    section("if / else / single stmt");
+    let flag = 0;
+    if (1 < 2) flag = 1; else flag = 2;
+    ok("single stmt if/else", flag == 1);
+
+    let branch = 0;
+    if (false) branch = 1; else if (true) branch = 2; else branch = 3;
+    ok("else if chain", branch == 2);
+
+    section("list / dict / subscript");
+    let arr = [1, 2, 3];
+    ok("list literal", arr.length() == 3);
+    ok("list read", arr[0] == 1);
+    arr[1] = 99;
+    ok("list write", arr[1] == 99);
+
+    let mp = {1: 1, 2: 2};
+    ok("dict literal", mp[1] == 1 and mp[2] == 2);
+    ok("dict read", mp[1] == 1);
+    mp[1] = 10;
+    ok("dict write", mp[1] == 10);
+
+    section("for loops");
+    let sum_count_simple = 0;
+    for (5) [idx] {
+        sum_count_simple = sum_count_simple + idx;
+    }
+    ok("for count simple", sum_count_simple == 10);
+
+    let sum_range = 0;
+    for (1..6..2) [i2] {
+        sum_range = sum_range + i2;
+    }
+    ok("for range with step", sum_range == 9);
+
+    let sum_dict = 0;
+    for (mp) [k: v] {
+        sum_dict = sum_dict + v;
+    }
+    ok("for dict iterate", sum_dict == 12);
+
+    let spin = 0;
+    for (true) {
+        spin = spin + 1;
+        if (spin >= 3) {
+            break;
+        }
+    }
+    ok("for condition + break", spin == 3);
+
+    section("function features");
+    ok("forward declaration", call_forward() == 5);
+    ok("default args", add_default(1) == 6);
+    ok("named args", add_default(a = 1, c = 10, b = 2) == 13);
+    ok("*args", count_args(1, 2, 3, 4) == 4);
+    ok("**kwargs", pick_any(x = 77, y = 88) != nil);
+
+    section("class / object / operators / new(args)");
+    let b1 = new Box(2);
+    let b2 = Box.make(3);
+    ok("constructor args", b1.get() == 2 and b2.get() == 3);
+
+    let b3 = b1 + b2;
+    ok("operator[+]", b3.get() == 5);
+    ok("operator[==]", b1 == new Box(2));
+
+    ok("operator[[]] read", b1["value"] == 2);
+
+    let chain = new Box(1);
+    chain.add(2).add(3);
+    ok("method chain", chain.get() == 6);
+
+    section("with / try-catch / throw");
+    let res = new ScopedResource();
+    with (res) [&r] {
+        ok("with capture var", r.isOpen() == true);
+    }
+    ok("with leave called", res.isOpen() == false);
+
+    try {
+        raise_error();
+        ok("try/catch with var", false);
+    } catch (&e) {
+        ok("catch variable", type(e.getMessage()) == "String" or type(e.getMessage()) == "string");
+        ok("try/catch with var", true);
+    }
+
+    try {
+        throw "string error";
+        ok("try/catch without var", false);
+    } catch () {
+        ok("try/catch without var", true);
+    }
+
+    section("using original");
+    using original {
+        let raw_list = [10, 20, 30];
+        ok("using original block list", len(raw_list) == 3);
+    }
+
+    // File-level switch (for remaining statements)
+    using original;
+    let post_original = [1, 2];
+    ok("using original stmt", len(post_original) == 2);
+
+    section("shared variable / shared class / delete");
+    var shared shared_counter = 5;
+    shared_counter = shared_counter + 1;
+    ok("shared var", shared_counter == 6);
+
+    let sb = new SharedBox(11);
+    ok("shared class", sb.get() == 11);
+
+    let d1 = new Box(100);
+    let d2 = new Box(200);
+    delete d1, d2;
+    delete sb;
+    delete res;
+    delete b1;
+    delete b2;
+    delete b3;
+    delete chain;
+
+    section("summary");
+    print("PASS =", PASS, "FAIL =", FAIL, "TOTAL =", PASS + FAIL);
+    if (FAIL > 0) {
+        throw new Exception("all_features_test failed");
+    }
+}
+
+main();

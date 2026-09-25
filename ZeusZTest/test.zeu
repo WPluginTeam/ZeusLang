@@ -1,0 +1,4 @@
+
+import ZeusBuiltins.time [&];
+
+print("Current time:", time.asctime());

@@ -1,0 +1,1 @@
+cl.exe /O2 /GL /MT /utf-8 /EHsc /nologo /std:c++17 /Fe"./Zeus.exe" "Zeus.cpp" /link /LTCG

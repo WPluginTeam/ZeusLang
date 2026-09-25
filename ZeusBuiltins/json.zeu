@@ -1,0 +1,51 @@
+
+// JSON class 
+
+
+class JSON {
+    using &this;
+    
+    let data = {};
+
+    func init (jsonDict) {
+        setattr(this, "data", jsonDict);
+    }
+
+    func toString () {
+        let s = "{";
+        let data = getattr(this, "data");
+
+        for (data) [&key: &value] {
+            s = s + str(key) + ": " + str(value) + ", ";
+        }
+        s = s + "}";
+        return s;
+    }
+
+    func operator[.] (key) {
+        // 使用__objget直接从this.data获取key，零拷贝
+        return __objget(this, "data", key);
+    }
+
+    func operator[.=] (key, value) {
+        // 使用__objset直接设置this.data[key]，零拷贝
+        __objset(this, "data", key, value);
+        return value;
+    }
+
+    func operator[[]] (key) {
+        // 使用__objget直接从this.data获取key，零拷贝
+        return __objget(this, "data", key);
+    }
+
+    func operator[[]=] (key, value) {
+        // 使用__objset直接设置this.data[key]，零拷贝
+        __objset(this, "data", key, value);
+        return value;
+    }
+
+    func copy () {
+        let a = (new JSON(this.data));
+        return a;
+    }
+}

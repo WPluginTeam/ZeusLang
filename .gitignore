@@ -1,0 +1,16 @@
+# Build outputs (MSVC / linker temporaries)
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.zir
+*_gen.ll
+*.log
+*.txt
+*.json
+
+# VS Code workspace cache (keep shared tasks/launch/settings tracked)
+/.vs/ipch/
+*.code-workspace
+.vscode

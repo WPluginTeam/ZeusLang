@@ -1,0 +1,111 @@
+
+using original;
+
+class Array {
+    using &this;
+    
+    func init(arr) {
+        this.data = arr;
+    }
+
+    let data = [];
+
+    func append(value) {
+        __array_push(this.data, value);
+        return this;
+    }
+
+    func remove (index) {
+        let newArr = new Array([]);
+
+        for (0..this.length()) [&i] {
+            if (i != index) {
+                newArr.append(this.data[i]);
+            }
+        }
+        return newArr;
+    }
+
+    func pop() {
+        return __array_pop(this.data);
+    }
+
+    func length() {
+        return len(this.data);
+    }
+
+    func get(index) {
+        return this.data[index];
+    }
+
+    func toString() {
+        var s = "[";
+        
+        for (this.data) [&item] {
+            s = s + str(item) + ", ";
+        }
+        
+        s = s + "]";
+        return new String(s);
+    }
+
+    func operator[+](other) {
+        var result = [];
+        
+        // 添加this的所有元素
+        for (this.data) [&item] {
+            __array_push(result, item);
+        }
+        
+        // 添加other的所有元素
+        for (other.data) [&item] {
+            __array_push(result, item);
+        }
+        
+        // 用结果数组创建新Array对象
+        return new Array(result);
+    }
+
+    func sort() {
+        let n = len(this.data);
+
+        // 冒泡排序
+        let i = 0;
+        for (i < n - 1) {
+            let j = 0;
+            for (j < n - i - 1) {
+                if (this.data[j] > this.data[j + 1]) {
+                    // 交换
+                    let tmp = this.data[j];
+                    this.data[j] = this.data[j + 1];
+                    this.data[j + 1] = tmp;
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+
+        return this;
+    }
+
+    func clear() {
+        this.data = [];
+        return this;
+    }
+
+    func copy () {
+        let newData = [];
+        for (this.data) [&item] {
+            __array_push(newData, item);
+        }
+        return new Array(newData);
+    }
+
+    func operator[[]=] (index, value) {
+        this.data[index] = value;
+    }
+
+    func operator[[]] (index) {
+        return this.data[index];
+    }
+}

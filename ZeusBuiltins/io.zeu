@@ -1,0 +1,69 @@
+
+// I/O functions for Zeus
+
+// Helper function to convert value to native string
+func _toStr(val) {
+    using original {
+        if (type(val) == "string") {
+            return val;
+        } else if (type(val) == "String") {
+            return val.value;
+        } else {
+            var converted = str(val);
+            if (type(converted) == "String") {
+                return converted.value;
+            } else {
+                return converted;
+            }
+        }
+    }
+}
+
+// Build string from array of values with separator
+func _joinArray(arr, sep) {
+    var len_arr = len(arr);
+
+    if (len_arr == 0) {
+        return "";
+    }
+
+    var result = _toStr(arr[0]);
+
+    for (1..len_arr) [&index] {
+        result = result + sep + _toStr(arr[index]);
+    }
+
+    return result;
+}
+
+// Enhanced print function supporting **kwargs
+// Usage: print(*args, **kwargs) where kwargs can contain sep="" and end=""
+func print(*args, **kwargs) {
+    var len_args = len(args);
+    var sep = " ";
+    var end = "\n";
+
+    // Extract sep and end from kwargs
+    var kwargs_type = type(kwargs);
+
+    if (kwargs_type == "dict" || kwargs_type == "object") {
+        for (kwargs) [const &key : ... value] {
+            if (key == "sep") {
+                sep = _toStr(value);
+            } else if (key == "end") {
+                end = _toStr(value);
+            }
+        }
+    }
+
+    if (len_args == 0) {
+        _write(end);
+        return nil;
+    }
+
+    var output = _joinArray(args, sep);
+
+    _write(output + end);
+
+    return nil;
+}

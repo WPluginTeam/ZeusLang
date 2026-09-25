@@ -1,0 +1,53 @@
+// Zeus 内置 Namespace 类
+// 用于包命名空间的实现
+
+using original;
+
+class Namespace {
+    using &this;
+    
+    // 存储命名空间的导出项列表
+    // exports: 导出项名称数组,例如 ["PI", "fibonacci"]
+    let exports;
+    let packageName;
+    
+    func init(pkgName, exportsList) {
+        // 使用 setattr 绕过 operator[.=] 直接设置成员变量
+        setattr(this, "packageName", pkgName);
+        setattr(this, "exports", exportsList);
+    }
+    
+    // 重载属性访问操作符 [.]
+    func operator[.](name) {
+        // 使用 getattr 绕过 operator[.] 直接访问成员变量
+        let exports = getattr(this, "exports");
+        let pkgName = getattr(this, "packageName");
+        
+        // 验证name是否在exports中 (exports现在是字典)
+        if (hasKey(exports, name) == false) {
+            print("Error: Namespace '", pkgName, "' has no member '", name, "'");
+            return 0;  // 返回0作为错误标记
+        }
+
+        // 通过包名前缀查找全局变量
+        let prefixedName = pkgName + "." + name;
+        return __loadglobal(prefixedName);
+    }
+    
+    // 重载属性赋值操作符 [.=]
+    func operator[.=](name, value) {
+        // 使用 getattr 绕过 operator[.] 直接访问成员变量
+        let pkgName = getattr(this, "packageName");
+
+        // 直接通过包名前缀设置全局变量
+        let prefixedName = pkgName + "." + name;
+        __storeglobal(prefixedName, value);
+        return value;
+    }
+    
+    func toString() {
+        // 使用 getattr 绕过 operator[.] 直接访问成员变量
+        let pkgName = getattr(this, "packageName");
+        return pkgName;
+    }
+}

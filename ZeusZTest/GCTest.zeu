@@ -1,0 +1,54 @@
+class Node {
+    let next = nil;
+    let value = nil;
+    using &this;
+
+    func init(v) {
+        this.value = v;
+    }
+
+    func link(other) {
+        this.next = other;
+    }
+}
+
+func makeCycle() {
+    let a = new Node("a");
+    let b = new Node("b");
+    a.link(b);
+    b.link(a);
+    delete a;
+    delete b;
+}
+
+func makeClosure() {
+    let x = "x";
+    func inner() [&] {
+        return x;
+    }
+    return inner;
+}
+
+func main() {
+    let i = 0;
+    for (true) {
+        if (i >= 1000) {
+            break;
+        }
+
+        makeCycle();
+        let f = makeClosure();
+        let y = f();
+        delete f;
+
+        if (i % 100 == 0) {
+            print("=== GC Test:", i, "Memory:", __get_memory_usage(), "MB ===");
+            __gc_stats();
+            __leak_summary();
+        }
+
+        i = i + 1;
+    }
+}
+
+main();

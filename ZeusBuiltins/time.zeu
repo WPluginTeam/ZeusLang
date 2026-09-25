@@ -1,0 +1,126 @@
+
+// Time module for Zeus
+// Provides comprehensive time functions similar to Python's time module
+// By Himpq
+
+// sleep(seconds): 暂停执行指定秒数（支持浮点数，如0.5表示500毫秒）
+func sleep(seconds) {
+    __time_sleep(seconds);
+}
+
+// time(): 返回当前时间的Unix时间戳（秒，浮点数）
+func time() {
+    return __time_time();
+}
+
+// clock(): 返回CPU时钟时间（秒）
+func clock() {
+    return __time_clock();
+}
+
+// monotonic(): 返回单调时钟时间（秒，不受系统时间调整影响）
+func monotonic() {
+    return __time_monotonic();
+}
+
+// perf_counter(): 返回高精度性能计数器（秒，用于精确计时）
+func perf_counter() {
+    return __time_perf_counter();
+}
+
+// localtime(timestamp=nil): 将时间戳转换为本地时间的字典
+// 返回: {year, month, day, hour, minute, second, weekday, yearday, isdst}
+// 如果timestamp为nil，使用当前时间
+func localtime(timestamp=nil) {
+    if (timestamp == nil) {
+        timestamp = __time_time();
+    }
+    return __time_localtime(timestamp);
+}
+
+// gmtime(timestamp=nil): 将时间戳转换为UTC时间的字典
+// 返回: {year, month, day, hour, minute, second, weekday, yearday, isdst}
+// 如果timestamp为nil，使用当前时间
+func gmtime(timestamp=nil) {
+    if (timestamp == nil) {
+        timestamp = __time_time();
+    }
+    return __time_gmtime(timestamp);
+}
+
+// mktime(timeDict): 将时间字典转换为时间戳
+// timeDict: 包含year, month, day, hour, minute, second的字典
+func mktime(timeDict) {
+    return __time_mktime(timeDict);
+}
+
+// strftime(format, timeDict=nil): 格式化时间字符串
+// format: 格式字符串，如"%Y-%m-%d %H:%M:%S"
+// timeDict: 时间字典，如果为nil则使用当前时间
+func strftime(format, timeDict=nil) {
+    if (timeDict == nil) {
+        timeDict = localtime();
+    }
+    return __time_strftime(format, timeDict);
+}
+
+// strptime(timeStr, format): 解析时间字符串
+// timeStr: 时间字符串，如"2024-01-15 10:30:00"
+// format: 格式字符串，如"%Y-%m-%d %H:%M:%S"
+// 返回: 时间字典
+func strptime(timeStr, format) {
+    return __time_strptime(timeStr, format);
+}
+
+// ctime(timestamp=nil): 返回可读的时间字符串
+// 格式类似: "Mon Jan 15 10:30:00 2024"
+func ctime(timestamp=nil) {
+    return strftime("%a %b %d %H:%M:%S %Y", localtime(timestamp));
+}
+
+// asctime(timeDict=nil): 将时间字典转换为可读字符串
+func asctime(timeDict=nil) {
+    if (timeDict == nil) {
+        timeDict = localtime();
+    }
+    return strftime("%a %b %d %H:%M:%S %Y", timeDict);
+}
+
+// 便捷函数：获取当前日期字符串 "YYYY-MM-DD"
+func today() {
+    return strftime("%Y-%m-%d");
+}
+
+// 便捷函数：获取当前时间字符串 "HH:MM:SS"
+func now() {
+    return strftime("%H:%M:%S");
+}
+
+// 便捷函数：获取当前日期时间字符串 "YYYY-MM-DD HH:MM:SS"
+func datetime() {
+    return strftime("%Y-%m-%d %H:%M:%S");
+}
+
+class SpeedTest {
+    using &this;
+
+    let startTime = 0.0;
+    let endTime = 0.0;
+
+    func init() {
+
+    }
+
+    func operator[with] () {
+        this.startTime = perf_counter();
+    }
+
+    func operator[~with] () {
+        this.endTime = perf_counter();
+    }
+
+    func get() {
+        return this.endTime - this.startTime;
+    }
+    
+}

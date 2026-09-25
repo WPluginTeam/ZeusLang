@@ -1,0 +1,69 @@
+
+using original;
+
+class Byte {
+    using &this;
+
+    func init(data) {
+        this.data = data;
+    }
+
+    let data = b"";
+
+    func get(index) {
+        return __bytes_get(this.data, index);
+    }
+
+    func length() {
+        return len(this.data);
+    }
+
+    func slice(start, end) {
+        let sliced = __bytes_slice(this.data, start, end);
+        return new Byte(sliced);
+    }
+
+    func split(bt) {
+        let arr = [];
+
+        let index = 0;
+        let match = false;
+
+        for (i = 0; i < len(this.data); i = i + 1) {
+            if (this.data[i] == bt) {
+                match = true;
+            } else {
+                if (match) {
+                    let part = __bytes_slice(this.data, index, i);
+                    arr.append(new Byte(part));
+                    index = i;
+                    match = false;
+                }
+            }
+
+        }
+        return arr;
+    }
+
+    func decode(encoding="utf-8") {
+        return __bytes_decode(this.data, encoding);
+    }
+
+    func toList() {
+        return __bytes_to_list(this.data);
+    }
+
+    func toString() {
+        return str(this.data);
+    }
+
+    func operator[+](other) {
+        // 直接合并两个bytes值（底层实现支持bytes+bytes）
+        var resultBytes = this.data + other.data;
+        return new Byte(resultBytes);
+    }
+
+    func operator[[]] (index) {
+        return this.slice(index, index + 1);
+    }
+}
