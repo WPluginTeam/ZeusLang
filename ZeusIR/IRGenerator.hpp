@@ -5062,32 +5062,28 @@ namespace IRGen {
                 }
 
                 // 提前根据显式捕获列表为当前函数建立 upvalue 捕获链
-                if (!codeBlock.captureVars.empty()) {
-                    ZEUS_DEBUG_PRINT("[IRGen    ] Function '%s' pre-resolving %zu captures (funcStack depth=%zu)", 
-                                    codeBlock.funcName.c_str(), codeBlock.captureVars.size(), IRScope::funcStack.size());
-                    for (const auto &capName : codeBlock.captureVars) {
-                        // 先尝试 resolve，如果失败则 forceCapture
+                std::vector<std::string> explicitCaptureNames = codeBlock.captureVars;
+                explicitCaptureNames.insert(
+                    explicitCaptureNames.end(),
+                    codeBlock.copyVars.begin(),
+                    codeBlock.copyVars.end()
+                );
+                if (!explicitCaptureNames.empty()) {
+                    ZEUS_DEBUG_PRINT("[IRGen    ] Function '%s' pre-resolving %zu captures (funcStack depth=%zu)",
+                                    codeBlock.funcName.c_str(), explicitCaptureNames.size(), IRScope::funcStack.size());
+                    for (const auto &capName : explicitCaptureNames) {
                         auto resolved = IRScope::resolve(capName);
                         if (resolved.kind == IRScope::Kind::UNDEFINED) {
                             ZEUS_DEBUG_PRINT("[IRGen    ]   '%s' not found by resolve, trying forceCapture...", capName.c_str());
-                            // 打印父函数环境的局部变量
-                            if (IRScope::funcStack.size() >= 2) {
-                                auto& parentEnv = IRScope::funcStack[IRScope::funcStack.size() - 2];
-                                ZEUS_DEBUG_PRINT("[IRGen    ]     Parent func has %zu locals:", parentEnv.locals.size());
-                                for (auto& kv : parentEnv.locals) {
-                                    ZEUS_DEBUG_PRINT("[IRGen    ]       '%s' -> slot %d", kv.first.c_str(), kv.second);
-                                }
-                            }
                             resolved = IRScope::forceCapture(capName);
                         }
-                        ZEUS_DEBUG_PRINT("[IRGen    ]   '%s' -> kind=%d index=%d", 
+                        ZEUS_DEBUG_PRINT("[IRGen    ]   '%s' -> kind=%d index=%d",
                                         capName.c_str(), (int)resolved.kind, resolved.index);
                         if (resolved.kind == IRScope::Kind::UNDEFINED) {
                             ZEUS_DEBUG_PRINT("[IRGen    ]   WARNING: '%s' still not found after forceCapture!", capName.c_str());
                         }
                     }
                 }
-
                 int preDeclaredIndex = -1;            // 本函数自身名字在其定义所在“声明域”(顶层或父函数)中的槽位
                 IRScope::Kind preDeclaredKind = IRScope::Kind::UNDEFINED; // GLOBAL 或 LOCAL
                 if (!codeBlock.funcName.empty()) {

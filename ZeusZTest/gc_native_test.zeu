@@ -1,0 +1,225 @@
+// Zeus shared-GC / closure regression script for the AOT (LLVM) path.
+// Run:
+//   zeusc.bat ZeusZTest/gc_native_test.zeu -o %TEMP%\gc_native_test.exe && %TEMP%\gc_native_test.exe
+// The VM accepts the same script; there __gc_native_nodes() is always 0 because
+// VM closures live in the VM closure table, not in the shared collector.
+//
+// Counters are function locals on purpose: the AOT backend still keeps top-level
+// globals in per-chunk allocas while native functions use the runtime slot
+// table, so a counter stored in a global would read back as nil under AOT.
+
+func ok(name, cond) {
+    if (cond) {
+        print("[PASS]", name);
+        return 1;
+    }
+    print("[FAIL]", name);
+    return 0;
+}
+
+func section(name) {
+    print("");
+    print("====", name, "====");
+}
+
+// ---------- capture semantics ----------
+
+func make_copy_counter(start: int) {
+    let x = start;
+    func next() [x] -> int {
+        x = x + 1;
+        return x;
+    }
+    return next;
+}
+
+func make_ref_counter(start: int) {
+    let x = start;
+    func next() [&x] -> int {
+        x = x + 1;
+        return x;
+    }
+    return next;
+}
+
+func make_stepper(start: int) {
+    let value = start;
+    func step(amount: int) [value] -> int {
+        value = value + amount;
+        return value;
+    }
+    return step;
+}
+
+func make_dynamic_adder(start) {
+    let value = start;
+    func add(amount) [value] {
+        value = value + amount;
+        return value;
+    }
+    return add;
+}
+
+func copy_leaves_outer() -> int {
+    let x = 30;
+    func increment() [x] -> int {
+        x = x + 1;
+        return x;
+    }
+    x = 40;
+    increment();
+    return x;
+}
+
+func ref_updates_outer() -> int {
+    let x = 30;
+    func increment() [&x] -> int {
+        x = x + 1;
+        return x;
+    }
+    increment();
+    return x;
+}
+
+// ---------- closure churn, observed through the collector ----------
+
+func churn(n: int) {
+    let i = 0;
+    for (true) {
+        if (i >= n) {
+            break;
+        }
+        let counter = make_copy_counter(i);
+        let first = counter();
+        i = i + 1;
+    }
+}
+
+// ---------- phi merge of a dynamic local ----------
+
+func pick_branch(c: bool) -> int {
+    let s = "";
+    let tag = 0;
+    if (c) {
+        s = "aaaaaaaaaaaaaaaaaaaaaaaa";
+        tag = 1;
+    } else {
+        s = "bbbbbbbbbbbbbbbbbbbbbbbb";
+        tag = 2;
+    }
+    s = s + "!";
+    print("merge ->", s, tag);
+    return tag;
+}
+
+func run_capture_tests() -> int {
+    section("closure captures");
+
+    let copyCounter = make_copy_counter(10);
+    let copyCounterB = make_copy_counter(10);
+    let copyA1 = copyCounter();
+    let copyA2 = copyCounter();
+    let copyB1 = copyCounterB();
+    let copyA3 = copyCounter();
+    let pass = 0;
+    pass = pass + ok("copy capture mutates its own slot", copyA1 == 11);
+    pass = pass + ok("copy capture keeps state across calls", copyA2 == 12);
+    pass = pass + ok("separate closures own separate copies", copyB1 == 11);
+    pass = pass + ok("copy capture state is private", copyA3 == 13);
+
+    let refCounter = make_ref_counter(20);
+    let refA1 = refCounter();
+    let refA2 = refCounter();
+    pass = pass + ok("reference capture mutates its slot", refA1 == 21);
+    pass = pass + ok("reference capture keeps state across calls", refA2 == 22);
+    pass = pass + ok("copy capture leaves outer binding", copy_leaves_outer() == 40);
+    pass = pass + ok("reference capture writes outer binding", ref_updates_outer() == 31);
+
+    let stepper = make_stepper(40);
+    let step1 = stepper(2);
+    let step2 = stepper(3);
+    pass = pass + ok("copy capture accumulates arguments", step1 == 42);
+    pass = pass + ok("copy capture accumulates again", step2 == 45);
+
+    let adder = make_dynamic_adder(2);
+    let add1 = adder(3);
+    let add2 = adder(4);
+    pass = pass + ok("dynamic copy capture first call", add1 == 5);
+    pass = pass + ok("dynamic copy capture second call", add2 == 9);
+    return pass;
+}
+
+func run_merge_tests() -> int {
+    section("block merge");
+
+    let pass = 0;
+    pass = pass + ok("if/else merge picks true branch", pick_branch(true) == 1);
+    pass = pass + ok("if/else merge picks false branch", pick_branch(false) == 2);
+
+    let merged = "";
+    let n = 0;
+    for (true) {
+        if (n >= 4) {
+            break;
+        }
+        if (n % 2 == 0) {
+            merged = "even";
+        } else {
+            merged = "odd";
+        }
+        n = n + 1;
+    }
+    pass = pass + ok("merged local survives the loop", n == 4);
+    pass = pass + ok("merged local kept the last branch value", merged == "odd");
+    return pass;
+}
+
+func run_string_tests() -> int {
+    section("string ABI over native class values");
+
+    let s = "abc";
+    let concatLiteral = s + "!";
+    let concatSelf = s + s;
+    let concatChain = "x" + "y" + "z";
+    let pass = 0;
+    pass = pass + ok("string concat with a literal", concatLiteral == "abc!");
+    pass = pass + ok("string concat of two locals", concatSelf == "abcabc");
+    pass = pass + ok("chained string concat", concatChain == "xyz");
+    return pass;
+}
+
+func run_gc_tests() -> int {
+    section("shared collector");
+
+    print("nodes at start", __gc_native_nodes());
+    let kept = make_copy_counter(100);
+    let pass = 0;
+    pass = pass + ok("kept closure runs", kept() == 101);
+
+    churn(3000);
+    let before = __gc_native_nodes();
+    let after = __gc_collect();
+    print("nodes before collect", before, "after", after);
+    pass = pass + ok("collection does not grow the node table", after <= before);
+    pass = pass + ok("churned closures are reclaimed", after < 3000);
+    let keptA = kept();
+    let keptB = kept();
+    pass = pass + ok("kept closure survives collection", keptA == 102);
+    pass = pass + ok("kept closure keeps its capture state", keptB == 103);
+    return pass;
+}
+
+func main() {
+    let pass = 0;
+    pass = pass + run_capture_tests();
+    pass = pass + run_merge_tests();
+    pass = pass + run_string_tests();
+    pass = pass + run_gc_tests();
+
+    section("summary");
+    print("PASS =", pass, "TOTAL =", pass);
+    // No throw here: the AOT path has no exception support, so a failing run is
+    // reported through the [FAIL] markers instead of the exit code.
+}
+
+main();

@@ -112,7 +112,17 @@ ZeusBox* applyBuiltin(
     }
 
     if (opcode == ZEUS_BINARY_ADD) return zeus_int_add(lhs, rhs);
+    // The runtime only implements strict less-than, so the inclusive forms swap
+    // operands and negate the result.
     if (opcode == ZEUS_BINARY_LESS_THAN) return zeus_less_than(lhs, rhs);
+    if (opcode == ZEUS_BINARY_GREATER_THAN) return zeus_less_than(rhs, lhs);
+    if (opcode == ZEUS_BINARY_LESS_EQUAL || opcode == ZEUS_BINARY_GREATER_EQUAL) {
+        std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> strict(
+            zeus_less_than(opcode == ZEUS_BINARY_LESS_EQUAL ? rhs : lhs,
+                           opcode == ZEUS_BINARY_LESS_EQUAL ? lhs : rhs),
+            &zeus_box_release);
+        return makeValueBox(LexerType::Value(zeus_truthy(strict.get()) == 0 ? 1 : 0));
+    }
 
     LexerType::Value leftValue(0);
     LexerType::Value rightValue(0);

@@ -296,6 +296,13 @@ namespace IRFor {
         int idxSlot  = in.block.loopHidden.idxSlot;
         int endSlot  = in.block.loopHidden.endSlot;
         int stepSlot = in.block.loopHidden.stepSlot;
+        auto firstTokenLine = [](const std::vector<TreeParser::Token>& tokens) {
+            if (tokens.empty()) return -1;
+            return std::visit(
+                [](const auto& token) { return token.line; },
+                tokens.front()
+            );
+        };
 
         int userIdxSlot = -1;
         if (hasBinding && !binding.isRef) {
@@ -324,7 +331,9 @@ namespace IRFor {
         // COUNT_CHECK_NEG (对 end 做非负检查)
         {
             out.push_back(IRUtils::makeLoadLocal(endSlot));
-            out.push_back(IRUtils::makeCountCheckNeg());
+            auto check = IRUtils::makeCountCheckNeg();
+            check.line = firstTokenLine(in.block.countEndTokens);
+            out.push_back(std::move(check));
         }
 
         // step (默认 1)
@@ -341,7 +350,11 @@ namespace IRFor {
         // COUNT_CHECK_STEP_ZERO (检查步长不能为0)
         {
             out.push_back(IRUtils::makeLoadLocal(stepSlot));
-            out.push_back(IRUtils::makeCountCheckStepZero());
+            auto check = IRUtils::makeCountCheckStepZero();
+            check.line = in.block.countStepTokens.empty()
+                ? firstTokenLine(in.block.countEndTokens)
+                : firstTokenLine(in.block.countStepTokens);
+            out.push_back(std::move(check));
         }
 
         size_t loopStartIndex = out.size();
@@ -369,8 +382,7 @@ namespace IRFor {
             return out.size() - 1;
         };
 
-        size_t jfalseIndex = 0;
-        bool usedRuntimeSignBranch = false;
+        std::vector<size_t> exitJumpIndices;
 
         // If step was pushed as a literal and is a Value BigInteger, we can inspect it here.
         // The emitted code earlier stored step into stepSlot; however we don't have the literal value here easily.
@@ -379,7 +391,9 @@ namespace IRFor {
         bool usedStaticStepPath = false;
         if (in.block.countStepTokens.empty()) {
             // default step == 1 (positive)
-            jfalseIndex = emitCmpAndJFalse(false, in.block.countEndInclusive);
+            exitJumpIndices.push_back(
+                emitCmpAndJFalse(false, in.block.countEndInclusive)
+            );
             usedStaticStepPath = true;
         }
 
@@ -390,85 +404,63 @@ namespace IRFor {
             if (std::holds_alternative<ZeusType::BigInteger>(val.data)) {
                 ZeusType::BigInteger v = std::get<ZeusType::BigInteger>(val.data);
                 if (v == ZeusType::BigInteger(0)) {
-                    // runtime error: step == 0
-                    IRType::IRInstr err; err.op = VMOperator::PUSH; err.args.push_back(LexerType::Value(std::string("RUNTIME_STEP_ZERO"))); out.push_back(err);
-                    // push an op to trigger error at VM if desired; for now we let loop condition be false so no iterations
-                    out.push_back(IRUtils::makePushInt(0));
-                    out.push_back(IRUtils::makeStoreLocal(stepSlot, false));
+                    // COUNT_CHECK_STEP_ZERO reports the runtime error before
+                    // entering this condition. Keep unreachable IR well-formed.
+                    out.push_back(IRUtils::makePushBool(false));
+                    out.push_back(IRUtils::makeJumpIfFalsePlaceholder());
+                    exitJumpIndices.push_back(out.size() - 1);
+                    usedStaticStepPath = true;
                 } else if (v > ZeusType::BigInteger(0)) {
                     // positive step
-                    jfalseIndex = emitCmpAndJFalse(false, in.block.countEndInclusive);
+                    exitJumpIndices.push_back(
+                        emitCmpAndJFalse(false, in.block.countEndInclusive)
+                    );
                     usedStaticStepPath = true;
                 } else {
                     // negative step
-                    jfalseIndex = emitCmpAndJFalse(true, in.block.countEndInclusive);
+                    exitJumpIndices.push_back(
+                        emitCmpAndJFalse(true, in.block.countEndInclusive)
+                    );
                     usedStaticStepPath = true;
                 }
             }
         }
 
         if (!usedStaticStepPath) {
-            // Emit runtime branch based on sign(step)
-            // Stack: (idx end step)
-            // We'll implement: load step; push 0; greater than -> branch to positive-case; less than -> branch to negative-case; equal -> runtime error
-
-            // Save positions: we'll generate code:
-            // load step; push 0; GREATER_THAN; JUMP_IF_TRUE pos_case_label
-            // load step; push 0; LESS_THAN; JUMP_IF_TRUE neg_case_label
-            // // equal -> runtime error: break loop
-            // pos_case_label: (emit idx < end && jumpiffalse placeholder) ; jump to after_condition_choice
-            // neg_case_label: (emit idx > end && jumpiffalse placeholder) ; jump to after_condition_choice
-
-            // load step
+            // Route positive and negative steps to separate bound checks.
             out.push_back(IRUtils::makeLoadLocal(stepSlot));
             out.push_back(IRUtils::makePushInt(0));
             out.push_back(IRUtils::makeGtOp());
             out.push_back(IRUtils::makeJumpIfFalsePlaceholder());
-            size_t jposcheck = out.size() - 1;
+            const size_t jumpToNegativeCheck = out.size() - 1;
 
-            // load step < 0?
+            exitJumpIndices.push_back(
+                emitCmpAndJFalse(false, in.block.countEndInclusive)
+            );
+            out.push_back(IRUtils::makeJump(0));
+            const size_t positiveJumpToBody = out.size() - 1;
+
+            const size_t negativeCheckStart = out.size();
+            const int negativeCheckOffset = static_cast<int>(
+                negativeCheckStart - (jumpToNegativeCheck + 1)
+            );
+            out[jumpToNegativeCheck].args[0] = LexerType::Value(negativeCheckOffset);
+
             out.push_back(IRUtils::makeLoadLocal(stepSlot));
             out.push_back(IRUtils::makePushInt(0));
             out.push_back(IRUtils::makeLtOp());
             out.push_back(IRUtils::makeJumpIfFalsePlaceholder());
-            size_t jnegcheck = out.size() - 1;
+            exitJumpIndices.push_back(out.size() - 1);
 
-            // equal-case: step == 0 -> runtime error: break loop (no iterations)
-            // push false jump to skip body by creating a JUMP_IF_FALSE with true condition 0
-            // We'll emit a JUMP_IF_FALSE placeholder with 0 so it immediately falls through to error handling
-            // For now simply emit a JUMP to skip body (no iterations)
-            out.push_back(IRUtils::makeJump(0)); // placeholder
-            size_t jskipIndex = out.size() - 1;
+            exitJumpIndices.push_back(
+                emitCmpAndJFalse(true, in.block.countEndInclusive)
+            );
 
-            // pos_case_label: backpatch jposcheck true-path to next instruction
-            int afterSignChecksOffset = static_cast<int>(out.size() - (jposcheck + 1));
-            out[jposcheck].args[0] = LexerType::Value(afterSignChecksOffset);
-
-            // emit idx < end (or <=)
-            size_t posJfalse = emitCmpAndJFalse(false, in.block.countEndInclusive);
-            // jump to after_choice
-            out.push_back(IRUtils::makeJump(0));
-            size_t posJumpToAfter = out.size() - 1;
-
-            // neg_case_label: backpatch jnegcheck
-            int negCaseOffset = static_cast<int>(out.size() - (jnegcheck + 1));
-            out[jnegcheck].args[0] = LexerType::Value(negCaseOffset);
-
-            // emit idx > end (or >=)
-            size_t negJfalse = emitCmpAndJFalse(true, in.block.countEndInclusive);
-            // jump to after_choice
-            out.push_back(IRUtils::makeJump(0));
-            size_t negJumpToAfter = out.size() - 1;
-
-            // after_choice: backpatch the two jumps to point here
-            int afterPos = static_cast<int>(out.size() - (posJumpToAfter + 1));
-            out[posJumpToAfter].args[0] = LexerType::Value(afterPos);
-            int afterNeg = static_cast<int>(out.size() - (negJumpToAfter + 1));
-            out[negJumpToAfter].args[0] = LexerType::Value(afterNeg);
-
-            // jfalseIndex should be one of posJfalse or negJfalse depending on path taken; to simplify later backpatch we pick posJfalse (not used further)
-            jfalseIndex = posJfalse;
-            usedRuntimeSignBranch = true;
+            const size_t bodyStart = out.size();
+            const int positiveBodyOffset = static_cast<int>(
+                bodyStart - (positiveJumpToBody + 1)
+            );
+            out[positiveJumpToBody].args[0] = LexerType::Value(positiveBodyOffset);
         }
 
 
@@ -502,8 +494,10 @@ namespace IRFor {
         // 循环结束位置（break 跳转目标）
         size_t loopEndIndex = out.size();
 
-    int skip = static_cast<int>(out.size() - (jfalseIndex + 1));
-    out[jfalseIndex].args[0] = LexerType::Value(skip);
+    for (const size_t exitJumpIndex : exitJumpIndices) {
+        const int skip = static_cast<int>(out.size() - (exitJumpIndex + 1));
+        out[exitJumpIndex].args[0] = LexerType::Value(skip);
+    }
 
         // 回填 body 中的 LOOP_BREAK 占位符
         patchBreakPlaceholders(out, bodyStartIndex, loopEndIndex);

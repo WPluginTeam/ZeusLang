@@ -22,7 +22,7 @@ class Socket {
     }
 
     func connect(host, port) {
-        var hostStr = host;
+        let hostStr = host;
 
         if (type(host) == "String") {
             hostStr = host.value;
@@ -33,7 +33,7 @@ class Socket {
     }
 
     func bind(host, port) {
-        var hostStr = host;
+        let hostStr = host;
 
         if (type(host) == "String") {
             hostStr = host.value;

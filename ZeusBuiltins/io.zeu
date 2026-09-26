@@ -4,21 +4,21 @@
 // Helper function to convert value to native string
 func _toStr(val) {
     using original {
-        var valType = type(val);
+        let valType = type(val);
         if (valType == "string") {
             return val;
         } else if (valType == "String") {
             return val.value;
         } else {
             try {
-                var converted = val.toString();
+                let converted = val.toString();
                 if (type(converted) == "String") {
                     return converted.value;
                 } else {
                     return converted;
                 }
             } catch (e) {
-                var converted = str(val);
+                let converted = str(val);
                 if (type(converted) == "String") {
                     return converted.value;
                 } else {
@@ -31,13 +31,13 @@ func _toStr(val) {
 
 // Build string from array of values with separator
 func _joinArray(arr, sep) {
-    var len_arr = len(arr);
+    let len_arr = len(arr);
 
     if (len_arr == 0) {
         return "";
     }
 
-    var result = _toStr(arr[0]);
+    let result = _toStr(arr[0]);
 
     for (1..len_arr) [&index] {
         result = result + sep + _toStr(arr[index]);
@@ -49,12 +49,12 @@ func _joinArray(arr, sep) {
 // Enhanced print function supporting **kwargs
 // Usage: print(*args, **kwargs) where kwargs can contain sep="" and end=""
 func print(*args, **kwargs) {
-    var len_args = len(args);
-    var sep = " ";
-    var end = "\n";
+    let len_args = len(args);
+    let sep = " ";
+    let end = "\n";
 
     // Extract sep and end from kwargs
-    var kwargs_type = type(kwargs);
+    let kwargs_type = type(kwargs);
 
     if (kwargs_type == "dict" || kwargs_type == "object") {
         for (kwargs) [const &key : ... value] {
@@ -71,7 +71,7 @@ func print(*args, **kwargs) {
         return nil;
     }
 
-    var output = _joinArray(args, sep);
+    let output = _joinArray(args, sep);
 
     _write(output + end);
 

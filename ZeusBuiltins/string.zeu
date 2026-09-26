@@ -62,7 +62,7 @@ class String {
 
     // 字符串连接（+操作符）
     func operator[+](other) {
-        var otherStr = "";
+        let otherStr = "";
 
         if (type(other) == "String") {
             otherStr = other.value;
@@ -70,14 +70,14 @@ class String {
             otherStr = __builtin_str(other);
         }
 
-        var resultStr = this.value + otherStr;
+        let resultStr = this.value + otherStr;
         return new String(resultStr);
     }
 
     // 字符串重复（*操作符）
     func operator[*](count) {
-        var result = "";
-        var i = 0;
+        let result = "";
+        let i = 0;
 
         for (i < count) {
             result = result + this.value;
@@ -174,7 +174,7 @@ class String {
 
     // 查找子字符串首次出现位置
     func index(substring) {
-        var sub = substring;
+        let sub = substring;
 
         if (type(substring) == "String") {
             sub = substring.value;
@@ -185,7 +185,7 @@ class String {
 
     // 查找子字符串最后出现位置
     func rindex(substring) {
-        var sub = substring;
+        let sub = substring;
 
         if (type(substring) == "String") {
             sub = substring.value;
@@ -196,8 +196,8 @@ class String {
 
     // 替换所有子字符串
     func replace(old, replacement) {
-        var oldStr = old;
-        var newStr = replacement;
+        let oldStr = old;
+        let newStr = replacement;
 
         if (type(old) == "String") {
             oldStr = old.value;
@@ -212,7 +212,7 @@ class String {
 
     // 分割字符串
     func split(separator) {
-        var sep = separator;
+        let sep = separator;
 
         if (type(separator) == "String") {
             sep = separator.value;
@@ -223,7 +223,7 @@ class String {
 
     // 检查字符串是否以prefix开头
     func startswith(prefix) {
-        var pre = prefix;
+        let pre = prefix;
 
         if (type(prefix) == "String") {
             pre = prefix.value;
@@ -234,7 +234,7 @@ class String {
 
     // 检查字符串是否以suffix结尾
     func endswith(suffix) {
-        var suf = suffix;
+        let suf = suffix;
 
         if (type(suffix) == "String") {
             suf = suffix.value;
@@ -255,7 +255,7 @@ class String {
 
     // 计算子字符串出现次数
     func count(substring) {
-        var sub = substring;
+        let sub = substring;
 
         if (type(substring) == "String") {
             sub = substring.value;
@@ -268,7 +268,7 @@ class String {
 // str() - 全局函数：将任意类型转换为 String 对象
 // 替代 __builtin_str 提供对象包装
 func str(obj) {
-    var t = type(obj);
+    let t = type(obj);
     
     // 如果已经是 String 对象，直接返回
     if (t == "String") {

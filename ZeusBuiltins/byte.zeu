@@ -59,7 +59,7 @@ class Byte {
 
     func operator[+](other) {
         // 直接合并两个bytes值（底层实现支持bytes+bytes）
-        var resultBytes = this.data + other.data;
+        let resultBytes = this.data + other.data;
         return new Byte(resultBytes);
     }
 

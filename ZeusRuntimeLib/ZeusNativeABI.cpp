@@ -4,8 +4,10 @@
 #include "../ZeusBuiltins/BuiltinNativeABI.hpp"
 #include "../ZeusRunner/ZeusBuiltins/array.hpp"
 #include "../ZeusRunner/ZeusBuiltins/dict.hpp"
+#include "../ZeusRunner/ZeusBuiltins/gc.hpp"
 #include "../ZeusRunner/ZeusBuiltins/type.hpp"
 #include "../ZeusRunner/ZeusBuiltins/strings.hpp"
+#include "../ZeusRunner/ZeusBuiltins/time.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +25,19 @@ namespace {
     std::abort();
 }
 
+// Returns the text of a boxed native String instance, or nullptr when the value
+// is not a native string. The caller converts it before invoking a builtin.
+const ZeusStringView* nativeStringTextOf(const ZeusValue* value,
+                                         const ZeusType::UniversalVariant& boxed) {
+    if (!value || value->flags != ZEUS_VALUE_FLAG_OWNS_BOX) return nullptr;
+    const auto* classHandle = std::get_if<ZeusType::LLVMClassHandle>(&boxed);
+    if (!classHandle || !classHandle->state ||
+        classHandle->state->typeName != "String") {
+        return nullptr;
+    }
+    return zeus_value_intern_string_view(value);
+}
+
 void initializeStandaloneBuiltins() {
     static std::once_flag initialized;
     std::call_once(initialized, [] {
@@ -30,6 +45,10 @@ void initializeStandaloneBuiltins() {
         ZeusBuiltins::registerStringBuiltins();
         ZeusBuiltins::registerArrayBuiltins();
         ZeusBuiltins::registerDictBuiltins();
+        ZeusBuiltins::registerGcBuiltins();
+        // The time builtins need no VM state, so imported packages that use them
+        // work in AOT binaries too.
+        ZeusBuiltins::registerTimeBuiltins();
     });
 }
 
@@ -69,7 +88,13 @@ void zeus_value_native_call(
         for (int32_t i = 0; i < argc; ++i) {
             std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> box(
                 zeus_value_to_box(values[i]), &zeus_box_release);
-            arguments.push_back(box->v);
+            // Builtins work on universal values. A native String instance only
+            // carries its text behind the registered toString method, so it is
+            // normalized here instead of in every builtin.
+            const ZeusStringView* text = nativeStringTextOf(values[i], box->v);
+            arguments.push_back(text
+                ? ZeusType::UniversalVariant(std::string(text->data, static_cast<size_t>(text->length)))
+                : box->v);
         }
 
         ZeusBox result;

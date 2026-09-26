@@ -1,9 +1,10 @@
-// ZeusBuiltins/debug.hpp - 调试和统计内置函�?
+// ZeusBuiltins/debug.hpp - 调试和统计内置函数
 // Part of ZeusBuiltins modular refactoring
 
 #pragma once
 
 #include "core.hpp"
+#include "gc.hpp"
 #include "../ZeusThread.hpp"
 #include "../../ZeusRuntimeLib/ZeusCell.hpp"
 
@@ -17,7 +18,7 @@
 
 namespace ZeusBuiltins {
 
-    // ===== 调试和统计函�?=====
+    // ===== 调试和统计函数 =====
     
     // __closure_stats(): 输出闭包统计信息，返回统计字符串
     inline ZeusType::UniversalVariant builtin_closure_stats(const std::vector<ZeusType::UniversalVariant>& args) {
@@ -39,7 +40,7 @@ namespace ZeusBuiltins {
         return ZeusType::UniversalVariant(std::string("No VM dump callback"));
     }
 
-    // __vm_stats: 输出 VM 关键结构统计信息（对象、闭包、socket、原型、全局名、内存等�?
+    // __vm_stats: 输出 VM 关键结构统计信息（对象、闭包、socket、原型、全局名、内存等）
     inline ZeusType::UniversalVariant builtin_vm_stats(const std::vector<ZeusType::UniversalVariant>& args) {
         // memory
 #ifdef _WIN32
@@ -85,14 +86,14 @@ namespace ZeusBuiltins {
         return ZeusType::UniversalVariant(LexerType::Value(true));
     }
     
-    // __dump_live_cells(): 输出所有存活Cell的详细信�?
+    // __dump_live_cells(): 输出所有存活Cell的详细信息
     inline ZeusType::UniversalVariant builtin_dump_live_cells(const std::vector<ZeusType::UniversalVariant>& args) {
         std::string info = HeapStats::getLiveCellsInfo();
         std::cout << info << std::endl;
         return ZeusType::UniversalVariant(info);
     }
     
-    // __dump_oldest_cells(n=10): 输出存活时间最长的 n �?object Cell
+    // __dump_oldest_cells(n=10): 输出存活时间最长的 n 个 object Cell
     inline ZeusType::UniversalVariant builtin_dump_oldest_cells(const std::vector<ZeusType::UniversalVariant>& args) {
         int maxCount = 10;
         if (!args.empty()) {
@@ -111,7 +112,7 @@ namespace ZeusBuiltins {
         return ZeusType::UniversalVariant(info);
     }
     
-    // __get_live_cells_summary(): 获取存活Cell类型统计的字�?
+    // __get_live_cells_summary(): 获取存活Cell类型统计的字典
     inline ZeusType::UniversalVariant builtin_get_live_cells_summary(const std::vector<ZeusType::UniversalVariant>& args) {
         auto cells = HeapStats::getLiveCells();
         
@@ -132,7 +133,7 @@ namespace ZeusBuiltins {
         return ZeusType::UniversalVariant(oss.str());
     }
     
-    // __dump_objects(): 输出objects数组的状态信�?
+    // __dump_objects(): 输出objects数组的状态信息
     inline ZeusType::UniversalVariant builtin_dump_objects(const std::vector<ZeusType::UniversalVariant>& args) {
         if (!g_vmObjects || !g_vmClasses) {
             return ZeusType::UniversalVariant(std::string("Objects info not available"));
@@ -170,7 +171,7 @@ namespace ZeusBuiltins {
         return ZeusType::UniversalVariant(oss.str());
     }
     
-    // __get_memory_usage(): 获取当前进程内存占用（MB�?
+    // __get_memory_usage(): 获取当前进程内存占用（MB）
     inline ZeusType::UniversalVariant builtin_get_memory_usage(const std::vector<ZeusType::UniversalVariant>& args) {
 #ifdef _WIN32
         PROCESS_MEMORY_COUNTERS pmc;
@@ -509,6 +510,7 @@ namespace ZeusBuiltins {
         registerBuiltin("__dump_objects", builtin_dump_objects, 0, 0);
         registerBuiltin("__get_memory_usage", builtin_get_memory_usage, 0, 0);
         registerBuiltin("__leak_summary", builtin_leak_summary, 0, 0);
+        registerGcBuiltins();
     }
 
 } // namespace ZeusBuiltins

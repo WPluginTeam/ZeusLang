@@ -955,6 +955,8 @@ namespace ZeusType {
 
     struct ClosureHandle    { int id; };
     struct NativeFuncHandle { int id; };
+    // Runtime-owned LLVM closure state carried through ZeusValue/UniversalVariant.
+    struct NativeClosureHandle { std::shared_ptr<void> state; };
 
     // SharedHandle：共享堆变量句柄，用于跨 VM 共享
     struct SharedHandle {

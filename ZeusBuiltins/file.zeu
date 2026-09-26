@@ -7,8 +7,8 @@ class File {
 
     func init (path, mode="r") {
         using original {
-            var pathStr = path;
-            var modeStr = mode;
+            let pathStr = path;
+            let modeStr = mode;
             
             if (type(path) == "String") {
                 pathStr = path.value;
@@ -28,7 +28,7 @@ class File {
         using original {
             if (type(data) == "Byte") {
                 // Mode could be String wrapper or basic string
-                var modeVal = this.mode;
+                let modeVal = this.mode;
                 
                 if (type(this.mode) == "String") {
                     modeVal = this.mode.value;

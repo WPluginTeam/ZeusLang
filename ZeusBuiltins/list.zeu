@@ -39,7 +39,7 @@ class Array {
     }
 
     func toString() {
-        var s = "[";
+        let s = "[";
         
         for (this.data) [&item] {
             s = s + str(item) + ", ";
@@ -50,7 +50,7 @@ class Array {
     }
 
     func operator[+](other) {
-        var result = [];
+        let result = [];
         
         // 添加this的所有元素
         for (this.data) [&item] {

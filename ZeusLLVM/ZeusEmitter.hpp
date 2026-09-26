@@ -3,18 +3,18 @@
 // Emitter v0：主程序单编 IR → LLVM IR 文本（naive 栈机直译）。
 //
 // 输入：ZeusCompile::compile() 的主程序结果（无包合并、无解释器参与）。
-//   v0 是 freestanding 子集：不含 import / 类。带原生签名标注的顶层函数
-//   会直接生成 LLVM function；闭包、捕获变量和包初始化仍不在处理范围。
+//   v0 是 freestanding 子集：不支持 import / 类。带原生签名标注的顶层函数。
+//   会直接生成 LLVM function；闭包、捕获变量和包初始化仍不在处理范围内。
 //
 // 约定：
 // - 所有 top-level chunk 按序拼进同一个 zeus_entry（与 ZeusCompile::run 的
-//   执行顺序一致）；FUNC_BEGIN chunk 由签名标注生成原生 LLVM function，
+//   执行顺序一致）；FUNC_BEGIN chunk 由签名标注生成原生 LLVM function。
 //   对应的 MAKE_FUNCTION/STORE 只作为动态闭包兼容痕迹被跳过。
 // - The native path keeps proven scalar values in LLVM registers.
 //   Dynamic values use the C-compatible ZeusValue layout and value-prefixed ABI.
 //   Runtime adapters bridge into legacy ZeusBox-based VM operations when required.
 // - Dynamic variadic calls use a shared argc + ZeusValue*[] + result-out ABI.
-// - COUNT_CHECK_* remains a v0 no-op until the exception model is integrated.
+// - COUNT_CHECK_* use the runtime range-check ABI and preserve the VM checks.
 
 #pragma once
 
@@ -36,6 +36,7 @@
 #include "ZeusDynamicBinaryABI.hpp"
 #include "ZeusDynamicMemberBridge.hpp"
 #include "ZeusContainerABI.hpp"
+#include "../ZeusRuntimeLib/ZeusRangeCheckABI.hpp"
 
 namespace ZeusLLVM {
 
@@ -72,7 +73,7 @@ inline std::string dynamicVariadicABISymbol(const std::string& name) {
     return {};
 }
 
-// LLVM c"..." 转义（不可见字符与 " \ 用 \xx）。
+// LLVM c"..." 转义（不可见字符 " \ 用 \xx）
 inline std::string escapeLLString(const std::string& s) {
     std::string o;
 
@@ -134,16 +135,81 @@ public:
         std::string sourceType;
     };
 
+    static std::string rangeCheckCall(
+        const NativeValue& value,
+        const IRType::IRInstr& instruction
+    ) {
+        const int32_t checkKind = instruction.op == VMOperator::COUNT_CHECK_NEG
+            ? ZEUS_RANGE_CHECK_NEGATIVE_END
+            : ZEUS_RANGE_CHECK_ZERO_STEP;
+        const int32_t sourceLine = instruction.line > 0 ? instruction.line : 0;
+
+        if (value.dynamic) {
+            return "call void @zeus_range_check_value(ptr " + value.value +
+                ", i32 " + std::to_string(checkKind) + ", i32 " +
+                std::to_string(sourceLine) + ")";
+        }
+        if (value.type == "i64") {
+            return "call void @zeus_range_check_i64(i64 " + value.value +
+                ", i32 " + std::to_string(checkKind) + ", i32 " +
+                std::to_string(sourceLine) + ")";
+        }
+
+        // VM range checks only inspect BigInteger values. Other statically
+        // represented Zeus types pass through unchanged, matching that rule.
+        return {};
+    }
+
+    // Removes every alloca from the part of a function body that starts at
+    // bodyStart and returns them separately so the caller can place them at the
+    // top of that body. At -O0 an alloca inside a loop grows the frame on each
+    // iteration, so a loop that boxes values would exhaust the stack. Hoisting is
+    // safe because these temporaries are always re-initialized before they are
+    // read.
+    static std::string takeAllocas(const std::string& text, size_t bodyStart,
+                                   std::string& allocas) {
+        std::string kept;
+        kept.reserve(text.size() - bodyStart);
+        size_t cursor = bodyStart;
+        while (cursor < text.size()) {
+            const size_t newline = text.find('\n', cursor);
+            const size_t end = newline == std::string::npos ? text.size() : newline + 1;
+            const std::string line = text.substr(cursor, end - cursor);
+            if (line.find(" = alloca ") != std::string::npos) {
+                allocas += line;
+            } else {
+                kept += line;
+            }
+            if (newline == std::string::npos) break;
+            cursor = end;
+        }
+        return kept;
+    }
+
     EmitResult result;
     std::string body;
+    // Storage for native slots has to dominate every access, and at -O0 LLVM
+    // does not hoist allocas out of loops. Slot allocas therefore go to the
+    // entry block instead of the block that first mentions the slot.
+    std::string entryPrologue;
+
+    // The prologue is built while the body is emitted, so it is only available
+    // once every top-level chunk is in. takeEntryAllocas hands it back and
+    // clears it, which keeps a second call from duplicating the allocas.
+    std::string takeEntryAllocas() {
+        std::string result;
+        result.swap(entryPrologue);
+        return result;
+    }
     std::map<std::string, std::string> strPool; // 内容 -> @.str.N
     int strCount = 0;
     long tmpCount = 0;
-    bool warnedCountCheck = false;
 
     std::vector<std::string> globalNames;
+    const std::vector<std::vector<IRType::IRInstr>>* programChunks = nullptr;
     std::map<size_t, FunctionSignature> functionSignaturesByChunk;
     std::map<std::string, FunctionSignature> functionSignatures;
+    std::map<std::string, size_t> internalFunctionSymbolCounts;
     std::set<size_t> reachableFunctionChunks;
     std::set<std::string> dynamicMemberMethodNames;
     std::map<int, std::string> functionGlobals;
@@ -152,11 +218,182 @@ public:
     std::map<int, NativeValue> nativeLocals;
     std::map<int, NativeSlot> nativeGlobalSlots;
     std::map<int, NativeSlot> nativeLocalSlots;
+    // Class name a global holds: recorded by prescanGlobalTypes from the
+    // initializer and refreshed by the top-level path as it writes. Storage for
+    // globals lives in the runtime slot table so top-level statements and native
+    // functions agree; this only keeps the type information that delete needs.
+    std::map<int, std::string> nativeGlobalClassTypes;
+    // Scalar LLVM type ("i64" / "i1") last written into a global, so reads can
+    // use the unboxed global accessors instead of materializing a ZeusValue.
+    std::map<int, std::string> nativeGlobalScalarTypes;
+    // Static class type of a global, from its initializer. Kept apart from the
+    // map above because the top-level path rewrites that one as it stores, while
+    // this one answers "what type does the program declare here" for native
+    // functions that need a class pointer instead of a boxed value.
+    std::map<int, std::string> prescanGlobalClassTypes;
+
+    // Records what each global slot holds, so both the top-level path and native
+    // functions can pick the cheapest correct access for it. Must run after
+    // collectMetadata, which is what fills classLayouts and classGlobals.
+    void prescanGlobalTypes() {
+        nativeGlobalScalarTypes.clear();
+        prescanGlobalClassTypes.clear();
+        if (!programChunks) return;
+        for (const auto& chunk : *programChunks) {
+            for (size_t pc = 0; pc < chunk.size(); ++pc) {
+                const auto& store = chunk[pc];
+                if (store.op != VMOperator::STORE_VALUE_GLOBAL &&
+                    store.op != VMOperator::ASSIGN_VALUE_GLOBAL) {
+                    continue;
+                }
+                if (store.args.empty() ||
+                    !std::holds_alternative<LexerType::Value>(store.args[0])) {
+                    continue;
+                }
+                const auto& indexLiteral = std::get<LexerType::Value>(store.args[0]);
+                if (!std::holds_alternative<ZeusType::BigInteger>(indexLiteral.data)) {
+                    continue;
+                }
+                int64_t index = 0;
+                if (!ZeusVMUtils::tryGetInt64FromValue(indexLiteral, index) || index < 0 ||
+                    index > std::numeric_limits<int>::max()) {
+                    continue;
+                }
+
+                if (pc > 0 && chunk[pc - 1].op == VMOperator::PUSH &&
+                    !chunk[pc - 1].args.empty() &&
+                    std::holds_alternative<LexerType::Value>(chunk[pc - 1].args[0])) {
+                    const auto& literal =
+                        std::get<LexerType::Value>(chunk[pc - 1].args[0]);
+                    const char* type = nullptr;
+                    if (std::holds_alternative<ZeusType::BigInteger>(literal.data) ||
+                        std::holds_alternative<ZeusType::BigDecimal>(literal.data)) {
+                        type = "i64";
+                    } else if (std::holds_alternative<bool>(literal.data)) {
+                        type = "i1";
+                    }
+                    if (type) {
+                        nativeGlobalScalarTypes[static_cast<int>(index)] = type;
+                        continue;
+                    }
+                }
+
+                if (pc == 0) continue;
+                const auto& build = chunk[pc - 1];
+
+                // A class declaration keeps its name in the CLASS_BUILD metadata.
+                if (build.op == VMOperator::CLASS_BUILD ||
+                    build.op == VMOperator::CLASS_BUILD_SHARED) {
+                    std::string className;
+                    ClassLayout layout;
+                    if (build.metadata.readClassLayout(
+                            className, layout.fieldNames, layout.fieldTypes,
+                            &layout.fieldConstness, &layout.fieldDefaults)) {
+                        prescanGlobalClassTypes[static_cast<int>(index)] =
+                            std::move(className);
+                    }
+                    continue;
+                }
+
+                // An instance is built by OBJ_BUILD, preceded by the class
+                // reference and then the constructor arguments.
+                if (build.op != VMOperator::OBJ_BUILD &&
+                    build.op != VMOperator::NEW_OBJ) {
+                    continue;
+                }
+                for (size_t back = 1; back <= 8 && pc >= back; ++back) {
+                    const auto& load = chunk[pc - back];
+                    if (load.op != VMOperator::LOAD_VALUE || load.args.empty() ||
+                        !std::holds_alternative<std::string>(load.args[0])) {
+                        continue;
+                    }
+                    const std::string& name = std::get<std::string>(load.args[0]);
+                    if (classLayouts.find(name) != classLayouts.end()) {
+                        prescanGlobalClassTypes[static_cast<int>(index)] = name;
+                        break;
+                    }
+                    if (name == "global" && load.args.size() > 1 &&
+                        std::holds_alternative<LexerType::Value>(load.args[1])) {
+                        int64_t classSlot = 0;
+                        if (ZeusVMUtils::tryGetInt64FromValue(
+                                std::get<LexerType::Value>(load.args[1]), classSlot)) {
+                            const auto classGlobal =
+                                classGlobals.find(static_cast<int>(classSlot));
+                            if (classGlobal != classGlobals.end()) {
+                                prescanGlobalClassTypes[static_cast<int>(index)] =
+                                    classGlobal->second;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
     std::set<std::string> structTypes;
     std::map<std::string, ClassLayout> classLayouts;
     std::string nativeFunctions;
     std::string externalDeclarations;
     DynamicMemberBridge::GeneratedIR dynamicMemberBridge;
+
+    struct ClosureCaptureDescriptor {
+        std::string sourceKind;
+        int sourceIndex = -1;
+        int destinationIndex = -1;
+        std::string name;
+        bool byReference = false;
+    };
+
+    static std::string closureAdapterSymbol(size_t chunkIndex) {
+        return "@zeus_closure_adapter_" + std::to_string(chunkIndex);
+    }
+
+    std::vector<ClosureCaptureDescriptor> captureDescriptors(size_t chunkIndex) const {
+        std::vector<ClosureCaptureDescriptor> result;
+        if (!programChunks || chunkIndex >= programChunks->size()) return result;
+        for (const auto& ins : (*programChunks)[chunkIndex]) {
+            if (ins.op != VMOperator::CAPTURE_OUTSIDE_VAR || ins.args.size() < 5 ||
+                !std::holds_alternative<std::string>(ins.args[0]) ||
+                !std::holds_alternative<LexerType::Value>(ins.args[1]) ||
+                !std::holds_alternative<LexerType::Value>(ins.args[2]) ||
+                !std::holds_alternative<std::string>(ins.args[3]) ||
+                !std::holds_alternative<LexerType::Value>(ins.args[4])) {
+                continue;
+            }
+            ClosureCaptureDescriptor capture;
+            capture.sourceKind = std::get<std::string>(ins.args[0]);
+            capture.sourceIndex = VMHelpers::getIntFromValue(
+                std::get<LexerType::Value>(ins.args[1]));
+            capture.destinationIndex = VMHelpers::getIntFromValue(
+                std::get<LexerType::Value>(ins.args[2]));
+            capture.name = std::get<std::string>(ins.args[3]);
+            capture.byReference = VMHelpers::getIntFromValue(
+                std::get<LexerType::Value>(ins.args[4])) != 0;
+            result.push_back(std::move(capture));
+        }
+        std::sort(result.begin(), result.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.destinationIndex < rhs.destinationIndex;
+        });
+        return result;
+    }
+
+    bool needsClosureAdapter(size_t chunkIndex) const {
+        if (!programChunks) return false;
+        for (const auto& chunk : *programChunks) {
+            for (const auto& ins : chunk) {
+                if (ins.op != VMOperator::MAKE_FUNCTION || ins.args.empty() ||
+                    !std::holds_alternative<LexerType::Value>(ins.args[0])) {
+                    continue;
+                }
+                if (VMHelpers::getIntFromValue(
+                        std::get<LexerType::Value>(ins.args[0])) ==
+                    static_cast<int>(chunkIndex)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 
     // 动态变长函数待决状态（LOAD 与 CALL 之间的参数求值期保持）。
     std::string pendingVariadicCall;
@@ -203,12 +440,22 @@ public:
         return result;
     }
 
+    std::string llvmCallTarget(const FunctionSignature& signature) const {
+        if (!signature.nativeSymbol.empty()) {
+            return llvmExternalFunctionName(signature.nativeSymbol);
+        }
+
+        std::string target = llvmFunctionName(signature.name);
+        const auto count = internalFunctionSymbolCounts.find(target);
+        if (count != internalFunctionSymbolCounts.end() && count->second > 1) {
+            target += "_chunk" + std::to_string(signature.chunkIndex);
+        }
+        return target;
+    }
+
     std::string llvmCallTarget(const std::string& name) const {
         const auto signature = functionSignatures.find(name);
-        if (signature != functionSignatures.end() &&
-            !signature->second.nativeSymbol.empty()) {
-            return llvmExternalFunctionName(signature->second.nativeSymbol);
-        }
+        if (signature != functionSignatures.end()) return llvmCallTarget(signature->second);
         return llvmFunctionName(name);
     }
 
@@ -359,8 +606,8 @@ public:
         const std::string nativeType = llvmType(typeName);
         if (!nativeType.empty()) return nativeType;
 
-        // 未完成静态 ABI 的字段先保留为指针槽位，避免类布局再次退回
-        // { i8 } 占位；真正的字符串/容器字段 lowering 仍需动态 ABI。
+        // 未完成静态 ABI 的字段先保留为指针槽位，避免类布局再次退。
+        // { i8 } 占位；真正的字符串 容器字段 lowering 仍需动态 ABI。
         return "ptr";
     }
 
@@ -405,6 +652,7 @@ public:
         globalNames = program.globalNames;
         functionSignatures.clear();
         functionSignaturesByChunk.clear();
+        internalFunctionSymbolCounts.clear();
         reachableFunctionChunks.clear();
         functionGlobals.clear();
         classGlobals.clear();
@@ -509,6 +757,7 @@ public:
 
                 if (!signature.isExternal) {
                     functionSignaturesByChunk[ci] = signature;
+                    ++internalFunctionSymbolCounts[llvmFunctionName(signature.name)];
                 }
             }
         }
@@ -755,15 +1004,10 @@ public:
                     reachableFunctionChunks.end()) {
                 continue;
             }
-            if (signature.captureCount != 0) {
-                result.error = "[emit-llvm] 动态成员调用暂不支持捕获函数: " +
-                    signature.name;
-                return false;
-            }
 
             const auto key = std::make_pair(signature.ownerType, methodName);
             if (!registeredMethods.insert(key).second) {
-                result.error = "[emit-llvm] 动态成员调用存在重载歧义: " +
+                result.error = "[emit-llvm] 动态成员调用存在重载歧义 " +
                     signature.ownerType + "::" + methodName;
                 return false;
             }
@@ -816,9 +1060,9 @@ public:
         body += "  " + s + "\n";
     }
 
-    // 发 label 定义（含 % 前缀传入，如 "%L1_10"）。
+    // 新 label 定义（含 % 前缀传入，如 "%L1_10"）。
     // 铁律：label 之前必须有终结指令；若当前块未终结（fallthrough 位置），
-    // 先补一个 br 跳过去（语义等价于 fallthrough，clang 实测只认这种形状）。
+    // 先补一条 br 跳过去（语义等价于 fallthrough，clang 实测只认这种形状）。
     void emitLabelDef(const std::string& pct) {
         if (!blkTerminated) {
             emitLine("br label " + pct);
@@ -993,20 +1237,65 @@ public:
         return nativeValue;
     }
 
-    std::string emitGlobalValueLoad(int index) {
+    // Global/local slot access has to be emitted into whichever function body
+    // is currently being built. The legacy top-level path uses emitLine, while a
+    // native function must write into its own functionText: leaking the load
+    // into the entry block would leave the use without a dominating definition.
+    template <typename EmitLine>
+    std::string emitSlotLoad(int index, bool global, EmitLine&& emit) {
         std::string value = freshTmp();
-        emitLine(value + " = alloca %ZeusValue, align 8");
-        emitLine("call void @zeus_value_global_load(ptr " + value +
-                 ", i32 " + std::to_string(index) + ")");
+        emit(value + " = alloca %ZeusValue, align 8");
+        emit(std::string("call void @zeus_value_") + (global ? "global" : "local") +
+             "_load(ptr " + value + ", i32 " + std::to_string(index) + ")");
         return value;
     }
 
+    // Reads a global that the AST walker did not describe, straight out of the
+    // runtime slot table, and returns it in whatever representation the rest of
+    // the native path expects: an unboxed scalar, a native class pointer, or a
+    // boxed ZeusValue.
+    bool boxNativeGlobalValue(const IRType::IRInstr& ins, int index, NativeValue& out) {
+        const auto classType = prescanGlobalClassTypes.find(index);
+        if (classType != prescanGlobalClassTypes.end() &&
+            findClassLayout(classType->second) != nullptr) {
+            const std::string boxed = emitGlobalValueLoad(index);
+            const std::string unboxed = freshTmp();
+            emitLine(unboxed + " = call ptr @zeus_value_require_class_ptr(ptr " +
+                     boxed + ", ptr " + poolStr(classType->second) + ")");
+            emitLine("call void @zeus_value_release(ptr " + boxed + ")");
+            out = NativeValue{ unboxed, "ptr", false, false, classType->second };
+            return true;
+        }
+
+        const auto scalarType = nativeGlobalScalarTypes.find(index);
+        if (scalarType != nativeGlobalScalarTypes.end()) {
+            const bool isBool = scalarType->second == "i1";
+            const std::string loaded = freshTmp();
+            emitLine(loaded + " = call " + std::string(isBool ? "i32" : "i64") +
+                     " @zeus_global_load_" + (isBool ? "bool" : "i64") +
+                     "(i32 " + std::to_string(index) + ")");
+            if (isBool) {
+                const std::string flag = freshTmp();
+                emitLine(flag + " = icmp ne i32 " + loaded + ", 0");
+                out = NativeValue{ flag, "i1", false, false };
+            } else {
+                out = NativeValue{ loaded, "i64", false, false };
+            }
+            return true;
+        }
+
+        out = NativeValue{ emitGlobalValueLoad(index), "ptr", false, true };
+        return true;
+    }
+
+    std::string emitGlobalValueLoad(int index) {
+        return emitSlotLoad(index, true,
+            [this](const std::string& line) { emitLine(line); });
+    }
+
     std::string emitLocalValueLoad(int index) {
-        std::string value = freshTmp();
-        emitLine(value + " = alloca %ZeusValue, align 8");
-        emitLine("call void @zeus_value_local_load(ptr " + value +
-                 ", i32 " + std::to_string(index) + ")");
-        return value;
+        return emitSlotLoad(index, false,
+            [this](const std::string& line) { emitLine(line); });
     }
 
     void emitPushNull() {
@@ -1043,7 +1332,7 @@ public:
 
         auto function = functionSignatures.find(pendingDirectCall);
         if (function == functionSignatures.end()) {
-            fail(ins, "[emit-llvm] 找不到直接调用目标 '" + pendingDirectCall + "'");
+            fail(ins, "[emit-llvm] 找不到直接调用目标'" + pendingDirectCall + "'");
             return false;
         }
 
@@ -1610,7 +1899,7 @@ public:
         if (destructor != nullptr) {
             if (destructor->parameterTypes.size() != 1 ||
                 destructor->parameterTypes.front() != object.sourceType) {
-                return failAt(ins, "[emit-llvm] operator[~] 必须只接收 class 实例");
+                return failAt(ins, "[emit-llvm] operator[~] 必须只接受 class 实例");
             }
             destructorReturnsDynamic = usesZeusValueABI(destructor->returnType);
             destructorReturnType = destructorReturnsDynamic
@@ -1853,10 +2142,25 @@ public:
         }
 
         const FunctionSignature& signature = signatureIt->second;
-        if (signature.captureCount != 0) {
-            result.error = "[emit-llvm] 函数 '" + signature.name +
-                           "' 包含捕获变量，当前原生 ABI 暂不支持闭包";
-            return false;
+
+        std::set<int> referenceCapturedLocals;
+        if (programChunks) {
+            for (const auto& instruction : chunk) {
+                if (instruction.op != VMOperator::MAKE_FUNCTION ||
+                    instruction.args.empty() ||
+                    !std::holds_alternative<LexerType::Value>(instruction.args[0])) {
+                    continue;
+                }
+                const int childChunk = VMHelpers::getIntFromValue(
+                    std::get<LexerType::Value>(instruction.args[0]));
+                if (childChunk < 0) continue;
+                for (const auto& capture : captureDescriptors(static_cast<size_t>(childChunk))) {
+                    if (capture.sourceKind == "local" && capture.byReference &&
+                        capture.sourceIndex >= 0) {
+                        referenceCapturedLocals.insert(capture.sourceIndex);
+                    }
+                }
+            }
         }
 
         const bool returnsDynamic = usesZeusValueABI(signature.returnType);
@@ -1879,13 +2183,24 @@ public:
         }
 
         std::string functionText;
-        functionText += "define " + returnType + " " + llvmFunctionName(signature.name) + "(";
-        if (returnsDynamic) functionText += "ptr %return.out";
+        functionText += "define " + returnType + " " + llvmCallTarget(signature) + "(";
+        bool hasFunctionParameter = false;
+        if (signature.captureCount != 0) {
+            functionText += "ptr %closure.env";
+            hasFunctionParameter = true;
+        }
+        if (returnsDynamic) {
+            if (hasFunctionParameter) functionText += ", ";
+            functionText += "ptr %return.out";
+            hasFunctionParameter = true;
+        }
         for (size_t i = 0; i < parameterLLVMTypes.size(); ++i) {
-            if (i > 0 || returnsDynamic) functionText += ", ";
+            if (hasFunctionParameter) functionText += ", ";
             functionText += parameterLLVMTypes[i] + " %arg" + std::to_string(i);
+            hasFunctionParameter = true;
         }
         functionText += ") {\nentry:\n";
+        const size_t nativeEntryBody = functionText.size();
 
         int nativeTmpCount = 0;
         auto freshNativeTmp = [&]() {
@@ -1897,6 +2212,7 @@ public:
 
         std::vector<NativeValue> valueStack;
         std::map<int, NativeValue> locals;
+        std::map<int, std::string> closureLocalCells;
         for (size_t i = 0; i < parameterLLVMTypes.size(); ++i) {
             const bool dynamicParameter = usesZeusValueABI(signature.parameterTypes[i]);
             locals[static_cast<int>(i)] = NativeValue{
@@ -1917,7 +2233,7 @@ public:
 
         auto popNative = [&](const IRType::IRInstr& ins, NativeValue& value) {
             if (valueStack.empty()) {
-                result.error = "[emit-llvm] 原生函数栈下溢 (" + ins.toString() + ")";
+                result.error = "[emit-llvm] 原生函数栈下溢(" + ins.toString() + ")";
                 return false;
             }
 
@@ -2201,6 +2517,65 @@ public:
             return true;
         };
 
+        auto emitClosureInvoke = [&] (
+            const IRType::IRInstr& ins,
+            NativeValue& callee,
+            const std::vector<NativeValue>& arguments,
+            NativeValue& callResult
+        ) {
+            if (!callee.dynamic || callee.type != "ptr") {
+                return failNative(ins, "[emit-llvm] indirect closure call requires a ZeusValue callee");
+            }
+
+            std::vector<std::string> dynamicArguments(arguments.size());
+            std::vector<bool> ownsDynamicArguments(arguments.size(), false);
+            for (size_t i = 0; i < arguments.size(); ++i) {
+                bool ownsDynamic = false;
+                if (!emitNativeDynamicValue(
+                        ins,
+                        arguments[i],
+                        dynamicArguments[i],
+                        ownsDynamic)) {
+                    return false;
+                }
+                ownsDynamicArguments[i] = ownsDynamic;
+            }
+
+            std::string argumentArray = "null";
+            if (!dynamicArguments.empty()) {
+                argumentArray = freshNativeTmp();
+                emitNativeLine(argumentArray + " = alloca ptr, i64 " +
+                               std::to_string(dynamicArguments.size()) + ", align 8");
+                for (size_t i = 0; i < dynamicArguments.size(); ++i) {
+                    const std::string slot = freshNativeTmp();
+                    emitNativeLine(slot + " = getelementptr inbounds ptr, ptr " +
+                                   argumentArray + ", i64 " + std::to_string(i));
+                    emitNativeLine("store ptr " + dynamicArguments[i] + ", ptr " + slot +
+                                   ", align 8");
+                }
+            }
+
+            const std::string output = freshNativeTmp();
+            emitNativeLine(output + " = alloca %ZeusValue, align 8");
+            emitNativeLine("call void @zeus_closure_call(ptr " + output + ", ptr " +
+                           callee.value + ", i32 " +
+                           std::to_string(dynamicArguments.size()) + ", ptr " +
+                           argumentArray + ")");
+            for (size_t i = 0; i < dynamicArguments.size(); ++i) {
+                if (ownsDynamicArguments[i]) {
+                    emitNativeLine("call void @zeus_value_release(ptr " +
+                                   dynamicArguments[i] + ")");
+                }
+            }
+            if (callee.ownsDynamic) {
+                emitNativeLine("call void @zeus_value_release(ptr " + callee.value + ")");
+            }
+            callResult = NativeValue{
+                output, "ptr", false, true, std::string(), true
+            };
+            return true;
+        };
+
         auto releaseOwnedFunctionLocals = [&]() {
             for (const auto& entry : locals) {
                 if (entry.second.dynamic && entry.second.ownsDynamic) {
@@ -2208,12 +2583,22 @@ public:
                                    entry.second.value + ")");
                 }
             }
+            for (const auto& entry : closureLocalCells) {
+                emitNativeLine("call void @zeus_capture_cell_release(ptr " +
+                               entry.second + ")");
+            }
         };
 
         std::string pendingDirectCall;
 
         struct NativeIncomingState {
+            // The block the edge really leaves from. It is not always the block
+            // the IR pc belongs to: a null check for new/delete splits a block in
+            // two, and the branch leaves from the tail label.
             std::string predecessor;
+            // Pc of the instruction that produced the edge, so a loop backedge
+            // can be matched up with its phi placeholder later on.
+            size_t sourcePc = 0;
             std::map<int, NativeValue> locals;
         };
 
@@ -2351,6 +2736,11 @@ public:
 
         std::map<size_t, std::set<std::string>> nativePredecessorBlocks;
         std::map<size_t, std::set<std::string>> nativeLoopBackedgeBlocks;
+        // Pc of every loop backedge, kept next to the block labels above. The
+        // labels come from the static analysis and go stale as soon as a block
+        // gets split, so the phi patch uses these pcs to find the real
+        // predecessor instead.
+        std::map<size_t, std::set<size_t>> nativeLoopBackedgePcs;
         for (const auto& predecessors : nativePredecessors) {
             for (size_t predecessorPc : predecessors.second) {
                 const auto block = nativeBlockForPc.find(predecessorPc);
@@ -2358,9 +2748,37 @@ public:
                 nativePredecessorBlocks[predecessors.first].insert(block->second);
                 if (predecessorPc >= predecessors.first) {
                     nativeLoopBackedgeBlocks[predecessors.first].insert(block->second);
+                    nativeLoopBackedgePcs[predecessors.first].insert(predecessorPc);
                 }
             }
         }
+        IRType::IRInstr captureInitializationInstruction;
+        if (!chunk.empty()) captureInitializationInstruction = chunk.front();
+        for (const int localIndex : referenceCapturedLocals) {
+            const std::string cell = freshNativeTmp();
+            emitNativeLine(cell + " = call ptr @zeus_capture_cell_create(ptr null)");
+            closureLocalCells.emplace(localIndex, cell);
+
+            const auto parameter = locals.find(localIndex);
+            if (parameter != locals.end()) {
+                std::string initialValue;
+                bool ownsInitialValue = false;
+                if (!emitNativeDynamicValue(
+                        captureInitializationInstruction,
+                        parameter->second,
+                        initialValue,
+                        ownsInitialValue)) {
+                    return false;
+                }
+                emitNativeLine("call void @zeus_capture_cell_store(ptr " + cell +
+                               ", ptr " + initialValue + ")");
+                if (ownsInitialValue) {
+                    emitNativeLine("call void @zeus_value_release(ptr " +
+                                   initialValue + ")");
+                }
+            }
+        }
+
         if (nativeLoopHeaders.find(0) != nativeLoopHeaders.end()) {
             nativePredecessorBlocks[0].insert("%entry");
         }
@@ -2370,19 +2788,22 @@ public:
         struct NativeLoopPhiPatch {
             size_t headerPc = 0;
             int localIndex = -1;
-            std::string predecessor;
+            size_t sourcePc = 0;
             std::string placeholder;
+            // The backedge leaves from a block that is still being emitted, so
+            // its label is only known once the whole function body is done.
+            std::string labelPlaceholder;
             std::string type;
             bool dynamic = false;
             std::string sourceType;
         };
         std::vector<NativeLoopPhiPatch> nativeLoopPhiPatches;
         size_t nativeLoopPhiPlaceholderCount = 0;
-        bool warnedNativeCountCheck = false;
         std::string currentNativeBlock = "%entry";
         bool nativeBlockTerminated = false;
 
-        auto recordNativeEdge = [&](size_t target, const IRType::IRInstr& ins) {
+        auto recordNativeEdge = [&](size_t target, const IRType::IRInstr& ins,
+                                    size_t sourcePc) {
             if (target == functionExitPc && returnsDynamic && !valueStack.empty()) {
                 // Falling off a function returns nil. Discard any unused
                 // expression result left by a statement such as a subscript
@@ -2445,7 +2866,7 @@ public:
             );
             if (existing == incoming.end()) {
                 incoming.push_back(NativeIncomingState{
-                    currentNativeBlock, std::move(edgeLocals)
+                    currentNativeBlock, sourcePc, std::move(edgeLocals)
                 });
             }
             return true;
@@ -2477,8 +2898,8 @@ public:
             std::vector<std::string> phiLines;
             std::vector<std::string> cleanupLines;
             std::map<int, NativeValue> mergedLocals;
-            const auto backedges = nativeLoopBackedgeBlocks.find(pc);
-            const bool hasBackedges = backedges != nativeLoopBackedgeBlocks.end() &&
+            const auto backedges = nativeLoopBackedgePcs.find(pc);
+            const bool hasBackedges = backedges != nativeLoopBackedgePcs.end() &&
                                       !backedges->second.empty();
             for (int index : localIndices) {
                 std::vector<const NativeValue*> values;
@@ -2566,16 +2987,25 @@ public:
                         incoming->second[i].predecessor + " ]";
                 }
                 if (hasBackedges) {
-                    for (const std::string& predecessor : backedges->second) {
+                    // A backedge is emitted after the header, so both the value
+                    // it carries and the block it leaves from are patched in
+                    // once the whole body exists. Keying the patch on the pc
+                    // that produced the edge is what makes this survive block
+                    // splitting: the label recorded while emitting the branch
+                    // is the real predecessor, not the IR block it started in.
+                    for (size_t sourcePc : backedges->second) {
                         const std::string placeholder = "%loop_phi_" +
                             std::to_string(nativeLoopPhiPlaceholderCount++);
+                        const std::string labelPlaceholder = "%loop_phi_label_" +
+                            std::to_string(nativeLoopPhiPlaceholderCount++);
                         expression += ", [ " + placeholder + ", " +
-                            predecessor + " ]";
+                            labelPlaceholder + " ]";
                         nativeLoopPhiPatches.push_back(NativeLoopPhiPatch{
                             pc,
                             index,
-                            predecessor,
+                            sourcePc,
                             placeholder,
+                            labelPlaceholder,
                             prototype->type,
                             prototype->dynamic,
                             prototype->sourceType
@@ -2612,7 +3042,7 @@ public:
                 reachableNativePcs.find(target) == reachableNativePcs.end()) {
                 return true;
             }
-            if (!recordNativeEdge(target, ins)) return false;
+            if (!recordNativeEdge(target, ins, pc)) return false;
             emitNativeLine("br label " + nativeLabelForPc(target));
             nativeBlockTerminated = true;
             return true;
@@ -2637,7 +3067,7 @@ public:
         };
 
         if (nativeLoopHeaders.find(0) != nativeLoopHeaders.end()) {
-            if (chunk.empty() || !recordNativeEdge(0, chunk.front())) return false;
+            if (chunk.empty() || !recordNativeEdge(0, chunk.front(), 0)) return false;
             emitNativeLine("br label " + nativeLabelForPc(0));
             nativeBlockTerminated = true;
         }
@@ -2649,7 +3079,7 @@ public:
 
             auto target = functionSignatures.find(pendingDirectCall);
             if (target == functionSignatures.end()) {
-                return failNative(ins, "[emit-llvm] 找不到静态运算目标 '" +
+                return failNative(ins, "[emit-llvm] 找不到静态运算目标'" +
                                   pendingDirectCall + "'");
             }
 
@@ -2787,6 +3217,17 @@ public:
                     }
 
                     if (kind == "local") {
+                        const auto capturedCell = closureLocalCells.find(static_cast<int>(index));
+                        if (capturedCell != closureLocalCells.end()) {
+                            const std::string loaded = freshNativeTmp();
+                            emitNativeLine(loaded + " = alloca %ZeusValue, align 8");
+                            emitNativeLine("call void @zeus_capture_cell_load(ptr " + loaded +
+                                           ", ptr " + capturedCell->second + ")");
+                            valueStack.push_back(NativeValue{
+                                loaded, "ptr", false, true, std::string(), true
+                            });
+                            break;
+                        }
                         auto local = locals.find(static_cast<int>(index));
                         if (local == locals.end()) {
                             return failNative(ins, "[emit-llvm] 原生函数读取了未初始化的局部变量");
@@ -2800,6 +3241,19 @@ public:
                         }
                         break;
                     }
+
+                    if (kind == "upvalue") {
+                        const std::string loaded = freshNativeTmp();
+                        emitNativeLine(loaded + " = alloca %ZeusValue, align 8");
+                        emitNativeLine("call void @zeus_closure_env_load(ptr " + loaded +
+                                       ", ptr %closure.env, i32 " +
+                                       std::to_string(index) + ")");
+                        valueStack.push_back(NativeValue{
+                            loaded, "ptr", false, true, std::string(), true
+                        });
+                        break;
+                    }
+
 
                     if (kind == "global" && isFunctionGlobal(static_cast<int>(index))) {
                         valueStack.push_back(NativeValue{
@@ -2823,8 +3277,54 @@ public:
                             break;
                         }
 
-                        const std::string value = emitGlobalValueLoad(
-                            static_cast<int>(index));
+                        // A global known to hold a class instance is unboxed back
+                        // to a native pointer, so field access resolves against
+                        // the class layout instead of failing on a boxed value.
+                        const auto globalClass =
+                            prescanGlobalClassTypes.find(static_cast<int>(index));
+                        if (globalClass != prescanGlobalClassTypes.end() &&
+                            findClassLayout(globalClass->second) != nullptr) {
+                            const std::string boxed = freshNativeTmp();
+                            emitNativeLine(boxed + " = alloca %ZeusValue, align 8");
+                            emitNativeLine("call void @zeus_value_global_load(ptr " +
+                                boxed + ", i32 " + std::to_string(index) + ")");
+                            const std::string unboxed = freshNativeTmp();
+                            emitNativeLine(unboxed +
+                                " = call ptr @zeus_value_require_class_ptr(ptr " +
+                                boxed + ", ptr " + poolStr(globalClass->second) + ")");
+                            emitNativeLine("call void @zeus_value_release(ptr " +
+                                boxed + ")");
+                            valueStack.push_back(NativeValue{
+                                unboxed, "ptr", false, false, globalClass->second
+                            });
+                            break;
+                        }
+
+                        const auto globalScalar =
+                            nativeGlobalScalarTypes.find(static_cast<int>(index));
+                        if (globalScalar != nativeGlobalScalarTypes.end()) {
+                            // Unboxed access: a loop that bumps a scalar global
+                            // must not build a ZeusValue per iteration.
+                            const bool globalIsBool = globalScalar->second == "i1";
+                            const std::string loaded = freshNativeTmp();
+                            emitNativeLine(loaded + " = call " +
+                                std::string(globalIsBool ? "i32" : "i64") +
+                                " @zeus_global_load_" +
+                                (globalIsBool ? "bool" : "i64") + "(i32 " +
+                                std::to_string(index) + ")");
+                            if (globalIsBool) {
+                                const std::string flag = freshNativeTmp();
+                                emitNativeLine(flag + " = icmp ne i32 " + loaded + ", 0");
+                                valueStack.push_back(NativeValue{ flag, "i1", false, false });
+                            } else {
+                                valueStack.push_back(NativeValue{ loaded, "i64", false, false });
+                            }
+                            break;
+                        }
+
+                        const std::string value = emitSlotLoad(
+                            static_cast<int>(index), true,
+                            [&](const std::string& line) { emitNativeLine(line); });
                         valueStack.push_back(NativeValue{
                             value, "ptr", false, true, std::string(), true
                         });
@@ -2940,7 +3440,7 @@ public:
                                 parameterCount);
                         if (operatorSignature == nullptr) {
                             return failNative(ins,
-                                "[emit-llvm] class 没有匹配的下标 operator");
+                                "[emit-llvm] class 没有匹配的下标operator");
                         }
                         const std::string qualifiedPrefix =
                             operatorSignature->ownerType + "::";
@@ -3056,6 +3556,10 @@ public:
                     };
                     auto emitConstructionLabel = [&](const std::string& label) {
                         functionText += label + ":\n";
+                        // The null-check split makes this label the block that
+                        // falls through. Phi nodes must name the real LLVM
+                        // predecessor, not the logical IR block we started in.
+                        currentNativeBlock = "%" + label;
                     };
                     auto freshConstructionTemporary = [&]() {
                         return freshNativeTmp();
@@ -3092,12 +3596,119 @@ public:
                     break;
                 }
 
+                case VMOperator::MAKE_FUNCTION: {
+                    int64_t childChunk = 0;
+                    if (!tryArgInt(ins, 0, childChunk) || childChunk < 0) {
+                        return failNative(ins, "[emit-llvm] MAKE_FUNCTION has an invalid chunk index");
+                    }
+                    const auto childSignature = functionSignaturesByChunk.find(
+                        static_cast<size_t>(childChunk));
+                    if (childSignature == functionSignaturesByChunk.end()) {
+                        return failNative(ins, "[emit-llvm] MAKE_FUNCTION has no function signature");
+                    }
+                    const auto captures = captureDescriptors(static_cast<size_t>(childChunk));
+                    if (childSignature->second.captureCount != static_cast<int>(captures.size())) {
+                        return failNative(ins, "[emit-llvm] closure capture metadata count mismatch");
+                    }
+
+                    std::vector<std::string> cells;
+                    std::vector<std::string> temporaryCells;
+                    cells.reserve(captures.size());
+                    for (const auto& capture : captures) {
+                        if (capture.sourceIndex < 0) {
+                            return failNative(ins, "[emit-llvm] closure capture has an invalid source slot");
+                        }
+                        if (capture.sourceKind == "upvalue") {
+                            const std::string cell = freshNativeTmp();
+                            emitNativeLine(cell + " = call ptr @zeus_closure_capture_" +
+                                (capture.byReference ? "ref" : "copy") +
+                                "(ptr %closure.env, i32 " + std::to_string(capture.sourceIndex) + ")");
+                            cells.push_back(cell);
+                            temporaryCells.push_back(cell);
+                            continue;
+                        }
+                        if (capture.sourceKind != "local") {
+                            return failNative(ins, "[emit-llvm] closure capture source kind is unsupported");
+                        }
+                        const auto parentCell = closureLocalCells.find(capture.sourceIndex);
+                        if (capture.byReference) {
+                            if (parentCell == closureLocalCells.end()) {
+                                return failNative(ins, "[emit-llvm] reference capture source was not cellified");
+                            }
+                            cells.push_back(parentCell->second);
+                            continue;
+                        }
+
+                        std::string cell;
+                        if (parentCell != closureLocalCells.end()) {
+                            cell = freshNativeTmp();
+                            emitNativeLine(cell + " = call ptr @zeus_capture_cell_clone(ptr " +
+                                           parentCell->second + ")");
+                        } else {
+                            const auto source = locals.find(capture.sourceIndex);
+                            if (source == locals.end()) {
+                                return failNative(ins, "[emit-llvm] copy capture source local is not initialized");
+                            }
+                            std::string dynamicSource;
+                            bool ownsDynamicSource = false;
+                            if (!emitNativeDynamicValue(ins, source->second,
+                                    dynamicSource, ownsDynamicSource)) return false;
+                            cell = freshNativeTmp();
+                            emitNativeLine(cell + " = call ptr @zeus_capture_cell_create(ptr " +
+                                           dynamicSource + ")");
+                            if (ownsDynamicSource) {
+                                emitNativeLine("call void @zeus_value_release(ptr " + dynamicSource + ")");
+                            }
+                        }
+                        cells.push_back(cell);
+                        temporaryCells.push_back(cell);
+                    }
+
+                    std::string cellsArray = "null";
+                    if (!cells.empty()) {
+                        cellsArray = freshNativeTmp();
+                        emitNativeLine(cellsArray + " = alloca ptr, i64 " +
+                                       std::to_string(cells.size()) + ", align 8");
+                        for (size_t i = 0; i < cells.size(); ++i) {
+                            const std::string slot = freshNativeTmp();
+                            emitNativeLine(slot + " = getelementptr inbounds ptr, ptr " +
+                                           cellsArray + ", i64 " + std::to_string(i));
+                            emitNativeLine("store ptr " + cells[i] + ", ptr " + slot + ", align 8");
+                        }
+                    }
+
+                    const std::string closure = freshNativeTmp();
+                    emitNativeLine(closure + " = alloca %ZeusValue, align 8");
+                    emitNativeLine("call void @zeus_closure_create(ptr " + closure +
+                        ", ptr " + closureAdapterSymbol(static_cast<size_t>(childChunk)) +
+                        ", i32 " + std::to_string(childSignature->second.parameterTypes.size()) +
+                        ", i32 " + std::to_string(cells.size()) + ", ptr " + cellsArray + ")");
+                    for (const auto& cell : temporaryCells) {
+                        emitNativeLine("call void @zeus_capture_cell_release(ptr " + cell + ")");
+                    }
+                    valueStack.push_back(NativeValue{
+                        closure, "ptr", false, true, std::string(), true
+                    });
+                    break;
+                }
                 case VMOperator::STORE_VALUE_LOCAL:
                 case VMOperator::ASSIGN_VALUE_LOCAL: {
                     int64_t index = 0;
                     NativeValue value;
                     if (!tryArgInt(ins, 0, index) || !popNative(ins, value)) {
                         return failNative(ins, "[emit-llvm] 原生函数局部变量存储失败");
+                    }
+                    const auto capturedCell = closureLocalCells.find(static_cast<int>(index));
+                    if (capturedCell != closureLocalCells.end()) {
+                        std::string dynamicValue;
+                        bool ownsDynamic = false;
+                        if (!emitNativeDynamicValue(ins, value, dynamicValue, ownsDynamic)) return false;
+                        emitNativeLine("call void @zeus_capture_cell_store(ptr " +
+                                       capturedCell->second + ", ptr " + dynamicValue + ")");
+                        if (ownsDynamic) {
+                            emitNativeLine("call void @zeus_value_release(ptr " + dynamicValue + ")");
+                        }
+                        break;
                     }
                     if (value.functionRef) {
                         return failNative(ins, "[emit-llvm] 原生函数不能把函数值存入原生局部变量");
@@ -3133,6 +3744,22 @@ public:
                         value = std::move(owned);
                     }
 
+                    const auto globalScalar =
+                        nativeGlobalScalarTypes.find(static_cast<int>(index));
+                    if (globalScalar != nativeGlobalScalarTypes.end() &&
+                        !value.dynamic && value.type == globalScalar->second) {
+                        if (value.type == "i64") {
+                            emitNativeLine("call void @zeus_global_store_i64(i32 " +
+                                std::to_string(index) + ", i64 " + value.value + ")");
+                        } else {
+                            const std::string raw = freshNativeTmp();
+                            emitNativeLine(raw + " = zext i1 " + value.value + " to i32");
+                            emitNativeLine("call void @zeus_global_store_bool(i32 " +
+                                std::to_string(index) + ", i32 " + raw + ")");
+                        }
+                        break;
+                    }
+
                     std::string dynamicValue;
                     bool ownsDynamic = false;
                     if (!emitNativeDynamicValue(ins, value, dynamicValue, ownsDynamic)) {
@@ -3162,6 +3789,9 @@ public:
                     const NativeValue object = objectIt->second;
                     auto emitDeleteLabel = [&](const std::string& label) {
                         functionText += label.substr(1) + ":\n";
+                        // Same as the construction split: the tail label is the
+                        // real predecessor of whatever comes next.
+                        currentNativeBlock = label;
                     };
                     auto failDelete = [&](
                         const IRType::IRInstr& at,
@@ -3205,7 +3835,7 @@ public:
                     const std::string& fieldName = std::get<std::string>(ins.args[0]);
                     const int fieldIndex = findFieldIndex(*layout, fieldName);
                     if (fieldIndex < 0 || static_cast<size_t>(fieldIndex) >= layout->fieldTypes.size()) {
-                        return failNative(ins, "[emit-llvm] 原生函数访问了不存在的字段 '" + fieldName + "'");
+                        return failNative(ins, "[emit-llvm] 原生函数访问了不存在的字段'" + fieldName + "'");
                     }
 
                     const std::string& fieldTypeName =
@@ -3368,7 +3998,17 @@ public:
                         return failNative(ins, "[emit-llvm] 原生函数二元运算操作数无效");
                     }
 
-                    if (left.dynamic || right.dynamic) {
+                    // Class instances have no static operator, but string
+                    // concatenation and equality are defined on the boxed form,
+                    // so they go through the dynamic ABI as well.
+                    const bool classOperands = !left.dynamic && !right.dynamic &&
+                        (isClassType(left.sourceType) || isClassType(right.sourceType));
+                    const bool classOperatorSupported =
+                        ins.op == VMOperator::ADD || ins.op == VMOperator::EQUL ||
+                        ins.op == VMOperator::NOT_EQUAL;
+
+                    if (left.dynamic || right.dynamic ||
+                        (classOperands && classOperatorSupported)) {
                         const int dynamicOpcode = DynamicBinaryABI::opcodeFor(ins.op);
                         if (dynamicOpcode < 0) {
                             return failNative(ins,
@@ -3567,8 +4207,16 @@ public:
                         }
 
                         NativeValue callee;
-                        if (!popNative(ins, callee) || !callee.functionRef) {
-                            return failNative(ins, "[emit-llvm] 原生函数无法解析直接调用目标");
+                        if (!popNative(ins, callee)) return false;
+                        if (callee.dynamic) {
+                            NativeValue closureResult;
+                            if (!emitClosureInvoke(ins, callee, arguments, closureResult)) return false;
+                            valueStack.push_back(std::move(closureResult));
+                            pendingDirectCall.clear();
+                            break;
+                        }
+                        if (!callee.functionRef) {
+                            return failNative(ins, "[emit-llvm] indirect call target is neither a closure nor a native function");
                         }
                         const std::string callSymbol = dynamicVariadicABISymbol(callee.value);
                         if (callSymbol.empty()) {
@@ -3611,7 +4259,7 @@ public:
 
                     auto function = functionSignatures.find(pendingDirectCall);
                     if (function == functionSignatures.end()) {
-                        return failNative(ins, "[emit-llvm] 找不到直接调用目标 '" + pendingDirectCall + "'");
+                        return failNative(ins, "[emit-llvm] 找不到直接调用目标'" + pendingDirectCall + "'");
                     }
 
                     const auto& called = function->second;
@@ -3625,8 +4273,15 @@ public:
                     }
 
                     NativeValue callee;
-                    if (!popNative(ins, callee) || !callee.functionRef ||
-                        callee.value != pendingDirectCall) {
+                    if (!popNative(ins, callee)) return false;
+                    if (callee.dynamic) {
+                        NativeValue closureResult;
+                        if (!emitClosureInvoke(ins, callee, arguments, closureResult)) return false;
+                        valueStack.push_back(std::move(closureResult));
+                        pendingDirectCall.clear();
+                        break;
+                    }
+                    if (!callee.functionRef || callee.value != pendingDirectCall) {
                         return failNative(ins, "[emit-llvm] 原生函数调用缺少匹配的函数引用");
                     }
 
@@ -3794,7 +4449,7 @@ public:
                     }
                     const auto target = nativeBranchTargets.find(pc);
                     if (target == nativeBranchTargets.end() ||
-                        !recordNativeEdge(target->second, ins)) {
+                        !recordNativeEdge(target->second, ins, pc)) {
                         return failNative(ins,
                             "LLVM 函数无条件分支缺少有效目标块");
                     }
@@ -3846,8 +4501,8 @@ public:
                     const size_t fallthrough = pc + 1 > functionExitPc
                         ? functionExitPc
                         : pc + 1;
-                    if (!recordNativeEdge(target->second, ins) ||
-                        !recordNativeEdge(fallthrough, ins)) {
+            if (!recordNativeEdge(target->second, ins, pc) ||
+                !recordNativeEdge(fallthrough, ins, pc)) {
                         return false;
                     }
 
@@ -3868,19 +4523,13 @@ public:
 
                 case VMOperator::COUNT_CHECK_NEG:
                 case VMOperator::COUNT_CHECK_STEP_ZERO: {
-                    // These checks remain runtime errors in the VM. Native v0
-                    // preserves the existing top-level behavior and records
-                    // the skipped range check for the caller.
                     NativeValue checked;
                     if (!popNative(ins, checked)) return false;
+                    const std::string checkCall = rangeCheckCall(checked, ins);
+                    if (!checkCall.empty()) emitNativeLine(checkCall);
                     if (checked.dynamic && checked.ownsDynamic) {
                         emitNativeLine("call void @zeus_value_release(ptr " +
                                        checked.value + ")");
-                    }
-                    if (!warnedNativeCountCheck) {
-                        warnedNativeCountCheck = true;
-                        result.warnings.push_back(
-                            "[emit-llvm] COUNT_CHECK_* skipped in v0; range checks require exception integration");
                     }
                     break;
                 }
@@ -3955,8 +4604,26 @@ public:
                     break;
                 }
 
+                case VMOperator::ASSIGN_VALUE_UPVALUE: {
+                    int64_t index = 0;
+                    NativeValue value;
+                    if (!tryArgInt(ins, 0, index) || !popNative(ins, value) ||
+                        index < 0 || index >= signature.captureCount) {
+                        return failNative(ins, "[emit-llvm] upvalue assignment slot is invalid");
+                    }
+                    std::string dynamicValue;
+                    bool ownsDynamic = false;
+                    if (!emitNativeDynamicValue(ins, value, dynamicValue, ownsDynamic)) return false;
+                    emitNativeLine("call void @zeus_closure_env_store(ptr %closure.env, i32 " +
+                                   std::to_string(index) + ", ptr " + dynamicValue + ")");
+                    if (ownsDynamic) {
+                        emitNativeLine("call void @zeus_value_release(ptr " + dynamicValue + ")");
+                    }
+                    break;
+                }
+
                 case VMOperator::CAPTURE_OUTSIDE_VAR:
-                    return failNative(ins, "[emit-llvm] 原生函数不支持捕获变量");
+                    break;
 
                 default:
                     return failNative(ins, "[emit-llvm] 原生函数暂不支持操作 " + VMO_toString(ins.op));
@@ -3983,7 +4650,7 @@ public:
             const auto edge = std::find_if(
                 incoming->second.begin(), incoming->second.end(),
                 [&](const NativeIncomingState& state) {
-                    return state.predecessor == patch.predecessor;
+                    return state.sourcePc == patch.sourcePc;
                 }
             );
             if (edge == incoming->second.end()) {
@@ -4001,16 +4668,183 @@ public:
                 return false;
             }
 
-            const size_t placeholder = functionText.find(patch.placeholder);
-            if (placeholder == std::string::npos) {
+            const size_t value = functionText.find(patch.placeholder);
+            if (value == std::string::npos) {
                 result.error = "[emit-llvm] loop phi placeholder was lost during lowering";
                 return false;
             }
-            functionText.replace(placeholder, patch.placeholder.size(), local->second.value);
+            functionText.replace(value, patch.placeholder.size(), local->second.value);
+
+            const size_t label = functionText.find(patch.labelPlaceholder);
+            if (label == std::string::npos) {
+                result.error = "[emit-llvm] loop phi predecessor placeholder was lost";
+                return false;
+            }
+            functionText.replace(label, patch.labelPlaceholder.size(), edge->predecessor);
         }
 
+        // Hoist the body allocas to the function entry: an alloca inside a loop
+        // grows the frame on every iteration at -O0.
+        std::string hoistedAllocas;
+        const std::string hoistedBody = takeAllocas(functionText, nativeEntryBody, hoistedAllocas);
+        functionText = functionText.substr(0, nativeEntryBody) + hoistedAllocas + hoistedBody;
         functionText += "}\n\n";
         nativeFunctions += functionText;
+
+        if (needsClosureAdapter(ci)) {
+        std::string adapterText;
+        adapterText += "define void " + closureAdapterSymbol(ci) +
+            "(ptr %out, ptr %env, i32 %argc, ptr %args) {\nentry:\n";
+        std::vector<std::string> adapterArguments;
+        adapterArguments.reserve(signature.parameterTypes.size());
+        int adapterTmp = 0;
+        auto freshAdapterTmp = [&]() {
+            return std::string("%a") + std::to_string(adapterTmp++);
+        };
+        auto emitAdapterLine = [&](const std::string& line) {
+            adapterText += "  " + line + "\n";
+        };
+        for (size_t i = 0; i < signature.parameterTypes.size(); ++i) {
+            const std::string slot = freshAdapterTmp();
+            const std::string dynamicArgument = freshAdapterTmp();
+            emitAdapterLine(slot + " = getelementptr inbounds ptr, ptr %args, i64 " +
+                            std::to_string(i));
+            emitAdapterLine(dynamicArgument + " = load ptr, ptr " + slot + ", align 8");
+
+            const std::string& declaredType = signature.parameterTypes[i];
+            const std::string abiType = functionParameterABIType(declaredType);
+            std::string nativeArgument = dynamicArgument;
+            if (!usesZeusValueABI(declaredType)) {
+                const std::string expectedType = llvmType(declaredType);
+                if (expectedType == "i64") {
+                    nativeArgument = freshAdapterTmp();
+                    emitAdapterLine(nativeArgument + " = call i64 @zeus_value_require_i64(ptr " +
+                                    dynamicArgument + ")");
+                } else if (expectedType == "i1") {
+                    const std::string raw = freshAdapterTmp();
+                    nativeArgument = freshAdapterTmp();
+                    emitAdapterLine(raw + " = call i32 @zeus_value_require_bool(ptr " +
+                                    dynamicArgument + ")");
+                    emitAdapterLine(nativeArgument + " = icmp ne i32 " + raw + ", 0");
+                } else if (expectedType == "ptr" && isReferenceTypeName(declaredType)) {
+                    const std::string referenced = referencedTypeName(declaredType);
+                    nativeArgument = freshAdapterTmp();
+                    if (referenced == "int" || referenced == "int32" || referenced == "int64") {
+                        emitAdapterLine(nativeArgument +
+                            " = call ptr @zeus_value_require_i64_ptr(ptr " + dynamicArgument + ")");
+                    } else if (referenced == "bool") {
+                        emitAdapterLine(nativeArgument +
+                            " = call ptr @zeus_value_require_bool_ptr(ptr " + dynamicArgument + ")");
+                    } else if (isClassType(referenced)) {
+                        const std::string typeName = poolStr(referenced);
+                        emitAdapterLine(nativeArgument +
+                            " = call ptr @zeus_value_require_class_ptr(ptr " + dynamicArgument +
+                            ", ptr " + typeName + ")");
+                    } else {
+                        result.error = "[emit-llvm] closure ABI cannot unbox reference parameter '" +
+                            declaredType + "'";
+                        return false;
+                    }
+                } else if (expectedType == "ptr" && isClassType(declaredType)) {
+                    const std::string typeName = poolStr(declaredType);
+                    nativeArgument = freshAdapterTmp();
+                    emitAdapterLine(nativeArgument +
+                        " = call ptr @zeus_value_require_class_ptr(ptr " + dynamicArgument +
+                        ", ptr " + typeName + ")");
+                } else if (expectedType == "ptr") {
+                    const auto* abi = ZeusBuiltins::findNativeTypeABI(declaredType);
+                    if (abi != nullptr &&
+                        abi->valueABI == ZeusBuiltins::NativeValueABI::StringView) {
+                        nativeArgument = freshAdapterTmp();
+                        emitAdapterLine(nativeArgument +
+                            " = call ptr @zeus_value_intern_string_view(ptr " +
+                            dynamicArgument + ")");
+                    } else {
+                        result.error = "[emit-llvm] closure ABI cannot unbox parameter '" +
+                            declaredType + "'";
+                        return false;
+                    }
+                } else {
+                    result.error = "[emit-llvm] closure ABI has no native parameter conversion for '" +
+                        declaredType + "'";
+                    return false;
+                }
+            }
+            adapterArguments.push_back(abiType + " " + nativeArgument);
+        }
+
+        const bool adapterReturnsDynamic = usesZeusValueABI(signature.returnType);
+        const std::string adapterReturnType = adapterReturnsDynamic
+            ? "void" : llvmType(signature.returnType);
+        if (adapterReturnType.empty()) {
+            result.error = "[emit-llvm] closure ABI has no return conversion for '" +
+                signature.returnType + "'";
+            return false;
+        }
+        std::vector<std::string> callArguments;
+        if (signature.captureCount != 0) callArguments.push_back("ptr %env");
+        if (adapterReturnsDynamic) callArguments.push_back("ptr %out");
+        callArguments.insert(callArguments.end(), adapterArguments.begin(), adapterArguments.end());
+        std::string callText;
+        std::string nativeReturn;
+        if (adapterReturnsDynamic) {
+            callText = "call void " + llvmCallTarget(signature) + "(";
+        } else {
+            nativeReturn = freshAdapterTmp();
+            callText = nativeReturn + " = call " + adapterReturnType + " " +
+                llvmCallTarget(signature) + "(";
+        }
+        for (size_t i = 0; i < callArguments.size(); ++i) {
+            if (i != 0) callText += ", ";
+            callText += callArguments[i];
+        }
+        callText += ")";
+        emitAdapterLine(callText);
+        if (!adapterReturnsDynamic) {
+            if (adapterReturnType == "i64") {
+                emitAdapterLine("call void @zeus_value_init_i64(ptr %out, i64 " +
+                                nativeReturn + ")");
+            } else if (adapterReturnType == "i1") {
+                const std::string raw = freshAdapterTmp();
+                emitAdapterLine(raw + " = zext i1 " + nativeReturn + " to i32");
+                emitAdapterLine("call void @zeus_value_init_bool(ptr %out, i32 " + raw + ")");
+            } else if (adapterReturnType == "ptr" && isClassType(signature.returnType)) {
+                const std::string typeName = poolStr(signature.returnType);
+                emitAdapterLine("call void @zeus_value_from_class_ptr(ptr %out, ptr " +
+                                nativeReturn + ", ptr " + typeName + ")");
+            } else if (adapterReturnType == "ptr" && isReferenceTypeName(signature.returnType)) {
+                const std::string referenced = referencedTypeName(signature.returnType);
+                if (referenced == "int" || referenced == "int32" || referenced == "int64" ||
+                    referenced == "bool") {
+                    emitAdapterLine(std::string("call void @zeus_value_from_") +
+                        (referenced == "bool" ? "bool" : "i64") +
+                        "_ptr(ptr %out, ptr " + nativeReturn + ")");
+                } else if (isClassType(referenced)) {
+                    const std::string typeName = poolStr(referenced);
+                    emitAdapterLine("call void @zeus_value_from_class_ptr(ptr %out, ptr " +
+                                    nativeReturn + ", ptr " + typeName + ")");
+                } else {
+                    result.error = "[emit-llvm] closure ABI cannot box reference return '" +
+                        signature.returnType + "'";
+                    return false;
+                }
+            } else {
+                const auto* abi = ZeusBuiltins::findNativeTypeABI(signature.returnType);
+                if (adapterReturnType == "ptr" && abi != nullptr &&
+                    abi->valueABI == ZeusBuiltins::NativeValueABI::StringView) {
+                    emitAdapterLine("call void @zeus_value_from_string_view(ptr %out, ptr " +
+                                    nativeReturn + ")");
+                } else {
+                    result.error = "[emit-llvm] closure ABI cannot box return '" +
+                        signature.returnType + "'";
+                    return false;
+                }
+            }
+        }
+        emitAdapterLine("ret void");
+        adapterText += "}\n\n";
+        nativeFunctions += adapterText;
+        }
         return true;
     }
 
@@ -4018,7 +4852,7 @@ public:
         return "%L" + std::to_string(ci) + "_" + std::to_string(pc);
     }
 
-    // chunk 尾出口（跳转目标 == size 即程序/块尾，语义是“执行流离开本 chunk”）。
+    // chunk 尾出口（跳转目标 == size 即程序块尾，语义是“执行流离开该 chunk”）。
     static std::string endLabelFor(size_t ci) {
         return "%L" + std::to_string(ci) + "_end";
     }
@@ -4100,6 +4934,9 @@ public:
         const auto oldNativeLocals = nativeLocals;
         const auto oldNativeGlobalSlots = nativeGlobalSlots;
         const auto oldNativeLocalSlots = nativeLocalSlots;
+        const auto oldNativeGlobalClassTypes = nativeGlobalClassTypes;
+        const auto oldNativeGlobalScalarTypes = nativeGlobalScalarTypes;
+        const std::string oldEntryPrologue = entryPrologue;
         const std::string oldPendingVariadicCall = pendingVariadicCall;
         const std::string oldPendingDirectCall = pendingDirectCall;
         const std::string oldPendingFunctionLoad = pendingFunctionLoad;
@@ -4118,6 +4955,10 @@ public:
             strPool = oldStringPool;
             strCount = oldStrCount;
             tmpCount = oldTmpCount;
+            // The prologue is rolled back with everything else: it holds temp
+            // names taken from the same counter, so leaving it behind would let
+            // the retried body hand out the same name twice.
+            entryPrologue = oldEntryPrologue;
             nativeGlobals = oldNativeGlobals;
             nativeLocals = oldNativeLocals;
             nativeGlobalSlots = oldNativeGlobalSlots;
@@ -4174,7 +5015,9 @@ public:
             slot.address = freshTmp();
             slot.type = type;
             slot.sourceType = sourceType;
-            emitLine(slot.address + " = alloca " + type);
+            // The storage has to dominate every later access, so it belongs to
+            // the entry block even when the first store sits inside a branch.
+            entryPrologue += slot.address + " = alloca " + type + "\n";
             slots.emplace(index, std::move(slot));
             return true;
         };
@@ -4254,7 +5097,7 @@ public:
                 return true;
             }
             if (ins.args.empty() || !std::holds_alternative<LexerType::Value>(ins.args[0])) {
-                failNativeTopLevel(ins, "[emit-llvm] 原生值 PUSH 参数不是 Value");
+                failNativeTopLevel(ins, "[emit-llvm] 原生 PUSH 参数不是 Value");
                 return false;
             }
 
@@ -4334,7 +5177,7 @@ public:
             NativeValue callee;
             if (!popValue(ins, callee) || !callee.functionRef ||
                 callee.type != "builtin") {
-                failNativeTopLevel(ins, "[emit-llvm] 原生调用缺少内置函数目标");
+                failNativeTopLevel(ins, "[emit-llvm] invalid native variadic call target");
                 return false;
             }
 
@@ -4380,6 +5223,52 @@ public:
                 else emitRelease(dynamicArguments[i]);
             }
             valueStack.push_back(NativeValue{ resultValue, "ptr", false, true, "nil", true });
+            return true;
+        };
+
+        auto emitClosureCallTopLevel = [&] (
+            const IRType::IRInstr& ins,
+            NativeValue& callee,
+            const std::vector<NativeValue>& arguments,
+            NativeValue& callResult
+        ) {
+            if (!callee.dynamic || callee.type != "ptr") {
+                failNativeTopLevel(ins, "[emit-llvm] closure call requires a dynamic closure value");
+                return false;
+            }
+            std::vector<std::string> dynamicArguments(arguments.size());
+            std::vector<bool> ownsDynamicArguments(arguments.size(), false);
+            for (size_t i = 0; i < arguments.size(); ++i) {
+                if (!emitNativeValueAsDynamic(arguments[i], ins, dynamicArguments[i])) {
+                    return false;
+                }
+                ownsDynamicArguments[i] = arguments[i].dynamic
+                    ? arguments[i].ownsDynamic : true;
+            }
+            std::string argumentArray = "null";
+            if (!dynamicArguments.empty()) {
+                argumentArray = freshTmp();
+                emitLine(argumentArray + " = alloca ptr, i64 " +
+                         std::to_string(dynamicArguments.size()) + ", align 8");
+                for (size_t i = 0; i < dynamicArguments.size(); ++i) {
+                    const std::string slot = freshTmp();
+                    emitLine(slot + " = getelementptr inbounds ptr, ptr " +
+                             argumentArray + ", i64 " + std::to_string(i));
+                    emitLine("store ptr " + dynamicArguments[i] + ", ptr " + slot +
+                             ", align 8");
+                }
+            }
+            const std::string output = freshTmp();
+            emitLine(output + " = alloca %ZeusValue, align 8");
+            emitLine("call void @zeus_closure_call(ptr " + output + ", ptr " +
+                     callee.value + ", i32 " +
+                     std::to_string(dynamicArguments.size()) + ", ptr " +
+                     argumentArray + ")");
+            for (size_t i = 0; i < dynamicArguments.size(); ++i) {
+                if (ownsDynamicArguments[i]) emitRelease(dynamicArguments[i]);
+            }
+            if (callee.ownsDynamic) releaseNativeValue(callee);
+            callResult = NativeValue{ output, "ptr", false, true, std::string(), true };
             return true;
         };
 
@@ -4619,6 +5508,12 @@ public:
                             className, "classref", false, false, className
                         });
                     } else if (kind == "global") {
+                        // A global the slot table owns has to be read back from
+                        // it, even when this scope still holds an older copy:
+                        // a native function called in between wrote the newer
+                        // value there.
+                        const auto slotBacked =
+                            nativeGlobalScalarTypes.find(static_cast<int>(index));
                         auto slot = nativeGlobalSlots.find(static_cast<int>(index));
                         if (slot != nativeGlobalSlots.end()) {
                             const std::string temporary = freshTmp();
@@ -4631,12 +5526,28 @@ public:
                             break;
                         }
 
+                        if (slotBacked != nativeGlobalScalarTypes.end()) {
+                            NativeValue loaded;
+                            if (!boxNativeGlobalValue(
+                                    ins, static_cast<int>(index), loaded)) {
+                                rollback();
+                                return false;
+                            }
+                            valueStack.push_back(loaded);
+                            break;
+                        }
+
                         auto value = nativeGlobals.find(static_cast<int>(index));
                         if (value != nativeGlobals.end()) {
                             valueStack.push_back(value->second);
                         } else {
-                            const std::string temporary = emitGlobalValueLoad(static_cast<int>(index));
-                            valueStack.push_back(NativeValue{ temporary, "ptr", false, true });
+                            NativeValue loaded;
+                            if (!boxNativeGlobalValue(
+                                    ins, static_cast<int>(index), loaded)) {
+                                rollback();
+                                return false;
+                            }
+                            valueStack.push_back(loaded);
                         }
                     } else if (kind == "local") {
                         auto slot = nativeLocalSlots.find(static_cast<int>(index));
@@ -4915,7 +5826,29 @@ public:
                                  std::to_string(index) + ", ptr " + value.value + ")");
                         nativeGlobals.erase(static_cast<int>(index));
                     } else {
-                        nativeGlobals[static_cast<int>(index)] = value;
+                        // A scalar written through a direct global access still
+                        // updates the runtime slot, so a later read from a native
+                        // function sees the new value.
+                        const auto scalar =
+                            nativeGlobalScalarTypes.find(static_cast<int>(index));
+                        if (scalar != nativeGlobalScalarTypes.end() &&
+                            !hasControlFlow && value.type == scalar->second) {
+                            if (value.type == "i64") {
+                                emitLine("call void @zeus_global_store_i64(i32 " +
+                                         std::to_string(index) + ", i64 " + value.value + ")");
+                            } else {
+                                const std::string raw = freshTmp();
+                                emitLine(raw + " = zext i1 " + value.value + " to i32");
+                                emitLine("call void @zeus_global_store_bool(i32 " +
+                                         std::to_string(index) + ", i32 " + raw + ")");
+                            }
+                            // The slot table is the only owner now: keeping an
+                            // SSA copy here would shadow writes made by native
+                            // functions called later.
+                            nativeGlobals.erase(static_cast<int>(index));
+                        } else {
+                            nativeGlobals[static_cast<int>(index)] = value;
+                        }
                     }
                     break;
                 }
@@ -5174,7 +6107,7 @@ public:
                                 parameterCount);
                         if (operatorSignature == nullptr) {
                             failNativeTopLevel(ins,
-                                "[emit-llvm] class 没有匹配的下标 operator");
+                                "[emit-llvm] class 没有匹配的下标operator");
                             rollback();
                             return false;
                         }
@@ -5372,8 +6305,22 @@ public:
                         }
 
                         NativeValue callee;
-                        if (!popValue(ins, callee) || !callee.functionRef ||
-                            callee.value != pendingDirectCall) {
+                        if (!popValue(ins, callee)) {
+                            rollback();
+                            return false;
+                        }
+                        if (callee.dynamic) {
+                            NativeValue closureResult;
+                            if (!emitClosureCallTopLevel(ins, callee, arguments, closureResult)) {
+                                rollback();
+                                return false;
+                            }
+                            valueStack.push_back(std::move(closureResult));
+                            pendingDirectCall.clear();
+                            pendingFunctionLoad.clear();
+                            break;
+                        }
+                        if (!callee.functionRef || callee.value != pendingDirectCall) {
                             failNativeTopLevel(ins, "[emit-llvm] 原生函数调用缺少匹配的函数引用");
                             rollback();
                             return false;
@@ -5480,6 +6427,30 @@ public:
                         break;
                     }
 
+                    if (calleePosition < valueStack.size() &&
+                        valueStack[calleePosition].dynamic &&
+                        valueStack.size() >= static_cast<size_t>(argc) + 1) {
+                        std::vector<NativeValue> arguments(static_cast<size_t>(argc));
+                        for (int64_t i = argc - 1; i >= 0; --i) {
+                            if (!popValue(ins, arguments[static_cast<size_t>(i)])) {
+                                rollback();
+                                return false;
+                            }
+                        }
+                        NativeValue callee;
+                        if (!popValue(ins, callee)) {
+                            rollback();
+                            return false;
+                        }
+                        NativeValue closureResult;
+                        if (!emitClosureCallTopLevel(ins, callee, arguments, closureResult)) {
+                            rollback();
+                            return false;
+                        }
+                        valueStack.push_back(std::move(closureResult));
+                        break;
+                    }
+
                     failNativeTopLevel(ins, "[emit-llvm] 原生闭包调用缺少 direct_call metadata");
                     rollback();
                     return false;
@@ -5578,20 +6549,14 @@ public:
 
                 case VMOperator::COUNT_CHECK_NEG:
                 case VMOperator::COUNT_CHECK_STEP_ZERO: {
-                    // 检查值在 VM 中会原样留在栈上；原生 lowering 不需要
-                    // 依赖这两个隐藏值，因此在检查点消费它们，避免把
-                    // for 的内部状态带入循环基本块。
                     NativeValue checked;
                     if (!popValue(ins, checked)) {
                         rollback();
                         return false;
                     }
+                    const std::string checkCall = rangeCheckCall(checked, ins);
+                    if (!checkCall.empty()) emitLine(checkCall);
                     releaseNativeValue(checked);
-                    if (!warnedCountCheck) {
-                        warnedCountCheck = true;
-                        result.warnings.push_back(
-                            "[emit-llvm] COUNT_CHECK_* skipped in v0; range checks require exception integration");
-                    }
                     break;
                 }
 
@@ -5659,7 +6624,7 @@ public:
         }
 
         if (classDeclaration) {
-            // 静态类函数已经单独生成为 LLVM function；类注册本身属于 VM
+            // 静态类函数已经单独生成了 LLVM function；类注册本身属于 VM
             // 运行时协议，AOT 入口不需要再执行 CLASS_BUILD。
             if (!entryLabelEmitted) {
                 emitLabelDef("%L0_0");
@@ -5677,9 +6642,9 @@ public:
         }
 
         if (chunk.empty()) {
-            // 空 chunk 一般无需出码；唯一例外是 chunk 0：entry 块的
-            // br %L0_0 要求该 label 必须存在。被跳过的静态类 chunk
-            // 后面可能还有空 chunk，也要保留控制流桥接 label。
+            // 本 chunk 一般无需出码；唯一例外是 chunk 0：entry 块的
+            // br %L0_0 要求的 label 必须存在。被跳过的静态类 chunk
+            // 后面可能还有的 chunk，也要保留控制流桥接 label。
             if (ci == 0 || blkNeedLabel) {
                 emitLabelDef(ci == 0 ? "%L0_0" : labelFor(ci, 0));
                 entryLabelEmitted = true;
@@ -5698,9 +6663,9 @@ public:
             return true;
         }
 
-        // Pass 1：只收集跳转目标。目标 == size 是合法的“离开本 chunk”
-        // （如末尾 if 的 false 分支），映射到出口块；条件分支 fall 到
-        // size 同理（隐式离开）。直線 fallthrough 不打 label。
+        // Pass 1：只收集跳转目标。目标 == size 是合法的“离开该 chunk”
+        // （如末尾 if 的 false 分支），映射到出口块；条件分支的 fall through
+        // size 同理（隐式离开）。直接 fallthrough 不打 label。
         std::set<size_t> labels;
         bool exitJump = false;
 
@@ -5736,7 +6701,7 @@ public:
                     if (pc + 1 < chunk.size()) {
                         labels.insert(pc + 1); // 条件分支的 fallthrough 后继必须有块
                     } else {
-                        exitJump = true; // fall 到 chunk 尾 = 隐式离开
+                        exitJump = true; // fall through chunk 尾= 隐式离开
                     }
                 }
             }
@@ -5746,7 +6711,7 @@ public:
         for (size_t pc = 0; pc < chunk.size(); ++pc) {
             const auto& ins = chunk[pc];
 
-            // L0_0 无条件存在（entry 块 br 到它），其余 label 只出现在控制流需要处。
+            // L0_0 无条件存在（entry 的 br 到它），其余 label 只出现在控制流需要处。
             if (labels.count(pc) || blkNeedLabel || (blkTerminated && pc == 0) ||
                 (ci == 0 && pc == 0)) {
                 std::string label = labelFor(ci, pc);
@@ -5825,7 +6790,7 @@ public:
                 }
 
                 case VMOperator::LOAD_VALUE: {
-                    // 形态1：单个 Value → 字面量。
+                    // 形态：单个 Value 或 字面量。
                     if (ins.args.size() == 1 && std::holds_alternative<LexerType::Value>(ins.args[0])) {
                         std::string t = emitDynamicValueForLiteral(std::get<LexerType::Value>(ins.args[0]), ins);
 
@@ -5835,7 +6800,7 @@ public:
                         break;
                     }
 
-                    // 形态2：单个 string → 未解析名或已知动态变长 ABI。
+                    // 形态：单个 string 、未解析名或已知动态变长 ABI。
                     if (ins.args.size() == 1 && std::holds_alternative<std::string>(ins.args[0])) {
                         const std::string& name = std::get<std::string>(ins.args[0]);
 
@@ -5846,14 +6811,14 @@ public:
 
                         if (functionSignatures.find(name) != functionSignatures.end()) {
                             pendingFunctionLoad = name;
-                            break; // 原生函数引用只作为直接调用的元信息存在
+                            break; // 原生函数引用只作为直接调用的元信息存。
                         }
 
                         fail(ins, "[emit-llvm] v0: 未知名字 '" + name + "'（freestanding：仅已注册的动态变长 ABI 可用）");
                         return false;
                     }
 
-                    // 形态3：scope + index。
+                    // 形态：scope + index。
                     if (ins.args.size() >= 2 && std::holds_alternative<std::string>(ins.args[0])) {
                         const std::string& kind = std::get<std::string>(ins.args[0]);
                         int64_t idx = 0;
@@ -6074,6 +7039,30 @@ public:
                     break;
                 }
 
+                case VMOperator::SUBTRACT:
+                case VMOperator::MULTIPLY:
+                case VMOperator::DIVIDE:
+                case VMOperator::MODULUS:
+                case VMOperator::EQUL:
+                case VMOperator::NOT_EQUAL: {
+                    const int dynamicOpcode = DynamicBinaryABI::opcodeFor(ins.op);
+                    if (dynamicOpcode < 0) {
+                        fail(ins, "[emit-llvm] dynamic 值暂不支持该二元运算");
+                        return false;
+                    }
+                    std::string r = emitPop();
+                    std::string l = emitPop();
+                    std::string t = freshTmp();
+                    emitLine(t + " = alloca %ZeusValue, align 8");
+                    emitLine("call void @zeus_value_dynamic_binary(ptr " + t +
+                             ", ptr null, i32 " + std::to_string(dynamicOpcode) +
+                             ", ptr " + l + ", ptr " + r + ")");
+                    emitPushValue(t);
+                    emitRelease(l);
+                    emitRelease(r);
+                    break;
+                }
+
                 case VMOperator::LESS_THAN: {
                     std::string r = emitPop();
                     std::string l = emitPop();
@@ -6086,10 +7075,25 @@ public:
                     break;
                 }
 
+                case VMOperator::GREATER_THAN: {
+                    std::string r = emitPop();
+                    std::string l = emitPop();
+                    std::string t = freshTmp();
+                    emitLine(t + " = alloca %ZeusValue, align 8");
+                    emitLine("call void @zeus_value_dynamic_binary(ptr " + t +
+                             ", ptr null, i32 " +
+                             std::to_string(DynamicBinaryABI::opcodeFor(ins.op)) +
+                             ", ptr " + l + ", ptr " + r + ")");
+                    emitPushValue(t);
+                    emitRelease(l);
+                    emitRelease(r);
+                    break;
+                }
+
                 case VMOperator::JUMP:
                 case VMOperator::LOOP_BREAK: {
                     int64_t off = 0;
-                    tryArgInt(ins, 0, off); // Pass 1 已验证
+                    tryArgInt(ins, 0, off); // Pass 1 已验证。
                     long long tgt = (long long)pc + 1 + off;
 
                     if (tgt == (long long)chunk.size()) {
@@ -6106,7 +7110,7 @@ public:
                 case VMOperator::JUMP_IF_FALSE:
                 case VMOperator::JUMP_IF_TRUE: {
                     int64_t off = 0;
-                    tryArgInt(ins, 0, off); // Pass 1 已验证
+                    tryArgInt(ins, 0, off); // Pass 1 已验证。
                     long long tgt = (long long)pc + 1 + off;
                     size_t fall = pc + 1;
 
@@ -6137,11 +7141,18 @@ public:
 
                 case VMOperator::COUNT_CHECK_NEG:
                 case VMOperator::COUNT_CHECK_STEP_ZERO: {
-                    // v0 跳过（for 越界检查随异常模型补齐），仅警告一次。
-                    if (!warnedCountCheck) {
-                        warnedCountCheck = true;
-                    }
-
+                    const int32_t checkKind =
+                        ins.op == VMOperator::COUNT_CHECK_NEG
+                            ? ZEUS_RANGE_CHECK_NEGATIVE_END
+                            : ZEUS_RANGE_CHECK_ZERO_STEP;
+                    const int32_t sourceLine = ins.line > 0 ? ins.line : 0;
+                    const std::string checked = freshTmp();
+                    emitLine(checked + " = alloca %ZeusValue, align 8");
+                    emitLine("call void @zeus_value_pop(ptr " + checked + ")");
+                    emitLine("call void @zeus_range_check_value(ptr " + checked +
+                             ", i32 " + std::to_string(checkKind) +
+                             ", i32 " + std::to_string(sourceLine) + ")");
+                    emitLine("call void @zeus_value_push(ptr " + checked + ")");
                     break;
                 }
 
@@ -6295,7 +7306,7 @@ public:
         }
 
         if (exitJump) {
-            // 出口块：跳到 size / fall 到 size 的边全部落在这里。
+            // 出口块：跳到 size / fall through size 的边全部落在这里。
             emitLabelDef(endLabelFor(ci));
 
             if (!isLast) {
@@ -6316,8 +7327,8 @@ public:
 inline EmitResult emit(const ZeusCompile::Result& r) {
     EmitResult res;
     detail::Emitter e;
-    // 失败判定统一看 error 字符串（fail() 负责填充）。
-
+    e.programChunks = &r.program;
+    // 失败判定统一为 error 字符串（fail() 负责填充）。
     if (r.program.empty()) {
         res.ok = false;
         res.error = "[emit-llvm] 空程序";
@@ -6329,6 +7340,10 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
         res.error = e.result.error;
         return res;
     }
+
+    // Both passes need to know what each global holds before any code is
+    // emitted, so the scan runs on its own here.
+    e.prescanGlobalTypes();
 
     for (size_t ci = 0; ci < r.program.size(); ++ci) {
         if (!r.program[ci].empty() &&
@@ -6370,10 +7385,10 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
         return res;
     }
 
-    // 组装：声明 + 字符串池 + 入口。
+    // 组装：声明+ 字符串池 + 入口。
     std::string out;
     out += "; Generated by Zeus --emit-llvm (v0 naive stack machine)\n";
-    out += "; 入口 zeus_entry 由所有 top-level chunk 按序拼接，main 在 libzeus_rt.lib。\n\n";
+    out += "; 入口 zeus_entry 由所有 top-level chunk 按序拼接，main 链接 libzeus_rt.lib。\n\n";
     out += "%ZeusValue = type { i32, i32, i64 }\n";
     out += "declare void @zeus_value_init_nil(ptr)\n";
     out += "declare void @zeus_value_init_i64(ptr, i64)\n";
@@ -6397,6 +7412,8 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
     out += "declare ptr @zeus_value_require_i64_ptr(ptr)\n";
     out += "declare ptr @zeus_value_require_bool_ptr(ptr)\n";
     out += "declare void @zeus_value_release(ptr)\n";
+    out += "declare void @zeus_range_check_i64(i64, i32, i32)\n";
+    out += "declare void @zeus_range_check_value(ptr, i32, i32)\n";
     out += "declare void @zeus_value_push(ptr)\n";
     out += "declare void @zeus_value_pop(ptr)\n";
     out += "declare void @zeus_value_print(ptr)\n";
@@ -6408,8 +7425,26 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
     out += "declare void @zeus_dynamic_member_arity_error(ptr, i32, i32)\n";
     out += "declare void @zeus_value_global_store(i32, ptr)\n";
     out += "declare void @zeus_value_global_load(ptr, i32)\n";
+    out += "declare i64 @zeus_global_load_i64(i32)\n";
+    out += "declare i32 @zeus_global_load_bool(i32)\n";
+    out += "declare void @zeus_global_store_i64(i32, i64)\n";
+    out += "declare void @zeus_global_store_bool(i32, i32)\n";
     out += "declare void @zeus_value_local_store(i32, ptr)\n";
     out += "declare void @zeus_value_local_load(ptr, i32)\n";
+    out += "declare ptr @zeus_capture_cell_create(ptr)\n";
+    out += "declare ptr @zeus_capture_cell_clone(ptr)\n";
+    out += "declare ptr @zeus_capture_cell_retain(ptr)\n";
+    out += "declare void @zeus_capture_cell_release(ptr)\n";
+    out += "declare void @zeus_capture_cell_load(ptr, ptr)\n";
+    out += "declare void @zeus_capture_cell_store(ptr, ptr)\n";
+    out += "declare ptr @zeus_closure_capture_ref(ptr, i32)\n";
+    out += "declare ptr @zeus_closure_capture_copy(ptr, i32)\n";
+    out += "declare void @zeus_closure_create(ptr, ptr, i32, i32, ptr)\n";
+    out += "declare void @zeus_closure_call(ptr, ptr, i32, ptr)\n";
+    out += "declare void @zeus_closure_env_load(ptr, ptr, i32)\n";
+    out += "declare void @zeus_closure_env_store(ptr, i32, ptr)\n";
+    out += "declare void @zeus_gc_collect()\n";
+    out += "declare i64 @zeus_gc_live_node_count()\n";
     out += "declare void @zeus_value_int_add(ptr, ptr, ptr)\n";
     out += "declare void @zeus_value_less_than(ptr, ptr, ptr)\n";
     out += "declare i32 @zeus_value_truthy(ptr)\n";
@@ -6453,29 +7488,36 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
     out += e.dynamicMemberBridge.adapters;
 
     out += "define i32 @zeus_entry() {\nentry:\n";
+    // The top-level statements all end up in this one function, so their
+    // allocas are hoisted the same way a native function hoists its own: at
+    // -O0 an alloca inside a loop grows the frame on every iteration.
+    std::string hoistedAllocas;
+    const std::string hoistedBody = detail::Emitter::takeAllocas(e.body, 0, hoistedAllocas);
+    out += e.takeEntryAllocas();
+    out += hoistedAllocas;
     if (!e.dynamicMemberBridge.empty()) {
         out += "  call void @__zeus_register_dynamic_members()\n";
     }
     out += "  br label %L0_0\n";
-    out += e.body;
+    out += hoistedBody;
 
     // 收尾：上一块若已终结（末尾是无条件跳转，如死循环），补不可达块。
     // 判定：取 body 最后一行，看是否为 "br label ..."。
     bool endsWithBr = false;
 
     {
-        // 取 body 最后一行（body 以换行结尾，out 尾部还有 "}\n" 未加——
+        // 取 body 最后一行（body 以换行结尾，out 尾部还有 "}\n" 未加——）。
         // 注意此处检查的是 e.body，不是 out）。
         std::string b = e.body;
 
         while (!b.empty() && (b.back() == '\n' || b.back() == ' ')) {
             b.pop_back();
         }
-        // 取最后一行
+        // 取最后一行。
         size_t nl = b.rfind('\n');
         std::string last = (nl == std::string::npos) ? b : b.substr(nl + 1);
 
-        // 去前导空格
+        // 去前导空白。
         size_t p = last.find_first_not_of(" \t");
 
         if (p != std::string::npos) last = last.substr(p);

@@ -203,6 +203,92 @@ bool isLLVMClassValue(const ZeusBox* box) {
     return box && std::holds_alternative<ZeusType::LLVMClassHandle>(box->v);
 }
 
+ZeusBox* valueReference(const ZeusValue* value);
+
+// A native String instance and a boxed string are both usable as text, but the
+// native one only exposes its bytes through the registered toString method, so
+// it has to travel the string ABI instead of the numeric fast paths.
+bool isNativeStringValue(const ZeusValue* value) {
+    if (!value || value->flags != ZEUS_VALUE_FLAG_OWNS_BOX) return false;
+    if (value->tag == ZEUS_VALUE_TAG_STRING) return true;
+    if (value->tag != ZEUS_VALUE_TAG_BOXED) return false;
+    const ZeusType::UniversalVariant& boxed = valueReference(value)->v;
+    const auto* classHandle = std::get_if<ZeusType::LLVMClassHandle>(&boxed);
+    return classHandle && classHandle->state &&
+           classHandle->state->typeName == "String";
+}
+
+void concatNativeStrings(ZeusValue* out, const ZeusValue* lhs, const ZeusValue* rhs) {
+    const ZeusStringView* left = zeus_value_intern_string_view(lhs);
+    const ZeusStringView* right = zeus_value_intern_string_view(rhs);
+    try {
+        std::string joined;
+        joined.reserve(static_cast<size_t>(left->length + right->length));
+        joined.append(left->data, static_cast<size_t>(left->length));
+        joined.append(right->data, static_cast<size_t>(right->length));
+        zeus_value_from_string_data(out, joined.data(),
+            static_cast<int64_t>(joined.size()));
+    } catch (...) {
+        dynamicValuePanic("failed to concatenate native strings");
+    }
+}
+
+// Returns true when the operands were handled as text, so the caller only
+// rejects class values that really have no dynamic operator.
+bool tryNativeStringConcat(ZeusValue* out, const ZeusValue* lhs, const ZeusValue* rhs) {
+    if (!isNativeStringValue(lhs) || !isNativeStringValue(rhs)) return false;
+    concatNativeStrings(out, lhs, rhs);
+    return true;
+}
+
+// A native class handle is a non-owning typed pointer, so equality is identity
+// on the underlying object. A native String still compares equal to text, so a
+// String instance and a boxed string with the same bytes are equal.
+const void* nativeClassObject(const ZeusValue* value) {
+    if (!value || value->flags != ZEUS_VALUE_FLAG_OWNS_BOX ||
+        value->tag != ZEUS_VALUE_TAG_BOXED) {
+        return nullptr;
+    }
+    const ZeusType::UniversalVariant& boxed = valueReference(value)->v;
+    const auto* handle = std::get_if<ZeusType::LLVMClassHandle>(&boxed);
+    if (!handle || !handle->state) return nullptr;
+    return handle->state->object.load(std::memory_order_acquire);
+}
+
+bool boxedStringText(const ZeusValue* value, std::string& out) {
+    if (!value || value->flags != ZEUS_VALUE_FLAG_OWNS_BOX) return false;
+    const ZeusType::UniversalVariant& boxed = valueReference(value)->v;
+    if (std::holds_alternative<ZeusType::LLVMClassHandle>(boxed)) return false;
+    const auto* text = stringUniversalValue(boxed);
+    if (!text) return false;
+    out = *text;
+    return true;
+}
+
+bool nativeStringEqualsText(const ZeusValue* value, const std::string& text) {
+    const ZeusStringView* view = zeus_value_intern_string_view(value);
+    return std::string_view(view->data, static_cast<size_t>(view->length)) == text;
+}
+
+bool tryNativeClassEquality(ZeusValue* out, int32_t opcode,
+                            const ZeusValue* lhs, const ZeusValue* rhs) {
+    const void* left = nativeClassObject(lhs);
+    const void* right = nativeClassObject(rhs);
+    if (!left && !right) return false;
+
+    bool equal = left != nullptr && left == right;
+    if (!equal) {
+        std::string text;
+        if (left && !right && boxedStringText(rhs, text)) {
+            equal = nativeStringEqualsText(lhs, text);
+        } else if (right && !left && boxedStringText(lhs, text)) {
+            equal = nativeStringEqualsText(rhs, text);
+        }
+    }
+    zeus_value_init_bool(out, (opcode == ZEUS_BINARY_EQUAL ? equal : !equal) ? 1 : 0);
+    return true;
+}
+
 ZeusBox* valueReference(const ZeusValue* value) {
     if (!value || !isReferenceTag(value->tag) ||
         value->flags != ZEUS_VALUE_FLAG_OWNS_BOX || value->payload == 0) {
@@ -356,7 +442,10 @@ void zeus_value_from_bool_ptr(ZeusValue* out, void* value) {
     out->payload = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(value));
 }
 
-void zeus_value_clone(ZeusValue* out, const ZeusValue* value) {
+// `rooted` boxes are caller-owned values and act as GC roots; unrooted boxes
+// are graph edges. The distinction must survive every clone, otherwise a
+// closure that captures itself would keep its own subgraph alive.
+static void cloneDynamicValue(ZeusValue* out, const ZeusValue* value, bool rooted) {
     if (!out || !value) dynamicValuePanic("null clone pointer");
     if (out == value) return;
     setNilValue(out);
@@ -385,7 +474,9 @@ void zeus_value_clone(ZeusValue* out, const ZeusValue* value) {
             case ZEUS_VALUE_TAG_BIGDECIMAL:
             case ZEUS_VALUE_TAG_STRING:
             case ZEUS_VALUE_TAG_BOXED: {
-                ZeusBox* copy = new ZeusBox(*valueReference(value));
+                ZeusBox* copy = rooted
+                    ? new ZeusBox(*valueReference(value))
+                    : new ZeusBox(*valueReference(value), false);
                 out->tag = value->tag;
                 out->flags = ZEUS_VALUE_FLAG_OWNS_BOX;
                 out->payload = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(copy));
@@ -397,6 +488,14 @@ void zeus_value_clone(ZeusValue* out, const ZeusValue* value) {
     } catch (...) {
         dynamicValuePanic("failed to clone dynamic value");
     }
+}
+
+void zeus_value_clone_internal(ZeusValue* out, const ZeusValue* value) {
+    cloneDynamicValue(out, value, false);
+}
+
+void zeus_value_clone(ZeusValue* out, const ZeusValue* value) {
+    cloneDynamicValue(out, value, true);
 }
 
 void zeus_value_from_box(ZeusValue* out, const ZeusBox* box) {
@@ -470,6 +569,24 @@ void* zeus_value_require_class_ptr(const ZeusValue* value, const char* type_name
     const ZeusBox* box = valueReference(value);
     const auto* handle = std::get_if<ZeusType::LLVMClassHandle>(&box->v);
     if (!handle) dynamicValuePanic("boxed value is not an LLVM class pointer");
+    return resolveLLVMClassPointer(*handle, type_name);
+}
+
+// Same as zeus_value_require_class_ptr, except that a nil value yields nullptr
+// instead of aborting. Callers use it to clear or delete a slot whose content
+// is not known statically. A non-nil value of the wrong class still aborts.
+void* zeus_value_try_class_ptr(const ZeusValue* value, const char* type_name) {
+    if (!value) return nullptr;
+    if (value->tag == ZEUS_VALUE_TAG_NIL) return nullptr;
+    if (value->tag != ZEUS_VALUE_TAG_BOXED || value->flags != ZEUS_VALUE_FLAG_OWNS_BOX) {
+        dynamicValuePanic("expected a boxed LLVM class pointer");
+    }
+    const ZeusBox* box = valueReference(value);
+    const auto* handle = std::get_if<ZeusType::LLVMClassHandle>(&box->v);
+    if (!handle) {
+        if (ZeusVMUtils::isNull(box->v)) return nullptr;
+        dynamicValuePanic("boxed value is not an LLVM class pointer");
+    }
     return resolveLLVMClassPointer(*handle, type_name);
 }
 
@@ -640,7 +757,7 @@ ZeusBox* zeus_value_to_box(const ZeusValue* value) {
     }
 }
 
-void zeus_value_release(ZeusValue* value) {
+void zeus_value_release_internal(ZeusValue* value) {
     if (!value) return;
     if (value->flags == ZEUS_VALUE_FLAG_OWNS_BOX) {
         delete valueReference(value);
@@ -648,6 +765,12 @@ void zeus_value_release(ZeusValue* value) {
         dynamicValuePanic("invalid value ownership flags");
     }
     setNilValue(value);
+}
+
+void zeus_value_release(ZeusValue* value) {
+    // The owning box unlinks its own root on destruction, so dropping the value
+    // is enough; there is no separate root entry to retire.
+    zeus_value_release_internal(value);
 }
 
 void zeus_value_from_cstr(ZeusValue* out, const char* text) {
@@ -837,6 +960,7 @@ void zeus_value_int_add(ZeusValue* out, const ZeusValue* lhs, const ZeusValue* r
     if (!out) dynamicValuePanic("null output pointer");
     setNilValue(out);
     try {
+        if (tryNativeStringConcat(out, lhs, rhs)) return;
         std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> left(
             zeus_value_to_box(lhs), &zeus_box_release);
         std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> right(
@@ -891,6 +1015,11 @@ void zeus_value_dynamic_binary(
     if (!out) dynamicValuePanic("null output pointer");
     setNilValue(out);
     try {
+        if (opcode == ZEUS_BINARY_ADD && tryNativeStringConcat(out, lhs, rhs)) return;
+        if ((opcode == ZEUS_BINARY_EQUAL || opcode == ZEUS_BINARY_NOT_EQUAL) &&
+            tryNativeClassEquality(out, opcode, lhs, rhs)) {
+            return;
+        }
         std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> left(
             zeus_value_to_box(lhs), &zeus_box_release);
         std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> right(
@@ -996,6 +1125,7 @@ Cell* abiEnsureGlobal(int idx) {
         globals[idx]->createdBy = "zeus_abi_global";
         HeapStats::recordCreate();
         HeapStats::registerCell(globals[idx]);
+        ZeusGC::addPermanentRootVariant(&globals[idx]->value);
     }
 
     return globals[idx];
@@ -1024,9 +1154,49 @@ ZeusBox* zeus_global_load(int idx) {
     if (!cell) return nullBox();
 
     ZeusBox* box = new ZeusBox();
-    box->v = cell->value; // 拷贝（小整数零分配；字符串一次拷贝）
+    box->v = cell->value; // 只复制值，不共享句柄/引用计数
     return box;
 }
+
+// ---- 标量全局量快路径 ----
+//
+// Globals live in the same slot table whether they are touched by a top-level
+// statement or by a native function, so a scalar global would otherwise pay for
+// a ZeusValue box on every access. These accessors read and write the cell
+// directly. A type mismatch aborts instead of silently reinterpreting a value.
+
+void zeus_global_store_i64(int idx, int64_t value) {
+    Cell* cell = abiEnsureGlobal(idx);
+    if (!cell) dynamicValuePanic("global slot is unavailable");
+    cell->value = LexerType::Value(value);
+}
+
+int64_t zeus_global_load_i64(int idx) {
+    Cell* cell = abiEnsureGlobal(idx);
+    if (!cell) dynamicValuePanic("global slot is unavailable");
+    int64_t result = 0;
+    if (!ZeusVMUtils::tryGetInt64(cell->value, result)) {
+        dynamicValuePanic("global slot does not hold an integer");
+    }
+    return result;
+}
+
+void zeus_global_store_bool(int idx, int32_t value) {
+    Cell* cell = abiEnsureGlobal(idx);
+    if (!cell) dynamicValuePanic("global slot is unavailable");
+    cell->value = LexerType::Value(value != 0);
+}
+
+int32_t zeus_global_load_bool(int idx) {
+    Cell* cell = abiEnsureGlobal(idx);
+    if (!cell) dynamicValuePanic("global slot is unavailable");
+    const auto* literal = std::get_if<LexerType::Value>(&cell->value);
+    if (!literal || !std::holds_alternative<bool>(literal->data)) {
+        dynamicValuePanic("global slot does not hold a boolean");
+    }
+    return std::get<bool>(literal->data) ? 1 : 0;
+}
+
 
 // ---- Emitter v0 栈机 ----
 
@@ -1056,6 +1226,7 @@ Cell* abiEnsureLocal(int idx) {
         locals[idx]->createdBy = "zeus_abi_local";
         HeapStats::recordCreate();
         HeapStats::registerCell(locals[idx]);
+        ZeusGC::addPermanentRootVariant(&locals[idx]->value);
     }
 
     return locals[idx];

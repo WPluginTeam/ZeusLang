@@ -8,7 +8,7 @@ namespace ZeusBuiltins {
 // These native callbacks are independent of a live VM instance and can be
 // invoked through the standalone ZeusValue ABI used by LLVM/AOT code.
 inline bool hasStandaloneValueCallABI(std::string_view name) noexcept {
-    static constexpr std::array<std::string_view, 24> names = {
+    static constexpr std::array<std::string_view, 39> names = {
         "__builtin_str",
         "type",
         "len",
@@ -32,8 +32,24 @@ inline bool hasStandaloneValueCallABI(std::string_view name) noexcept {
         "__str_endswith",
         "__str_lower",
         "__str_upper",
-        "__str_count"
+        "__str_count",
+        "__gc_native_nodes",
+        "__gc_collect",
+        "__time_time",
+        "__time_time_ms",
+        "__time_time_ns",
+        "__time_clock",
+        "__time_perf_counter",
+        "__time_perf_counter_ns",
+        "__time_localtime",
+        "__time_gmtime",
+        "__time_mktime",
+        "__time_strftime",
+        "__time_monotonic",
+        "__time_monotonic_ns",
+        "__time_sleep"
     };
+
 
     for (const auto candidate : names) {
         if (candidate == name) return true;

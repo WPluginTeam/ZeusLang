@@ -1,0 +1,88 @@
+// ZeusZTest/object_in_loop_test.zeu
+// new / delete inside a loop body split the basic block (the malloc null check),
+// so the loop's back-edge phi had to be patched with the real predecessor label.
+//   zeusc.bat ZeusZTest/object_in_loop_test.zeu -o %TEMP%\object_in_loop.exe && %TEMP%\object_in_loop.exe
+
+var PASS = 0;
+var FAIL = 0;
+
+func ok(name, cond) {
+    if (cond) {
+        PASS = PASS + 1;
+        print("[PASS]", name);
+    } else {
+        FAIL = FAIL + 1;
+        print("[FAIL]", name);
+    }
+}
+
+class Point {
+    let x = 0;
+    using &this;
+
+    func init(v: int) {
+        this.x = v;
+    }
+}
+
+// The allocated object feeds a loop-carried local, so the phi has to carry both
+// the counter and the sum across the split block.
+func new_in_loop(n: int) -> int {
+    let sum = 0;
+    let i = 0;
+    for (true) {
+        if (i >= n) {
+            break;
+        }
+        let p = new Point(i);
+        sum = sum + p.x;
+        i = i + 1;
+    }
+    return sum;
+}
+
+// The split happens on one branch only, and the other branch keeps reading the
+// object.
+func new_and_delete_in_loop(n: int) -> int {
+    let count = 0;
+    let i = 0;
+    for (true) {
+        if (i >= n) {
+            break;
+        }
+        let p = new Point(7);
+        if (i % 2 == 0) {
+            delete p;
+        } else {
+            count = count + p.x;
+        }
+        i = i + 1;
+    }
+    return count;
+}
+
+func loop_over_new(n: int) -> int {
+    let seen = 0;
+    let i = 0;
+    for (true) {
+        if (i >= n) {
+            break;
+        }
+        let p = new Point(1);
+        seen = seen + p.x;
+        i = i + 1;
+    }
+    return seen;
+}
+
+ok("new in a loop accumulates", new_in_loop(5) == 10);
+ok("new in a loop with delete takes both branches", new_and_delete_in_loop(6) == 21);
+ok("new in a second loop shape", loop_over_new(4) == 4);
+ok("new in a zero-trip loop", new_in_loop(0) == 0);
+ok("new in a one-trip loop", new_in_loop(1) == 0);
+
+print("");
+print("PASS =", PASS, "FAIL =", FAIL);
+if (FAIL > 0) {
+    print("[FAILED] object_in_loop_test");
+}

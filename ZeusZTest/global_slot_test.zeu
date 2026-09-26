@@ -1,0 +1,59 @@
+// ZeusZTest/global_slot_test.zeu
+// A global written by a top-level statement and by a native function must be the
+// same cell. Before the slot-table unification each side kept its own storage,
+// so the counters below read back as nil under AOT.
+// Run:
+//   zeusc.bat ZeusZTest/global_slot_test.zeu -o %TEMP%\global_slot_test.exe && %TEMP%\global_slot_test.exe
+
+var PASS = 0;
+var FAIL = 0;
+var COUNTER = 0;
+var SEEN = 0;
+
+func ok(name, cond) {
+    if (cond) {
+        PASS = PASS + 1;
+        print("[PASS]", name);
+    } else {
+        FAIL = FAIL + 1;
+        print("[FAIL]", name);
+    }
+}
+
+func bump() {
+    COUNTER = COUNTER + 1;
+    SEEN = COUNTER;
+}
+
+func bump_loop(n: int) {
+    let i = 0;
+    for (true) {
+        if (i >= n) {
+            break;
+        }
+        COUNTER = COUNTER + 1;
+        i = i + 1;
+    }
+}
+
+func read_counter() -> int {
+    return COUNTER;
+}
+
+bump();
+ok("function sees the top-level global", COUNTER == 1);
+ok("function wrote the top-level global", SEEN == 1);
+bump();
+ok("second function call accumulates", COUNTER == 2);
+bump_loop(3);
+ok("function loop accumulates on the same cell", COUNTER == 5);
+ok("top-level reads what functions wrote", COUNTER == 5);
+COUNTER = COUNTER + 1;
+ok("top-level write is visible to functions", COUNTER == 6);
+ok("function reads the top-level write", read_counter() == 6);
+
+print("");
+print("PASS =", PASS, "FAIL =", FAIL);
+if (FAIL > 0) {
+    print("[FAILED] global_slot_test");
+}

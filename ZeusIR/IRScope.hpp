@@ -276,12 +276,7 @@ namespace IRScope {
 
     // 从最近作用域开始解析标识符；未命中则查全局；都没有则返回 UNDEFINED
     inline SymRef resolve(const std::string& name) {
-        // 0) 最高优先级：共享堆变量
-        if (sharedVars.find(name) != sharedVars.end()) {
-            return SymRef{ Kind::SHARED, 0 };  // index 无意义，按名称访问
-        }
-
-        // 若在函数内：按闭包规则优先解析
+        // 若在函数内：先解析词法局部和捕获，再查全局符号。
         if (!funcStack.empty()) {
             // 1) 当前函数的局部
             FuncEnv& cur = funcStack.back();
@@ -369,19 +364,8 @@ namespace IRScope {
                     return SymRef{ Kind::UPVALUE, dst };
                 }
             }
-        }
-        
-        _resolve_globals:
-        // 4) 全局
-        auto g = globals.find(name);
-        if (g != globals.end()) return SymRef{ Kind::GLOBAL, g->second };
-
-        auto imported = importedGlobalSlots.find(name);
-        if (imported != importedGlobalSlots.end()) return SymRef{ Kind::GLOBAL, imported->second };
-
-        // 5) 在非函数上下文尝试 scopeStack 中最近的局部（使顶层 let 也能解析成 LOCAL）
-        // 如果当前处于函数内部且隐式捕获被禁止，则不要把外层作用域的局部当作 LOCAL 返回。
-        if (funcStack.empty()) {
+        } else {
+            // 顶层代码块中的循环绑定等词法局部必须遮蔽同名全局变量。
             for (int si = static_cast<int>(scopeStack.size()) - 1; si >= 0; --si) {
                 auto it = scopeStack[si].nameToLocal.find(name);
                 if (it != scopeStack[si].nameToLocal.end()) {
@@ -389,8 +373,21 @@ namespace IRScope {
                 }
             }
         }
+        
+        _resolve_globals:
+        // shared 与普通全局变量同属非词法局部符号。
+        if (sharedVars.find(name) != sharedVars.end()) {
+            return SymRef{ Kind::SHARED, 0 };  // index 无意义，按名称访问
+        }
 
-        // 引用符号表（延后，优先普通局部解析）
+        // 4) 全局
+        auto g = globals.find(name);
+        if (g != globals.end()) return SymRef{ Kind::GLOBAL, g->second };
+
+        auto imported = importedGlobalSlots.find(name);
+        if (imported != importedGlobalSlots.end()) return SymRef{ Kind::GLOBAL, imported->second };
+
+        // 引用绑定使用独立符号表；先让显式局部、共享变量和全局变量完成解析。
         auto rit = refSymbols.find(name);
         if (rit != refSymbols.end()) {
             const auto &meta = rit->second;

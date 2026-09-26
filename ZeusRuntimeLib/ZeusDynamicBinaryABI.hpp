@@ -19,7 +19,10 @@ typedef enum ZeusDynamicBinaryOp {
     ZEUS_BINARY_MODULUS = 4,
     ZEUS_BINARY_LESS_THAN = 5,
     ZEUS_BINARY_EQUAL = 6,
-    ZEUS_BINARY_NOT_EQUAL = 7
+    ZEUS_BINARY_NOT_EQUAL = 7,
+    ZEUS_BINARY_GREATER_THAN = 8,
+    ZEUS_BINARY_GREATER_EQUAL = 9,
+    ZEUS_BINARY_LESS_EQUAL = 10
 } ZeusDynamicBinaryOp;
 
 typedef struct ZeusRuntimeContext ZeusRuntimeContext;

@@ -43,7 +43,15 @@ if errorlevel 1 exit /b 1
 cl /c /MT /O2 /EHsc /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusDynamicMemberABI.cpp /Fozeus_dynamic_member_abi.obj
 if errorlevel 1 exit /b 1
 
-lib zeus_rt.obj zeus_abi.obj zeus_native_abi.obj zeus_string_native_abi.obj zeus_dynamic_abi.obj zeus_dynamic_binary_abi.obj zeus_dynamic_member_abi.obj /OUT:libzeus_rt.lib /NOLOGO
+cl /c /MT /O2 /EHsc /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusRangeCheckABI.cpp /Fozeus_range_check_abi.obj
+if errorlevel 1 exit /b 1
+
+cl /c /MT /O2 /EHsc /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusClosureABI.cpp /Fozeus_closure_abi.obj
+if errorlevel 1 exit /b 1
+cl /c /MT /O2 /EHsc /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusGCABI.cpp /Fozeus_gc_abi.obj
+if errorlevel 1 exit /b 1
+
+lib zeus_rt.obj zeus_abi.obj zeus_native_abi.obj zeus_string_native_abi.obj zeus_dynamic_abi.obj zeus_dynamic_binary_abi.obj zeus_dynamic_member_abi.obj zeus_range_check_abi.obj zeus_closure_abi.obj zeus_gc_abi.obj /OUT:libzeus_rt.lib /NOLOGO
 if errorlevel 1 exit /b 1
 
 REM ---- demo 1: print("hello") ----

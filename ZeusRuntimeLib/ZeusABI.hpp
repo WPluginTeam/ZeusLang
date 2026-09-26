@@ -72,6 +72,39 @@ typedef struct ZeusStringView {
     uint64_t length;
 } ZeusStringView;
 
+// Native closure ABI used by LLVM-generated functions. Captured values are
+// held in reference-counted cells; copy captures allocate a new cell at closure
+// creation while reference captures retain the parent's cell.
+typedef void (*ZeusClosureInvoke)(
+    ZeusValue* out,
+    void* environment,
+    int32_t argc,
+    const ZeusValue* const* values
+);
+void* zeus_capture_cell_create(const ZeusValue* initial);
+void* zeus_capture_cell_clone(void* cell);
+void* zeus_capture_cell_retain(void* cell);
+void zeus_capture_cell_release(void* cell);
+void zeus_capture_cell_load(ZeusValue* out, void* cell);
+void zeus_capture_cell_store(void* cell, const ZeusValue* value);
+void* zeus_closure_capture_ref(void* environment, int32_t index);
+void* zeus_closure_capture_copy(void* environment, int32_t index);
+void zeus_closure_create(
+    ZeusValue* out,
+    ZeusClosureInvoke invoke,
+    int32_t arity,
+    int32_t capture_count,
+    void* const* cells
+);
+void zeus_closure_call(
+    ZeusValue* out,
+    const ZeusValue* closure,
+    int32_t argc,
+    const ZeusValue* const* values
+);
+void zeus_closure_env_load(ZeusValue* out, void* environment, int32_t index);
+void zeus_closure_env_store(void* environment, int32_t index, const ZeusValue* value);
+
 // Dynamic variadic call ABI. Arguments are borrowed ZeusValue pointers for the
 // duration of the call; the callback initializes an owned result in `out`.
 typedef void (*ZeusValueVariadicFunction)(
@@ -95,6 +128,9 @@ void zeus_value_from_box(ZeusValue* out, const ZeusBox* box);
 // does not extend object lifetime. delete invalidates all copies of that handle.
 void zeus_value_from_class_ptr(ZeusValue* out, void* object, const char* type_name);
 void* zeus_value_require_class_ptr(const ZeusValue* value, const char* type_name);
+// Like zeus_value_require_class_ptr, but a nil value returns nullptr instead of
+// aborting. A non-nil value of the wrong class still aborts.
+void* zeus_value_try_class_ptr(const ZeusValue* value, const char* type_name);
 void zeus_class_pointer_invalidate(void* object);
 int64_t zeus_value_require_i64(const ZeusValue* value);
 int32_t zeus_value_require_bool(const ZeusValue* value);
@@ -132,6 +168,13 @@ void zeus_value_global_store(int idx, ZeusValue* value);
 void zeus_value_global_load(ZeusValue* out, int idx);
 void zeus_value_local_store(int idx, ZeusValue* value);
 void zeus_value_local_load(ZeusValue* out, int idx);
+// Scalar fast path for the same global slots. A top-level loop that bumps a
+// scalar global uses these instead of boxing a ZeusValue per access; a type
+// mismatch aborts rather than reinterpreting the stored value.
+void zeus_global_store_i64(int idx, int64_t value);
+int64_t zeus_global_load_i64(int idx);
+void zeus_global_store_bool(int idx, int32_t value);
+int32_t zeus_global_load_bool(int idx);
 void zeus_value_int_add(ZeusValue* out, const ZeusValue* lhs, const ZeusValue* rhs);
 void zeus_value_less_than(ZeusValue* out, const ZeusValue* lhs, const ZeusValue* rhs);
 int32_t zeus_value_truthy(const ZeusValue* value);
@@ -148,6 +191,8 @@ ZeusBox* zeus_box_bool(int32_t v);
 ZeusBox* zeus_box_cstr(const char* s);
 ZeusBox* zeus_null_box(void);
 void zeus_box_release(ZeusBox* box);
+void zeus_gc_collect(void);
+uint64_t zeus_gc_live_node_count(void);
 
 int64_t zeus_unbox_int(const ZeusBox* box);
 int32_t zeus_unbox_bool(const ZeusBox* box);

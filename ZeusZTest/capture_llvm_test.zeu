@@ -1,0 +1,68 @@
+func make_copy_counter(start: int) {
+    let x = start;
+    func next() [x] -> int {
+        x = x + 1;
+        return x;
+    }
+    x = 100;
+    return next;
+}
+
+func make_ref_counter(start: int) {
+    let x = start;
+    func next() [&x] -> int {
+        x = x + 1;
+        return x;
+    }
+    return next;
+}
+
+func make_step_counter(start: int) {
+    let value = start;
+    func step(amount: int) [value] -> int {
+        value = value + amount;
+        return value;
+    }
+    return step;
+}
+
+func make_dynamic_adder(start) {
+    let value = start;
+    func add(amount) [value] {
+        value = value + amount;
+        return value;
+    }
+    return add;
+}
+
+func reference_capture_updates_outer() -> int {
+    let x = 30;
+    func increment() [&x] -> int {
+        x = x + 1;
+        return x;
+    }
+    increment();
+    return x;
+}
+
+func copy_capture_leaves_outer() -> int {
+    let x = 30;
+    func increment() [x] -> int {
+        x = x + 1;
+        return x;
+    }
+    x = 40;
+    increment();
+    return x;
+}
+
+let copyCounter = make_copy_counter(10);
+let refCounter = make_ref_counter(20);
+let stepCounter = make_step_counter(40);
+let dynamicAdder = make_dynamic_adder(2);
+print("copy", copyCounter(), copyCounter());
+print("ref", refCounter(), refCounter());
+print("ref outer", reference_capture_updates_outer());
+print("copy outer", copy_capture_leaves_outer());
+print("args", stepCounter(2), stepCounter(3));
+print("dynamic", dynamicAdder(3), dynamicAdder(4));

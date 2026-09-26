@@ -15,7 +15,7 @@ namespace ZeusType {
     // 命名参数包装器：在函数调用时,包装参数值和参数名
     struct NamedArg;  // 前向声明
 
-    using UniversalVariant = std::variant<Variant, BigInteger, BigDecimal, bool, char, std::string, LexerType::Value, ClosureHandle, NativeFuncHandle, ClassHandle, ObjectHandle, NamespaceHandle, ArgInfo, std::shared_ptr<NamedArg>, ModuleProxy, SocketHandle, Bytes, SharedHandle, SharedClassHandle, SharedObjectHandle, LLVMClassHandle, ReferenceHandle>;
+    using UniversalVariant = std::variant<Variant, BigInteger, BigDecimal, bool, char, std::string, LexerType::Value, ClosureHandle, NativeFuncHandle, NativeClosureHandle, ClassHandle, ObjectHandle, NamespaceHandle, ArgInfo, std::shared_ptr<NamedArg>, ModuleProxy, SocketHandle, Bytes, SharedHandle, SharedClassHandle, SharedObjectHandle, LLVMClassHandle, ReferenceHandle>;
 
     // 命名参数包装器定义(需要在 UniversalVariant 之后)
     struct NamedArg {

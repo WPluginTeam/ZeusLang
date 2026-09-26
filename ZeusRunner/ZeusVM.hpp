@@ -1562,6 +1562,8 @@ class VM {
         // Mark vectors sized to current storage.
         std::vector<uint8_t> markedObj(objects.size(), 0);
         std::vector<uint8_t> markedClo(closures.size(), 0);
+        std::unordered_set<const void*> markedNativeClo;
+        std::vector<std::shared_ptr<void>> nativeClosureRoots;
 
         auto markObject = [&](int objId, auto&& markObjectRef, auto&& markVariantRef) -> void {
             if (objId < 0 || objId >= (int)objects.size()) return;
@@ -1603,6 +1605,16 @@ class VM {
                 markClosure(cid, markClosure, markVariantRef, markObjectRef);
                 return;
             }
+            if (std::holds_alternative<ZeusType::NativeClosureHandle>(v)) {
+                const auto& native = std::get<ZeusType::NativeClosureHandle>(v);
+                if (native.state && markedNativeClo.insert(native.state.get()).second) {
+                    nativeClosureRoots.push_back(native.state);
+                    ZeusGC::traceNodeValues(native.state, [&](const ZeusType::UniversalVariant& captured) {
+                        markVariantRef(captured, markVariantRef, markObjectRef);
+                    });
+                }
+                return;
+            }
             if (std::holds_alternative<std::shared_ptr<ZeusType::NamedArg>>(v)) {
                 auto ptr = std::get<std::shared_ptr<ZeusType::NamedArg>>(v);
                 if (ptr) markVariantRef(ptr->value, markVariantRef, markObjectRef);
@@ -1629,6 +1641,10 @@ class VM {
             }, var);
         };
 
+        ZeusGC::traceRoots([&](const ZeusType::UniversalVariant& value) {
+            markVariant(value, markVariant, markObject);
+        });
+
         // Roots: stack
         for (size_t i = 0; i < stack.size(); ++i) {
             markVariant(stack[i], markVariant, markObject);
@@ -1644,6 +1660,8 @@ class VM {
         for (auto* cell : upvalue) {
             if (cell) markVariant(cell->value, markVariant, markObject);
         }
+
+        ZeusGC::collect(nativeClosureRoots);
 
         // Sweep closures (skip shared/inherited slots)
         for (int cid = (int)inheritedClosuresSize; cid < (int)closures.size(); ++cid) {
@@ -5866,6 +5884,16 @@ class VM {
                 const Prototype&  proto = *protoPtr;
 
                 // 保存调用前的 local 和 upvalue 环境
+                bool capturesReady = true;
+                for (Cell* captureCell : clos.upvalues) {
+                    if (!captureCell) {
+                        fail("CALL_CLOSURE: closure has an uninitialized capture cell", true);
+                        capturesReady = false;
+                        break;
+                    }
+                }
+                if (!capturesReady) break;
+
                 auto oldLocal   = local;
                 auto oldUpvalue = upvalue;
 
@@ -5876,86 +5904,13 @@ class VM {
                     local[i] = newCell(LexerType::Value(0), 0, "CALL_CLOSURE_local");
                 }
                 // upvalue 指向 closure 的 upvalues（Cell 指针集合）
-                    // For copy-captured slots, we need to create per-call clones from the
-                    // current environment. We'll build a temporary vector `callUpvalues`
-                    // which is what the callee will see as its upvalue array during execution.
-                    std::vector<Cell*> callUpvalues;
-                    callUpvalues.resize(clos.upvalues.size());
-                    std::vector<int> tempCloneIndices;
-
-                    // Build lookup tables keyed by dstIndex so we don't rely on
-                    // proto.captures being stored in dst-order.
-                    std::vector<int> capMode(clos.upvalues.size(), 0);
-                    std::vector<std::string> capFromKind(clos.upvalues.size(), std::string());
-                    std::vector<int> capSrcIndex(clos.upvalues.size(), -1);
-                    for (const auto &cap : proto.captures) {
-                        if (cap.dstIndex >= 0 && (size_t)cap.dstIndex < capMode.size()) {
-                            capMode[cap.dstIndex] = cap.modeFlag;
-                            capFromKind[cap.dstIndex] = cap.fromKind;
-                            capSrcIndex[cap.dstIndex] = cap.srcIndex;
-                        }
-                    }
-
-                    // Debug: print capture descriptors for this proto (debug channel)
-                    if (!proto.captures.empty()) {
-                        ZEUS_DEBUG_PRINT("[CAPS proto=%d] count=%d", clos.protoId, (int)proto.captures.size());
-                        for (const auto &cap : proto.captures) {
-                            ZEUS_DEBUG_PRINT("   cap dst=%d src=%d name=%s mode=%d", cap.dstIndex, cap.srcIndex, cap.name.c_str(), cap.modeFlag);
-                        }
-                    }
-
-                    for (size_t ci = 0; ci < clos.upvalues.size(); ++ci) {
-                        int mode = capMode[ci];
-
-                        if (mode == 1) {
-                            // reference mode: share the closure's template pointer for this call
-                            if (clos.upvalues[ci]) {
-                                callUpvalues[ci] = clos.upvalues[ci];
-                                // retain for the call's owner
-                                callUpvalues[ci]->retain();
-                            } else {
-                                callUpvalues[ci] = newCell(LexerType::Value(0), 0, "CALL_upv_ref_nil");
-                                // newCell starts with refcount 1; considered owned by call
-                                tempCloneIndices.push_back((int)ci);
-                            }
-                        } else {
-                            // copy mode: clone from the closure template so each call gets a fresh copy
-                            if (clos.upvalues[ci]) {
-                                callUpvalues[ci] = cloneCell(clos.upvalues[ci], "CALL_upv_copy");
-                                tempCloneIndices.push_back((int)ci);
-                            } else {
-                                // fallback: attempt to clone from old environment using the per-dst descriptors
-                                int src = capSrcIndex[ci];
-                                const std::string &fromKind = capFromKind[ci];
-                                if (src >= 0) {
-                                    if (fromKind == "local") {
-                                        if ((size_t)src < oldLocal.size() && oldLocal[src]) {
-                                            callUpvalues[ci] = cloneCell(oldLocal[src], "CALL_upv_local");
-                                            tempCloneIndices.push_back((int)ci);
-                                        } else {
-                                            callUpvalues[ci] = newCell(LexerType::Value(0), 0, "CALL_upv_local_nil");
-                                            tempCloneIndices.push_back((int)ci);
-                                        }
-                                    } else {
-                                        if ((size_t)src < oldUpvalue.size() && oldUpvalue[src]) {
-                                            callUpvalues[ci] = cloneCell(oldUpvalue[src], "CALL_upv_outer");
-                                            tempCloneIndices.push_back((int)ci);
-                                        } else {
-                                            callUpvalues[ci] = newCell(LexerType::Value(0), 0, "CALL_upv_outer_nil");
-                                            tempCloneIndices.push_back((int)ci);
-                                        }
-                                    }
-                                } else {
-                                    callUpvalues[ci] = newCell(LexerType::Value(0), 0, "CALL_upv_fallback");
-                                    tempCloneIndices.push_back((int)ci);
-                                }
-                            }
-                        }
-                    }
-
-                    // Set the VM's current upvalue vector to the per-call constructed one
-                    upvalue = callUpvalues;
-
+                // The closure owns the capture cells. Reference captures share
+                // the outer cell; copy captures share the closure's snapshot cell.
+                // Both modes use that same cell for each invocation, so a copied
+                // capture can keep private mutable state across calls.
+                std::vector<Cell*> callUpvalues = clos.upvalues;
+                for (auto* cell : callUpvalues) cell->retain();
+                upvalue = callUpvalues;
                     // Debug: dump callUpvalues (debug channel)
                     ZEUS_DEBUG_PRINT("[CALL_CLOSURE] calling proto=%d clos=%d callUpvals=", clos.protoId, handle);
                     for (size_t ui = 0; ui < callUpvalues.size(); ++ui) {
@@ -6302,16 +6257,6 @@ class VM {
                 }
                 shrinkStackWithRelease(callFrameBase);
 
-                // Release temporary cloned upvalues created for this call
-                for (int idx : tempCloneIndices) {
-                    if (idx >= 0 && (size_t)idx < callUpvalues.size() && callUpvalues[idx]) {
-                        callUpvalues[idx]->release();
-                        // delete handled by Cell::release when refCount hits 0
-                        callUpvalues[idx] = nullptr;
-                    }
-                }
-
-                // 恢复调用前的 local/upvalue 环境
                 local = std::move(oldLocal);
                 upvalue = std::move(oldUpvalue);
 
