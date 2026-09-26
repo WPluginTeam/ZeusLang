@@ -205,6 +205,46 @@ class_block ::= ("class" | "shared class" | "class shared") identifier block ;
 - 方法：`func ... { ... }`
 - 类内实例别名声明：`using &alias;`
 
+### 5.1.1 接收者（receiver）的两种写法
+
+`this` **不是关键字**，语言也不会凭空造一个接收者名字。运行时总是把接收者作为**第一个实参**压栈
+（方法调用、`operator[.]`、`operator[.=]`、以及构造时的 `init` 都是这个顺序），所以形参按位置依次绑定。
+接收者怎么被命名，只有两种合法写法：
+
+写法一，类内声明别名，由编译器把别名**注入**成第一个形参：
+
+```
+class Point {
+    using &me;                 // 注入点：me 成为第一个形参
+    var x = 0;
+    func get() { return me.x; }        // 直接用 me
+    func operator[+](count) { ... }    // 运算符同样拿到注入的 me
+}
+```
+
+写法二，不声明别名，方法**自己**把接收者写成第一个形参：
+
+```
+class Point {
+    var x = 0;
+    func operator[+](self, other) { return self.x + other.x; }
+}
+```
+
+判定规则（普通方法与运算符一致，运算符没有例外）：
+
+- 类声明了 `using &alias`：没有 `static` 修饰的方法都是实例方法，别名注入为第一个形参；
+  此时再写 `[&alias]` 捕获是错误（会重复绑定并使所有实参错位）。
+- 类未声明 `using &alias`：带显式捕获 `[&name]` 的方法是实例方法，别名为 `name`；
+  其余方法按静态方法处理。
+- 标记 `static` 的方法不接收接收者。
+
+未声明别名也未捕获时，方法拿不到接收者。若此时在方法体里写 `this`，
+编译期报 `Cannot find local variable 'this'`；运算符则会因为形参数量不足而在调用时报
+`too many arguments`。
+
+> 注意：`init` 只在实例方法表中查找，因此需要构造函数的类必须使用写法一。
+
 ### 5.2 对象创建
 
 ```ebnf

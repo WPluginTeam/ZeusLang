@@ -4292,9 +4292,12 @@ namespace IRGen {
                                                 classifyAsInstance = true;
                                             }
 
-                                            // forbid method declaration capturing the same alias explicitly
-                                            // EXCEPT for operator overloads - they can have capture lists independently
-                                            if (methodHasCaptureDecl && declaredCaptureAlias == usingThisAlias && !cbPtr->isOperatorOverload) {
+                                            // A method of a class that already declares
+                                            // `using &alias` must not capture that same alias
+                                            // again: the receiver is injected as the first
+                                            // parameter, so a second binding would shift every
+                                            // argument. This applies to operator overloads too.
+                                            if (methodHasCaptureDecl && declaredCaptureAlias == usingThisAlias) {
                                                 TreeParser::Node dummy;
                                                 std::string msg = "Class '" + className + "' declares using &" + usingThisAlias + "; method '" + cbPtr->funcName + "' must not explicitly capture [&" + usingThisAlias + "] in its declaration.\n";
                                                 msg += "Hint: remove the capture list for this method (it's already implicitly available as '" + usingThisAlias + "'), or mark the method 'static' if you intend it to be static.";
@@ -4309,9 +4312,6 @@ namespace IRGen {
                                                 classifyAsInstance = true;
                                             } else if (methodIsStaticByModifier) {
                                                 classifyAsInstance = false;
-                                            } else if (cbPtr->isOperatorOverload) {
-                                                // operator overloads are instance methods by default
-                                                classifyAsInstance = true;
                                             } else {
                                                 // default: treat as static (per note.md final decision)
                                                 classifyAsInstance = false;
@@ -4325,10 +4325,23 @@ namespace IRGen {
                                             std::string aliasToInsert;
                                             if (!usingThisAlias.empty()) {
                                                 aliasToInsert = usingThisAlias;
-                                            } else if (!declaredCaptureAlias.empty()) {
-                                                aliasToInsert = declaredCaptureAlias;
                                             } else {
-                                                aliasToInsert = std::string("this");
+                                                aliasToInsert = declaredCaptureAlias;
+                                            }
+
+                                            if (aliasToInsert.empty()) {
+                                                // Unreachable: classifyAsInstance is only set when
+                                                // the class declares an alias or the method captures
+                                                // one. Failing loudly beats inventing a receiver name:
+                                                // a hardcoded "this" would silently bind every
+                                                // argument one slot over.
+                                                TreeParser::Node dummy;
+                                                std::string msg = "Internal error: instance method '" +
+                                                    cbPtr->funcName + "' of class '" + className +
+                                                    "' was classified as an instance method without a receiver name";
+                                                IRExceptionNS::IRException ex(msg, 0, dummy);
+                                                ex._throw(status);
+                                                return;
                                             }
 
                                             // Ensure alias is present as the first parameter (insert persistently)

@@ -3183,6 +3183,12 @@ class VM {
                 const auto& ci = *classPtr;
                 for (const auto& kv : ci.fields) {
                     obj.values[kv.first] = kv.second.defaultValue;
+                    // The object now holds a reference to the default value, so it
+                    // has to be retained. Without this the instance owns a
+                    // reference it never took, and the first OBJ_STORE_ATTR on the
+                    // field releases the value out from under every other instance
+                    // that was initialised from the same default.
+                    ZeusGC::retainVariantDeep(*this, obj.values[kv.first]);
                     obj.flags[kv.first]  = kv.second.isConst ? 0x1 : 0x0;
                 }
 
@@ -3689,6 +3695,9 @@ class VM {
                 const auto& ci = *classPtr;
                 for (const auto& kv : ci.fields) {
                     obj.values[kv.first] = kv.second.defaultValue;
+                    // Same ownership rule as OBJ_BUILD: the instance owns its
+                    // field values, so the shared default has to be retained.
+                    ZeusGC::retainVariantDeep(*this, obj.values[kv.first]);
                     obj.flags[kv.first]  = kv.second.isConst ? 0x1 : 0x0;
                 }
 

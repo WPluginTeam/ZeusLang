@@ -182,6 +182,28 @@ shared class SharedBox {
     }
 }
 
+// A class whose field default is a string, used by the field-default ownership
+// regression check further down.
+class FieldDefaultBox {
+    using &this;
+    var label = "default";
+}
+
+// A class with no `using &alias` declaration. Its operator takes the receiver as
+// a plain first parameter, which is the non-injected form: the VM already pushes
+// the receiver as the first argument, so the parameters just bind in order.
+class ExplicitReceiverBox {
+    var value = 10;
+    func operator[+](this, other) { return this.value + other.value; }
+}
+
+// A class that injects the receiver under a name of its choosing.
+class AliasedBox {
+    using &me;
+    var value = 9;
+    func get() { return me.value; }
+}
+
 func raise_error() {
     throw new Exception("boom from raise_error");
 }
@@ -289,6 +311,34 @@ func main() {
     let chain = new Box(1);
     chain.add(2).add(3);
     ok("method chain", chain.get() == 6);
+
+    section("field default is not freed by a sibling store");
+    // Regression: the class field default was copied into each instance without
+    // retaining it, so the first store to any instance released a reference the
+    // instance never owned. Every other instance initialised from the same
+    // default was left pointing at freed memory.
+    let fa = new FieldDefaultBox();
+    let fb = new FieldDefaultBox();
+    ok("sibling field default before store", type(fa.label) == "String" or type(fa.label) == "string");
+    fb.label = "changed";
+    ok("sibling field default after store", type(fa.label) == "String" or type(fa.label) == "string");
+    ok("sibling field default value intact", fa.label == "default");
+    let fc = new FieldDefaultBox();
+    ok("fresh instance after store", type(fc.label) == "String" or type(fc.label) == "string");
+    ok("fresh instance value intact", fc.label == "default");
+    delete fa, fb, fc;
+
+    section("receiver binding: injected alias and explicit first parameter");
+    // Two ways to name the receiver, and only two. There is no built-in "this":
+    // a class either declares `using &alias` (the alias is injected as the first
+    // parameter) or the method takes the receiver as its own first parameter.
+    let ea1 = new ExplicitReceiverBox();
+    let ea2 = new ExplicitReceiverBox();
+    ok("operator receiver bound positionally", ea1 + ea2 == 20);
+    let ab1 = new AliasedBox();
+    ok("injected alias names the receiver", ab1.get() == 9);
+    delete ea1, ea2, ab1;
+
 
     section("with / try-catch / throw");
     let res = new ScopedResource();

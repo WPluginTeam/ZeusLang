@@ -206,7 +206,10 @@ namespace ZeusTypeInfer {
             auto declaredAlias = classReceiverAliases.find(block.ownerClassName);
             if (declaredAlias != classReceiverAliases.end()) return declaredAlias->second;
             if (!block.captureVars.empty()) return block.captureVars.front();
-            if (block.isOperatorOverload) return "this";
+            // No declared alias and no explicit capture: the method takes no
+            // receiver, so there is nothing to infer. Operators get no exemption
+            // here; a receiver only exists if the class or the method asked for
+            // one by name.
             return {};
         }
 
