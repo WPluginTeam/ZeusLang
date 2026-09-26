@@ -2675,9 +2675,16 @@ class VM {
         ZeusType::UniversalVariant retVal = frameState.retVal;
         uint8_t retOwner = frameState.retOwner;
         
-        // 清理 callUpvalues（如果还没有被清理）
-        for (auto* cell : callUpvalues) {
-            if (cell) releaseCellAndContent(cell);
+        // 清理 callUpvalues。
+        //
+        // 正常返回时，sync 帧的 upvalue 循环（releaseCurrentFrameEnvironment）
+        // 已经按下面这行 retain 配平释放过一次，这里再释放就是重复释放，会让
+        // 闭包和捕获它的外层帧一起指向已释放的 Cell。只有帧循环异常退出、
+        // 帧清理没有执行时才需要补上。
+        if (vmstat != ZeusType::VMStatus::Running) {
+            for (auto* cell : callUpvalues) {
+                if (cell) releaseCellAndContent(cell);
+            }
         }
         
         // 压入返回值（将所有权从 retOwner 转移到调用者栈）
