@@ -2279,59 +2279,79 @@ class VM {
         }
     }
 
-    bool handlePendingRuntimeException() {
-        if (vmstat != ZeusType::VMStatus::Error || exceptionHandlers.empty()) {
+    void discardFrameExceptionHandlers(size_t frameDepth) {
+        while (!exceptionHandlers.empty() &&
+               exceptionHandlers.back().callFrameDepth > frameDepth) {
+            exceptionHandlers.pop_back();
+        }
+    }
+
+    void unwindFrameEnvironments(size_t targetDepth) {
+        while (callFrames.size() > targetDepth) {
+            CallFrame frame = std::move(callFrames.back());
+            callFrames.pop_back();
+            shrinkStackWithRelease(frame.stackBase);
+            releaseCurrentFrameEnvironment();
+            local = std::move(frame.savedLocal);
+            upvalue = std::move(frame.savedUpvalue);
+            __line = frame.savedLine;
+        }
+        discardFrameExceptionHandlers(targetDepth);
+    }
+
+    bool handlePendingRuntimeException(size_t stopFrameDepth = 0) {
+        if (vmstat != ZeusType::VMStatus::Error || exceptionHandlers.empty() ||
+            exceptionHandlers.back().callFrameDepth <= stopFrameDepth) {
             return false;
         }
 
         ZEUS_DEBUG_PRINT("[VM] Runtime error with exception handler, attempting catch");
 
-        std::string errorType = "RuntimeError";
-        std::string errorMsg = "Unknown error";
-        if (VMException::lastError.hasError) {
-            errorType = VMException::lastError.errorType;
-            errorMsg = VMException::lastError.message;
-        }
+        // An explicit THROW already owns currentException; keep its identity.
+        if (!hasUnhandledException) {
+            std::string errorType = "RuntimeError";
+            std::string errorMsg = "Unknown error";
+            if (VMException::lastError.hasError) {
+                errorType = VMException::lastError.errorType;
+                errorMsg = VMException::lastError.message;
+            }
 
-        // 类名带有完整命名空间前缀：ZeusBuiltins.exception.XXX
-        std::string fullClassName = "ZeusBuiltins.exception." + errorType;
-        int classId = findClassByName(fullClassName);
-        if (classId < 0) {
-            classId = findClassByName("ZeusBuiltins.exception.RuntimeError");
-        }
-        if (classId < 0) {
-            classId = findClassByName("ZeusBuiltins.exception.Exception");
-        }
+            // 类名带有完整命名空间前缀：ZeusBuiltins.exception.XXX
+            std::string fullClassName = "ZeusBuiltins.exception." + errorType;
+            int classId = findClassByName(fullClassName);
+            if (classId < 0) {
+                classId = findClassByName("ZeusBuiltins.exception.RuntimeError");
+            }
+            if (classId < 0) {
+                classId = findClassByName("ZeusBuiltins.exception.Exception");
+            }
 
-        if (classId >= 0) {
-            ZeusType::ObjectInstance obj;
-            obj.classId = classId;
-            obj.values["_message"] = errorMsg;
-            obj.values["_type"] = errorType;
-            obj.flags["_message"] = 0;
-            obj.flags["_type"] = 0;
+            if (classId >= 0) {
+                ZeusType::ObjectInstance obj;
+                obj.classId = classId;
+                obj.values["_message"] = errorMsg;
+                obj.values["_type"] = errorType;
+                obj.flags["_message"] = 0;
+                obj.flags["_type"] = 0;
 
-            ZeusType::ObjectHandle objHandle = allocObject(std::move(obj));
-            currentException = objHandle;
-        } else {
-            currentException = errorType + ": " + errorMsg;
+                ZeusType::ObjectHandle objHandle = allocObject(std::move(obj));
+                currentException = objHandle;
+            } else {
+                currentException = errorType + ": " + errorMsg;
+            }
+
         }
 
         hasUnhandledException = true;
         VMException::lastError.hasError = false;
 
-        ExceptionHandler& handler = exceptionHandlers.back();
+        const ExceptionHandler handler = exceptionHandlers.back();
         const size_t catchPc = handler.catchPc;
+        unwindFrameEnvironments(handler.callFrameDepth);
         shrinkStackWithRelease(handler.stackBase);
         while (local.size() > handler.localSize) {
-            if (local.back()) {
-                releaseCellAndContent(local.back());
-            }
+            if (local.back()) releaseCellAndContent(local.back());
             local.pop_back();
-        }
-
-        while (callFrames.size() > handler.callFrameDepth) {
-            callFrames.pop_back();
         }
 
         if (!callFrames.empty()) {
@@ -2352,11 +2372,28 @@ class VM {
         while (callFrames.size() > options.stopFrameDepth) {
             CallFrame& frame = callFrames.back();
 
+            if (vmstat != ZeusType::VMStatus::Running) {
+                if (options.handleExceptions && handlePendingRuntimeException(options.stopFrameDepth)) {
+                    continue;
+                }
+
+                if (options.handleExceptions && options.stopFrameDepth == 0 && vmstat == ZeusType::VMStatus::Error && VMException::lastError.hasError) {
+                    printf("%s\n", VMException::lastError.formattedMsg.c_str());
+                    VMException::lastError.hasError = false;
+                }
+
+                if (options.handleExceptions) {
+                    ZEUS_DEBUG_PRINT("[VM] Aborted, status: %d", (int)vmstat);
+                }
+                break;
+            }
+
             if (frame.pc >= frame.code->size()) {
                 ZEUS_DEBUG_PRINT("%s Frame done (depth=%zu)", options.traceName, callFrames.size());
 
                 CallFrame finishedFrame = callFrames.back();
                 callFrames.pop_back();
+                discardFrameExceptionHandlers(callFrames.size());
 
                 if (callFrames.size() > options.stopFrameDepth) {
                     shrinkStackWithRelease(finishedFrame.stackBase);
@@ -2399,22 +2436,6 @@ class VM {
                 break;
             }
 
-            if (vmstat != ZeusType::VMStatus::Running) {
-                if (options.handleExceptions && handlePendingRuntimeException()) {
-                    continue;
-                }
-
-                if (options.handleExceptions && vmstat == ZeusType::VMStatus::Error && VMException::lastError.hasError) {
-                    printf("%s\n", VMException::lastError.formattedMsg.c_str());
-                    VMException::lastError.hasError = false;
-                }
-
-                if (options.handleExceptions) {
-                    ZEUS_DEBUG_PRINT("[VM] Aborted, status: %d", (int)vmstat);
-                }
-                break;
-            }
-
             if (options.traceExecution) {
                 ZEUS_DEBUG_PRINT("[Executing] >>> %s (depth=%zu pc=%zu)",
                     ins.toString().c_str(), callFrames.size(), frame.pc);
@@ -2437,6 +2458,7 @@ class VM {
                 CallFrame returningFrame = callFrames.back();
                 int autoReleaseId = returningFrame.calleeAutoReleaseId;
                 callFrames.pop_back();
+                discardFrameExceptionHandlers(callFrames.size());
 
                 if (captureReturn || callFrames.size() > options.stopFrameDepth) {
                     if (autoReleaseId >= 0) {
@@ -2579,16 +2601,12 @@ class VM {
         }
         
         Closure& clos = *closPtr;
-        // RAII guard: if this closure was marked autoRelease, ensure it is released
-        // when execution finishes or returns early due to error.
-        struct AutoClosureGR {
+        retainClosure(closureId);
+        struct ClosureHold {
             VM* vm;
             int id;
-            bool active;
-            AutoClosureGR(VM* vm, int id, bool act) : vm(vm), id(id), active(act) {}
-            void dismiss() { active = false; }
-            ~AutoClosureGR() { if (active) vm->releaseClosure(id); }
-        } guard(this, closureId, clos.autoRelease);
+            ~ClosureHold() { vm->releaseClosure(id); }
+        } closureHold{this, closureId};
         const Prototype* protoPtr = getPrototype(clos.protoId);
         if (!protoPtr) {
             return false;
@@ -2669,35 +2687,26 @@ class VM {
         FrameLoopOptions frameOptions;
         frameOptions.stopFrameDepth = initialFrameDepth;
         frameOptions.captureReturn = true;
+        frameOptions.handleExceptions = true;
         frameOptions.traceName = "[executeClosureSync]";
         runFrameLoop(frameOptions, &frameState);
 
         ZeusType::UniversalVariant retVal = frameState.retVal;
         uint8_t retOwner = frameState.retOwner;
         
-        // 清理 callUpvalues。
-        //
-        // 正常返回时，sync 帧的 upvalue 循环（releaseCurrentFrameEnvironment）
-        // 已经按下面这行 retain 配平释放过一次，这里再释放就是重复释放，会让
-        // 闭包和捕获它的外层帧一起指向已释放的 Cell。只有帧循环异常退出、
-        // 帧清理没有执行时才需要补上。
         if (vmstat != ZeusType::VMStatus::Running) {
-            for (auto* cell : callUpvalues) {
-                if (cell) releaseCellAndContent(cell);
-            }
+            ZEUS_DEBUG_PRINT("[executeClosureSync] aborted closure=%d status=%d depth=%zu -> %zu",
+                closureId, (int)vmstat, callFrames.size(), initialFrameDepth);
+            unwindFrameEnvironments(initialFrameDepth);
+            if (retOwner) dropStackItem(StackItem{retVal, retOwner});
+            return false;
         }
-        
-        // 压入返回值（将所有权从 retOwner 转移到调用者栈）
+
         stack.push_back(retVal);
         if (retOwner) {
             stack.setOwnerFlag(stack.size() - 1, retOwner);
             retOwner = 0;
         }
-        // 如果 closure 是临时 autoRelease 的，执行后释放它
-        if (clos.autoRelease) {
-            releaseClosure(closureId);
-        }
-        
         return true;
     }
 
@@ -3224,25 +3233,9 @@ class VM {
                         clo.protoId = protoId;
                         clo.autoRelease = true;
                         int cloId = allocClosure(std::move(clo));
-                        
-                        // 注意：在新的栈帧模式下，不能使用execute(CALL_CLOSURE)
-                        // 因为它会创建frame并break，导致后续代码不执行
-                        // 
-                        // 解决方案：不在这里调用init，而是让对象自己在第一次使用时调用
-                        // 但这样会破坏构造函数语义
-                        //
-                        // 更好的方案：在OBJ_BUILD中，将对象保存到特殊位置，
-                        // 然后调用init，init返回时从特殊位置恢复对象
-                        //
-                        // 最简方案：不调用init，让用户手动调用或者IR生成器生成调用
-                        // 
-                        // 临时方案：使用旧的递归方式调用init（保存callFrames状态）
-                        
-                        // 保存当前callFrames状态
-                        auto savedCallFrames = callFrames;
-                        auto savedJustPushedFrame = justPushedFrame;
-                        
-                         // 准备栈: [closure, this, arg1, arg2, ...]
+                        const size_t constructorFrameDepth = callFrames.size();
+                        const bool savedJustPushedFrame = justPushedFrame;
+
                          stack.push_back(ZeusType::ClosureHandle{cloId});
                          retainObject(objId); // stack will later release this slot in shrinkStackWithRelease
                          stack.push_back(objHandle);  // 使用完整的 ObjectHandle（包含 generation）
@@ -3263,6 +3256,7 @@ class VM {
                         int regularParamCount = proto.paramCount;
                         local.clear();
                         local.resize(regularParamCount);
+                        upvalue.clear();
                         for (int i = 0; i < regularParamCount; ++i) {
                             local[i] = newCell(LexerType::Value(0), 0, "CONSTRUCTOR_local");
                         }
@@ -3377,234 +3371,40 @@ class VM {
                             assignCellValue(local[kwargsSlot], variantKwargs);
                         }
                         
-                        // 执行init的字节码
-                        size_t pc = 0;
-                        bool ctorLocalsReleased = false; // 防止重复释放 callee 的 local
-                        while (pc < proto.body.size() && vmstat == ZeusType::VMStatus::Running) {
-                            const auto& ins = proto.body[pc];
-                            
-                            if (ins.op == VMOperator::FUNC_BEGIN || ins.op == VMOperator::FUNC_END || ins.op == VMOperator::CAPTURE_OUTSIDE_VAR) {
-                                pc++;
-                                continue;
-                            }
-                            
-                             if (ins.op == VMOperator::RETURN) {
-                                 // Init返回，结束
-                                 if (!stack.empty()) dropStackBack();  // Pop返回值（释放栈持有的引用）
-                                 break;
-                             }
-                            
-                            // 处理跳转指令
-                            if (ins.op == VMOperator::JUMP) {
-                                int off = VMHelpers::getIntFromValue(std::get<LexerType::Value>(ins.args[0]));
-                                pc += 1 + off;
-                                continue;
-                            }
-                            
-                             if (ins.op == VMOperator::JUMP_IF_FALSE) {
-                                 int off = VMHelpers::getIntFromValue(std::get<LexerType::Value>(ins.args[0]));
-                                 if (!stack.empty()) {
-                                     StackItem condItem = popStackItem();
-                                     bool take = !truthy(condItem.value);
-                                     dropStackItem(condItem);
-                                     if (take) {
-                                         pc += 1 + off;
-                                         continue;
-                                     }
-                                 }
-                                 pc++;
-                                 continue;
-                             }
-                            
-                             if (ins.op == VMOperator::JUMP_IF_TRUE) {
-                                 int off = VMHelpers::getIntFromValue(std::get<LexerType::Value>(ins.args[0]));
-                                 if (!stack.empty()) {
-                                     StackItem condItem = popStackItem();
-                                     bool take = truthy(condItem.value);
-                                     dropStackItem(condItem);
-                                     if (take) {
-                                         pc += 1 + off;
-                                         continue;
-                                     }
-                                 }
-                                 pc++;
-                                 continue;
-                             }
-                            
-                            justPushedFrame = false;
-                            execute(ins);
-                            
-                            // 如果 execute 创建了新栈帧（嵌套函数调用），需要执行它
-                            // 记录当前栈帧深度，确保只处理从这里开始创建的嵌套帧
-                            size_t initFrameDepth = savedCallFrames.size();
-                            while (callFrames.size() > initFrameDepth && vmstat == ZeusType::VMStatus::Running) {
-                                // 每次循环都重新获取当前帧
-                                size_t currentDepth = callFrames.size();
-                                
-                                if (callFrames.back().pc >= callFrames.back().code->size()) {
-                                    // 帧执行完毕，清理并弹出
-                                    if (!ctorLocalsReleased) {
-                                        // 先释放当前函数的 local Cells（防止内存泄漏）
-                                        // 特殊处理构造函数的 this：避免把新对象提前 release
-                                        for (auto* cell : local) {
-                                            if (!cell) continue;
-                                            // 构造期间为了防止提前析构对 this 进行了 retain，这里可以对称释放对象本身
-                                            releaseCellAndContent(cell);
-                                        }
-                                        for (auto* cell : upvalue) {
-                                            if (cell) releaseCellAndContent(cell);
-                                        }
-                                        ctorLocalsReleased = true;
-                                    }
-                                    local = callFrames.back().savedLocal;
-                                    upvalue = callFrames.back().savedUpvalue;
-                                    shrinkStackWithRelease(callFrames.back().stackBase);
-                                    stack.push_back(LexerType::Value(0)); // 隐式返回0
-                                    callFrames.pop_back();
-                                    
-                                    // 如果还有上层帧，跳过调用者的 CALL_CLOSURE 指令
-                                    if (callFrames.size() > initFrameDepth) {
-                                        callFrames.back().pc++;
-                                    }
-                                    continue;
-                                }
-                                
-                                const auto& nestedIns = (*callFrames.back().code)[callFrames.back().pc];
-                                
-                                if (nestedIns.op == VMOperator::FUNC_BEGIN || nestedIns.op == VMOperator::FUNC_END || nestedIns.op == VMOperator::CAPTURE_OUTSIDE_VAR) {
-                                    callFrames.back().pc++;
-                                    continue;
-                                }
-                                
-                                if (nestedIns.op == VMOperator::RETURN) {
-                                    // 嵌套函数返回
-                                    // 获取返回值
-                                    ZeusType::UniversalVariant retVal = LexerType::Value(0);
-                                    if (!stack.empty()) {
-                                        retVal = stack.back();
-                                        stack.pop_back();
-                                        ZeusGC::retainVariantIfObject(*this, retVal);
-                                    }
-                                    
-                                    // 清理栈到调用点
-                                        shrinkStackWithRelease(callFrames.back().stackBase);
-                                    
-                                    if (!ctorLocalsReleased) {
-                                        // 先释放当前函数的 local Cells（防止内存泄漏）
-                                        // 特殊处理构造函数的 this：避免把新对象提前 release
-                                            for (auto* cell : local) {
-                                                if (!cell) continue;
-                                                releaseCellAndContent(cell);
-                                            }
-                                        for (auto* cell : upvalue) {
-                                            if (cell) releaseCellAndContent(cell);
-                                        }
-                                        ctorLocalsReleased = true;
-                                    }
-                                    
-                                    // 恢复调用者的环境
-                                    local = callFrames.back().savedLocal;
-                                    upvalue = callFrames.back().savedUpvalue;
-                                    
-                                    // 弹出栈帧
-                                    int autoReleaseId = callFrames.back().calleeAutoReleaseId;
-                                    callFrames.pop_back();
-                                    
-                                    // 压入返回值
-                                    stack.push_back(retVal);
-                                    
-                                    // 如果还有上层帧，跳过调用者的 CALL_CLOSURE 指令
-                                    if (callFrames.size() > initFrameDepth) {
-                                        callFrames.back().pc++;
-                                    }
-                                    
-                                    // 如果有需要自动释放的临时闭包，在这里释放
-                                    if (autoReleaseId >= 0) {
-                                        releaseClosure(autoReleaseId);
-                                    }
-                                    // 继续处理剩余帧（可能还有上层调用者）
-                                    continue;
-                                }
-                                
-                                // 处理跳转指令
-                                if (nestedIns.op == VMOperator::JUMP) {
-                                    int off = VMHelpers::getIntFromValue(std::get<LexerType::Value>(nestedIns.args[0]));
-                                    callFrames.back().pc += 1 + off;
-                                    continue;
-                                }
-                                
-                                if (nestedIns.op == VMOperator::JUMP_IF_FALSE) {
-                                    int off = VMHelpers::getIntFromValue(std::get<LexerType::Value>(nestedIns.args[0]));
-                                    if (!stack.empty()) {
-                                        auto cond = stack.back();
-                                        stack.pop_back();
-                                        if (!truthy(cond)) {
-                                            callFrames.back().pc += 1 + off;
-                                            continue;
-                                        }
-                                    }
-                                    callFrames.back().pc++;
-                                    continue;
-                                }
-                                
-                                if (nestedIns.op == VMOperator::JUMP_IF_TRUE) {
-                                    int off = VMHelpers::getIntFromValue(std::get<LexerType::Value>(nestedIns.args[0]));
-                                    if (!stack.empty()) {
-                                        auto cond = stack.back();
-                                        stack.pop_back();
-                                        if (truthy(cond)) {
-                                            callFrames.back().pc += 1 + off;
-                                            continue;
-                                        }
-                                    }
-                                    callFrames.back().pc++;
-                                    continue;
-                                }
-                                
-                                justPushedFrame = false;
-                                execute(nestedIns);
-                                
-                                // 检查是否创建了新帧
-                                if (callFrames.size() > currentDepth) {
-                                    // 新帧被创建，不增加当前帧的 pc（它现在是调用者帧，下次迭代会处理新帧）
-                                    // 但我们需要记住调用指令已执行，待新帧返回后要跳过
-                                    // 实际上，当新帧返回时，RETURN 处理会增加调用者的 pc
-                                    // 所以这里不需要做任何事
-                                } else {
-                                    // 没有创建新帧，正常增加 pc
-                                    if (!callFrames.empty() && callFrames.size() > initFrameDepth) {
-                                        callFrames.back().pc++;
-                                    }
-                                }
-                            }
-                            
-                            pc++;
+                        // Use the shared frame loop while retaining constructor argument binding.
+                        CallFrame constructorFrame;
+                        constructorFrame.code = &proto.body;
+                        constructorFrame.pc = 0;
+                        constructorFrame.savedLocal = oldLocal;
+                        constructorFrame.savedUpvalue = oldUpvalue;
+                        constructorFrame.stackBase = calleeIndex;
+                        constructorFrame.savedLine = __line;
+                        callFrames.push_back(std::move(constructorFrame));
+                        FrameLoopOptions constructorOptions;
+                        constructorOptions.stopFrameDepth = constructorFrameDepth;
+                        constructorOptions.captureReturn = true;
+                        constructorOptions.handleExceptions = true;
+                        constructorOptions.traceName = "[constructor]";
+                        FrameLoopState constructorState;
+                        runFrameLoop(constructorOptions, &constructorState);
+                        if (vmstat != ZeusType::VMStatus::Running) {
+                            unwindFrameEnvironments(constructorFrameDepth);
                         }
-                            
-                        // 释放 init 函数的 local 变量 Cell
-                        // 如果有 upvalue 引用这些 Cell，refCount 不会降到0
-                        // 手动执行的 init 循环未经过 runChunk 的 RETURN 释放，这里显式释放本地 local/upvalue
-                        for (auto* cell : local) {
-                            if (cell) releaseCellAndContent(cell);
+                        if (constructorState.retOwner) {
+                            dropStackItem(StackItem{constructorState.retVal, constructorState.retOwner});
                         }
-                        for (auto* cell : upvalue) {
-                            if (cell) releaseCellAndContent(cell);
-                        }
-                        // 恢复调用者环境
-                        local = oldLocal;
-                        upvalue = oldUpvalue;
-                        callFrames = savedCallFrames;
                         justPushedFrame = savedJustPushedFrame;
-                        
-                        // 清理栈（移除closure+this+args）
-                        // release temporary constructor closure
-                        releaseClosure(cloId);
+                        // The stack owns the temporary constructor closure and arguments.
                         shrinkStackWithRelease(calleeIndex);
                     }
                 }
 
                 // 释放构造保护 retain（创建时 +1）
                 releaseObject(objId);
+                if (vmstat != ZeusType::VMStatus::Running) {
+                    releaseObject(objId); // no result is transferred to the caller
+                    break;
+                }
                 stack.push_back(objHandle);  // 使用完整的 ObjectHandle（包含 generation）
                 printStack();
                 break;
@@ -3988,6 +3788,7 @@ class VM {
                         
                         // 使用同步调用 operator[.]
                         if (!executeClosureSync(cloId, 2)) {
+                            if (vmstat != ZeusType::VMStatus::Running) break;
                             VMException::VMException exp("OBJ_LOAD_ATTR: operator[.] sync call failed", __line, instr);
                             exp._throw(vmstat, currentChunk);
                             break;
@@ -4194,6 +3995,7 @@ class VM {
                         // local slots. A recursive execute() would share this frame's local
                         // buffer and leave the callee's slots behind in it.
                         if (!executeClosureSync(cloId, 3)) {
+                            if (vmstat != ZeusType::VMStatus::Running) break;
                             VMException::VMException exp(
                                 "[execute] nested dispatch failed", __line, instr);
                             exp._throw(vmstat, currentChunk);
@@ -4287,6 +4089,7 @@ class VM {
                 // Dispatch through a real frame so the callee gets its own local
                 // slots instead of sharing this frame's local buffer.
                 if (!executeClosureSync(cloId, argc)) {
+                    if (vmstat != ZeusType::VMStatus::Running) break;
                     VMException::VMException exp(
                         "[execute] nested dispatch failed", __line, instr);
                     exp._throw(vmstat, currentChunk);
@@ -4352,6 +4155,7 @@ class VM {
                      // Dispatch through a real frame so the callee gets its own local
                      // slots instead of sharing this frame's local buffer.
                      if (!executeClosureSync(cloId, argc)) {
+                         if (vmstat != ZeusType::VMStatus::Running) break;
                          VMException::VMException exp(
                              "[execute] nested dispatch failed", __line, instr);
                          exp._throw(vmstat, currentChunk);
@@ -4465,6 +4269,7 @@ class VM {
                     // Dispatch through a real frame so the callee gets its own local
                     // slots instead of sharing this frame's local buffer.
                     if (!executeClosureSync(cloId, argc + 1)) {
+                        if (vmstat != ZeusType::VMStatus::Running) break;
                         VMException::VMException exp(
                             "[execute] nested dispatch failed", __line, instr);
                         exp._throw(vmstat, currentChunk);
@@ -4574,6 +4379,7 @@ class VM {
                             
                             // 使用同步调用，等待 operator[.] 返回
                             if (!executeClosureSync(opCloId, 2)) {
+                                if (vmstat != ZeusType::VMStatus::Running) break;
                                 VMException::VMException exp("operator[.] sync call failed", __line, instr);
                                 exp._throw(vmstat, currentChunk);
                                 break;
@@ -4649,6 +4455,7 @@ class VM {
                 // Dispatch through a real frame so the callee gets its own local
                 // slots instead of sharing this frame's local buffer.
                 if (!executeClosureSync(cloId, argc)) {
+                    if (vmstat != ZeusType::VMStatus::Running) break;
                     VMException::VMException exp(
                         "[execute] nested dispatch failed", __line, instr);
                     exp._throw(vmstat, currentChunk);
@@ -4783,6 +4590,7 @@ class VM {
                                 // Dispatch through a real frame so the callee gets its own local
                                 // slots instead of sharing this frame's local buffer.
                                 if (!executeClosureSync(cloId, 2)) {
+                                    if (vmstat != ZeusType::VMStatus::Running) break;
                                     VMException::VMException exp(
                                         "[execute] nested dispatch failed", __line, instr);
                                     exp._throw(vmstat, currentChunk);
@@ -5094,6 +4902,7 @@ class VM {
                      // local slots. A recursive execute() would share this frame's local
                      // buffer and leave the callee's slots behind in it.
                      if (!executeClosureSync(cloId, 2)) {
+                         if (vmstat != ZeusType::VMStatus::Running) break;
                          VMException::VMException exp(
                              "[execute] nested dispatch failed", __line, instr);
                          exp._throw(vmstat, currentChunk);
@@ -5203,6 +5012,7 @@ class VM {
                      // local slots. A recursive execute() would share this frame's local
                      // buffer and leave the callee's slots behind in it.
                      if (!executeClosureSync(cloId, 3)) {
+                         if (vmstat != ZeusType::VMStatus::Running) break;
                          VMException::VMException exp(
                              "[execute] nested dispatch failed", __line, instr);
                          exp._throw(vmstat, currentChunk);
@@ -5414,6 +5224,7 @@ class VM {
                                 // local slots. A recursive execute() would share this frame's local
                                 // buffer and leave the callee's slots behind in it.
                                 if (!executeClosureSync(cloId, 2)) {
+                                    if (vmstat != ZeusType::VMStatus::Running) break;
                                     VMException::VMException exp(
                                         "[execute] nested dispatch failed", __line, instr);
                                     exp._throw(vmstat, currentChunk);
@@ -5494,6 +5305,7 @@ class VM {
                                 // local slots. A recursive execute() would share this frame's local
                                 // buffer and leave the callee's slots behind in it.
                                 if (!executeClosureSync(cloId, 2)) {
+                                    if (vmstat != ZeusType::VMStatus::Running) break;
                                     VMException::VMException exp(
                                         "[execute] nested dispatch failed", __line, instr);
                                     exp._throw(vmstat, currentChunk);
@@ -5570,6 +5382,7 @@ class VM {
                                 // local slots. A recursive execute() would share this frame's local
                                 // buffer and leave the callee's slots behind in it.
                                 if (!executeClosureSync(cloId, 2)) {
+                                    if (vmstat != ZeusType::VMStatus::Running) break;
                                     VMException::VMException exp(
                                         "[execute] nested dispatch failed", __line, instr);
                                     exp._throw(vmstat, currentChunk);
@@ -5653,6 +5466,7 @@ class VM {
                                 // local slots. A recursive execute() would share this frame's local
                                 // buffer and leave the callee's slots behind in it.
                                 if (!executeClosureSync(cloId, 2)) {
+                                    if (vmstat != ZeusType::VMStatus::Running) break;
                                     VMException::VMException exp(
                                         "[execute] nested dispatch failed", __line, instr);
                                     exp._throw(vmstat, currentChunk);
@@ -7171,6 +6985,7 @@ class VM {
                                 // local slots. A recursive execute() would share this frame's local
                                 // buffer and leave the callee's slots behind in it.
                                 if (!executeClosureSync(cloId, 2)) {
+                                    if (vmstat != ZeusType::VMStatus::Running) break;
                                     VMException::VMException exp(
                                         "[execute] nested dispatch failed", __line, instr);
                                     exp._throw(vmstat, currentChunk);
@@ -7288,6 +7103,7 @@ class VM {
                                 // local slots. A recursive execute() would share this frame's local
                                 // buffer and leave the callee's slots behind in it.
                                 if (!executeClosureSync(cloId, 2)) {
+                                    if (vmstat != ZeusType::VMStatus::Running) break;
                                     VMException::VMException exp(
                                         "[execute] nested dispatch failed", __line, instr);
                                     exp._throw(vmstat, currentChunk);
@@ -7394,6 +7210,7 @@ class VM {
                                 // local slots. A recursive execute() would share this frame's local
                                 // buffer and leave the callee's slots behind in it.
                                 if (!executeClosureSync(cloId, 2)) {
+                                    if (vmstat != ZeusType::VMStatus::Running) break;
                                     VMException::VMException exp(
                                         "[execute] nested dispatch failed", __line, instr);
                                     exp._throw(vmstat, currentChunk);
@@ -7475,6 +7292,7 @@ class VM {
                                 // local slots. A recursive execute() would share this frame's local
                                 // buffer and leave the callee's slots behind in it.
                                 if (!executeClosureSync(cloId, 2)) {
+                                    if (vmstat != ZeusType::VMStatus::Running) break;
                                     VMException::VMException exp(
                                         "[execute] nested dispatch failed", __line, instr);
                                     exp._throw(vmstat, currentChunk);
@@ -7538,6 +7356,7 @@ class VM {
                                 // local slots. A recursive execute() would share this frame's local
                                 // buffer and leave the callee's slots behind in it.
                                 if (!executeClosureSync(cloId, 2)) {
+                                    if (vmstat != ZeusType::VMStatus::Running) break;
                                     VMException::VMException exp(
                                         "[execute] nested dispatch failed", __line, instr);
                                     exp._throw(vmstat, currentChunk);
@@ -7598,6 +7417,7 @@ class VM {
                                 // local slots. A recursive execute() would share this frame's local
                                 // buffer and leave the callee's slots behind in it.
                                 if (!executeClosureSync(cloId, 2)) {
+                                    if (vmstat != ZeusType::VMStatus::Running) break;
                                     VMException::VMException exp(
                                         "[execute] nested dispatch failed", __line, instr);
                                     exp._throw(vmstat, currentChunk);
@@ -7865,6 +7685,7 @@ class VM {
                     
                     if (cell) {
                         callDestructor(cell);
+                        if (vmstat != ZeusType::VMStatus::Running) break;
                         breakCyclesIfObject(cell);
                         releaseRefInCell(cell);
                         cell->release();
@@ -7877,6 +7698,7 @@ class VM {
                     
                     if (cell) {
                         callDestructor(cell);
+                        if (vmstat != ZeusType::VMStatus::Running) break;
                         breakCyclesIfObject(cell);
                         releaseRefInCell(cell);
                         cell->release();
@@ -7889,6 +7711,7 @@ class VM {
                         if (i < globalNames.size() && globalNames[i] == varName) {
                             if (global[i]) {
                                 callDestructor(global[i]);
+                                if (vmstat != ZeusType::VMStatus::Running) break;
                                 breakCyclesIfObject(global[i]);
                                 releaseRefInCell(global[i]);
                                 global[i]->release();
@@ -7899,6 +7722,8 @@ class VM {
                         }
                     }
                 }
+
+                if (vmstat != ZeusType::VMStatus::Running) break;
 
                 if (!found) {
                     vmMessage("[DELETE_VAR] Warning: Variable not found or already null: " + varName);
@@ -8012,39 +7837,8 @@ class VM {
                 
                 ZEUS_DEBUG_PRINT("[VM] THROW: exception raised");
                 
-                // 查找最近的异常处理器
-                if (!exceptionHandlers.empty()) {
-                    ExceptionHandler& handler = exceptionHandlers.back();
-                    
-                    // 恢复栈和局部变量到处理器注册时的状态
-                    shrinkStackWithRelease(handler.stackBase);
-                    // 释放多余的局部变量
-                    while (local.size() > handler.localSize) {
-                        if (local.back()) {
-                            releaseCellAndContent(local.back());
-                        }
-                        local.pop_back();
-                    }
-                    
-                    // 弹出到处理器所在的调用栈深度
-                    while (callFrames.size() > handler.callFrameDepth) {
-                        callFrames.pop_back();
-                    }
-                    
-                    // 跳转到 catch 块
-                    if (!callFrames.empty()) {
-                        callFrames.back().pc = handler.catchPc;
-                        // 设置 justPushedFrame 阻止 runChunk 递增 PC
-                        justPushedFrame = true;
-                    }
-                    
-                    exceptionHandlers.pop_back();
-                    ZEUS_DEBUG_PRINT("[VM] THROW: jumping to catch at pc=%zu", handler.catchPc);
-                } else {
-                    // 没有异常处理器，终止执行
-                    vmstat = ZeusType::VMStatus::Error;
-                    
-                    // 尝试从异常对象获取消息
+                vmstat = ZeusType::VMStatus::Error;
+                if (exceptionHandlers.empty()) {
                     std::string errorMsg = "Unhandled exception";
                     if (std::holds_alternative<ZeusType::ObjectHandle>(currentException)) {
                         auto& oh = std::get<ZeusType::ObjectHandle>(currentException);
@@ -8156,6 +7950,7 @@ class VM {
                 // local slots. A recursive execute() would share this frame's local
                 // buffer and leave the callee's slots behind in it.
                 if (!executeClosureSync(cloId, 1)) {
+                    if (vmstat != ZeusType::VMStatus::Running) break;
                     VMException::VMException exp("WITH_BEGIN: operator[with] call failed", __line, instr);
                     exp._throw(vmstat, currentChunk);
                     break;
@@ -8212,6 +8007,7 @@ class VM {
                                 // CallFrame and runs it to completion, so the callee gets its
                                 // own local slots instead of sharing this frame's buffer.
                                 if (!executeClosureSync(cloId, 1)) {
+                                    if (vmstat != ZeusType::VMStatus::Running) break;
                                     VMException::VMException exp(
                                         "WITH_END: operator[~with] call failed", __line, instr);
                                     exp._throw(vmstat, currentChunk);

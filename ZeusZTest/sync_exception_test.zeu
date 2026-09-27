@@ -1,0 +1,83 @@
+// Regression: synchronous calls must catch/unwind before returning to their caller.
+var PASS = 0;
+var FAIL = 0;
+func ok(name, condition) {
+    if (condition) { PASS = PASS + 1; }
+    else { FAIL = FAIL + 1; _write("FAIL: " + name + "\n"); }
+}
+func runtime_failure() {
+    let number = 42;
+    number.toString();
+}
+class PrintedResource {
+    using &this;
+    let value = 100;
+    func operator[~]() { print("destroy", this.value); }
+}
+class Probe {
+    using &this;
+    func caught() {
+        let sentinel = 17;
+        try { runtime_failure(); }
+        catch (e) { return sentinel; }
+        return -1;
+    }
+    func fail() { runtime_failure(); return -1; }
+    func raised() { throw "explicit sync failure"; }
+    func returnFromTry() {
+        try { return 23; }
+        catch (e) { return -1; }
+    }
+}
+class FailingResource {
+    using &this;
+    let value = 99;
+    func operator[~]() { runtime_failure(); }
+}
+class CatchingConstructor {
+    using &this;
+    let value = 0;
+    func init() {
+        try { throw "constructor failure"; }
+        catch (e) { this.value = 9; }
+    }
+}
+class FailingConstructor {
+    using &this;
+    func init() { runtime_failure(); }
+}
+func main() {
+    using original {
+        ok("str integer", str(100) == "100");
+        ok("str negative integer", str(-42) == "-42");
+    }
+    let before = 31;
+    let resource = new PrintedResource();
+    delete resource;
+    ok("destructor print restores caller", before == 31);
+    let probe = new Probe();
+    ok("catch inside sync restores its locals", probe.caught() == 17);
+    var caught = 0;
+    try { probe.fail(); caught = -100; }
+    catch (e) { caught = caught + 1; }
+    ok("runtime error reaches outer catch", caught == 1 and before == 31);
+    try { probe.raised(); caught = -100; }
+    catch (e) { caught = caught + 1; }
+    ok("explicit throw reaches outer catch", caught == 2);
+    ok("return from try", probe.returnFromTry() == 23);
+    try { runtime_failure(); caught = -100; }
+    catch (e) { caught = caught + 1; }
+    ok("returned frame leaves no stale handler", caught == 3);
+    let failing = new FailingResource();
+    try { delete failing; caught = -100; }
+    catch (e) { caught = caught + 1; }
+    ok("failed destructor preserves caller binding", caught == 4 and failing.value == 99);
+    let constructed = new CatchingConstructor();
+    ok("constructor catches its own throw", constructed.value == 9);
+    try { let rejected = new FailingConstructor(); caught = -100; }
+    catch (e) { caught = caught + 1; }
+    ok("constructor error reaches caller", caught == 5 and before == 31);
+    print("PASS =", PASS, "FAIL =", FAIL);
+    if (FAIL > 0) { throw "sync exception regression"; }
+}
+main();
