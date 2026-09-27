@@ -4189,8 +4189,16 @@ class VM {
                         stack.push_back(val);   // 值
                         
                         // 调用 CALL_CLOSURE,3个参数(this + 属性名 + 值)
-                        IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(3) } };
-                        execute(callIns);
+                        // Dispatch through a real frame: executeClosureSync pushes a
+                        // CallFrame and runs it to completion, so the callee gets its own
+                        // local slots. A recursive execute() would share this frame's local
+                        // buffer and leave the callee's slots behind in it.
+                        if (!executeClosureSync(cloId, 3)) {
+                            VMException::VMException exp(
+                                "[execute] nested dispatch failed", __line, instr);
+                            exp._throw(vmstat, currentChunk);
+                            break;
+                        }
                         
                         // 方法调用完成,继续执行
                         break;
@@ -4276,8 +4284,14 @@ class VM {
                 stack.set(calleeIndex, ZeusType::ClosureHandle{cloId});
 
                 // 直接用 CALL_CLOSURE 指令调用新创建的 closure（相当于 execute(CALL_CLOSURE ...)）
-                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(argc) } };
-                execute(callIns);
+                // Dispatch through a real frame so the callee gets its own local
+                // slots instead of sharing this frame's local buffer.
+                if (!executeClosureSync(cloId, argc)) {
+                    VMException::VMException exp(
+                        "[execute] nested dispatch failed", __line, instr);
+                    exp._throw(vmstat, currentChunk);
+                    break;
+                }
                 break;
             }
 
@@ -4335,8 +4349,14 @@ class VM {
                      stack.set(calleeIndex, ZeusType::ClosureHandle{cloId});
  
                      // Reuse CALL_CLOSURE with same argc
-                     IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(argc) } };
-                     execute(callIns);
+                     // Dispatch through a real frame so the callee gets its own local
+                     // slots instead of sharing this frame's local buffer.
+                     if (!executeClosureSync(cloId, argc)) {
+                         VMException::VMException exp(
+                             "[execute] nested dispatch failed", __line, instr);
+                         exp._throw(vmstat, currentChunk);
+                         break;
+                     }
                      break;
                  }
 
@@ -4442,8 +4462,14 @@ class VM {
                     stack.insert(stack.begin() + calleeIndex + 1, ZeusType::SharedObjectHandle{sharedName});
                     
                     // 调用闭包，argc + 1 因为添加了 this
-                    IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(argc + 1) } };
-                    execute(callIns);
+                    // Dispatch through a real frame so the callee gets its own local
+                    // slots instead of sharing this frame's local buffer.
+                    if (!executeClosureSync(cloId, argc + 1)) {
+                        VMException::VMException exp(
+                            "[execute] nested dispatch failed", __line, instr);
+                        exp._throw(vmstat, currentChunk);
+                        break;
+                    }
                     break;
                 }
 
@@ -4620,8 +4646,14 @@ class VM {
                 dropStackItem(StackItem{oldCallee, oldOwner});
 
                 // Reuse CALL_CLOSURE with original argc; CALL_CLOSURE will inject boundThis.
-                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(argc) } };
-                execute(callIns);
+                // Dispatch through a real frame so the callee gets its own local
+                // slots instead of sharing this frame's local buffer.
+                if (!executeClosureSync(cloId, argc)) {
+                    VMException::VMException exp(
+                        "[execute] nested dispatch failed", __line, instr);
+                    exp._throw(vmstat, currentChunk);
+                    break;
+                }
                 break;
             }
 
@@ -4748,8 +4780,14 @@ class VM {
                                 stack.push_back(right); // other -> local 1
                                 
                                 // 调用: argc=2 (this + other)
-                                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(2) } }; // 2个参数
-                                execute(callIns);
+                                // Dispatch through a real frame so the callee gets its own local
+                                // slots instead of sharing this frame's local buffer.
+                                if (!executeClosureSync(cloId, 2)) {
+                                    VMException::VMException exp(
+                                        "[execute] nested dispatch failed", __line, instr);
+                                    exp._throw(vmstat, currentChunk);
+                                    break;
+                                }
                                 // 结果已在栈顶，直接break
                                 vmMessage(">>> Operator[+] overload called.");
                                 break;
@@ -5051,8 +5089,16 @@ class VM {
                     stack.push_back(keyVar);                          // key argument
                     
                      // 调用 CALL_CLOSURE (argc=2: this + key)
-                     IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(2) } };
-                     execute(callIns);
+                     // Dispatch through a real frame: executeClosureSync pushes a
+                     // CallFrame and runs it to completion, so the callee gets its own
+                     // local slots. A recursive execute() would share this frame's local
+                     // buffer and leave the callee's slots behind in it.
+                     if (!executeClosureSync(cloId, 2)) {
+                         VMException::VMException exp(
+                             "[execute] nested dispatch failed", __line, instr);
+                         exp._throw(vmstat, currentChunk);
+                         break;
+                     }
                      break;  // 结果已在栈顶
                  } else {
                     // dictVar 不是 Variant 也不是 ObjectHandle，生成更友好的类型错误信息
@@ -5152,8 +5198,16 @@ class VM {
                     stack.push_back(newVal);                          // value argument
                     
                      // 调用 CALL_CLOSURE (argc=3: this + key + value)
-                     IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(3) } };
-                     execute(callIns);
+                     // Dispatch through a real frame: executeClosureSync pushes a
+                     // CallFrame and runs it to completion, so the callee gets its own
+                     // local slots. A recursive execute() would share this frame's local
+                     // buffer and leave the callee's slots behind in it.
+                     if (!executeClosureSync(cloId, 3)) {
+                         VMException::VMException exp(
+                             "[execute] nested dispatch failed", __line, instr);
+                         exp._throw(vmstat, currentChunk);
+                         break;
+                     }
                      
                      // operator[[]=] 通常返回 nil，但我们保持与数组/字典一致，将新值压回栈
                      stack.pop_back();  // 移除 operator[[]=] 的返回值
@@ -5355,8 +5409,16 @@ class VM {
                                 stack.push_back(left);
                                 stack.push_back(right);
                                 
-                                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(2) } };
-                                execute(callIns);
+                                // Dispatch through a real frame: executeClosureSync pushes a
+                                // CallFrame and runs it to completion, so the callee gets its own
+                                // local slots. A recursive execute() would share this frame's local
+                                // buffer and leave the callee's slots behind in it.
+                                if (!executeClosureSync(cloId, 2)) {
+                                    VMException::VMException exp(
+                                        "[execute] nested dispatch failed", __line, instr);
+                                    exp._throw(vmstat, currentChunk);
+                                    break;
+                                }
                                 vmMessage(">>> Operator- overload called.");
                                 break;
                             }
@@ -5427,8 +5489,16 @@ class VM {
                                 stack.push_back(left);
                                 stack.push_back(right);
                                 
-                                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(2) } };
-                                execute(callIns);
+                                // Dispatch through a real frame: executeClosureSync pushes a
+                                // CallFrame and runs it to completion, so the callee gets its own
+                                // local slots. A recursive execute() would share this frame's local
+                                // buffer and leave the callee's slots behind in it.
+                                if (!executeClosureSync(cloId, 2)) {
+                                    VMException::VMException exp(
+                                        "[execute] nested dispatch failed", __line, instr);
+                                    exp._throw(vmstat, currentChunk);
+                                    break;
+                                }
                                 vmMessage(">>> Operator* overload called.");
                                 break;
                             }
@@ -5495,8 +5565,16 @@ class VM {
                                 stack.push_back(ZeusType::ClosureHandle{cloId});
                                 stack.push_back(left);
                                 stack.push_back(right);
-                                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(2) } };
-                                execute(callIns);
+                                // Dispatch through a real frame: executeClosureSync pushes a
+                                // CallFrame and runs it to completion, so the callee gets its own
+                                // local slots. A recursive execute() would share this frame's local
+                                // buffer and leave the callee's slots behind in it.
+                                if (!executeClosureSync(cloId, 2)) {
+                                    VMException::VMException exp(
+                                        "[execute] nested dispatch failed", __line, instr);
+                                    exp._throw(vmstat, currentChunk);
+                                    break;
+                                }
                                 vmMessage(">>> Operator/ overload called.");
                                 break;
                             }
@@ -5570,8 +5648,16 @@ class VM {
                                 stack.push_back(ZeusType::ClosureHandle{cloId});
                                 stack.push_back(left);
                                 stack.push_back(right);
-                                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(2) } };
-                                execute(callIns);
+                                // Dispatch through a real frame: executeClosureSync pushes a
+                                // CallFrame and runs it to completion, so the callee gets its own
+                                // local slots. A recursive execute() would share this frame's local
+                                // buffer and leave the callee's slots behind in it.
+                                if (!executeClosureSync(cloId, 2)) {
+                                    VMException::VMException exp(
+                                        "[execute] nested dispatch failed", __line, instr);
+                                    exp._throw(vmstat, currentChunk);
+                                    break;
+                                }
                                 vmMessage(">>> Operator% overload called.");
                                 break;
                             }
@@ -7080,8 +7166,16 @@ class VM {
                                 stack.push_back(ZeusType::ClosureHandle{cloId});
                                 stack.push_back(left);
                                 stack.push_back(right);
-                                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(2) } };
-                                execute(callIns);
+                                // Dispatch through a real frame: executeClosureSync pushes a
+                                // CallFrame and runs it to completion, so the callee gets its own
+                                // local slots. A recursive execute() would share this frame's local
+                                // buffer and leave the callee's slots behind in it.
+                                if (!executeClosureSync(cloId, 2)) {
+                                    VMException::VMException exp(
+                                        "[execute] nested dispatch failed", __line, instr);
+                                    exp._throw(vmstat, currentChunk);
+                                    break;
+                                }
                                 vmMessage(">>> Operator== overload called.");
                                 break;
                             }
@@ -7189,8 +7283,16 @@ class VM {
                                 stack.push_back(ZeusType::ClosureHandle{cloId});
                                 stack.push_back(left);
                                 stack.push_back(right);
-                                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(2) } };
-                                execute(callIns);
+                                // Dispatch through a real frame: executeClosureSync pushes a
+                                // CallFrame and runs it to completion, so the callee gets its own
+                                // local slots. A recursive execute() would share this frame's local
+                                // buffer and leave the callee's slots behind in it.
+                                if (!executeClosureSync(cloId, 2)) {
+                                    VMException::VMException exp(
+                                        "[execute] nested dispatch failed", __line, instr);
+                                    exp._throw(vmstat, currentChunk);
+                                    break;
+                                }
                                 vmMessage(">>> Operator!= overload called.");
                                 break;
                             }
@@ -7287,8 +7389,16 @@ class VM {
                                 stack.push_back(ZeusType::ClosureHandle{cloId});
                                 stack.push_back(left);
                                 stack.push_back(right);
-                                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(2) } };
-                                execute(callIns);
+                                // Dispatch through a real frame: executeClosureSync pushes a
+                                // CallFrame and runs it to completion, so the callee gets its own
+                                // local slots. A recursive execute() would share this frame's local
+                                // buffer and leave the callee's slots behind in it.
+                                if (!executeClosureSync(cloId, 2)) {
+                                    VMException::VMException exp(
+                                        "[execute] nested dispatch failed", __line, instr);
+                                    exp._throw(vmstat, currentChunk);
+                                    break;
+                                }
                                 vmMessage(">>> Operator> overload called.");
                                 break;
                             }
@@ -7360,8 +7470,16 @@ class VM {
                                 stack.push_back(ZeusType::ClosureHandle{cloId});
                                 stack.push_back(left);
                                 stack.push_back(right);
-                                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(2) } };
-                                execute(callIns);
+                                // Dispatch through a real frame: executeClosureSync pushes a
+                                // CallFrame and runs it to completion, so the callee gets its own
+                                // local slots. A recursive execute() would share this frame's local
+                                // buffer and leave the callee's slots behind in it.
+                                if (!executeClosureSync(cloId, 2)) {
+                                    VMException::VMException exp(
+                                        "[execute] nested dispatch failed", __line, instr);
+                                    exp._throw(vmstat, currentChunk);
+                                    break;
+                                }
                                 vmMessage(">>> Operator< overload called.");
                                 break;
                             }
@@ -7415,8 +7533,16 @@ class VM {
                                 stack.push_back(ZeusType::ClosureHandle{cloId});
                                 stack.push_back(left);
                                 stack.push_back(right);
-                                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(2) } };
-                                execute(callIns);
+                                // Dispatch through a real frame: executeClosureSync pushes a
+                                // CallFrame and runs it to completion, so the callee gets its own
+                                // local slots. A recursive execute() would share this frame's local
+                                // buffer and leave the callee's slots behind in it.
+                                if (!executeClosureSync(cloId, 2)) {
+                                    VMException::VMException exp(
+                                        "[execute] nested dispatch failed", __line, instr);
+                                    exp._throw(vmstat, currentChunk);
+                                    break;
+                                }
                                 vmMessage(">>> Operator>= overload called.");
                                 break;
                             }
@@ -7467,8 +7593,16 @@ class VM {
                                 stack.push_back(ZeusType::ClosureHandle{cloId});
                                 stack.push_back(left);
                                 stack.push_back(right);
-                                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(2) } };
-                                execute(callIns);
+                                // Dispatch through a real frame: executeClosureSync pushes a
+                                // CallFrame and runs it to completion, so the callee gets its own
+                                // local slots. A recursive execute() would share this frame's local
+                                // buffer and leave the callee's slots behind in it.
+                                if (!executeClosureSync(cloId, 2)) {
+                                    VMException::VMException exp(
+                                        "[execute] nested dispatch failed", __line, instr);
+                                    exp._throw(vmstat, currentChunk);
+                                    break;
+                                }
                                 vmMessage(">>> Operator<= overload called.");
                                 break;
                             }
@@ -8004,14 +8138,28 @@ class VM {
                 }
                 
                 // 调用 operator[with]()
+                //
+                // 用 executeClosureSync 而不是递归 execute()：它会压一个真正的栈帧
+                // 并把帧跑完，局部变量随帧保存/还原。递归 execute() 会共用同一份
+                // local 缓冲区，被调用帧的槽位会污染调用者。
                 int protoId = opIt->second;
                 Closure clo;
                 clo.protoId = protoId;
                 int cloId = allocClosure(std::move(clo));
                 stack.push_back(ZeusType::ClosureHandle{cloId});
+                // The nested call machinery releases every argument slot it pops,
+                // so the stack has to own a reference for the receiver it pushes.
+                ZeusGC::retainVariantDeep(*this, withObj);
                 stack.push_back(withObj);  // this 参数
-                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(1) } };
-                execute(callIns);
+                // Dispatch through a real frame: executeClosureSync pushes a
+                // CallFrame and runs it to completion, so the callee gets its own
+                // local slots. A recursive execute() would share this frame's local
+                // buffer and leave the callee's slots behind in it.
+                if (!executeClosureSync(cloId, 1)) {
+                    VMException::VMException exp("WITH_BEGIN: operator[with] call failed", __line, instr);
+                    exp._throw(vmstat, currentChunk);
+                    break;
+                }
                 
                 // 弹出 operator[with]() 的返回值（不需要使用）
                 if (!stack.empty()) {
@@ -8055,9 +8203,20 @@ class VM {
                                 clo.protoId = protoId;
                                 int cloId = allocClosure(std::move(clo));
                                 stack.push_back(ZeusType::ClosureHandle{cloId});
+                                // Same ownership rule as WITH_BEGIN: the nested call
+                                // releases the receiver slot it pops.
+                                ZeusGC::retainVariantDeep(
+                                    *this, ZeusType::ObjectHandle{ctx.objHandle.id, ctx.objHandle.generation});
                                 stack.push_back(ZeusType::ObjectHandle{ctx.objHandle.id, ctx.objHandle.generation});
-                                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(1) } };
-                                execute(callIns);
+                                // Dispatch through a real frame: executeClosureSync pushes a
+                                // CallFrame and runs it to completion, so the callee gets its
+                                // own local slots instead of sharing this frame's buffer.
+                                if (!executeClosureSync(cloId, 1)) {
+                                    VMException::VMException exp(
+                                        "WITH_END: operator[~with] call failed", __line, instr);
+                                    exp._throw(vmstat, currentChunk);
+                                    break;
+                                }
                                 
                                 // 弹出 operator[~with]() 的返回值（不需要使用）
                                 if (!stack.empty()) {
