@@ -10,6 +10,7 @@
 #include <map>
 #include "IRType.hpp"
 #include "../ZeusParser/TreeParser.hpp"
+#include "../ZeusDiagnostics.hpp"
 
 namespace IRExceptionNS {
 
@@ -113,18 +114,22 @@ namespace IRExceptionNS {
             stat = IRType::IRCompilerStatus::Stopped;
 
             std::ostringstream oss;
-            
-            // 错误头：[类别 Error E错误码]
-            oss << "[" << categoryToString(category) << " Error E" 
-                << static_cast<int>(code) << "] ";
-            
-            // 位置信息
-            if (line > 0) {
-                oss << "Line " << line << ": ";
+            int actualLine = errorPosition.sourceLine;
+            int actualColumn = errorPosition.sourceColumn;
+            if (!errorPosition.tokens.empty()) {
+                std::visit([&](const auto& token) {
+                    if (actualLine <= 0) actualLine = token.line;
+                    if (actualColumn <= 0) actualColumn = token.column;
+                }, errorPosition.tokens.front());
             }
-            
-            // 主要错误信息
-            oss << message << "\n";
+            if (actualLine <= 0) actualLine = line;
+            const std::string codeLabel =
+                categoryToString(category) + " E" + std::to_string(static_cast<int>(code));
+            oss << ZeusDiagnostics::render(
+                { codeLabel, message, actualLine, actualColumn },
+                ZeusDiagnostics::currentSourcePath,
+                ZeusDiagnostics::currentSourceCode
+            ) << "\n";
             
             // Token信息（作为代码上下文）
             std::string tokens = tokensToString(errorPosition);
@@ -143,6 +148,7 @@ namespace IRExceptionNS {
             }
 
             std::cout << oss.str() << std::endl;
+            ZeusDiagnostics::noteReported();
         }
     };
 

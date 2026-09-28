@@ -96,6 +96,14 @@ void zeus_closure_create(
     int32_t capture_count,
     void* const* cells
 );
+void zeus_closure_create_range(
+    ZeusValue* out,
+    ZeusClosureInvoke invoke,
+    int32_t min_arity,
+    int32_t max_arity,
+    int32_t capture_count,
+    void* const* cells
+);
 void zeus_closure_call(
     ZeusValue* out,
     const ZeusValue* closure,

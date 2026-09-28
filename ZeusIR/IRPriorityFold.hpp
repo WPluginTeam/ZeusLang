@@ -137,6 +137,16 @@ inline std::vector<LexerType::Token> postfixToInfix(
 inline std::vector<LexerType::Token> priorityFoldExpression(
     IRType::IRCompilerStatus& irstat,
     const std::vector<LexerType::Token>& tokens) {
+    // This folder's infix/postfix reconstruction is binary-only. Preserve a
+    // prefix logical-not expression intact so the real expression parser can
+    // lower it as a unary operation instead of silently dropping the token.
+    if (std::any_of(tokens.begin(), tokens.end(), [](const LexerType::Token& token) {
+            return std::holds_alternative<LexerType::Operator>(token) &&
+                   std::get<LexerType::Operator>(token).symbol == "!";
+        })) {
+        return tokens;
+    }
+
     // 辅助：检测是否是函数调用起点（Keyword 后紧跟 '('）
     auto isCallStart = [&](size_t i) -> bool {
         if (i + 1 >= tokens.size()) return false;

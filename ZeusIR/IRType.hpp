@@ -18,8 +18,10 @@
 
 namespace IRType {
 
+    struct NullLiteral {};
+
     // IR 参数：既支持标识字符串（变量名、标志），也支持类型化的立即数（沿用 LexerType::Value）
-    using IRArgs = std::variant<std::string, LexerType::Value, ZeusType::Bytes>;
+    using IRArgs = std::variant<std::string, LexerType::Value, ZeusType::Bytes, NullLiteral>;
 
     enum class IRCompilerStatus {
         Running,
@@ -58,6 +60,8 @@ namespace IRType {
                         if (a.data.size() > 16) s += "...";
                         s += "\"";
                         return s;
+                    } else if constexpr (std::is_same_v<T, NullLiteral>) {
+                        return "nil";
                     }
                 }, arg);
             }

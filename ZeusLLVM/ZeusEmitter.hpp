@@ -44,6 +44,7 @@ struct EmitResult {
     bool ok = false;
     std::string text;
     std::string error;
+    int errorLine = 0;
     std::vector<std::string> warnings;
 };
 
@@ -94,12 +95,21 @@ struct FunctionSignature {
     std::string name;
     std::string returnType;
     std::vector<std::string> parameterTypes;
+    int minRequiredParams = 0;
+    std::vector<bool> defaultParameterMask;
     std::string ownerType;
     std::string operatorSymbol;
     std::string nativeSymbol;
     int captureCount = 0;
     size_t chunkIndex = 0;
     bool isExternal = false;
+
+    bool hasDefaultParameters() const {
+        return std::any_of(
+            defaultParameterMask.begin(), defaultParameterMask.end(),
+            [](bool hasDefault) { return hasDefault; }
+        );
+    }
 };
 
 inline bool hasCompleteFunctionAnnotations(const FunctionSignature& signature) {
@@ -600,6 +610,33 @@ public:
         return usesZeusValueABI(typeName) ? "ptr" : llvmType(typeName);
     }
 
+    template <typename EmitLine, typename FreshTemporary>
+    bool emitOptionalArgumentPlaceholder(
+        const std::string& typeName,
+        NativeValue& value,
+        EmitLine&& emitLine,
+        FreshTemporary&& freshTemporary
+    ) {
+        const std::string abiType = functionParameterABIType(typeName);
+        if (abiType.empty()) return false;
+        if (usesZeusValueABI(typeName)) {
+            const std::string nilValue = freshTemporary();
+            emitLine(nilValue + " = alloca %ZeusValue, align 8");
+            emitLine("call void @zeus_value_init_nil(ptr " + nilValue + ")");
+            value = NativeValue{ nilValue, "ptr", false, true, typeName, false };
+            return true;
+        }
+        if (abiType == "i64" || abiType == "i1") {
+            value = NativeValue{ "0", abiType, false, false, typeName, false };
+            return true;
+        }
+        if (abiType == "ptr") {
+            value = NativeValue{ "null", "ptr", false, false, typeName, false };
+            return true;
+        }
+        return false;
+    }
+
     std::string llvmFieldType(const std::string& typeName) const {
         if (usesZeusValueABI(typeName)) return "%ZeusValue";
 
@@ -638,6 +675,19 @@ public:
                 signature.parameterTypes.size() == parameterCount &&
                 !signature.parameterTypes.empty() &&
                 signature.parameterTypes.front() == ownerType) {
+                return &signature;
+            }
+        }
+        return nullptr;
+    }
+
+    const FunctionSignature* findNewOperatorSignature(
+        const std::string& ownerType
+    ) const {
+        for (const auto& entry : functionSignatures) {
+            const FunctionSignature& signature = entry.second;
+            if (signature.ownerType == ownerType &&
+                signature.operatorSymbol == "new") {
                 return &signature;
             }
         }
@@ -734,6 +784,52 @@ public:
                         5 + static_cast<size_t>(parameterCount);
                     if (nativeSymbolIndex < ins.args.size()) {
                         annotationString(ins, nativeSymbolIndex, signature.nativeSymbol);
+                    }
+                }
+
+                signature.minRequiredParams = static_cast<int>(signature.parameterTypes.size());
+                signature.defaultParameterMask.assign(signature.parameterTypes.size(), false);
+                if (!isExternalSignature && !chunk.empty() &&
+                    chunk.front().op == VMOperator::FUNC_BEGIN &&
+                    chunk.front().args.size() >= 7 &&
+                    std::holds_alternative<LexerType::Value>(chunk.front().args[5]) &&
+                    std::holds_alternative<LexerType::Value>(chunk.front().args[6])) {
+                    const auto& header = chunk.front();
+                    const int minRequired = VMHelpers::getIntFromValue(
+                        std::get<LexerType::Value>(header.args[5]));
+                    const int defaultCount = VMHelpers::getIntFromValue(
+                        std::get<LexerType::Value>(header.args[6]));
+                    if (minRequired < 0 ||
+                        minRequired > static_cast<int>(signature.parameterTypes.size()) ||
+                        defaultCount < 0 || header.args.size() < 7 +
+                            static_cast<size_t>(defaultCount) * 2) {
+                        result.error = "[emit-llvm] function default-parameter metadata is invalid";
+                        return false;
+                    }
+                    signature.minRequiredParams = minRequired;
+                    for (int i = 0; i < defaultCount; ++i) {
+                        const size_t index = 7 + static_cast<size_t>(i) * 2;
+                        if (!std::holds_alternative<LexerType::Value>(header.args[index])) {
+                            result.error = "[emit-llvm] function default parameter index is invalid";
+                            return false;
+                        }
+                        const int parameterIndex = VMHelpers::getIntFromValue(
+                            std::get<LexerType::Value>(header.args[index]));
+                        if (parameterIndex < 0 ||
+                            parameterIndex >= static_cast<int>(signature.parameterTypes.size())) {
+                            result.error = "[emit-llvm] function default parameter index is out of range";
+                            return false;
+                        }
+                        signature.defaultParameterMask[static_cast<size_t>(parameterIndex)] = true;
+                    }
+                    bool sawDefaultParameter = false;
+                    for (bool hasDefault : signature.defaultParameterMask) {
+                        if (hasDefault) {
+                            sawDefaultParameter = true;
+                        } else if (sawDefaultParameter) {
+                            result.error = "[emit-llvm] native calls require default parameters to be trailing";
+                            return false;
+                        }
                     }
                 }
 
@@ -862,6 +958,18 @@ public:
         return signature.name.substr(prefix.size());
     }
 
+    bool hasTypedInstanceMethodSignature(
+        const std::string& ownerType,
+        const std::string& methodName
+    ) const {
+        if (ownerType.empty() || methodName.empty()) return false;
+        const auto function = functionSignatures.find(ownerType + "::" + methodName);
+        return function != functionSignatures.end() &&
+            function->second.ownerType == ownerType &&
+            !function->second.parameterTypes.empty() &&
+            function->second.parameterTypes.front() == ownerType;
+    }
+
     void collectReachableFunctionChunks(
         const std::vector<std::vector<IRType::IRInstr>>& program
     ) {
@@ -965,6 +1073,7 @@ public:
                     const auto& candidate = function.second;
                     if (isBuiltinImplementationFunction(candidate) &&
                         (candidate.name == candidate.ownerType + "::init" ||
+                         candidate.operatorSymbol == "new" ||
                          (callsDelete && candidate.operatorSymbol == "~"))) {
                         addTarget(candidate.name);
                     }
@@ -990,12 +1099,14 @@ public:
         for (const auto& entry : functionSignatures) {
             const FunctionSignature& signature = entry.second;
             const std::string methodName = methodNameForSignature(signature);
+            const bool hasNativeOwnerABI =
+                ZeusBuiltins::findNativeTypeABI(signature.ownerType) != nullptr;
             if (methodName.empty() ||
                 dynamicMemberMethodNames.find(methodName) == dynamicMemberMethodNames.end() ||
                 signature.operatorSymbol.size() > 0 ||
                 signature.parameterTypes.empty() ||
                 signature.parameterTypes.front() != signature.ownerType ||
-                !isClassType(signature.ownerType)) {
+                (!isClassType(signature.ownerType) && !hasNativeOwnerABI)) {
                 continue;
             }
 
@@ -1076,19 +1187,13 @@ public:
     void fail(const IRType::IRInstr& ins, const std::string& msg) {
         result.ok = false;
         result.error = msg + " (" + ins.toString() + ")";
+        result.errorLine = ins.line;
     }
 
     // PUSH/LOAD-字面量 的值部分（不含 push）：返回 box 的 SSA 名，失败返回 ""。
     std::string emitDynamicValueForLiteral(const LexerType::Value& v, const IRType::IRInstr& ins) {
         if (std::holds_alternative<std::string>(v.data)) {
             const std::string& s = std::get<std::string>(v.data);
-
-            if (s == "__NIL__") {
-                std::string t = freshTmp();
-                emitLine(t + " = alloca %ZeusValue, align 8");
-                emitLine("call void @zeus_value_init_nil(ptr " + t + ")");
-                return t;
-            }
 
             std::string sym = poolStr(s);
             std::string t = freshTmp();
@@ -1128,6 +1233,14 @@ public:
 
         fail(ins, "[emit-llvm] v0: 该字面量类型暂不支持（仅 int/string/nil）");
         return "";
+    }
+
+    std::string emitDynamicValueForNull(const IRType::IRInstr& ins) {
+        std::string value = freshTmp();
+        emitLine(value + " = alloca %ZeusValue, align 8");
+        emitLine("call void @zeus_value_init_nil(ptr " + value + ")");
+        (void)ins;
+        return value;
     }
 
     std::string emitDynamicValueForBytes(
@@ -1342,7 +1455,8 @@ public:
             return false;
         }
 
-        if (argc < 0 || called.parameterTypes.size() != static_cast<size_t>(argc)) {
+        if (argc < called.minRequiredParams ||
+            argc > static_cast<int64_t>(called.parameterTypes.size())) {
             fail(ins, "[emit-llvm] 原生函数调用参数数量不匹配");
             return false;
         }
@@ -1361,7 +1475,21 @@ public:
         nativeArguments.reserve(dynamicArguments.size());
         std::vector<std::string> nativeArgumentTypes;
 
-        for (size_t i = 0; i < dynamicArguments.size(); ++i) {
+        for (size_t i = 0; i < called.parameterTypes.size(); ++i) {
+            if (i >= dynamicArguments.size()) {
+                NativeValue placeholder;
+                if (!emitOptionalArgumentPlaceholder(
+                        called.parameterTypes[i], placeholder,
+                        [this](const std::string& line) { emitLine(line); },
+                        [this]() { return freshTmp(); })) {
+                    fail(ins, "[emit-llvm] optional argument has no native ABI placeholder");
+                    return false;
+                }
+                nativeArguments.push_back(placeholder.value);
+                nativeArgumentTypes.push_back(
+                    functionParameterABIType(called.parameterTypes[i]));
+                continue;
+            }
             const std::string argumentType = functionParameterABIType(called.parameterTypes[i]);
             if (usesZeusValueABI(called.parameterTypes[i])) {
                 nativeArguments.push_back(dynamicArguments[i]);
@@ -1454,6 +1582,10 @@ public:
         for (size_t i = 0; i < nativeArguments.size(); ++i) {
             if (i > 0 || returnsDynamic) callText += ", ";
             callText += nativeArgumentTypes[i] + " " + nativeArguments[i];
+        }
+        if (called.hasDefaultParameters()) {
+            if (!nativeArguments.empty() || returnsDynamic) callText += ", ";
+            callText += "i32 " + std::to_string(argc);
         }
         callText += ")";
         emitLine(callText);
@@ -1640,6 +1772,105 @@ public:
         return true;
     }
 
+    template <typename EmitLine, typename FreshTemporary,
+              typename ConvertArgument, typename Fail>
+    bool emitNewOperatorConstruction(
+        const IRType::IRInstr& ins,
+        const std::string& typeName,
+        const std::vector<NativeValue>& arguments,
+        NativeValue& result,
+        EmitLine&& emit,
+        FreshTemporary&& freshTemporary,
+        ConvertArgument&& convertArgument,
+        Fail&& failAt
+    ) {
+        const FunctionSignature* factory = findNewOperatorSignature(typeName);
+        if (factory == nullptr) {
+            return failAt(ins, "type '" + typeName + "' has no operator[new] factory");
+        }
+        if (factory->captureCount != 0) {
+            return failAt(ins, "operator[new] cannot capture variables");
+        }
+        if (arguments.size() < static_cast<size_t>(factory->minRequiredParams) ||
+            arguments.size() > factory->parameterTypes.size()) {
+            return failAt(ins, "operator[new] argument count does not match its signature");
+        }
+
+        const bool returnsDynamic = usesZeusValueABI(factory->returnType);
+        const std::string returnType = returnsDynamic
+            ? "void"
+            : llvmType(factory->returnType);
+        if (returnType.empty() || (!returnsDynamic && returnType == "void")) {
+            return failAt(ins,
+                "operator[new] must return a value with a valid LLVM ABI mapping");
+        }
+
+        const std::string callResult = freshTemporary();
+        std::string callText;
+        if (returnsDynamic) {
+            emit(callResult + " = alloca %ZeusValue, align 8");
+            callText = "call void " + llvmCallTarget(factory->name) + "(ptr " + callResult;
+        } else {
+            callText = callResult + " = call " + returnType + " " +
+                llvmCallTarget(factory->name) + "(";
+        }
+
+        std::vector<std::string> dynamicArguments;
+        std::vector<bool> ownsDynamicArguments;
+        for (size_t i = 0; i < factory->parameterTypes.size(); ++i) {
+            std::string argument;
+            bool ownsDynamic = false;
+            const std::string& declaredType = factory->parameterTypes[i];
+            if (i < arguments.size()) {
+                if (!convertArgument(
+                        arguments[i], declaredType, argument, ownsDynamic)) {
+                    return false;
+                }
+            } else {
+                NativeValue placeholder;
+                if (!emitOptionalArgumentPlaceholder(
+                        declaredType, placeholder, emit, freshTemporary)) {
+                    return failAt(ins,
+                        "operator[new] has no ABI placeholder for an omitted argument");
+                }
+                argument = placeholder.value;
+            }
+
+            const std::string parameterABIType =
+                functionParameterABIType(declaredType);
+            if (parameterABIType.empty()) {
+                return failAt(ins,
+                    "operator[new] parameter has no LLVM ABI mapping");
+            }
+            callText += ", " + parameterABIType + " " + argument;
+            if (usesZeusValueABI(declaredType) && i < arguments.size()) {
+                dynamicArguments.push_back(argument);
+                ownsDynamicArguments.push_back(ownsDynamic);
+            }
+        }
+        if (factory->hasDefaultParameters()) {
+            callText += ", i32 " + std::to_string(arguments.size());
+        }
+        callText += ")";
+        emit(callText);
+
+        for (size_t i = 0; i < dynamicArguments.size(); ++i) {
+            if (ownsDynamicArguments[i]) {
+                emit("call void @zeus_value_release(ptr " + dynamicArguments[i] + ")");
+            }
+        }
+
+        result = NativeValue{
+            callResult,
+            returnsDynamic ? "ptr" : returnType,
+            false,
+            returnsDynamic,
+            factory->returnType,
+            returnsDynamic
+        };
+        return true;
+    }
+
     template <typename EmitLine, typename EmitLabel, typename FreshTemporary,
               typename ConvertArgument, typename Fail>
     bool emitClassConstruction(
@@ -1653,6 +1884,18 @@ public:
         ConvertArgument&& convertArgument,
         Fail&& failAt
     ) {
+        if (findNewOperatorSignature(className) != nullptr) {
+            return emitNewOperatorConstruction(
+                ins,
+                className,
+                arguments,
+                instance,
+                emit,
+                freshTemporary,
+                convertArgument,
+                failAt);
+        }
+
         const ClassLayout* layout = findClassLayout(className);
         if (layout == nullptr) {
             return failAt(ins, "[emit-llvm] new 目标没有 LLVM class 布局");
@@ -1678,7 +1921,8 @@ public:
         }
         if (constructor != nullptr &&
             (constructor->parameterTypes.empty() ||
-             constructor->parameterTypes.size() != arguments.size() + 1 ||
+             arguments.size() + 1 < static_cast<size_t>(constructor->minRequiredParams) ||
+             arguments.size() + 1 > constructor->parameterTypes.size() ||
              constructor->parameterTypes.front() != className)) {
             return failAt(ins, "[emit-llvm] init 构造函数参数数量或类型不匹配");
         }
@@ -1842,18 +2086,31 @@ public:
 
             std::vector<std::string> dynamicArguments;
             std::vector<bool> ownsDynamicArguments;
-            for (size_t i = 0; i < arguments.size(); ++i) {
+            for (size_t i = 0; i + 1 < constructor->parameterTypes.size(); ++i) {
                 std::string argument;
                 bool ownsDynamic = false;
                 const std::string& declaredType = constructor->parameterTypes[i + 1];
-                if (!convertArgument(arguments[i], declaredType, argument, ownsDynamic)) {
-                    return false;
+                if (i < arguments.size()) {
+                    if (!convertArgument(arguments[i], declaredType, argument, ownsDynamic)) {
+                        return false;
+                    }
+                } else {
+                    NativeValue placeholder;
+                    if (!emitOptionalArgumentPlaceholder(
+                            declaredType, placeholder, emit, freshTemporary)) {
+                        return failAt(ins,
+                            "[emit-llvm] init constructor has no ABI placeholder for an omitted argument");
+                    }
+                    argument = placeholder.value;
                 }
                 callText += ", " + functionParameterABIType(declaredType) + " " + argument;
-                if (usesZeusValueABI(declaredType)) {
+                if (usesZeusValueABI(declaredType) && i < arguments.size()) {
                     dynamicArguments.push_back(argument);
                     ownsDynamicArguments.push_back(ownsDynamic);
                 }
+            }
+            if (constructor->hasDefaultParameters()) {
+                callText += ", i32 " + std::to_string(arguments.size() + 1);
             }
             callText += ")";
             emit(callText);
@@ -1973,10 +2230,10 @@ public:
 
         const NativeValue& receiver = arguments.front();
         if (receiver.functionRef || receiver.type != "ptr" ||
-            !isClassType(receiver.sourceType)) {
+            receiver.sourceType.empty()) {
             return failAt(
                 ins,
-                "[emit-llvm] class method call requires a statically known class receiver"
+                "[emit-llvm] typed method call requires a statically known receiver type"
             );
         }
 
@@ -1984,12 +2241,13 @@ public:
         const auto function = functionSignatures.find(qualifiedName);
         if (function == functionSignatures.end() ||
             function->second.ownerType != receiver.sourceType ||
-            function->second.parameterTypes.size() != arguments.size() ||
+            arguments.size() < static_cast<size_t>(function->second.minRequiredParams) ||
+            arguments.size() > function->second.parameterTypes.size() ||
             function->second.parameterTypes.empty() ||
             function->second.parameterTypes.front() != receiver.sourceType) {
             return failAt(
                 ins,
-                "[emit-llvm] no matching class method LLVM signature: " + qualifiedName
+                "[emit-llvm] no matching typed method LLVM signature: " + qualifiedName
             );
         }
 
@@ -2004,21 +2262,31 @@ public:
 
         std::vector<std::string> nativeArguments;
         std::vector<std::string> cleanupValues;
-        nativeArguments.reserve(arguments.size());
-        for (size_t i = 0; i < arguments.size(); ++i) {
+        nativeArguments.reserve(called.parameterTypes.size());
+        for (size_t i = 0; i < called.parameterTypes.size(); ++i) {
             const std::string& parameterType = called.parameterTypes[i];
             if (functionParameterABIType(parameterType).empty()) {
                 return failAt(ins, "[emit-llvm] class method parameter has no LLVM ABI mapping");
             }
 
             std::string nativeArgument;
-            std::string cleanupValue;
-            if (!convertArgument(
-                    arguments[i], parameterType, nativeArgument, cleanupValue)) {
-                return false;
+            if (i < arguments.size()) {
+                std::string cleanupValue;
+                if (!convertArgument(
+                        arguments[i], parameterType, nativeArgument, cleanupValue)) {
+                    return false;
+                }
+                if (!cleanupValue.empty()) cleanupValues.push_back(std::move(cleanupValue));
+            } else {
+                NativeValue placeholder;
+                if (!emitOptionalArgumentPlaceholder(
+                        parameterType, placeholder, emit, freshTemporary)) {
+                    return failAt(ins,
+                        "[emit-llvm] class method has no ABI placeholder for an omitted argument");
+                }
+                nativeArgument = placeholder.value;
             }
             nativeArguments.push_back(std::move(nativeArgument));
-            if (!cleanupValue.empty()) cleanupValues.push_back(std::move(cleanupValue));
         }
 
         const std::string callResult = freshTemporary();
@@ -2035,6 +2303,10 @@ public:
             if (i > 0 || returnsDynamic) callText += ", ";
             callText += functionParameterABIType(called.parameterTypes[i]) +
                         " " + nativeArguments[i];
+        }
+        if (called.hasDefaultParameters()) {
+            if (!nativeArguments.empty() || returnsDynamic) callText += ", ";
+            callText += "i32 " + std::to_string(arguments.size());
         }
         callText += ")";
         emit(callText);
@@ -2199,6 +2471,10 @@ public:
             functionText += parameterLLVMTypes[i] + " %arg" + std::to_string(i);
             hasFunctionParameter = true;
         }
+        if (signature.hasDefaultParameters()) {
+            if (hasFunctionParameter) functionText += ", ";
+            functionText += "i32 %provided.argc";
+        }
         functionText += ") {\nentry:\n";
         const size_t nativeEntryBody = functionText.size();
 
@@ -2244,6 +2520,14 @@ public:
 
         auto parseNativeValue = [&](const IRType::IRInstr& ins, NativeValue& value) {
             if (!ins.args.empty() &&
+                std::holds_alternative<IRType::NullLiteral>(ins.args[0])) {
+                const std::string nilValue = freshNativeTmp();
+                emitNativeLine(nilValue + " = alloca %ZeusValue, align 8");
+                emitNativeLine("call void @zeus_value_init_nil(ptr " + nilValue + ")");
+                value = NativeValue{ nilValue, "ptr", false, true, "nil", true };
+                return true;
+            }
+            if (!ins.args.empty() &&
                 std::holds_alternative<ZeusType::Bytes>(ins.args[0])) {
                 const auto& bytes = std::get<ZeusType::Bytes>(ins.args[0]);
                 const std::string contents(bytes.data.begin(), bytes.data.end());
@@ -2263,15 +2547,6 @@ public:
             }
 
             const auto& literal = std::get<LexerType::Value>(ins.args[0]);
-            if (std::holds_alternative<std::string>(literal.data) &&
-                std::get<std::string>(literal.data) == "__NIL__") {
-                const std::string nilValue = freshNativeTmp();
-                emitNativeLine(nilValue + " = alloca %ZeusValue, align 8");
-                emitNativeLine("call void @zeus_value_init_nil(ptr " + nilValue + ")");
-                value = NativeValue{ nilValue, "ptr", false, true, "nil", true };
-                return true;
-            }
-
             if (std::holds_alternative<std::string>(literal.data)) {
                 const std::string& text = std::get<std::string>(literal.data);
                 const std::string symbol = poolStr(text);
@@ -2645,10 +2920,13 @@ public:
                 ins.op == VMOperator::JUMP || ins.op == VMOperator::LOOP_BREAK;
             const bool conditionalJump =
                 ins.op == VMOperator::JUMP_IF_FALSE ||
-                ins.op == VMOperator::JUMP_IF_TRUE;
+                ins.op == VMOperator::JUMP_IF_TRUE ||
+                ins.op == VMOperator::JUMP_IF_PARAM_PROVIDED;
             if (unconditionalJump || conditionalJump) {
                 int64_t offset = 0;
-                if (!tryArgInt(ins, 0, offset)) {
+                const size_t offsetIndex =
+                    ins.op == VMOperator::JUMP_IF_PARAM_PROVIDED ? 1 : 0;
+                if (!tryArgInt(ins, offsetIndex, offset)) {
                     return failNative(ins, "LLVM 函数分支缺少有效的跳转偏移");
                 }
                 const long long rawTarget =
@@ -2685,7 +2963,8 @@ public:
             nativeBlockLeaders.insert(branch.second);
             nativePredecessors[branch.second].insert(branch.first);
             if (chunk[branch.first].op == VMOperator::JUMP_IF_FALSE ||
-                chunk[branch.first].op == VMOperator::JUMP_IF_TRUE) {
+                chunk[branch.first].op == VMOperator::JUMP_IF_TRUE ||
+                chunk[branch.first].op == VMOperator::JUMP_IF_PARAM_PROVIDED) {
                 const size_t fallthrough = branch.first + 1 > functionExitPc
                     ? functionExitPc
                     : branch.first + 1;
@@ -2930,9 +3209,13 @@ public:
                 }
 
                 auto compatible = [&](const NativeValue& value) {
+                    const bool dynamicSourceTypesCompatible = value.dynamic &&
+                        prototype->dynamic && value.type == "ptr" &&
+                        prototype->type == "ptr";
                     return value.type == prototype->type &&
                            value.dynamic == prototype->dynamic &&
-                           value.sourceType == prototype->sourceType &&
+                           (value.sourceType == prototype->sourceType ||
+                            dynamicSourceTypesCompatible) &&
                            value.functionRef == prototype->functionRef;
                 };
                 for (const NativeValue* value : values) {
@@ -3017,6 +3300,12 @@ public:
                 NativeValue merged = *prototype;
                 merged.value = phi;
                 if (merged.dynamic) merged.ownsDynamic = true;
+                for (const NativeValue* value : values) {
+                    if (value->sourceType != merged.sourceType) {
+                        merged.sourceType.clear();
+                        break;
+                    }
+                }
                 mergedLocals[index] = std::move(merged);
             }
 
@@ -3128,6 +3417,9 @@ public:
                     dynamicArguments.push_back(argument);
                     ownsDynamicArguments.push_back(ownsDynamic);
                 }
+            }
+            if (signature.hasDefaultParameters()) {
+                callText += ", i32 2";
             }
             callText += ")";
             emitNativeLine(callText);
@@ -3535,8 +3827,13 @@ public:
 
                 case VMOperator::OBJ_BUILD: {
                     int64_t argc = 0;
+                    const std::string nativeTargetType = ins.args.size() > 1 &&
+                        std::holds_alternative<std::string>(ins.args[1])
+                            ? std::get<std::string>(ins.args[1])
+                            : std::string();
                     if (!tryArgInt(ins, 0, argc) || argc < 0 ||
-                        valueStack.size() < static_cast<size_t>(argc + 1)) {
+                        valueStack.size() < static_cast<size_t>(argc) +
+                            (nativeTargetType.empty() ? 1u : 0u)) {
                         return failNative(ins, "[emit-llvm] class 构造参数数量无效");
                     }
 
@@ -3546,7 +3843,8 @@ public:
                     }
 
                     NativeValue classReference;
-                    if (!popNative(ins, classReference) || classReference.type != "classref") {
+                    if (nativeTargetType.empty() &&
+                        (!popNative(ins, classReference) || classReference.type != "classref")) {
                         return failNative(ins, "[emit-llvm] new 目标不是静态 class 名称");
                     }
 
@@ -3579,7 +3877,8 @@ public:
                     ) {
                         return failNative(at, message);
                     };
-                    if (!emitClassConstruction(
+                    const bool constructionSucceeded = nativeTargetType.empty()
+                        ? emitClassConstruction(
                             ins,
                             classReference.sourceType,
                             arguments,
@@ -3588,7 +3887,17 @@ public:
                             emitConstructionLabel,
                             freshConstructionTemporary,
                             convertConstructorArgument,
-                            failConstruction)) {
+                            failConstruction)
+                        : emitNewOperatorConstruction(
+                            ins,
+                            nativeTargetType,
+                            arguments,
+                            instance,
+                            emitConstructionLine,
+                            freshConstructionTemporary,
+                            convertConstructorArgument,
+                            failConstruction);
+                    if (!constructionSucceeded) {
                         return false;
                     }
 
@@ -3679,10 +3988,18 @@ public:
 
                     const std::string closure = freshNativeTmp();
                     emitNativeLine(closure + " = alloca %ZeusValue, align 8");
-                    emitNativeLine("call void @zeus_closure_create(ptr " + closure +
-                        ", ptr " + closureAdapterSymbol(static_cast<size_t>(childChunk)) +
-                        ", i32 " + std::to_string(childSignature->second.parameterTypes.size()) +
-                        ", i32 " + std::to_string(cells.size()) + ", ptr " + cellsArray + ")");
+                    if (childSignature->second.hasDefaultParameters()) {
+                        emitNativeLine("call void @zeus_closure_create_range(ptr " + closure +
+                            ", ptr " + closureAdapterSymbol(static_cast<size_t>(childChunk)) +
+                            ", i32 " + std::to_string(childSignature->second.minRequiredParams) +
+                            ", i32 " + std::to_string(childSignature->second.parameterTypes.size()) +
+                            ", i32 " + std::to_string(cells.size()) + ", ptr " + cellsArray + ")");
+                    } else {
+                        emitNativeLine("call void @zeus_closure_create(ptr " + closure +
+                            ", ptr " + closureAdapterSymbol(static_cast<size_t>(childChunk)) +
+                            ", i32 " + std::to_string(childSignature->second.parameterTypes.size()) +
+                            ", i32 " + std::to_string(cells.size()) + ", ptr " + cellsArray + ")");
+                    }
                     for (const auto& cell : temporaryCells) {
                         emitNativeLine("call void @zeus_capture_cell_release(ptr " + cell + ")");
                     }
@@ -3712,6 +4029,25 @@ public:
                     }
                     if (value.functionRef) {
                         return failNative(ins, "[emit-llvm] 原生函数不能把函数值存入原生局部变量");
+                    }
+                    if (index >= 0 &&
+                        index < static_cast<int64_t>(signature.parameterTypes.size())) {
+                        const std::string& declaredType =
+                            signature.parameterTypes[static_cast<size_t>(index)];
+                        std::string nativeValue;
+                        bool ownsDynamic = false;
+                        if (!emitFunctionABIArgument(
+                                ins, value, declaredType, nativeValue, ownsDynamic)) {
+                            return false;
+                        }
+                        value = NativeValue{
+                            nativeValue,
+                            functionParameterABIType(declaredType),
+                            false,
+                            usesZeusValueABI(declaredType),
+                            declaredType,
+                            ownsDynamic
+                        };
                     }
                     auto existing = locals.find(static_cast<int>(index));
                     if (existing != locals.end() && existing->second.dynamic &&
@@ -3955,6 +4291,17 @@ public:
                                            " = call ptr @zeus_string_view_intern(ptr " +
                                            value.value + ")");
                         }
+                    } else if (value.dynamic) {
+                        bool ownsConvertedValue = false;
+                        if (!emitFunctionABIArgument(
+                                ins, value, fieldTypeName, storedValue,
+                                ownsConvertedValue)) {
+                            return false;
+                        }
+                        if (ownsConvertedValue) {
+                            emitNativeLine("call void @zeus_value_release(ptr " +
+                                           storedValue + ")");
+                        }
                     } else if (fieldType.empty() || value.type != fieldType ||
                                (isClassType(fieldTypeName) &&
                                 value.sourceType != fieldTypeName)) {
@@ -3964,6 +4311,35 @@ public:
                     emitNativeLine(
                         "store " + fieldType + " " + storedValue + ", ptr " + fieldAddress
                     );
+                    break;
+                }
+
+                case VMOperator::LOGICAL_NOT: {
+                    NativeValue operand;
+                    if (!popNative(ins, operand) || operand.functionRef) {
+                        return failNative(ins, "[emit-llvm] 原生函数一元逻辑非操作数无效");
+                    }
+
+                    const std::string resultValue = freshNativeTmp();
+                    if (!operand.dynamic && operand.type == "i1") {
+                        emitNativeLine(resultValue + " = xor i1 " + operand.value + ", true");
+                    } else {
+                        std::string dynamicValue;
+                        bool ownsDynamicValue = false;
+                        if (!emitNativeDynamicValue(
+                                ins, operand, dynamicValue, ownsDynamicValue)) {
+                            return false;
+                        }
+                        const std::string truthy = freshNativeTmp();
+                        emitNativeLine(truthy + " = call i32 @zeus_value_truthy(ptr " +
+                                       dynamicValue + ")");
+                        if (ownsDynamicValue) {
+                            emitNativeLine("call void @zeus_value_release(ptr " +
+                                           dynamicValue + ")");
+                        }
+                        emitNativeLine(resultValue + " = icmp eq i32 " + truthy + ", 0");
+                    }
+                    valueStack.push_back(NativeValue{ resultValue, "i1", false });
                     break;
                 }
 
@@ -4263,7 +4639,8 @@ public:
                     }
 
                     const auto& called = function->second;
-                    if (called.parameterTypes.size() != static_cast<size_t>(argc)) {
+                    if (argc < called.minRequiredParams ||
+                        argc > static_cast<int64_t>(called.parameterTypes.size())) {
                         return failNative(ins, "[emit-llvm] 原生函数调用参数数量不匹配");
                     }
 
@@ -4302,7 +4679,20 @@ public:
                         : resultValue + " = call " + calledReturnType + " " + llvmCallTarget(called.name) + "(";
                     std::vector<std::string> dynamicCallArguments;
                     std::vector<bool> ownsDynamicCallArguments;
-                    for (size_t i = 0; i < arguments.size(); ++i) {
+                    for (size_t i = 0; i < called.parameterTypes.size(); ++i) {
+                        if (i >= arguments.size()) {
+                            NativeValue placeholder;
+                            if (!emitOptionalArgumentPlaceholder(
+                                    called.parameterTypes[i], placeholder,
+                                    emitNativeLine, freshNativeTmp)) {
+                                return failNative(ins,
+                                    "[emit-llvm] optional argument has no native ABI placeholder");
+                            }
+                            if (i > 0 || calledReturnsDynamic) callText += ", ";
+                            callText += functionParameterABIType(called.parameterTypes[i]) +
+                                        " " + placeholder.value;
+                            continue;
+                        }
                         if (i > 0 || calledReturnsDynamic) callText += ", ";
                         std::string nativeArgument;
                         bool ownsDynamicArgument = false;
@@ -4320,6 +4710,10 @@ public:
                             dynamicCallArguments.push_back(nativeArgument);
                             ownsDynamicCallArguments.push_back(ownsDynamicArgument);
                         }
+                    }
+                    if (called.hasDefaultParameters()) {
+                        if (!called.parameterTypes.empty() || calledReturnsDynamic) callText += ", ";
+                        callText += "i32 " + std::to_string(argc);
                     }
                     callText += ")";
 
@@ -4405,8 +4799,11 @@ public:
                     };
 
                     NativeValue callResult;
+                    const std::string methodName = std::get<std::string>(ins.args[0]);
+                    const bool hasTypedImplMethod = hasTypedInstanceMethodSignature(
+                        arguments[0].sourceType, methodName);
                     if (arguments[0].dynamic || arguments[0].type != "ptr" ||
-                        !isClassType(arguments[0].sourceType)) {
+                        (!isClassType(arguments[0].sourceType) && !hasTypedImplMethod)) {
                         auto toDynamic = [&](const NativeValue& value,
                                              std::string& dynamicValue,
                                              bool& ownsDynamic) {
@@ -4415,7 +4812,7 @@ public:
                         };
                         if (!emitDynamicMemberCall(
                                 ins,
-                                std::get<std::string>(ins.args[0]),
+                                methodName,
                                 arguments,
                                 callResult,
                                 emitNativeLine,
@@ -4427,7 +4824,7 @@ public:
                         }
                     } else if (!emitKnownClassMethodCall(
                                    ins,
-                                   std::get<std::string>(ins.args[0]),
+                                   methodName,
                                    arguments,
                                    callResult,
                                    emitNativeLine,
@@ -4454,6 +4851,44 @@ public:
                             "LLVM 函数无条件分支缺少有效目标块");
                     }
                     emitNativeLine("br label " + nativeLabelForPc(target->second));
+                    nativeBlockTerminated = true;
+                    break;
+                }
+
+                case VMOperator::JUMP_IF_PARAM_PROVIDED: {
+                    int64_t parameterIndex = -1;
+                    if (!tryArgInt(ins, 0, parameterIndex) || parameterIndex < 0 ||
+                        parameterIndex >= static_cast<int64_t>(
+                            signature.defaultParameterMask.size()) ||
+                        !signature.defaultParameterMask[static_cast<size_t>(parameterIndex)] ||
+                        !signature.hasDefaultParameters()) {
+                        return failNative(ins,
+                            "LLVM default-parameter branch refers to a non-default parameter");
+                    }
+                    if (!valueStack.empty()) {
+                        return failNative(ins,
+                            "LLVM default-parameter branch requires an empty VM value stack");
+                    }
+
+                    const auto target = nativeBranchTargets.find(pc);
+                    if (target == nativeBranchTargets.end()) {
+                        return failNative(ins,
+                            "LLVM default-parameter branch has no verified target");
+                    }
+                    const size_t fallthrough = pc + 1 > functionExitPc
+                        ? functionExitPc
+                        : pc + 1;
+                    if (!recordNativeEdge(target->second, ins, pc) ||
+                        !recordNativeEdge(fallthrough, ins, pc)) {
+                        return false;
+                    }
+
+                    const std::string isProvided = freshNativeTmp();
+                    emitNativeLine(isProvided + " = icmp ugt i32 %provided.argc, " +
+                                   std::to_string(parameterIndex));
+                    emitNativeLine("br i1 " + isProvided + ", label " +
+                                   nativeLabelForPc(target->second) + ", label " +
+                                   nativeLabelForPc(fallthrough));
                     nativeBlockTerminated = true;
                     break;
                 }
@@ -4705,16 +5140,17 @@ public:
             adapterText += "  " + line + "\n";
         };
         for (size_t i = 0; i < signature.parameterTypes.size(); ++i) {
-            const std::string slot = freshAdapterTmp();
-            const std::string dynamicArgument = freshAdapterTmp();
-            emitAdapterLine(slot + " = getelementptr inbounds ptr, ptr %args, i64 " +
-                            std::to_string(i));
-            emitAdapterLine(dynamicArgument + " = load ptr, ptr " + slot + ", align 8");
-
             const std::string& declaredType = signature.parameterTypes[i];
             const std::string abiType = functionParameterABIType(declaredType);
-            std::string nativeArgument = dynamicArgument;
-            if (!usesZeusValueABI(declaredType)) {
+            auto emitProvidedArgument = [&](std::string& nativeArgument) {
+                const std::string slot = freshAdapterTmp();
+                const std::string dynamicArgument = freshAdapterTmp();
+                emitAdapterLine(slot + " = getelementptr inbounds ptr, ptr %args, i64 " +
+                                std::to_string(i));
+                emitAdapterLine(dynamicArgument + " = load ptr, ptr " + slot + ", align 8");
+                nativeArgument = dynamicArgument;
+                if (usesZeusValueABI(declaredType)) return true;
+
                 const std::string expectedType = llvmType(declaredType);
                 if (expectedType == "i64") {
                     nativeArgument = freshAdapterTmp();
@@ -4769,6 +5205,47 @@ public:
                         declaredType + "'";
                     return false;
                 }
+                return true;
+            };
+
+            std::string nativeArgument;
+            const bool hasDefault = i < signature.defaultParameterMask.size() &&
+                signature.defaultParameterMask[i];
+            if (hasDefault) {
+                const std::string suffix = std::to_string(i);
+                const std::string providedLabel = "param_" + suffix + "_provided";
+                const std::string missingLabel = "param_" + suffix + "_missing";
+                const std::string joinLabel = "param_" + suffix + "_join";
+                const std::string isProvided = freshAdapterTmp();
+                emitAdapterLine(isProvided + " = icmp ugt i32 %argc, " + suffix);
+                emitAdapterLine("br i1 " + isProvided + ", label %" + providedLabel +
+                                ", label %" + missingLabel);
+
+                adapterText += providedLabel + ":\n";
+                std::string providedValue;
+                if (!emitProvidedArgument(providedValue)) return false;
+                emitAdapterLine("br label %" + joinLabel);
+
+                adapterText += missingLabel + ":\n";
+                NativeValue placeholder;
+                if (!emitOptionalArgumentPlaceholder(
+                        declaredType,
+                        placeholder,
+                        emitAdapterLine,
+                        freshAdapterTmp)) {
+                    result.error = "[emit-llvm] closure ABI has no default placeholder for '" +
+                        declaredType + "'";
+                    return false;
+                }
+                emitAdapterLine("br label %" + joinLabel);
+
+                adapterText += joinLabel + ":\n";
+                nativeArgument = freshAdapterTmp();
+                emitAdapterLine(nativeArgument + " = phi " + abiType + " [ " +
+                    providedValue + ", %" + providedLabel + " ], [ " +
+                    placeholder.value + ", %" + missingLabel + " ]");
+            } else if (!emitProvidedArgument(nativeArgument)) {
+                return false;
             }
             adapterArguments.push_back(abiType + " " + nativeArgument);
         }
@@ -4785,6 +5262,9 @@ public:
         if (signature.captureCount != 0) callArguments.push_back("ptr %env");
         if (adapterReturnsDynamic) callArguments.push_back("ptr %out");
         callArguments.insert(callArguments.end(), adapterArguments.begin(), adapterArguments.end());
+        if (signature.hasDefaultParameters()) {
+            callArguments.push_back("i32 %argc");
+        }
         std::string callText;
         std::string nativeReturn;
         if (adapterReturnsDynamic) {
@@ -4906,6 +5386,7 @@ public:
                 case VMOperator::LESS_EQUAL:
                 case VMOperator::LOGICAL_AND:
                 case VMOperator::LOGICAL_OR:
+                case VMOperator::LOGICAL_NOT:
                 case VMOperator::JUMP:
                 case VMOperator::JUMP_IF_TRUE:
                 case VMOperator::JUMP_IF_FALSE:
@@ -4974,6 +5455,7 @@ public:
 
         auto failNativeTopLevel = [&](const IRType::IRInstr& ins, const std::string& message) {
             result.error = message + " (" + ins.toString() + ")";
+            result.errorLine = ins.line;
         };
 
         std::vector<NativeValue> valueStack;
@@ -5088,6 +5570,13 @@ public:
         };
 
         auto parseLiteral = [&](const IRType::IRInstr& ins, NativeValue& value) {
+            if (!ins.args.empty() &&
+                std::holds_alternative<IRType::NullLiteral>(ins.args[0])) {
+                const std::string nilValue = emitDynamicValueForNull(ins);
+                if (nilValue.empty()) return false;
+                value = NativeValue{ nilValue, "ptr", false, true, "nil" };
+                return true;
+            }
             if (!ins.args.empty() &&
                 std::holds_alternative<ZeusType::Bytes>(ins.args[0])) {
                 const auto& bytes = std::get<ZeusType::Bytes>(ins.args[0]);
@@ -5272,6 +5761,31 @@ public:
             return true;
         };
 
+        auto emitLogicalNot = [&](const IRType::IRInstr& ins) {
+            NativeValue operand;
+            if (!popValue(ins, operand) || operand.functionRef) {
+                failNativeTopLevel(ins, "[emit-llvm] 一元逻辑非操作数无效");
+                return false;
+            }
+
+            const std::string resultValue = freshTmp();
+            if (!operand.dynamic && operand.type == "i1") {
+                emitLine(resultValue + " = xor i1 " + operand.value + ", true");
+            } else if (!operand.dynamic && operand.type == "i64") {
+                emitLine(resultValue + " = icmp eq i64 " + operand.value + ", 0");
+            } else {
+                std::string dynamicValue;
+                if (!emitNativeValueAsDynamic(operand, ins, dynamicValue)) return false;
+                const std::string truthy = freshTmp();
+                emitLine(truthy + " = call i32 @zeus_value_truthy(ptr " + dynamicValue + ")");
+                if (!operand.dynamic || operand.ownsDynamic) emitRelease(dynamicValue);
+                emitLine(resultValue + " = icmp eq i32 " + truthy + ", 0");
+            }
+
+            valueStack.push_back(NativeValue{ resultValue, "i1", false, false });
+            return true;
+        };
+
         auto emitBinary = [&](const IRType::IRInstr& ins) {
             NativeValue right;
             NativeValue left;
@@ -5412,6 +5926,7 @@ public:
                     break;
 
                 case VMOperator::IMPORT:
+                case VMOperator::TYPE_IMPL_BUILD:
                     break;
 
                 case VMOperator::PUSH: {
@@ -5579,8 +6094,13 @@ public:
 
                 case VMOperator::OBJ_BUILD: {
                     int64_t argc = 0;
+                    const std::string nativeTargetType = ins.args.size() > 1 &&
+                        std::holds_alternative<std::string>(ins.args[1])
+                            ? std::get<std::string>(ins.args[1])
+                            : std::string();
                     if (!tryArgInt(ins, 0, argc) || argc < 0 ||
-                        valueStack.size() < static_cast<size_t>(argc + 1)) {
+                        valueStack.size() < static_cast<size_t>(argc) +
+                            (nativeTargetType.empty() ? 1u : 0u)) {
                         failNativeTopLevel(ins, "[emit-llvm] class 构造参数数量无效");
                         rollback();
                         return false;
@@ -5595,7 +6115,8 @@ public:
                     }
 
                     NativeValue classReference;
-                    if (!popValue(ins, classReference) || classReference.type != "classref") {
+                    if (nativeTargetType.empty() &&
+                        (!popValue(ins, classReference) || classReference.type != "classref")) {
                         failNativeTopLevel(ins, "[emit-llvm] new 目标不是静态 class 名称");
                         rollback();
                         return false;
@@ -5645,7 +6166,8 @@ public:
                     };
 
                     NativeValue instance;
-                    if (!emitClassConstruction(
+                    const bool constructionSucceeded = nativeTargetType.empty()
+                        ? emitClassConstruction(
                             ins,
                             classReference.sourceType,
                             arguments,
@@ -5654,7 +6176,17 @@ public:
                             emitConstructionLabel,
                             freshConstructionTemporary,
                             convertConstructorArgument,
-                            failConstruction)) {
+                            failConstruction)
+                        : emitNewOperatorConstruction(
+                            ins,
+                            nativeTargetType,
+                            arguments,
+                            instance,
+                            emitConstructionLine,
+                            freshConstructionTemporary,
+                            convertConstructorArgument,
+                            failConstruction);
+                    if (!constructionSucceeded) {
                         rollback();
                         return false;
                     }
@@ -5726,8 +6258,11 @@ public:
                     };
 
                     NativeValue callResult;
+                    const std::string methodName = std::get<std::string>(ins.args[0]);
+                    const bool hasTypedImplMethod = hasTypedInstanceMethodSignature(
+                        arguments[0].sourceType, methodName);
                     if (arguments[0].dynamic || arguments[0].type != "ptr" ||
-                        !isClassType(arguments[0].sourceType)) {
+                        (!isClassType(arguments[0].sourceType) && !hasTypedImplMethod)) {
                         auto toDynamic = [&](const NativeValue& value,
                                              std::string& dynamicValue,
                                              bool& ownsDynamic) {
@@ -5742,7 +6277,7 @@ public:
                         };
                         if (!emitDynamicMemberCall(
                                 ins,
-                                std::get<std::string>(ins.args[0]),
+                                methodName,
                                 arguments,
                                 callResult,
                                 [&](const std::string& line) { emitLine(line); },
@@ -5755,7 +6290,7 @@ public:
                         }
                     } else if (!emitKnownClassMethodCall(
                                    ins,
-                                   std::get<std::string>(ins.args[0]),
+                                   methodName,
                                    arguments,
                                    callResult,
                                    [&](const std::string& line) { emitLine(line); },
@@ -6230,6 +6765,13 @@ public:
                     }
                     break;
 
+                case VMOperator::LOGICAL_NOT:
+                    if (!emitLogicalNot(ins)) {
+                        rollback();
+                        return false;
+                    }
+                    break;
+
                 case VMOperator::LOAD_NATIVE: {
                     int64_t nativeId = 0;
                     if (!tryArgInt(ins, 0, nativeId)) {
@@ -6283,7 +6825,8 @@ public:
                     if (!pendingDirectCall.empty()) {
                         auto function = functionSignatures.find(pendingDirectCall);
                         if (function == functionSignatures.end() ||
-                            function->second.parameterTypes.size() != static_cast<size_t>(argc)) {
+                            argc < function->second.minRequiredParams ||
+                            argc > static_cast<int64_t>(function->second.parameterTypes.size())) {
                             failNativeTopLevel(ins, "[emit-llvm] 原生函数调用签名不匹配");
                             rollback();
                             return false;
@@ -6339,7 +6882,25 @@ public:
                         std::vector<std::string> nativeArguments;
                         std::vector<std::string> dynamicArguments;
                         std::vector<bool> ownsDynamicArguments;
-                        for (size_t i = 0; i < arguments.size(); ++i) {
+                        for (size_t i = 0; i < function->second.parameterTypes.size(); ++i) {
+                            if (i >= arguments.size()) {
+                                NativeValue placeholder;
+                                if (!emitOptionalArgumentPlaceholder(
+                                        function->second.parameterTypes[i], placeholder,
+                                        [this](const std::string& line) { emitLine(line); },
+                                        [this]() { return freshTmp(); })) {
+                                    failNativeTopLevel(ins,
+                                        "[emit-llvm] optional argument has no native ABI placeholder");
+                                    rollback();
+                                    return false;
+                                }
+                                if (usesZeusValueABI(function->second.parameterTypes[i])) {
+                                    dynamicArguments.push_back(placeholder.value);
+                                    ownsDynamicArguments.push_back(false);
+                                }
+                                nativeArguments.push_back(placeholder.value);
+                                continue;
+                            }
                             std::string nativeArgument;
                             const std::string& parameterType =
                                 function->second.parameterTypes[i];
@@ -6378,6 +6939,10 @@ public:
                             callText += functionParameterABIType(
                                             function->second.parameterTypes[i]) +
                                         " " + nativeArguments[i];
+                        }
+                        if (function->second.hasDefaultParameters()) {
+                            if (!nativeArguments.empty() || returnsDynamic) callText += ", ";
+                            callText += "i32 " + std::to_string(argc);
                         }
                         callText += ")";
                         emitLine(callText);
@@ -6751,9 +7316,17 @@ public:
                 }
 
                 case VMOperator::IMPORT:
+                case VMOperator::TYPE_IMPL_BUILD:
                     break;
 
                 case VMOperator::PUSH: {
+                    if (!ins.args.empty() &&
+                        std::holds_alternative<IRType::NullLiteral>(ins.args[0])) {
+                        const std::string nilValue = emitDynamicValueForNull(ins);
+                        if (nilValue.empty()) return false;
+                        emitPushValue(nilValue);
+                        break;
+                    }
                     if (!ins.args.empty() &&
                         std::holds_alternative<ZeusType::Bytes>(ins.args[0])) {
                         const std::string bytesValue = emitDynamicValueForBytes(
@@ -7024,6 +7597,23 @@ public:
                     emitRelease(keyOrIndex);
                     if (isStore) emitRelease(storedValue);
                     emitPushValue(resultValue);
+                    break;
+                }
+
+                case VMOperator::LOGICAL_NOT: {
+                    const std::string operand = emitPop();
+                    const std::string truthy = freshTmp();
+                    emitLine(truthy + " = call i32 @zeus_value_truthy(ptr " + operand + ")");
+                    const std::string resultBool = freshTmp();
+                    emitLine(resultBool + " = icmp eq i32 " + truthy + ", 0");
+                    const std::string resultRaw = freshTmp();
+                    emitLine(resultRaw + " = zext i1 " + resultBool + " to i32");
+                    const std::string resultValue = freshTmp();
+                    emitLine(resultValue + " = alloca %ZeusValue, align 8");
+                    emitLine("call void @zeus_value_init_bool(ptr " + resultValue +
+                             ", i32 " + resultRaw + ")");
+                    emitPushValue(resultValue);
+                    emitRelease(operand);
                     break;
                 }
 
@@ -7338,6 +7928,7 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
     if (!e.collectMetadata(r)) {
         res.ok = false;
         res.error = e.result.error;
+        res.errorLine = e.result.errorLine;
         return res;
     }
 
@@ -7351,6 +7942,7 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
             if (!e.emitChunk({}, ci, ci + 1 == r.program.size())) {
                 res.ok = false;
                 res.error = e.result.error;
+                res.errorLine = e.result.errorLine;
                 res.warnings = e.result.warnings;
                 return res;
             }
@@ -7359,6 +7951,7 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
         if (!e.emitChunk(r.program[ci], ci, ci + 1 == r.program.size())) {
             res.ok = false;
             res.error = e.result.error;
+            res.errorLine = e.result.errorLine;
             res.warnings = e.result.warnings;
             return res;
         }
@@ -7381,6 +7974,7 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
     if (!e.buildDynamicMemberBridge()) {
         res.ok = false;
         res.error = e.result.error;
+        res.errorLine = e.result.errorLine;
         res.warnings = e.result.warnings;
         return res;
     }
@@ -7440,6 +8034,7 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
     out += "declare ptr @zeus_closure_capture_ref(ptr, i32)\n";
     out += "declare ptr @zeus_closure_capture_copy(ptr, i32)\n";
     out += "declare void @zeus_closure_create(ptr, ptr, i32, i32, ptr)\n";
+    out += "declare void @zeus_closure_create_range(ptr, ptr, i32, i32, i32, ptr)\n";
     out += "declare void @zeus_closure_call(ptr, ptr, i32, ptr)\n";
     out += "declare void @zeus_closure_env_load(ptr, ptr, i32)\n";
     out += "declare void @zeus_closure_env_store(ptr, i32, ptr)\n";

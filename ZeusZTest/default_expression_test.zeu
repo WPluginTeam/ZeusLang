@@ -1,0 +1,108 @@
+func add_values(left, right) {
+    return left + right;
+}
+
+var tick_count = 0;
+func tick() {
+    tick_count = tick_count + 1;
+    return tick_count;
+}
+
+func arithmetic_default(value = 1 + 2) {
+    return value;
+}
+
+func call_default(value = add_values(2, 3)) {
+    return value;
+}
+
+func dependent_defaults(first = 2, second = first * 4) {
+    return second;
+}
+
+func make_captured_default(seed) {
+    let captured = seed;
+    func inner(value = captured + 1) [&captured] {
+        return value;
+    }
+    return inner;
+}
+
+func collection_default(values = [4, 5, 6]) {
+    return values[2];
+}
+
+func side_effect_default(value = tick()) {
+    return value;
+}
+
+func nullable_default(value = tick()) {
+    return value;
+}
+
+func nil_default(value = nil) {
+    return value;
+}
+
+func nil_value() {
+    return nil;
+}
+
+func sentinel_string(value = "__NIL__") {
+    return value;
+}
+
+func named_default(default = "__NIL__") {
+    return default;
+}
+
+class ConstructorDefault {
+    using &this;
+    let value = 0;
+
+    func init(value = add_values(8, 9)) {
+        this.value = value;
+    }
+}
+
+class SentinelFields {
+    let marker = "__NIL__";
+    let empty = nil;
+}
+
+func check(name, actual, expected) {
+    if (actual == expected) {
+        print("PASS", name);
+    } else {
+        print("FAIL", name, "actual:", actual, "expected:", expected);
+    }
+}
+
+check("arithmetic default", arithmetic_default(), 3);
+check("explicit argument wins", arithmetic_default(9), 9);
+check("nested call default", call_default(), 5);
+check("earlier default feeds later default", dependent_defaults(), 8);
+check("explicit argument feeds later default", dependent_defaults(7), 28);
+let captured_default = make_captured_default(10);
+check("captured value is visible to default expression", captured_default(), 11);
+check("collection commas stay inside expression", collection_default(), 6);
+check("call-time default evaluation first", side_effect_default(), 1);
+check("call-time default evaluation repeats", side_effect_default(), 2);
+check("explicit nil is not replaced", nullable_default(nil) == nil, true);
+check("explicit nil skips the default expression", tick_count, 2);
+check("default expression runs on next omitted call", nullable_default(), 3);
+check("sentinel spelling remains a string", sentinel_string(), "__NIL__");
+check("sentinel spelling has string type", type("__NIL__"), "string");
+check("NIL text remains a string", "NIL", "NIL");
+check("NIL text has string type", type("NIL"), "string");
+check("nil keeps nil type", type(nil), "nil");
+check("nil expression default stays nil", nil_default() == nil, true);
+check("default parameter name remains aligned", named_default(), "__NIL__");
+check("named argument matches the parameter", named_default(default = "explicit"), "explicit");
+let constructed = new ConstructorDefault();
+check("constructor evaluates expression default", constructed.value, 17);
+let sentinel_fields = new SentinelFields();
+check("class string field keeps sentinel spelling", sentinel_fields.marker, "__NIL__");
+check("class nil field remains nil", sentinel_fields.empty == nil, true);
+
+print("DEFAULT_EXPRESSION_TEST_DONE");

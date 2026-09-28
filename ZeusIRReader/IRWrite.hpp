@@ -19,7 +19,7 @@ namespace IRBinary {
 
     // Magic + version
     static const unsigned char MAGIC[4] = { 'Z', 'I', 'R', '1' };
-    static const uint16_t VERSION = 2;
+    static const uint16_t VERSION = 3;
 
     // Arg type tags（尾部追加：老 .zir 里不可能出现新 tag，前向兼容）
     enum ArgTag : uint8_t {
@@ -32,6 +32,7 @@ namespace IRBinary {
         ARG_STRING_MUTABLE_KEYWORD = 6,
         ARG_STRING_SYMREF = 7,
         ARG_VALUE_BYTES = 8,
+        ARG_VALUE_NULL = 9,
     };
 
     enum SectionType : uint16_t {
@@ -96,7 +97,7 @@ namespace IRBinary {
         std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv);
         meta.buildTime = buf;
 
-        meta.buildVersion = "ZeusIR v2";
+        meta.buildVersion = "ZeusIR v3";
         return meta;
     }
 
@@ -184,6 +185,8 @@ namespace IRBinary {
                     } else if (std::holds_alternative<ZeusType::Bytes>(a)) {
                         writeUint8(ofs, ARG_VALUE_BYTES);
                         writeBytes(ofs, std::get<ZeusType::Bytes>(a));
+                    } else if (std::holds_alternative<IRType::NullLiteral>(a)) {
+                        writeUint8(ofs, ARG_VALUE_NULL);
                     } else {
                         if (errorMsg) *errorMsg = "Unknown IRArgs variant";
                         return false;

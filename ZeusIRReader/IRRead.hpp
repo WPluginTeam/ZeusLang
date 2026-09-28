@@ -107,6 +107,25 @@ namespace IRBinary {
         return true;
     }
 
+    inline void convertLegacyNilSentinel(IRType::IRInstr& instr) {
+        size_t literalArgIndex = 0;
+        if (instr.op == VMOperator::HOTSPOT) {
+            // Older optimized PUSH instructions stored the literal in args[1].
+            literalArgIndex = 1;
+        } else if (instr.op != VMOperator::PUSH) {
+            return;
+        }
+
+        if (literalArgIndex < instr.args.size() &&
+            std::holds_alternative<LexerType::Value>(instr.args[literalArgIndex])) {
+            const auto& value = std::get<LexerType::Value>(instr.args[literalArgIndex]);
+            if (std::holds_alternative<std::string>(value.data) &&
+                std::get<std::string>(value.data) == "__NIL__") {
+                instr.args[literalArgIndex] = IRType::NullLiteral{};
+            }
+        }
+    }
+
     inline std::vector<std::vector<IRType::IRInstr>> readIRProgram(
         const std::string& path,
         std::string* errorMsg = nullptr,
@@ -137,6 +156,7 @@ namespace IRBinary {
                         else if (tag == ARG_VALUE_BYTES) { ZeusType::Bytes b; if (!readBytes(ifs, b)) { if (errorMsg) *errorMsg = "Truncated reading bytes"; prog.clear(); return {}; } instr.args.push_back(std::move(b)); }
                         else { LexerType::Value v(0); if (!readValue(ifs, v, tag)) { if (errorMsg) *errorMsg = "Bad value tag"; prog.clear(); return {}; } instr.args.push_back(v); }
                     }
+                    convertLegacyNilSentinel(instr);
                     chunk.push_back(std::move(instr));
                 }
                 prog.push_back(std::move(chunk));
@@ -144,7 +164,7 @@ namespace IRBinary {
             return prog;
         }
 
-        if (ver != VERSION) { if (errorMsg) *errorMsg = "Unsupported version"; return prog; }
+        if (ver != 2 && ver != VERSION) { if (errorMsg) *errorMsg = "Unsupported version"; return prog; }
 
         IRMeta meta;
         if (!readString(ifs, meta.compilerName)) { if (errorMsg) *errorMsg = "File too short (compilerName)"; return prog; }
@@ -206,10 +226,13 @@ namespace IRBinary {
                         ZeusType::Bytes b;
                         if (!readBytes(ifs, b)) { if (errorMsg) *errorMsg = "Truncated reading bytes"; prog.clear(); return {}; }
                         instr.args.push_back(std::move(b));
+                    } else if (tag == ARG_VALUE_NULL && ver >= 3) {
+                        instr.args.push_back(IRType::NullLiteral{});
                     } else {
                         LexerType::Value v(0); if (!readValue(ifs, v, tag)) { if (errorMsg) *errorMsg = "Bad value tag"; prog.clear(); return {}; } instr.args.push_back(v);
                     }
                 }
+                if (ver == 2) convertLegacyNilSentinel(instr);
                 chunk.push_back(std::move(instr));
             }
             prog.push_back(std::move(chunk));

@@ -43,6 +43,7 @@
 #include "../ZeusRuntimeLib/ZeusVMUtils.hpp"
 #include "ZeusHotspot.hpp"
 #include "../ZeusRuntimeLib/ZeusGC.hpp"
+#include "../ZeusBuiltins/NativeTypeABI.hpp"
 #if 0
 /* Computed-goto dispatch removed for MSVC builds. */
 #endif
@@ -324,6 +325,32 @@ class VM {
         }
 
         ZeusType::UniversalVariant ret = LexerType::Value(0);
+
+        // Native array arguments are shared mutable values. A loaded array
+        // owns deep references to its pre-call elements on the VM stack, but
+        // an in-place native mutation changes the shared data before normal
+        // stack cleanup can release those references. Keep a snapshot so the
+        // temporary argument releases exactly the elements it originally
+        // retained, not the post-mutation contents.
+        const std::string& builtinName = ctx.desc->name;
+        const bool mutatesArrayArgument =
+            builtinName == "__array_push" || builtinName == "__array_pop" ||
+            builtinName == "__array_set" || builtinName == "__array_clear";
+        const size_t arrayArgumentStackIndex = ctx.calleeIndex + 1;
+        bool hasArrayArgumentSnapshot = false;
+        bool arrayArgumentOwnsSnapshot = false;
+        bool arrayMutationSucceeded = false;
+        std::vector<ZeusType::UniversalVariant> arrayValuesBeforeCall;
+        if (mutatesArrayArgument && !args.empty()) {
+            const auto* array = ZeusBuiltins::getArrayPtr(args[0]);
+            if (array && array->impl) {
+                arrayValuesBeforeCall = array->impl->data;
+                hasArrayArgumentSnapshot = true;
+                arrayArgumentOwnsSnapshot =
+                    arrayArgumentStackIndex < stack.size() &&
+                    (stack.ownerFlag(arrayArgumentStackIndex) & 0x4) != 0;
+            }
+        }
 
         try {
             // 特殊处理需要访问VM内部状态的内置函数
@@ -846,6 +873,32 @@ class VM {
             else {
                 // 普通内置函数,调用注册的函数指针
                 ret = ctx.desc->fn(args);
+
+                if (hasArrayArgumentSnapshot) {
+                    if (builtinName == "__array_push" && args.size() == 2) {
+                        // The appended value becomes owned by the array.
+                        ZeusGC::retainVariantDeep(*this, args[1]);
+                    } else if (builtinName == "__array_set" && args.size() == 3) {
+                        int index = 0;
+                        ZeusVMUtils::tryGetInt(args[1], index);
+                        if (index >= 0 && index < static_cast<int>(arrayValuesBeforeCall.size())) {
+                            ZeusGC::releaseVariantDeep(*this, arrayValuesBeforeCall[index]);
+                            ZeusGC::retainVariantDeep(*this, args[2]);
+                        }
+                    } else if (builtinName == "__array_clear") {
+                        // Clearing drops every element previously owned by the array.
+                        for (const auto& value : arrayValuesBeforeCall) {
+                            ZeusGC::releaseVariantDeep(*this, value);
+                        }
+                    }
+
+                    // pop transfers the removed element's array ownership to
+                    // its return value, so it needs no extra retain/release.
+                    arrayMutationSucceeded = true;
+                } else if (builtinName == "__array_get" || builtinName == "__array_slice") {
+                    // These builtins return values copied out of array storage.
+                    ZeusGC::retainVariantDeep(*this, ret);
+                }
             }
         }
         catch (const std::exception& e) {
@@ -854,6 +907,15 @@ class VM {
             errInstr.sourceFileId = __sourceFileId;
             VMException::VMException exp(std::string("Native exception in ") + ctx.desc->name + ": " + e.what(), __line, errInstr);
             exp._throw(vmstat, currentChunk);
+        }
+
+        if (arrayMutationSucceeded && arrayArgumentOwnsSnapshot) {
+            for (const auto& value : arrayValuesBeforeCall) {
+                ZeusGC::releaseVariantDeep(*this, value);
+            }
+            stack.setOwnerFlag(
+                arrayArgumentStackIndex,
+                static_cast<uint8_t>(stack.ownerFlag(arrayArgumentStackIndex) & ~0x4));
         }
 
         return ret;
@@ -889,7 +951,9 @@ class VM {
         bool hasVariadicKwargs = false; // 是否有**kwargs
         std::string variadicArgsName;   // *args的参数名
         std::string variadicKwargsName; // **kwargs的参数名
-        std::vector<ZeusType::UniversalVariant> paramDefaults; // 参数默认值(空表示无默认值)
+        std::vector<bool> paramHasDefault; // defaults are evaluated by bytecode at call time
+        std::vector<ZeusType::UniversalVariant> paramDefaultValues; // legacy literal defaults
+        bool hasRuntimeDefaultPrologue = false;
         int minRequiredParams = -1; // 最少必需参数数量(-1表示未设置,默认所有参数都是必需的)
     };
 
@@ -922,6 +986,7 @@ class VM {
         size_t                              stackBase;                // 栈基址（用于返回时恢复）
         int                                 savedLine;                // 保存的行号
         int                                 calleeAutoReleaseId = -1; // 如果为函数调用传递的临时闭包, 返回时自动 release id
+        std::vector<bool>                   paramProvided;           // supplied positional/named arguments for default prologue
     };
 
     std::vector<Prototype> prototypes; // 为外部函数/闭包注册的原型列表
@@ -953,6 +1018,7 @@ class VM {
     
     // 类/对象/捕获等运行时信息集合
     std::vector<ZeusType::ClassInfo> classes;
+    std::unordered_map<std::string, ZeusType::ClassInfo> typeImplementations;
     std::deque<ZeusType::ObjectInstance> objects;  // 使用 deque 避免重分配时指针失效
     mutable std::shared_mutex objectsMutex;  // 读写锁，用于线程安全的对象访问
     std::vector<ZeusType::NamespaceData> namespaces;  // 包命名空间集合
@@ -1064,6 +1130,25 @@ class VM {
         }
         
         return nullptr;
+    }
+
+    static bool mergeTypeImplementationMethods(
+        ZeusType::ClassInfo& destination,
+        const ZeusType::ClassInfo& source,
+        std::string& conflict
+    ) {
+        const auto merge = [&](auto& target, const auto& additions) {
+            for (const auto& entry : additions) {
+                if (!target.emplace(entry.first, entry.second).second) {
+                    conflict = entry.first;
+                    return false;
+                }
+            }
+            return true;
+        };
+        return merge(destination.instanceMethods, source.instanceMethods) &&
+               merge(destination.staticMethods, source.staticMethods) &&
+               merge(destination.operatorMethods, source.operatorMethods);
     }
 
     std::string dictionaryKeyString(
@@ -1926,6 +2011,12 @@ class VM {
             if (isFuncBegin) {
                 Prototype proto;
                 proto.body = bc;
+                for (const auto& bodyInstr : bc) {
+                    if (bodyInstr.op == VMOperator::JUMP_IF_PARAM_PROVIDED) {
+                        proto.hasRuntimeDefaultPrologue = true;
+                        break;
+                    }
+                }
 
                 if (!bc.front().args.empty()) {
                     // 如果 IRGenerator 在 FUNC_BEGIN 中放入参数个数（以 LexerType::Value 形式），则读取之
@@ -1955,24 +2046,25 @@ class VM {
                         }
                         if (std::holds_alternative<LexerType::Value>(bc.front().args[6])) {
                             int defaultCount = VMHelpers::getIntFromValue(std::get<LexerType::Value>(bc.front().args[6]));
-                            
-                            // 初始化 paramDefaults 数组
-                            proto.paramDefaults.resize(proto.paramCount);
-                            
-                            // 读取每个默认值 (索引 + 值)
+                            proto.paramHasDefault.assign(proto.paramCount, false);
+                            proto.paramDefaultValues.resize(proto.paramCount);
+
+                            // Read parameter index/value pairs; new code evaluates the expression in its prologue.
                             size_t argIdx = 7;
                             for (int i = 0; i < defaultCount && argIdx + 1 < bc.front().args.size(); ++i) {
                                 if (std::holds_alternative<LexerType::Value>(bc.front().args[argIdx])) {
                                     int paramIdx = VMHelpers::getIntFromValue(std::get<LexerType::Value>(bc.front().args[argIdx]));
                                     if (paramIdx >= 0 && paramIdx < proto.paramCount) {
-                                        auto defVal = std::get<LexerType::Value>(bc.front().args[argIdx + 1]);
-                                        
-                                        // 检查是否是 __NIL__ 标记，转换为 ZeusType::Null
-                                        if (std::holds_alternative<std::string>(defVal.data) && 
-                                            std::get<std::string>(defVal.data) == "__NIL__") {
-                                            proto.paramDefaults[paramIdx] = ZeusType::Variant(ZeusType::Null());
-                                        } else {
-                                            proto.paramDefaults[paramIdx] = defVal;
+                                        proto.paramHasDefault[paramIdx] = true;
+                                        if (!proto.hasRuntimeDefaultPrologue &&
+                                            std::holds_alternative<LexerType::Value>(bc.front().args[argIdx + 1])) {
+                                            const auto& defVal = std::get<LexerType::Value>(bc.front().args[argIdx + 1]);
+                                            if (std::holds_alternative<std::string>(defVal.data) &&
+                                                std::get<std::string>(defVal.data) == "__NIL__") {
+                                                proto.paramDefaultValues[paramIdx] = ZeusType::Variant(ZeusType::Null());
+                                            } else {
+                                                proto.paramDefaultValues[paramIdx] = defVal;
+                                            }
                                         }
                                     }
                                 }
@@ -2153,7 +2245,7 @@ class VM {
     enum class ReferenceWriteResult { NotReference, Stored, ConstTarget, Invalid };
 
     ZeusType::UniversalVariant loadCellValue(const Cell* cell) const {
-        if (!cell) return LexerType::Value(std::string("__NIL__"));
+        if (!cell) return ZeusType::Variant(ZeusType::Null());
         const ZeusType::UniversalVariant* current = &cell->value;
         for (int depth = 0; depth < 64; ++depth) {
             const auto* reference = std::get_if<ZeusType::ReferenceHandle>(current);
@@ -2577,6 +2669,62 @@ class VM {
                 continue;
             }
 
+            if (ins.op == VMOperator::JUMP_IF_PARAM_PROVIDED) {
+                if (ins.args.size() < 2 ||
+                    !std::holds_alternative<LexerType::Value>(ins.args[0]) ||
+                    !std::holds_alternative<LexerType::Value>(ins.args[1])) {
+                    VMException::VMException exp(
+                        "JUMP_IF_PARAM_PROVIDED: invalid parameter or offset",
+                        __line,
+                        ins
+                    );
+                    exp._throw(vmstat, currentChunk);
+                    break;
+                }
+
+                int paramIndex = -1;
+                int offset = 0;
+                try {
+                    paramIndex = VMHelpers::getIntFromValue(std::get<LexerType::Value>(ins.args[0]));
+                    offset = VMHelpers::getIntFromValue(std::get<LexerType::Value>(ins.args[1]));
+                } catch (const std::exception&) {
+                    VMException::VMException exp(
+                        "JUMP_IF_PARAM_PROVIDED: parameter and offset must be integers",
+                        __line,
+                        ins
+                    );
+                    exp._throw(vmstat, currentChunk);
+                    break;
+                }
+
+                if (paramIndex < 0 || paramIndex >= (int)frame.paramProvided.size()) {
+                    VMException::VMException exp(
+                        "JUMP_IF_PARAM_PROVIDED: parameter index is outside the active call frame",
+                        __line,
+                        ins
+                    );
+                    exp._throw(vmstat, currentChunk);
+                    break;
+                }
+
+                if (frame.paramProvided[paramIndex]) {
+                    const long long target = static_cast<long long>(frame.pc) + 1 + offset;
+                    if (target < 0 || target >= static_cast<long long>(frame.code->size())) {
+                        VMException::VMException exp(
+                            "JUMP_IF_PARAM_PROVIDED: jump target is outside the function body",
+                            __line,
+                            ins
+                        );
+                        exp._throw(vmstat, currentChunk);
+                        break;
+                    }
+                    frame.pc = static_cast<size_t>(target);
+                } else {
+                    frame.pc++;
+                }
+                continue;
+            }
+
             justPushedFrame = false;
             execute(ins);
 
@@ -2665,6 +2813,14 @@ class VM {
             assignCellValue(local[i], stack[calleeIndex + 1 + i]);
             ZEUS_DEBUG_PRINT("[executeClosureSync] local[%d] set", i);
         }
+        if (!proto.hasRuntimeDefaultPrologue) {
+            for (int i = actualArgc; i < proto.paramCount; ++i) {
+                if (i < (int)proto.paramHasDefault.size() && proto.paramHasDefault[i] &&
+                    i < (int)proto.paramDefaultValues.size()) {
+                    assignCellValue(local[i], proto.paramDefaultValues[i]);
+                }
+            }
+        }
         
         // 弹出参数和闭包（释放栈持有的引用）
         shrinkStackWithRelease(calleeIndex);
@@ -2683,6 +2839,10 @@ class VM {
         syncFrame.savedLine = __line;
         syncFrame.savedLocal = oldLocal;
         syncFrame.savedUpvalue = oldUpvalue;
+        syncFrame.paramProvided.assign(proto.paramCount, false);
+        for (int i = 0; i < actualArgc && i < proto.paramCount; ++i) {
+            syncFrame.paramProvided[i] = true;
+        }
         callFrames.push_back(syncFrame);
         FrameLoopOptions frameOptions;
         frameOptions.stopFrameDepth = initialFrameDepth;
@@ -2732,6 +2892,139 @@ class VM {
         }
         
         switch (instr.op) {
+            case VMOperator::TYPE_IMPL_BUILD: {
+                auto failImpl = [&](const std::string& message) {
+                    VMException::VMException exp(message, __line, instr);
+                    exp._throw(vmstat, currentChunk);
+                };
+                if (instr.args.empty() ||
+                    !std::holds_alternative<std::string>(instr.args[0]) ||
+                    std::get<std::string>(instr.args[0]).empty()) {
+                    failImpl("TYPE_IMPL_BUILD requires a non-empty target type");
+                    break;
+                }
+
+                ZeusType::ClassInfo additions;
+                additions.name = std::get<std::string>(instr.args[0]);
+                size_t cursor = 1;
+                auto readMethodMap = [&](std::unordered_map<std::string, int>& methods) {
+                    if (cursor >= instr.args.size() ||
+                        !std::holds_alternative<LexerType::Value>(instr.args[cursor])) {
+                        return false;
+                    }
+                    const int count = VMHelpers::getIntFromValue(
+                        std::get<LexerType::Value>(instr.args[cursor++]));
+                    if (count < 0 || static_cast<size_t>(count) >
+                            (instr.args.size() - cursor) / 2) {
+                        return false;
+                    }
+                    for (int i = 0; i < count; ++i) {
+                        if (cursor + 1 >= instr.args.size() ||
+                            !std::holds_alternative<std::string>(instr.args[cursor]) ||
+                            !std::holds_alternative<LexerType::Value>(instr.args[cursor + 1])) {
+                            return false;
+                        }
+                        const std::string& name = std::get<std::string>(instr.args[cursor++]);
+                        const int protoId = VMHelpers::getIntFromValue(
+                            std::get<LexerType::Value>(instr.args[cursor++]));
+                        if (name.empty() || protoId < 0 || !getPrototype(protoId) ||
+                            !methods.emplace(name, protoId).second) {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+
+                if (!readMethodMap(additions.instanceMethods) ||
+                    !readMethodMap(additions.staticMethods) ||
+                    !readMethodMap(additions.operatorMethods) ||
+                    cursor != instr.args.size()) {
+                    failImpl("TYPE_IMPL_BUILD contains malformed or duplicate method metadata");
+                    break;
+                }
+
+                ZeusType::ClassInfo mergedType = additions;
+                auto existing = typeImplementations.find(additions.name);
+                if (existing != typeImplementations.end()) {
+                    mergedType = existing->second;
+                    std::string conflict;
+                    if (!mergeTypeImplementationMethods(mergedType, additions, conflict)) {
+                        failImpl("impl member '" + conflict +
+                                 "' is already registered for type '" + additions.name + "'");
+                        break;
+                    }
+                }
+
+                std::vector<std::pair<size_t, ZeusType::ClassInfo>> updatedClasses;
+                for (size_t i = 0; i < classes.size(); ++i) {
+                    if (classes[i].name != additions.name) continue;
+                    ZeusType::ClassInfo updated = classes[i];
+                    std::string conflict;
+                    if (!mergeTypeImplementationMethods(updated, additions, conflict)) {
+                        failImpl("impl member '" + conflict +
+                                 "' conflicts with class member on type '" + additions.name + "'");
+                        updatedClasses.clear();
+                        break;
+                    }
+                    updatedClasses.emplace_back(i, std::move(updated));
+                }
+                if (vmstat != ZeusType::VMStatus::Running) break;
+
+                std::vector<std::pair<size_t, ZeusType::ClassInfo>> updatedSharedClasses;
+                if (sharedClasses && sharedClasses != &classes) {
+                    for (size_t i = 0; i < sharedClasses->size(); ++i) {
+                        if ((*sharedClasses)[i].name != additions.name) continue;
+                        ZeusType::ClassInfo updated = (*sharedClasses)[i];
+                        std::string conflict;
+                        if (!mergeTypeImplementationMethods(updated, additions, conflict)) {
+                            failImpl("impl member '" + conflict +
+                                     "' conflicts with shared class member on type '" +
+                                     additions.name + "'");
+                            updatedSharedClasses.clear();
+                            break;
+                        }
+                        updatedSharedClasses.emplace_back(i, std::move(updated));
+                    }
+                }
+                if (vmstat != ZeusType::VMStatus::Running) break;
+
+                typeImplementations[additions.name] = std::move(mergedType);
+                for (auto& entry : updatedClasses) {
+                    classes[entry.first] = std::move(entry.second);
+                }
+                if (sharedClasses && sharedClasses != &classes) {
+                    for (auto& entry : updatedSharedClasses) {
+                        (*sharedClasses)[entry.first] = std::move(entry.second);
+                    }
+                }
+
+                auto sharedClassCell = ZeusShared::getGlobalHeap().find(
+                    "__class__" + additions.name);
+                if (sharedClassCell) {
+                    std::lock_guard<std::recursive_mutex> lock(sharedClassCell->mutex);
+                    auto* classVariant = std::get_if<ZeusType::Variant>(
+                        &sharedClassCell->value);
+                    auto* classObject = classVariant != nullptr
+                        ? std::get_if<ZeusType::Object>(classVariant)
+                        : nullptr;
+                    if (classObject != nullptr && classObject->impl) {
+                        for (const auto& entry : additions.staticMethods) {
+                            classObject->impl->data["__static_" + entry.first] =
+                                LexerType::Value(entry.second);
+                        }
+                        for (const auto& entry : additions.instanceMethods) {
+                            classObject->impl->data["__inst_" + entry.first] =
+                                LexerType::Value(entry.second);
+                        }
+                        for (const auto& entry : additions.operatorMethods) {
+                            classObject->impl->data["__op_" + entry.first] =
+                                LexerType::Value(entry.second);
+                        }
+                    }
+                }
+                break;
+            }
+
             case VMOperator::CLASS_BUILD: {
                 // 说明：栈布局 [ className, usingThisDefault, staticMethods(dict), instanceMethods(dict), operatorMethods(dict), fields(dict) ]
                 if (stack.size() < 6) {
@@ -2857,6 +3150,22 @@ class VM {
                     }
                 }
 
+                auto implementation = typeImplementations.find(className);
+                if (implementation != typeImplementations.end()) {
+                    ZeusType::ClassInfo merged = info;
+                    std::string conflict;
+                    if (!mergeTypeImplementationMethods(
+                            merged, implementation->second, conflict)) {
+                        VMException::VMException exp(
+                            "impl method '" + conflict +
+                            "' conflicts with class member on type '" + className + "'",
+                            __line, instr);
+                        exp._throw(vmstat, currentChunk);
+                        break;
+                    }
+                    info = std::move(merged);
+                }
+
                 int classId = (int)classes.size();
                 classes.push_back(std::move(info));
 
@@ -2947,6 +3256,22 @@ class VM {
                     }
                 }
 
+                auto implementation = typeImplementations.find(className);
+                if (implementation != typeImplementations.end()) {
+                    ZeusType::ClassInfo merged = info;
+                    std::string conflict;
+                    if (!mergeTypeImplementationMethods(
+                            merged, implementation->second, conflict)) {
+                        VMException::VMException exp(
+                            "impl method '" + conflict +
+                            "' conflicts with shared class member on type '" + className + "'",
+                            __line, instr);
+                        exp._throw(vmstat, currentChunk);
+                        break;
+                    }
+                    info = std::move(merged);
+                }
+
                 // 同时存储到本地 classes 数组（用于本 VM 访问）
                 int classId = (int)classes.size();
                 classes.push_back(info);
@@ -2994,8 +3319,17 @@ class VM {
                 if (!instr.args.empty() && std::holds_alternative<LexerType::Value>(instr.args[0])) {
                     argc = VMHelpers::getIntFromValue(std::get<LexerType::Value>(instr.args[0]));
                 }
+
+                std::string nativeTargetType;
+                if (instr.args.size() > 1 &&
+                    std::holds_alternative<std::string>(instr.args[1])) {
+                    nativeTargetType = std::get<std::string>(instr.args[1]);
+                }
+                const bool hasNativeTarget = !nativeTargetType.empty();
                 
-                if (stack.size() < (size_t)(argc + 1)) {
+                const size_t requiredStackItems = static_cast<size_t>(argc) +
+                    (hasNativeTarget ? 0u : 1u);
+                if (stack.size() < requiredStackItems) {
                     VMException::VMException exp("OBJ_BUILD stack underflow", __line, instr);
                     exp._throw(vmstat, currentChunk);
                     break;
@@ -3020,9 +3354,12 @@ class VM {
                     ctorArgItems.insert(ctorArgItems.begin(), popStackItem());
                 }
 
-                StackItem clsItem = popStackItem();
-                auto clsU = clsItem.value;
-                dropStackItem(clsItem);
+                ZeusType::UniversalVariant clsU = LexerType::Value(nativeTargetType);
+                if (!hasNativeTarget) {
+                    StackItem clsItem = popStackItem();
+                    clsU = clsItem.value;
+                    dropStackItem(clsItem);
+                }
                 
                 // DEBUG: 输出 clsU 的类型
                 ZEUS_DEBUG_PRINT("[OBJ_BUILD] clsU type: ClassHandle=%d, SharedClassHandle=%d, Value=%d", 
@@ -3034,6 +3371,70 @@ class VM {
                 }
 
                 int classId = -1;
+
+                auto invokeNewFactory = [&](int protoId) {
+                    const Prototype* proto = getPrototype(protoId);
+                    if (!proto) {
+                        VMException::VMException exp(
+                            "operator[new] has an invalid function prototype",
+                            __line, instr);
+                        exp._throw(vmstat, currentChunk);
+                        return false;
+                    }
+                    if (!proto->captures.empty()) {
+                        VMException::VMException exp(
+                            "operator[new] cannot capture variables",
+                            __line, instr);
+                        exp._throw(vmstat, currentChunk);
+                        return false;
+                    }
+
+                    Closure factory;
+                    factory.protoId = protoId;
+                    factory.autoRelease = true;
+                    const int closureId = allocClosure(std::move(factory));
+                    stack.push_back(ZeusType::ClosureHandle{closureId});
+                    for (auto& argument : ctorArgItems) {
+                        stack.push_back(argument.value);
+                        argument.owner = 0;
+                    }
+                    if (!executeClosureSync(closureId, argc)) {
+                        if (vmstat == ZeusType::VMStatus::Running) {
+                            VMException::VMException exp(
+                                "operator[new] dispatch failed", __line, instr);
+                            exp._throw(vmstat, currentChunk);
+                        }
+                        return false;
+                    }
+                    return true;
+                };
+
+                if (hasNativeTarget) {
+                    if (const auto* abi =
+                            ZeusBuiltins::findNativeTypeABI(nativeTargetType)) {
+                        nativeTargetType = std::string(abi->canonicalName);
+                    }
+                    const auto implementation = typeImplementations.find(nativeTargetType);
+                    if (implementation == typeImplementations.end()) {
+                        VMException::VMException exp(
+                            "OBJ_BUILD native type has no impl: " + nativeTargetType,
+                            __line, instr);
+                        exp._throw(vmstat, currentChunk);
+                        break;
+                    }
+                    const auto factory =
+                        implementation->second.operatorMethods.find("[new]");
+                    if (factory == implementation->second.operatorMethods.end()) {
+                        VMException::VMException exp(
+                            "type '" + nativeTargetType +
+                            "' does not define operator[new]",
+                            __line, instr);
+                        exp._throw(vmstat, currentChunk);
+                        break;
+                    }
+                    invokeNewFactory(factory->second);
+                    break;
+                }
                 
                 // 支持多种形式：ClassHandle、SharedClassHandle 或类名字符串
                 if (std::holds_alternative<ZeusType::ClassHandle>(clsU)) {
@@ -3192,6 +3593,12 @@ class VM {
                     break;
                 }
 
+                const auto factory = classPtr->operatorMethods.find("[new]");
+                if (factory != classPtr->operatorMethods.end()) {
+                    invokeNewFactory(factory->second);
+                    break;
+                }
+
                 ZeusType::ObjectInstance obj;
                 obj.classId = classId;
 
@@ -3256,6 +3663,7 @@ class VM {
                         int regularParamCount = proto.paramCount;
                         local.clear();
                         local.resize(regularParamCount);
+                        std::vector<bool> paramProvided(regularParamCount, false);
                         upvalue.clear();
                         for (int i = 0; i < regularParamCount; ++i) {
                             local[i] = newCell(LexerType::Value(0), 0, "CONSTRUCTOR_local");
@@ -3303,6 +3711,7 @@ class VM {
                             // 优先使用位置参数
                             if (i < positionalCount) {
                                 assignCellValue(local[i], positionalArgs[i]);
+                                paramProvided[i] = true;
                                 filled = true;
                             }
                             
@@ -3313,20 +3722,16 @@ class VM {
                                 if (it != namedArgs.end()) {
                                     assignCellValue(local[i], it->second);
                                     consumedNamedArgs.insert(paramName);
+                                    paramProvided[i] = true;
                                     filled = true;
                                 }
                             }
-                            
-                            // 使用默认值
-                            if (!filled && i < (int)proto.paramDefaults.size()) {
-                                const auto& defVal = proto.paramDefaults[i];
-                                if (std::holds_alternative<LexerType::Value>(defVal)) {
-                                    assignCellValue(local[i], std::get<LexerType::Value>(defVal));
-                                    filled = true;
-                                } else if (ZeusVMUtils::isNull(defVal)) {
-                                    assignCellValue(local[i], ZeusType::Variant(ZeusType::Null()));
-                                    filled = true;
-                                }
+
+                            if (!filled && !proto.hasRuntimeDefaultPrologue &&
+                                i < (int)proto.paramHasDefault.size() && proto.paramHasDefault[i] &&
+                                i < (int)proto.paramDefaultValues.size()) {
+                                assignCellValue(local[i], proto.paramDefaultValues[i]);
+                                filled = true;
                             }
                             
                             // 最后用0初始化
@@ -3379,6 +3784,7 @@ class VM {
                         constructorFrame.savedUpvalue = oldUpvalue;
                         constructorFrame.stackBase = calleeIndex;
                         constructorFrame.savedLine = __line;
+                        constructorFrame.paramProvided = std::move(paramProvided);
                         callFrames.push_back(std::move(constructorFrame));
                         FrameLoopOptions constructorOptions;
                         constructorOptions.stopFrameDepth = constructorFrameDepth;
@@ -3781,6 +4187,9 @@ class VM {
                         
                         // 压入: closure, this(对象), 属性名
                         stack.push_back(ZeusType::ClosureHandle{cloId});
+                        // objItem remains owned by DropObj until this opcode
+                        // finishes, so the synchronous call needs its own copy.
+                        ZeusGC::retainVariantDeep(*this, objU);
                         stack.push_back(objU);  // this
                         stack.push_back(LexerType::Value(attr));  // 属性名作为参数
                         
@@ -4278,6 +4687,39 @@ class VM {
                     break;
                 }
 
+                if (std::holds_alternative<LexerType::Value>(callee)) {
+                    const LexerType::Value receiver = std::get<LexerType::Value>(callee);
+                    auto implementation = typeImplementations.find(receiver.getStringType());
+                    if (implementation != typeImplementations.end()) {
+                        auto methodIt = implementation->second.instanceMethods.find(method);
+                        if (methodIt != implementation->second.instanceMethods.end()) {
+                            const int protoId = methodIt->second;
+                            if (!getPrototype(protoId)) {
+                                VMException::VMException exp(
+                                    "TYPE_IMPL_BUILD registered an invalid method prototype",
+                                    __line, instr);
+                                exp._throw(vmstat, currentChunk);
+                                break;
+                            }
+
+                            Closure clo;
+                            clo.protoId = protoId;
+                            clo.autoRelease = true;
+                            const int cloId = allocClosure(std::move(clo));
+                            stack.set(calleeIndex, ZeusType::ClosureHandle{cloId});
+                            stack.insert(calleeIndex + 1, receiver);
+                            if (!executeClosureSync(cloId, argc + 1)) {
+                                if (vmstat != ZeusType::VMStatus::Running) break;
+                                VMException::VMException exp(
+                                    "[execute] type implementation method dispatch failed",
+                                    __line, instr);
+                                exp._throw(vmstat, currentChunk);
+                            }
+                            break;
+                        }
+                    }
+                }
+
                 if (!std::holds_alternative<ZeusType::ObjectHandle>(callee)) {
                     std::string msg = "Cannot call method '" + method + "' on a non-object value";
                     VMException::VMException exp(msg, __line, instr);
@@ -4466,14 +4908,11 @@ class VM {
 
 
             case VMOperator::PUSH: {
-                    // IR 中用 Value("__NIL__") 表示 Zeus 的 Null
-                    if (!instr.args.empty() && std::holds_alternative<LexerType::Value>(instr.args[0])) {
+                    if (!instr.args.empty() && std::holds_alternative<IRType::NullLiteral>(instr.args[0])) {
+                        stack.push_back(ZeusType::Variant(ZeusType::Null()));
+                    } else if (!instr.args.empty() && std::holds_alternative<LexerType::Value>(instr.args[0])) {
                         const auto &val = std::get<LexerType::Value>(instr.args[0]);
-                        if (std::holds_alternative<std::string>(val.data) && std::get<std::string>(val.data) == "__NIL__") {
-                            stack.push_back(ZeusType::Variant(ZeusType::Null()));
-                        } else {
-                            stack.push_back(val);
-                        }
+                        stack.push_back(val);
                     } else if (!instr.args.empty() && std::holds_alternative<ZeusType::Bytes>(instr.args[0])) {
                         // Bytes 字面量：包装到 Variant 后推入栈
                         ZeusType::Variant bytesVar = std::get<ZeusType::Bytes>(instr.args[0]);
@@ -4893,7 +5332,11 @@ class VM {
                      int cloId = allocClosure(std::move(clo));
                     
                     stack.push_back(ZeusType::ClosureHandle{cloId});  // callee
+                    // dictItem/keyItem stay owned by DropInputs through the
+                    // synchronous call; retain the copies placed on the VM stack.
+                    ZeusGC::retainVariantDeep(*this, dictVar);
                     stack.push_back(objHandle);                       // this (完整 ObjectHandle)
+                    ZeusGC::retainVariantDeep(*this, keyVar);
                     stack.push_back(keyVar);                          // key argument
                     
                      // 调用 CALL_CLOSURE (argc=2: this + key)
@@ -5848,7 +6291,6 @@ class VM {
 
                 // ===== 参数处理：支持默认参数、可变参数和命名参数 =====
                 int regularParamCount = proto.paramCount;
-                int minRequiredArgs = proto.minRequiredParams >= 0 ? proto.minRequiredParams : regularParamCount;
                 
                 // 扩展 local 以容纳常规参数 + *args + **kwargs
                 if (proto.hasVariadicArgs || proto.hasVariadicKwargs) {
@@ -5866,6 +6308,7 @@ class VM {
                 // 扫描栈上的参数,分离位置参数和命名参数
                 std::map<std::string, ZeusType::UniversalVariant> namedArgs;
                 std::vector<ZeusType::UniversalVariant> positionalArgs;
+                std::vector<bool> paramProvided(regularParamCount, false);
                 
                 for (int i = 0; i < actualArgc; ++i) {
                     auto& arg = stack[calleeIndex + 1 + i];
@@ -5892,6 +6335,7 @@ class VM {
                     // 优先使用位置参数
                     if (i < positionalCount) {
                         assignCellValue(local[i], positionalArgs[i]);
+                        paramProvided[i] = true;
                         filled = true;
                     }
                     
@@ -5902,23 +6346,17 @@ class VM {
                         if (it != namedArgs.end()) {
                             assignCellValue(local[i], it->second);
                             consumedNamedArgs.insert(paramName);
+                            paramProvided[i] = true;
                             filled = true;
                             ZEUS_DEBUG_PRINT("[CALL_CLOSURE] Filled param[%d] '%s' from named arg", i, paramName.c_str());
                         }
                     }
-                    
-                    // 使用默认值
-                    if (!filled) {
-                        if (i < (int)proto.paramDefaults.size()) {
-                            const auto& defVal = proto.paramDefaults[i];
-                            if (std::holds_alternative<LexerType::Value>(defVal)) {
-                                assignCellValue(local[i], std::get<LexerType::Value>(defVal));
-                                filled = true;
-                            } else if (ZeusVMUtils::isNull(defVal)) {
-                                assignCellValue(local[i], ZeusType::Variant(ZeusType::Null()));
-                                filled = true;
-                            }
-                        }
+
+                    if (!filled && !proto.hasRuntimeDefaultPrologue &&
+                        i < (int)proto.paramHasDefault.size() && proto.paramHasDefault[i] &&
+                        i < (int)proto.paramDefaultValues.size()) {
+                        assignCellValue(local[i], proto.paramDefaultValues[i]);
+                        filled = true;
                     }
                     
                     // 最后用0初始化
@@ -5926,19 +6364,23 @@ class VM {
                         assignCellValue(local[i], LexerType::Value(0));
                     }
                 }
-                
-                // 检查必需参数
-                if (positionalCount < minRequiredArgs && namedArgs.empty()) {
-                    VMException::VMException exp(
-                        "CALL_CLOSURE: missing required arguments. Expected at least " + 
-                        std::to_string(minRequiredArgs) + " arguments, but got " +
-                        std::to_string(positionalCount),
-                        __line,
-                        instr
-                    );
-                    exp._throw(vmstat, currentChunk);
-                    break;
+
+                for (int i = 0; i < regularParamCount; ++i) {
+                    const bool hasDefault = i < (int)proto.paramHasDefault.size() && proto.paramHasDefault[i];
+                    if (!paramProvided[i] && !hasDefault) {
+                        const std::string paramName = i < (int)proto.paramNames.size()
+                            ? proto.paramNames[i]
+                            : std::to_string(i);
+                        VMException::VMException exp(
+                            "CALL_CLOSURE: missing required argument '" + paramName + "'",
+                            __line,
+                            instr
+                        );
+                        exp._throw(vmstat, currentChunk);
+                        break;
+                    }
                 }
+                if (vmstat != ZeusType::VMStatus::Running) break;
                 
                 // 检查是否传递了过多的参数（仅当没有 *args 时）
                 if (!proto.hasVariadicArgs && positionalCount > regularParamCount) {
@@ -6037,6 +6479,7 @@ class VM {
                 newFrame.savedUpvalue = oldUpvalue;
                 newFrame.stackBase = callFrameBase;
                 newFrame.savedLine = __line;
+                newFrame.paramProvided = std::move(paramProvided);
                 
                  // callee closure 的生命周期由栈收缩（RETURN -> shrinkStackWithRelease(stackBase)）统一处理。
                  // 这里不再基于 refCount 推断“临时闭包”，避免与栈/容器 retain 语义冲突。
@@ -6935,6 +7378,9 @@ class VM {
             case VMOperator::JUMP_IF_FALSE: {
                 break;
             }
+            case VMOperator::JUMP_IF_PARAM_PROVIDED: {
+                break;
+            }
 
             case VMOperator::EQUL: {
                 // 1. 检查栈中是否有足够的元素
@@ -7486,6 +7932,20 @@ class VM {
                 
                 bool result = leftBool || rightBool;
                 stack.push_back(LexerType::Value(result));
+                printStack();
+                break;
+            }
+
+            case VMOperator::LOGICAL_NOT: {
+                if (stack.empty()) {
+                    VMException::VMException exp("LOGICAL_NOT stack underflow", __line, instr);
+                    exp._throw(vmstat, currentChunk);
+                    break;
+                }
+
+                const auto operand = stack.back();
+                stack.pop_back();
+                stack.push_back(LexerType::Value(!ZeusVMUtils::toBool(operand)));
                 printStack();
                 break;
             }

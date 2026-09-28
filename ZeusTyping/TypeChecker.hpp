@@ -27,6 +27,8 @@ namespace ZeusTypeInfer {
         int nodeIndex = -1;
         TypeCheckSeverity severity = TypeCheckSeverity::Error;
         std::string message;
+        int line = 0;
+        int column = 0;
     };
 
     struct TypeCheckOptions {
@@ -86,6 +88,8 @@ namespace ZeusTypeInfer {
         TypeInferer inferer;
         std::vector<TypeCheckDiagnostic> diagnostics;
         TypeCheckOptions rootOptions = TypeCheckOptions::dynamic();
+        int currentSourceLine = 0;
+        int currentSourceColumn = 0;
         std::unordered_set<std::string> classNames;
         std::unordered_map<std::string, std::unordered_map<std::string, std::string>> classFields;
         std::unordered_map<std::string, std::string> classReceiverAliases;
@@ -199,8 +203,13 @@ namespace ZeusTypeInfer {
 
         std::string instanceReceiverAlias(const TreeParser::CodeBlock& block) const {
             if (block.type != CodeBlockType::FUNC || !block.isClassMethod ||
-                block.isStaticMethod || block.ownerClassName.empty()) {
+                block.isStaticMethod || block.isCompileTimeStatic ||
+                block.ownerClassName.empty()) {
                 return {};
+            }
+
+            if (!block.paramNames.empty() && block.paramNames.front() == "this") {
+                return "this";
             }
 
             auto declaredAlias = classReceiverAliases.find(block.ownerClassName);
@@ -316,14 +325,18 @@ namespace ZeusTypeInfer {
                     std::vector<LexerType::Token>{ expression[0] },
                     environment
                 );
-                if (!receiver.type.namedType.empty()) {
+                std::string receiverType = receiver.type.namedType;
+                if (receiverType.empty() && receiver.type.kind == InferredType::String) {
+                    receiverType = "string";
+                }
+                if (!receiverType.empty()) {
                     const std::string method =
                         std::get<LexerType::Keyword>(expression[2]).name;
                     TypeInfo result = functionResult(
-                        receiver.type.namedType + "::" + method
+                        receiverType + "::" + method
                     );
                     if (!result.resolved) {
-                        result = functionResult(receiver.type.namedType + "." + method);
+                        result = functionResult(receiverType + "." + method);
                     }
                     if (!result.resolved) result = functionResult(method);
                     if (result.resolved) return result;
@@ -422,7 +435,13 @@ namespace ZeusTypeInfer {
             TypeCheckSeverity severity,
             std::string message
         ) {
-            diagnostics.push_back({ nodeIndex, severity, std::move(message) });
+            diagnostics.push_back({
+                nodeIndex,
+                severity,
+                std::move(message),
+                currentSourceLine,
+                currentSourceColumn
+            });
         }
 
         static bool canAssign(InferredType expected, InferredType actual) {
@@ -904,6 +923,10 @@ namespace ZeusTypeInfer {
             Environment environment,
             int& nodeIndex
         ) {
+            const int previousSourceLine = currentSourceLine;
+            const int previousSourceColumn = currentSourceColumn;
+            currentSourceLine = block.sourceLine;
+            currentSourceColumn = block.sourceColumn;
             FunctionContext function;
             function.name = block.funcName;
             const std::string receiverAlias = instanceReceiverAlias(block);
@@ -1022,6 +1045,8 @@ namespace ZeusTypeInfer {
             }
 
             checkBlock(block.nodes, std::move(environment), nodeIndex, functionOptions, &function);
+            currentSourceLine = block.sourceLine;
+            currentSourceColumn = block.sourceColumn;
 
             if (!hasReturnAnnotation) {
                 if (!function.hasReturn) {
@@ -1063,6 +1088,8 @@ namespace ZeusTypeInfer {
                     "函数 " + block.funcName + " 声明了返回类型，但没有 return"
                 );
             }
+            currentSourceLine = previousSourceLine;
+            currentSourceColumn = previousSourceColumn;
         }
 
         void checkBlock(
@@ -1078,6 +1105,8 @@ namespace ZeusTypeInfer {
 
                 if (element.isNode()) {
                     const auto& statement = element.node();
+                    currentSourceLine = statement.sourceLine;
+                    currentSourceColumn = statement.sourceColumn;
 
                     if (statement.type == NodeType::VAR_DECL_STMT) {
                         checkVariableDeclaration(statement, environment, nodeIndex, options);
@@ -1092,6 +1121,8 @@ namespace ZeusTypeInfer {
 
                 const auto* block = element.block();
                 if (block == nullptr) continue;
+                currentSourceLine = block->sourceLine;
+                currentSourceColumn = block->sourceColumn;
 
                 if (block->type == CodeBlockType::FUNC) {
                     checkFunction(*block, environment, nodeIndex);
@@ -1116,6 +1147,8 @@ namespace ZeusTypeInfer {
         bool check(const TypeCheckOptions& options = TypeCheckOptions::dynamic()) {
             diagnostics.clear();
             inferredFunctionReturnTypes.clear();
+            currentSourceLine = 0;
+            currentSourceColumn = 0;
             rootOptions = options;
             classNames.clear();
             classFields.clear();

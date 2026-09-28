@@ -22,6 +22,7 @@ namespace LexerType {
         public:
             TokenType type;
             int line = 1;  // Source line number
+            int column = 1; // 1-based Unicode code-point column
 
             TokenType getType() const { return TokenType::UNDEF; }
             

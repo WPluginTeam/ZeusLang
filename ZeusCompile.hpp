@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include "./ZeusParser/LexerParser.hpp"
 #include "./ZeusParser/TreeParser.hpp"
+#include "./ZeusParser/SyntaxValidator.hpp"
 #include "./ZeusTyping/TypeChecker.hpp"
 #ifdef ZEUS_DEBUG_FILE_CHANNEL
 #undef ZEUS_DEBUG_FILE_CHANNEL
@@ -32,6 +33,8 @@ namespace ZeusCompile {
     struct Result {
         std::vector<std::vector<IRType::IRInstr>> program;
         std::vector<std::string> globalNames;
+        std::vector<ZeusDiagnostics::Diagnostic> diagnostics;
+        bool hasReportedErrors = false;
         bool strictDecl = false; // 记录是否严格模式（影响 VM 行为：禁用 late resolve）
         std::string sourceFilePath; // 源文件路径（用于错误信息）
         std::string sourceCode;     // 源代码（用于错误信息显示行内容）
@@ -119,28 +122,50 @@ namespace ZeusCompile {
         }
     }
 
-    inline Result compile(const std::string& src, bool strictDecl=false, bool enableHotspot=true) {
+    inline Result compile(
+        const std::string& src,
+        bool strictDecl=false,
+        bool enableHotspot=true,
+        const std::string& sourceFilePath={}
+    ) {
         // 注意：源文件信息的清除应在整个编译流程开始前进行（在 Zeus.cpp 中）
         // 这样包编译期间注册的源文件信息不会被清除
         
+        Result r;
+        r.strictDecl = strictDecl;
+        r.sourceFilePath = sourceFilePath;
+        r.sourceCode = src;
+        ZeusDiagnostics::setSourceContext(sourceFilePath, src);
+
         auto t0 = std::chrono::steady_clock::now();
-        std::vector<LexerType::Token> tokens = LexerParser::parse(src);
+        std::vector<LexerType::Token> tokens = LexerParser::parse(src, &r.diagnostics);
         auto t1 = std::chrono::steady_clock::now();
-        std::vector<TreeParser::NodeAndBlock> ast = TreeParser::parse(tokens);
+        ZeusDiagnostics::append(r.diagnostics, ZeusParser::validateSyntax(tokens));
+        if (!r.diagnostics.empty()) {
+            r.lexTimeMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            return r;
+        }
+        std::vector<TreeParser::NodeAndBlock> ast = TreeParser::parse(tokens, &r.diagnostics);
         auto t2 = std::chrono::steady_clock::now();
+        ZeusDiagnostics::append(r.diagnostics, ZeusParser::validateParsedSyntax(ast));
+        if (!r.diagnostics.empty()) {
+            r.lexTimeMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            r.parseTimeMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+            return r;
+        }
         ZeusTypeInfer::TypeChecker returnTypeChecker(ast);
         returnTypeChecker.check(ZeusTypeInfer::TypeCheckOptions::llvm());
         IRGen::IRGenerator irGen;
         irGen.strictDecl = strictDecl;
         irGen.inferredFunctionReturnTypes =
             returnTypeChecker.getInferredFunctionReturnTypes();
+        const size_t reportCountBeforeIR = ZeusDiagnostics::reportedCount;
         irGen.parse(ast);
+        r.hasReportedErrors = ZeusDiagnostics::reportedCount > reportCountBeforeIR;
         auto t3 = std::chrono::steady_clock::now();
 
-        Result r;
         r.program = irGen.bytecodes;
         r.globalNames = irGen.globalNamesByIndex;
-        r.strictDecl = strictDecl;
         r.lexTimeMs   = std::chrono::duration<double, std::milli>(t1 - t0).count();
         r.parseTimeMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
         r.irTimeMs    = std::chrono::duration<double, std::milli>(t3 - t2).count();

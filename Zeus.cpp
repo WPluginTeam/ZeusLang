@@ -202,7 +202,18 @@ int main(int argc, char* argv[]) {
         VMException::setSourceFilePath(srcPath);
         VMException::setSourceCode(code);
 
-        const auto prescanTokens = LexerParser::parse(code);
+        std::vector<ZeusDiagnostics::Diagnostic> sourceDiagnostics;
+        const auto prescanTokens = LexerParser::parse(code, &sourceDiagnostics);
+        ZeusDiagnostics::append(
+            sourceDiagnostics,
+            ZeusParser::validateSyntax(prescanTokens)
+        );
+        if (!sourceDiagnostics.empty()) {
+            for (const auto& diagnostic : sourceDiagnostics) {
+                std::cout << ZeusDiagnostics::render(diagnostic, srcPath, code) << std::endl;
+            }
+            return 1;
+        }
         bool usesBytesLiteral = false;
         for (const auto& token : prescanTokens) {
             if (std::holds_alternative<LexerType::BytesLiteral>(token)) {
@@ -270,31 +281,82 @@ int main(int argc, char* argv[]) {
             };
 
             for (const auto& module : llvmModuleGraph.dependencyOrder) {
-                auto moduleTokens = LexerParser::parse(module.source);
-                auto moduleAst = TreeParser::parse(moduleTokens);
+                std::vector<ZeusDiagnostics::Diagnostic> moduleDiagnostics;
+                auto moduleTokens = LexerParser::parse(module.source, &moduleDiagnostics);
+                ZeusDiagnostics::append(
+                    moduleDiagnostics,
+                    ZeusParser::validateSyntax(moduleTokens)
+                );
+                if (!moduleDiagnostics.empty()) {
+                    for (const auto& diagnostic : moduleDiagnostics) {
+                        std::cout << ZeusDiagnostics::render(
+                            diagnostic, module.path, module.source
+                        ) << std::endl;
+                    }
+                    return 1;
+                }
+                auto moduleAst = TreeParser::parse(moduleTokens, &moduleDiagnostics);
+                ZeusDiagnostics::append(
+                    moduleDiagnostics,
+                    ZeusParser::validateParsedSyntax(moduleAst)
+                );
+                if (!moduleDiagnostics.empty()) {
+                    for (const auto& diagnostic : moduleDiagnostics) {
+                        std::cout << ZeusDiagnostics::render(
+                            diagnostic, module.path, module.source
+                        ) << std::endl;
+                    }
+                    return 1;
+                }
                 ZeusTypeInfer::TypeChecker moduleChecker(moduleAst);
                 registerImportedInterfaces(moduleChecker, module.imports);
                 if (!moduleChecker.check(ZeusTypeInfer::TypeCheckOptions::llvm())) {
                     for (const auto& diagnostic : moduleChecker.getDiagnostics()) {
                         if (diagnostic.severity == ZeusTypeInfer::TypeCheckSeverity::Error) {
-                            std::cout << "[emit-llvm] type error in module '" << module.packageName
-                                      << "' (node " << diagnostic.nodeIndex << "): "
-                                      << diagnostic.message << std::endl;
+                            std::cout << ZeusDiagnostics::render(
+                                { "type", diagnostic.message, diagnostic.line, diagnostic.column },
+                                module.path,
+                                module.source
+                            ) << std::endl;
                         }
                     }
                     return 1;
                 }
             }
 
-            auto typingTokens = LexerParser::parse(code);
-            auto typingAst = TreeParser::parse(typingTokens);
+            std::vector<ZeusDiagnostics::Diagnostic> parseDiagnostics;
+            auto typingTokens = LexerParser::parse(code, &parseDiagnostics);
+            ZeusDiagnostics::append(
+                parseDiagnostics,
+                ZeusParser::validateSyntax(typingTokens)
+            );
+            if (!parseDiagnostics.empty()) {
+                for (const auto& diagnostic : parseDiagnostics) {
+                    std::cout << ZeusDiagnostics::render(diagnostic, srcPath, code) << std::endl;
+                }
+                return 1;
+            }
+            auto typingAst = TreeParser::parse(typingTokens, &parseDiagnostics);
+            ZeusDiagnostics::append(
+                parseDiagnostics,
+                ZeusParser::validateParsedSyntax(typingAst)
+            );
+            if (!parseDiagnostics.empty()) {
+                for (const auto& diagnostic : parseDiagnostics) {
+                    std::cout << ZeusDiagnostics::render(diagnostic, srcPath, code) << std::endl;
+                }
+                return 1;
+            }
             ZeusTypeInfer::TypeChecker typeChecker(typingAst);
             registerImportedInterfaces(typeChecker, llvmModuleGraph.rootImports);
             if (!typeChecker.check(ZeusTypeInfer::TypeCheckOptions::llvm())) {
                 for (const auto& diagnostic : typeChecker.getDiagnostics()) {
                     if (diagnostic.severity == ZeusTypeInfer::TypeCheckSeverity::Error) {
-                        std::cout << "[emit-llvm] type error (node " << diagnostic.nodeIndex
-                                  << "): " << diagnostic.message << std::endl;
+                        std::cout << ZeusDiagnostics::render(
+                            { "type", diagnostic.message, diagnostic.line, diagnostic.column },
+                            srcPath,
+                            code
+                        ) << std::endl;
                     }
                 }
                 return 1;
@@ -524,6 +586,7 @@ int main(int argc, char* argv[]) {
                         return 1;
                     }
                     try {
+                        ZeusDiagnostics::setSourceContext(module->path, module->source);
                         auto compiled = ZeusPackage::compilePackage(packageName, module->path, strictDecl);
                         ZeusPackage::loadedPackages[packageName] = std::move(compiled);
                         pkg = &ZeusPackage::loadedPackages[packageName];
@@ -533,7 +596,12 @@ int main(int argc, char* argv[]) {
                         return 1;
                     }
                 } else {
-                    pkg = ZeusPackage::loadPackage(packageName, srcPath, strictDecl);
+                    try {
+                        pkg = ZeusPackage::loadPackage(packageName, srcPath, strictDecl);
+                    } catch (const std::exception& ex) {
+                        std::cout << ex.what() << std::endl;
+                        return 1;
+                    }
                     if (pkg != nullptr) {
                         pkg->namespaceAliasSentinels = std::move(vmNamespaceAliasSentinels);
                         pkg->importedGlobalSlotSentinels = std::move(vmImportedGlobalSlotSentinels);
@@ -846,11 +914,17 @@ int main(int argc, char* argv[]) {
 
         ZEUS_DEBUG_PRINT("[Main] Compiling main program (package globals: %d)...", packageGlobalCount);
 
-        ZeusCompile::Result cr = ZeusCompile::compile(code, strictDecl, emitLLVM ? false : enableHotspot);
+        ZeusCompile::Result cr = ZeusCompile::compile(
+            code, strictDecl, emitLLVM ? false : enableHotspot, srcPath
+        );
         
         // 设置源文件信息用于错误报告
         cr.sourceFilePath = srcPath;
         cr.sourceCode = code;
+
+        for (const auto& diagnostic : cr.diagnostics) {
+            std::cout << ZeusDiagnostics::render(diagnostic, srcPath, code) << std::endl;
+        }
         
         ZEUS_DEBUG_PRINT("[Main] Compile done. cr.globalNames.size()=%zu", cr.globalNames.size());
         for (size_t i = 0; i < cr.globalNames.size(); ++i) {
@@ -890,7 +964,9 @@ int main(int argc, char* argv[]) {
         }
 
         if (cr.program.empty()) {
-            std::cout << "Compile failed (IR stopped)." << std::endl;
+            if (cr.diagnostics.empty() && !cr.hasReportedErrors) {
+                std::cout << "Compile failed (IR stopped)." << std::endl;
+            }
             return 1;
         }
 
@@ -918,7 +994,11 @@ int main(int argc, char* argv[]) {
                 std::cout << "[emit-llvm] warning: " << warning << std::endl;
             }
             if (!emitted.ok) {
-                std::cout << emitted.error << std::endl;
+                std::cout << ZeusDiagnostics::render(
+                    { "llvm", emitted.error, emitted.errorLine, 0 },
+                    srcPath,
+                    code
+                ) << std::endl;
                 return 1;
             }
 

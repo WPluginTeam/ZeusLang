@@ -7,6 +7,7 @@ enum class CodeBlockType {
     FOR,
     FUNC,
     CLASS,
+    IMPL,
     TRY,    // try block
     CATCH,  // catch block
     WITH,   // with block
@@ -35,6 +36,7 @@ enum class NodeType {
     FOR_DECL_STMT,
     FUNC_DECL_STMT,
     CLASS_DECL_STMT,
+    IMPL_DECL_STMT,
     TRY_DECL_STMT,  // try {} catch (&e) {}
     WITH_DECL_STMT, // with (expr) {}
 
@@ -66,6 +68,7 @@ namespace Debug {
             case NodeType::FOR_DECL_STMT: return "FOR_DECL_STMT";
             case NodeType::FUNC_DECL_STMT: return "FUNC_DECL_STMT";
             case NodeType::CLASS_DECL_STMT: return "CLASS_DECL_STMT";
+            case NodeType::IMPL_DECL_STMT: return "IMPL_DECL_STMT";
             case NodeType::TRY_DECL_STMT: return "TRY_DECL_STMT";
             case NodeType::WITH_DECL_STMT: return "WITH_DECL_STMT";
             case NodeType::KWARG_NODE: return "KWARG_NODE";
@@ -79,6 +82,7 @@ namespace Debug {
             case CodeBlockType::FOR: return "FOR";
             case CodeBlockType::FUNC: return "FUNC";
             case CodeBlockType::CLASS: return "CLASS";
+            case CodeBlockType::IMPL: return "IMPL";
             case CodeBlockType::TRY: return "TRY";
             case CodeBlockType::CATCH: return "CATCH";
             case CodeBlockType::WITH: return "WITH";

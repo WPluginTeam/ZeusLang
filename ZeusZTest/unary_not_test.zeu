@@ -1,0 +1,15 @@
+func negate(value: bool) -> bool {
+    return !value;
+}
+
+func negate_dynamic(value) {
+    return !value;
+}
+
+print(!false, !true, !!false, !(1 + 2 == 3));
+print(negate(false), negate(true));
+print(negate_dynamic(""), negate_dynamic("zeus"));
+
+if (!false) {
+    print("unary not condition passed");
+}

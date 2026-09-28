@@ -165,7 +165,16 @@ enum class VMOperator {
     HOTSPOT,
 
     // 仅供后端使用的语义标注，不改变动态 VM 栈语义。
-    IR_ANNOTATION
+    IR_ANNOTATION,
+
+    // Conditional branch used by function default-argument prologues.
+    JUMP_IF_PARAM_PROVIDED,
+
+    // Appended to preserve the numeric values of existing serialized operators.
+    LOGICAL_NOT,
+
+    // Registers class-style methods for an existing runtime type.
+    TYPE_IMPL_BUILD
 };
 
 
@@ -255,6 +264,9 @@ std::string VMO_toString(VMOperator opr) {
         // Hotspot
         case VMOperator::HOTSPOT: return "HOTSPOT";
         case VMOperator::IR_ANNOTATION: return "IR_ANNOTATION";
+        case VMOperator::JUMP_IF_PARAM_PROVIDED: return "JUMP_IF_PARAM_PROVIDED";
+        case VMOperator::LOGICAL_NOT: return "LOGICAL_NOT";
+        case VMOperator::TYPE_IMPL_BUILD: return "TYPE_IMPL_BUILD";
         default: return "UNKNOWN";
     }
 }

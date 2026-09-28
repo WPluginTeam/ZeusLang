@@ -11,6 +11,7 @@
 #include <sstream>
 #include "./ZeusParser/LexerParser.hpp"
 #include "./ZeusParser/TreeParser.hpp"
+#include "./ZeusParser/SyntaxValidator.hpp"
 #include "./ZeusIR/IRGenerator.hpp"
 #include "./ZeusIR/IRImport.hpp"
 #include "./ZeusIR/IRScope.hpp"
@@ -20,6 +21,36 @@
 #define ZEUS_DEBUG_FILE_CHANNEL ::ZeusDebug::CH_PackageLoader
 
 namespace ZeusPackage {
+
+    inline void relocateTypeImplPrototypes(IRType::IRInstr& instr, int prototypeOffset) {
+        if (instr.op != VMOperator::TYPE_IMPL_BUILD) return;
+        size_t cursor = 1;
+        for (int group = 0; group < 3; ++group) {
+            if (cursor >= instr.args.size() ||
+                !std::holds_alternative<LexerType::Value>(instr.args[cursor])) {
+                throw std::runtime_error("Malformed TYPE_IMPL_BUILD method count");
+            }
+            const int count = VMHelpers::getIntFromValue(
+                std::get<LexerType::Value>(instr.args[cursor++]));
+            if (count < 0 || static_cast<size_t>(count) >
+                    (instr.args.size() - cursor) / 2) {
+                throw std::runtime_error("Malformed TYPE_IMPL_BUILD method entries");
+            }
+            for (int method = 0; method < count; ++method) {
+                if (!std::holds_alternative<std::string>(instr.args[cursor]) ||
+                    !std::holds_alternative<LexerType::Value>(instr.args[cursor + 1])) {
+                    throw std::runtime_error("Malformed TYPE_IMPL_BUILD method entry");
+                }
+                auto& value = std::get<LexerType::Value>(instr.args[cursor + 1]);
+                value.data = ZeusType::BigInteger(
+                    VMHelpers::getIntFromValue(value) + prototypeOffset);
+                cursor += 2;
+            }
+        }
+        if (cursor != instr.args.size()) {
+            throw std::runtime_error("Unexpected TYPE_IMPL_BUILD method metadata");
+        }
+    }
 
     // 包编译结果
     struct CompiledPackage {
@@ -231,12 +262,36 @@ namespace ZeusPackage {
 
         // čŻćłĺć
         ZEUS_DEBUG_PRINT("[PackageLoader] Starting lexer...");
-        auto tokens = LexerParser::parse(source);
+        std::vector<ZeusDiagnostics::Diagnostic> syntaxDiagnostics;
+        auto tokens = LexerParser::parse(source, &syntaxDiagnostics);
+        ZeusDiagnostics::append(syntaxDiagnostics, ZeusParser::validateSyntax(tokens));
+        ZEUS_DEBUG_PRINT("[PackageLoader] Syntax checks done (%zu diagnostics)", syntaxDiagnostics.size());
         ZEUS_DEBUG_PRINT("[PackageLoader] Lexer done (%zu tokens)", tokens.size());
+        if (!syntaxDiagnostics.empty()) {
+            throw std::runtime_error(ZeusDiagnostics::render(
+                syntaxDiagnostics.front(), sourceFilePath, source
+            ));
+        }
 
         // čŻ­ćłĺć
         ZEUS_DEBUG_PRINT("[PackageLoader] Starting tree parser...");
-        auto trees = TreeParser::parse(tokens);
+        auto trees = TreeParser::parse(tokens, &syntaxDiagnostics);
+        ZEUS_DEBUG_PRINT("[PackageLoader] Tree parser returned (%zu diagnostics)", syntaxDiagnostics.size());
+        ZeusDiagnostics::append(
+            syntaxDiagnostics,
+            ZeusParser::validateParsedSyntax(trees)
+        );
+        ZEUS_DEBUG_PRINT("[PackageLoader] AST syntax checks done (%zu diagnostics)", syntaxDiagnostics.size());
+        if (!syntaxDiagnostics.empty()) {
+            for (const auto& diagnostic : syntaxDiagnostics) {
+                ZEUS_DEBUG_PRINT("[PackageLoader] %s at %d:%d: %s",
+                                 diagnostic.code.c_str(), diagnostic.line,
+                                 diagnostic.column, diagnostic.message.c_str());
+            }
+            throw std::runtime_error(ZeusDiagnostics::render(
+                syntaxDiagnostics.front(), sourceFilePath, source
+            ));
+        }
         ZEUS_DEBUG_PRINT("[PackageLoader] Tree parser done (%zu trees)", trees.size());
 
         // IR生成
@@ -659,6 +714,7 @@ namespace ZeusPackage {
                 auto pkgChunk = pkgChunkSrc;
                 for (size_t i = 0; i < pkgChunk.size(); ++i) {
                     auto& instr = pkgChunk[i];
+                    relocateTypeImplPrototypes(instr, totalInsertedProtos);
                     
                     if (instr.op == VMOperator::MAKE_FUNCTION) {
                         if (instr.args.size() >= 1 && 
@@ -1059,6 +1115,7 @@ namespace ZeusPackage {
             
             for (size_t i = 0; i < chunk.size(); ++i) {
                 auto& instr = chunk[i];
+                relocateTypeImplPrototypes(instr, totalInsertedProtos);
                 
                 if (instr.op == VMOperator::MAKE_FUNCTION) {
                     if (instr.args.size() >= 1 && 

@@ -5,6 +5,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -13,6 +14,7 @@
 #include "../ZeusIR/IRImport.hpp"
 #include "../ZeusParser/AstElementView.hpp"
 #include "../ZeusParser/LexerParser.hpp"
+#include "../ZeusParser/SyntaxValidator.hpp"
 #include "../ZeusParser/TreeParser.hpp"
 #include "../ZeusBuiltins/BuiltinRegistry.hpp"
 
@@ -109,9 +111,21 @@ inline std::vector<ModuleImport> readImports(const std::string& source) {
     return imports;
 }
 
-inline std::vector<ModuleFunctionInterface> readInterfaces(const std::string& source) {
-    const auto tokens = LexerParser::parse(source);
-    const auto nodes = TreeParser::parse(tokens);
+inline std::vector<ModuleFunctionInterface> readInterfaces(
+    const std::string& source,
+    const std::string& sourcePath = {}
+) {
+    std::vector<ZeusDiagnostics::Diagnostic> diagnostics;
+    const auto tokens = LexerParser::parse(source, &diagnostics);
+    ZeusDiagnostics::append(diagnostics, ZeusParser::validateSyntax(tokens));
+    if (!diagnostics.empty()) {
+        throw std::runtime_error(ZeusDiagnostics::render(diagnostics.front(), sourcePath, source));
+    }
+    const auto nodes = TreeParser::parse(tokens, &diagnostics);
+    ZeusDiagnostics::append(diagnostics, ZeusParser::validateParsedSyntax(nodes));
+    if (!diagnostics.empty()) {
+        throw std::runtime_error(ZeusDiagnostics::render(diagnostics.front(), sourcePath, source));
+    }
     std::vector<ModuleFunctionInterface> functions;
 
     const auto collectTopLevelFunctions = [&](const auto& self,
@@ -203,7 +217,12 @@ class Builder {
         node.path = canonicalPath;
         node.source = std::move(source);
         node.imports = readImports(node.source);
-        node.functions = readInterfaces(node.source);
+        try {
+            node.functions = readInterfaces(node.source, node.path);
+        } catch (const std::exception& ex) {
+            result.error = ex.what();
+            return false;
+        }
 
         visitState[packageName] = 1;
         importStack.push_back(packageName);
@@ -230,6 +249,20 @@ public:
         packageToNode.clear();
         pathToPackage.clear();
         importStack.clear();
+
+        std::vector<ZeusDiagnostics::Diagnostic> rootDiagnostics;
+        const auto rootTokens = LexerParser::parse(rootSource, &rootDiagnostics);
+        ZeusDiagnostics::append(rootDiagnostics, ZeusParser::validateSyntax(rootTokens));
+        if (!rootDiagnostics.empty()) {
+            result.error = ZeusDiagnostics::render(rootDiagnostics.front(), rootPath, rootSource);
+            return std::move(result);
+        }
+        const auto rootAst = TreeParser::parse(rootTokens, &rootDiagnostics);
+        ZeusDiagnostics::append(rootDiagnostics, ZeusParser::validateParsedSyntax(rootAst));
+        if (!rootDiagnostics.empty()) {
+            result.error = ZeusDiagnostics::render(rootDiagnostics.front(), rootPath, rootSource);
+            return std::move(result);
+        }
         result.rootImports = readImports(rootSource);
 
         for (const auto& packageName : implicitPackages) {

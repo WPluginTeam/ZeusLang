@@ -32,7 +32,8 @@ struct CaptureCellHandle {
 
 struct ClosureRecord {
     ZeusClosureInvoke invoke = nullptr;
-    int32_t arity = 0;
+    int32_t minArity = 0;
+    int32_t maxArity = 0;
     std::mutex mutex;
     std::vector<std::shared_ptr<CaptureCell>> captures;
 };
@@ -79,13 +80,15 @@ CaptureCellHandle* requireCell(void* handle);
 // a collection triggered by the registration cannot see a half-built node.
 std::shared_ptr<ClosureRecord> makeClosureRecord(
     ZeusClosureInvoke invoke,
-    int32_t arity,
+    int32_t minArity,
+    int32_t maxArity,
     int32_t captureCount,
     void* const* cells
 ) {
     auto record = std::make_shared<ClosureRecord>();
     record->invoke = invoke;
-    record->arity = arity;
+    record->minArity = minArity;
+    record->maxArity = maxArity;
     record->captures.reserve(static_cast<size_t>(captureCount));
     for (int32_t i = 0; i < captureCount; ++i) {
         record->captures.push_back(requireCell(cells[i])->cell);
@@ -134,18 +137,19 @@ std::shared_ptr<CaptureCell> requireCapture(ClosureRecord* environment, int32_t 
 
 ZeusType::NativeClosureHandle makeClosureHandle(
     ZeusClosureInvoke invoke,
-    int32_t arity,
+    int32_t minArity,
+    int32_t maxArity,
     int32_t captureCount,
     void* const* cells
 ) {
-    if (!invoke || arity < 0 || captureCount < 0 ||
+    if (!invoke || minArity < 0 || maxArity < minArity || captureCount < 0 ||
         (captureCount != 0 && !cells)) {
         closurePanic("invalid closure construction arguments");
     }
 
     try {
         return ZeusType::NativeClosureHandle{
-            makeClosureRecord(invoke, arity, captureCount, cells)
+            makeClosureRecord(invoke, minArity, maxArity, captureCount, cells)
         };
     } catch (...) {
         rethrowAsClosurePanic("failed to register closure environment");
@@ -286,7 +290,28 @@ void zeus_closure_create(
         // The local box is a root, so the record stays reachable if the scope
         // exit triggers a collection.
         ZeusBox box;
-        box.v = makeClosureHandle(invoke, arity, capture_count, cells);
+        box.v = makeClosureHandle(invoke, arity, arity, capture_count, cells);
+        zeus_value_from_box(out, &box);
+    } catch (...) {
+        closurePanic("failed to create closure value");
+    }
+}
+
+void zeus_closure_create_range(
+    ZeusValue* out,
+    ZeusClosureInvoke invoke,
+    int32_t min_arity,
+    int32_t max_arity,
+    int32_t capture_count,
+    void* const* cells
+) {
+    if (!out) closurePanic("null closure output");
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    ZeusGC::AllocationScope allocation;
+    try {
+        ZeusBox box;
+        box.v = makeClosureHandle(
+            invoke, min_arity, max_arity, capture_count, cells);
         zeus_value_from_box(out, &box);
     } catch (...) {
         closurePanic("failed to create closure value");
@@ -305,7 +330,9 @@ void zeus_closure_call(
     ZeusBox* box = nullptr;
     ClosureRecord* record = closureRecordFromValue(closure, box);
     std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> ownedBox(box, &zeus_box_release);
-    if (argc != record->arity) closurePanic("closure call arity mismatch");
+    if (argc < record->minArity || argc > record->maxArity) {
+        closurePanic("closure call arity mismatch");
+    }
     zeus_value_init_nil(out);
     record->invoke(out, record, argc, values);
 }

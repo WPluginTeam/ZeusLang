@@ -1,0 +1,1119 @@
+#ifndef ZEUS_PARSER_SYNTAX_VALIDATOR_HPP
+#define ZEUS_PARSER_SYNTAX_VALIDATOR_HPP
+
+#include <algorithm>
+#include <cctype>
+#include <string>
+#include <utility>
+#include <vector>
+#include "ExpressionSyntaxValidator.hpp"
+#include "LexerType.hpp"
+#include "TreeParser.hpp"
+#include "../ZeusDiagnostics.hpp"
+#include "../ZeusBuiltins/BuiltinRegistry.hpp"
+
+namespace ZeusParser {
+
+inline bool isSyntaxOperator(const LexerType::Token& token, const std::string& symbol) {
+    return std::holds_alternative<LexerType::Operator>(token) &&
+           std::get<LexerType::Operator>(token).symbol == symbol;
+}
+
+inline bool isSyntaxIdentifier(const LexerType::Token& token) {
+    if (!std::holds_alternative<LexerType::Keyword>(token)) return false;
+    const std::string& name = std::get<LexerType::Keyword>(token).name;
+    static const std::vector<std::string> reserved = {
+        "var", "let", "const", "shared", "if", "else", "for", "func", "class", "impl",
+        "return", "break", "continue", "delete", "throw", "try", "catch", "with",
+        "import", "using", "original", "decl", "static", "new", "true", "false", "nil"
+    };
+    for (const auto& keyword : reserved) {
+        if (name == keyword) return false;
+    }
+    return true;
+}
+
+inline bool isSyntaxTypePath(const std::string& name) {
+    if (name.empty()) return false;
+    bool expectIdentifierStart = true;
+    for (unsigned char ch : name) {
+        if (ch == '.') {
+            if (expectIdentifierStart) return false;
+            expectIdentifierStart = true;
+            continue;
+        }
+        if (expectIdentifierStart) {
+            if (!(std::isalpha(ch) || ch == '_')) return false;
+            expectIdentifierStart = false;
+        } else if (!(std::isalnum(ch) || ch == '_')) {
+            return false;
+        }
+    }
+    return !expectIdentifierStart;
+}
+
+inline std::string canonicalSyntaxTypeName(const std::string& name) {
+    if (const auto* builtin = ZeusBuiltins::findTypeImplementation(name)) {
+        return std::string(builtin->canonicalName);
+    }
+    return name;
+}
+
+inline bool isSyntaxFunctionName(const LexerType::Token& token) {
+    if (isSyntaxIdentifier(token)) return true;
+    // `with` is also used as a method name by the bundled thread API.
+    return std::holds_alternative<LexerType::Keyword>(token) &&
+           std::get<LexerType::Keyword>(token).name == "with";
+}
+
+inline bool isSyntaxMemberKeyword(const std::vector<LexerType::Token>& tokens, size_t index) {
+    return index > 0 && isSyntaxOperator(tokens[index - 1], ".");
+}
+
+inline bool isSyntaxFunctionKeyword(const std::vector<LexerType::Token>& tokens, size_t index) {
+    if (index > 0 && std::holds_alternative<LexerType::Keyword>(tokens[index - 1]) &&
+        std::get<LexerType::Keyword>(tokens[index - 1]).name == "func") {
+        return true;
+    }
+    return index > 1 &&
+           std::holds_alternative<LexerType::Keyword>(tokens[index - 1]) &&
+           std::get<LexerType::Keyword>(tokens[index - 1]).name == "static" &&
+           std::holds_alternative<LexerType::Keyword>(tokens[index - 2]) &&
+           std::get<LexerType::Keyword>(tokens[index - 2]).name == "func";
+}
+
+inline int syntaxTokenLine(const LexerType::Token& token) {
+    return std::visit([](const auto& value) { return value.line; }, token);
+}
+
+inline int syntaxTokenColumn(const LexerType::Token& token) {
+    return std::visit([](const auto& value) { return value.column; }, token);
+}
+
+inline size_t matchingSyntaxDelimiter(
+    const std::vector<LexerType::Token>& tokens,
+    size_t openIndex
+) {
+    if (openIndex >= tokens.size() || !std::holds_alternative<LexerType::Operator>(tokens[openIndex])) {
+        return tokens.size();
+    }
+
+    const std::string open = std::get<LexerType::Operator>(tokens[openIndex]).symbol;
+    const std::string close = open == "(" ? ")" : open == "[" ? "]" : open == "{" ? "}" : "";
+    if (close.empty()) return tokens.size();
+
+    size_t depth = 0;
+    for (size_t i = openIndex; i < tokens.size(); ++i) {
+        if (isSyntaxOperator(tokens[i], open)) ++depth;
+        else if (isSyntaxOperator(tokens[i], close) && --depth == 0) return i;
+    }
+    return tokens.size();
+}
+
+inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
+    const std::vector<LexerType::Token>& tokens
+) {
+    std::vector<ZeusDiagnostics::Diagnostic> diagnostics;
+
+    auto addDiagnostic = [&](const std::string& code, const std::string& message,
+                             const LexerType::Token& token) {
+        ZeusDiagnostics::Diagnostic diagnostic;
+        diagnostic.code = code;
+        diagnostic.message = message;
+        diagnostic.line = syntaxTokenLine(token);
+        diagnostic.column = syntaxTokenColumn(token);
+        diagnostics.push_back(std::move(diagnostic));
+    };
+
+    // Operator overload names contain operator tokens inside brackets. Those
+    // tokens are part of a declaration, not expression operators.
+    std::vector<bool> inOperatorName(tokens.size(), false);
+    for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+        if (!std::holds_alternative<LexerType::Keyword>(tokens[i]) ||
+            std::get<LexerType::Keyword>(tokens[i]).name != "operator" ||
+            !isSyntaxOperator(tokens[i + 1], "[")) {
+            continue;
+        }
+        const size_t close = matchingSyntaxDelimiter(tokens, i + 1);
+        const size_t end = close == tokens.size() ? i + 1 : close;
+        for (size_t j = i; j <= end; ++j) inOperatorName[j] = true;
+    }
+
+    // Report mismatched and unclosed delimiters before the permissive tree
+    // parser can discard or misclassify the remaining tokens.
+    struct Delimiter {
+        std::string open;
+        size_t index;
+    };
+    std::vector<Delimiter> delimiters;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (!std::holds_alternative<LexerType::Operator>(tokens[i])) continue;
+        const std::string& symbol = std::get<LexerType::Operator>(tokens[i]).symbol;
+        if (symbol == "(" || symbol == "[" || symbol == "{") {
+            delimiters.push_back({ symbol, i });
+            continue;
+        }
+        if (symbol != ")" && symbol != "]" && symbol != "}") continue;
+
+        const std::string expectedOpen = symbol == ")" ? "(" : symbol == "]" ? "[" : "{";
+        if (delimiters.empty() || delimiters.back().open != expectedOpen) {
+            addDiagnostic("P0005", "unmatched closing delimiter '" + symbol + "'", tokens[i]);
+            continue;
+        }
+        delimiters.pop_back();
+    }
+    for (const auto& delimiter : delimiters) {
+        const std::string expectedClose = delimiter.open == "(" ? ")" : delimiter.open == "[" ? "]" : "}";
+        addDiagnostic("P0005", "expected '" + expectedClose + "' to close '" + delimiter.open + "'",
+                      tokens[delimiter.index]);
+    }
+
+    auto isExpressionBoundary = [&](size_t index) {
+        if (index >= tokens.size()) return true;
+        if (!std::holds_alternative<LexerType::Operator>(tokens[index])) return false;
+        const std::string& symbol = std::get<LexerType::Operator>(tokens[index]).symbol;
+        return symbol == ";" || symbol == ")" || symbol == "]" ||
+               symbol == "}" || symbol == ",";
+    };
+
+    // An assignment/default argument with no expression on its right side is
+    // a syntax error. Do not treat '=' inside operator[[]=] as an assignment.
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (inOperatorName[i] || !isSyntaxOperator(tokens[i], "=")) continue;
+        if (i + 1 >= tokens.size() || isExpressionBoundary(i + 1)) {
+            addDiagnostic("P0002", "expected an expression after '='", tokens[i]);
+        }
+    }
+
+    // Catch incomplete binary/postfix expressions such as `1 +;` and `item.`.
+    static const std::vector<std::string> operatorsRequiringRightOperand = {
+        "+", "-", "*", "/", "%", "==", "!=", ">", "<", ">=", "<=",
+        "and", "or", "."
+    };
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (inOperatorName[i] || !std::holds_alternative<LexerType::Operator>(tokens[i])) continue;
+        const std::string& symbol = std::get<LexerType::Operator>(tokens[i]).symbol;
+        bool needsRightOperand = false;
+        for (const auto& op : operatorsRequiringRightOperand) {
+            if (symbol == op) {
+                needsRightOperand = true;
+                break;
+            }
+        }
+        if (needsRightOperand && (i + 1 >= tokens.size() || isExpressionBoundary(i + 1))) {
+            addDiagnostic("P0006", "expected an expression after '" + symbol + "'", tokens[i]);
+        }
+    }
+
+    // `new` always takes a class expression; a call with no class name is not
+    // a constructor expression.
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (inOperatorName[i] || !std::holds_alternative<LexerType::Keyword>(tokens[i]) ||
+            std::get<LexerType::Keyword>(tokens[i]).name != "new") {
+            continue;
+        }
+        if (i + 1 >= tokens.size() || !std::holds_alternative<LexerType::Keyword>(tokens[i + 1])) {
+            addDiagnostic("P0003", "expected a class name after 'new'", tokens[i]);
+        }
+    }
+
+    // Function values/anonymous functions are not part of the language. A
+    // `func` declaration must name a function or introduce an operator overload.
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (inOperatorName[i] || !std::holds_alternative<LexerType::Keyword>(tokens[i]) ||
+            std::get<LexerType::Keyword>(tokens[i]).name != "func") {
+            continue;
+        }
+
+        size_t nameIndex = i + 1;
+        if (nameIndex < tokens.size() && std::holds_alternative<LexerType::Keyword>(tokens[nameIndex]) &&
+            std::get<LexerType::Keyword>(tokens[nameIndex]).name == "static") {
+            ++nameIndex;
+        }
+
+        if (nameIndex >= tokens.size() || !std::holds_alternative<LexerType::Keyword>(tokens[nameIndex])) {
+            addDiagnostic("P0004", "function declarations require a name; anonymous functions are not supported",
+                          tokens[i]);
+            continue;
+        }
+        const bool operatorFunction =
+            std::get<LexerType::Keyword>(tokens[nameIndex]).name == "operator";
+        if (!operatorFunction && !isSyntaxFunctionName(tokens[nameIndex])) {
+            addDiagnostic("P0004", "function name must be an identifier", tokens[nameIndex]);
+            continue;
+        }
+
+        size_t paramsOpen = nameIndex + 1;
+        if (operatorFunction) {
+            if (paramsOpen >= tokens.size() || !isSyntaxOperator(tokens[paramsOpen], "[")) {
+                addDiagnostic("P0007", "expected '[' after 'operator' in function declaration", tokens[nameIndex]);
+                continue;
+            }
+            const size_t operatorClose = matchingSyntaxDelimiter(tokens, paramsOpen);
+            if (operatorClose == tokens.size()) continue; // unmatched delimiter is already reported
+            if (operatorClose == paramsOpen + 1) {
+                addDiagnostic("P0007", "operator overload requires at least one operator symbol",
+                              tokens[nameIndex]);
+            }
+            paramsOpen = operatorClose + 1;
+        }
+
+        if (paramsOpen < tokens.size() && std::holds_alternative<LexerType::Keyword>(tokens[paramsOpen]) &&
+            std::get<LexerType::Keyword>(tokens[paramsOpen]).name == "static") {
+            ++paramsOpen;
+        }
+        if (paramsOpen >= tokens.size() || !isSyntaxOperator(tokens[paramsOpen], "(")) {
+            addDiagnostic("P0008", "expected a parameter list after the function name", tokens[i]);
+            continue;
+        }
+
+        const size_t paramsClose = matchingSyntaxDelimiter(tokens, paramsOpen);
+        if (paramsClose == tokens.size()) continue; // unmatched delimiter is already reported
+
+        size_t segmentStart = paramsOpen + 1;
+        std::vector<std::pair<size_t, size_t>> parameterSegments;
+        bool hasParameter = false;
+        bool previousWasComma = false;
+        bool emptyParameterReported = false;
+        int parenDepth = 0;
+        int bracketDepth = 0;
+        int braceDepth = 0;
+        for (size_t j = paramsOpen + 1; j < paramsClose; ++j) {
+            const bool atTopLevelComma = isSyntaxOperator(tokens[j], ",") &&
+                parenDepth == 0 && bracketDepth == 0 && braceDepth == 0;
+            if (atTopLevelComma) {
+                if (segmentStart == j) {
+                    if (!emptyParameterReported) {
+                        addDiagnostic("P0018", "expected a parameter between commas",
+                                      tokens[j]);
+                        emptyParameterReported = true;
+                    }
+                } else {
+                    hasParameter = true;
+                    parameterSegments.push_back({ segmentStart, j });
+                }
+                segmentStart = j + 1;
+                previousWasComma = true;
+                continue;
+            }
+
+            previousWasComma = false;
+            if (!std::holds_alternative<LexerType::Operator>(tokens[j])) continue;
+            const std::string& symbol = std::get<LexerType::Operator>(tokens[j]).symbol;
+            if (symbol == "(") ++parenDepth;
+            else if (symbol == ")" && parenDepth > 0) --parenDepth;
+            else if (symbol == "[") ++bracketDepth;
+            else if (symbol == "]" && bracketDepth > 0) --bracketDepth;
+            else if (symbol == "{") ++braceDepth;
+            else if (symbol == "}" && braceDepth > 0) --braceDepth;
+        }
+        if (paramsClose > paramsOpen + 1 && segmentStart == paramsClose &&
+            previousWasComma && !hasParameter && !emptyParameterReported) {
+            addDiagnostic("P0018", "expected a parameter between commas", tokens[paramsClose]);
+        }
+        if (segmentStart < paramsClose) {
+            parameterSegments.push_back({ segmentStart, paramsClose });
+        }
+
+        for (const auto& segment : parameterSegments) {
+            size_t position = segment.first;
+            const size_t end = segment.second;
+            const bool variadic = isSyntaxOperator(tokens[position], "*");
+            if (variadic) {
+                ++position;
+                if (position < end && isSyntaxOperator(tokens[position], "*")) ++position;
+            }
+            if (position >= end || !isSyntaxIdentifier(tokens[position])) {
+                addDiagnostic("P0019", "expected a parameter name", tokens[segment.first]);
+                continue;
+            }
+            ++position;
+
+            if (position < end && isSyntaxOperator(tokens[position], ":")) {
+                const size_t typeStart = ++position;
+                while (position < end && !isSyntaxOperator(tokens[position], "=")) ++position;
+                if (position == typeStart) {
+                    addDiagnostic("P0019", "expected a type after ':' in parameter declaration",
+                                  tokens[segment.first]);
+                    continue;
+                }
+            }
+
+            if (position < end && isSyntaxOperator(tokens[position], "=")) {
+                ++position;
+                if (position == end) {
+                    addDiagnostic("P0019", "expected a default expression after '=' in parameter declaration",
+                                  tokens[segment.first]);
+                    continue;
+                }
+                position = end;
+            }
+
+            if (variadic && position != end) {
+                addDiagnostic("P0019", "variadic parameters cannot have a type or default value",
+                              tokens[segment.first]);
+            } else if (position != end) {
+                addDiagnostic("P0019", "unexpected token in parameter declaration",
+                              tokens[position]);
+            }
+        }
+
+        const bool forwardDeclaration = i > 0 &&
+            std::holds_alternative<LexerType::Keyword>(tokens[i - 1]) &&
+            std::get<LexerType::Keyword>(tokens[i - 1]).name == "decl";
+        size_t bodyIndex = paramsClose + 1;
+        if (bodyIndex < tokens.size() && isSyntaxOperator(tokens[bodyIndex], "[")) {
+            const size_t captureOpen = bodyIndex;
+            const size_t captureClose = matchingSyntaxDelimiter(tokens, captureOpen);
+            if (captureClose != tokens.size()) {
+                const bool captureAllByRef = captureClose == captureOpen + 2 &&
+                    isSyntaxOperator(tokens[captureOpen + 1], "&");
+                if (!captureAllByRef && captureClose > captureOpen + 1) {
+                    size_t captureSegmentStart = captureOpen + 1;
+                    bool hasCapture = false;
+                    bool previousWasComma = false;
+                    for (size_t j = captureOpen + 1; j <= captureClose; ++j) {
+                        const bool atEnd = j == captureClose;
+                        const bool atComma = !atEnd && isSyntaxOperator(tokens[j], ",");
+                        if (!atEnd && !atComma) {
+                            previousWasComma = false;
+                            continue;
+                        }
+                        if (captureSegmentStart == j) {
+                            if (!(atEnd && previousWasComma && hasCapture)) {
+                                addDiagnostic("P0021", "expected a capture name between commas",
+                                              atEnd ? tokens[captureClose] : tokens[j]);
+                            }
+                        } else {
+                            size_t item = captureSegmentStart;
+                            if (isSyntaxOperator(tokens[item], "&")) ++item;
+                            if (item >= j || !isSyntaxIdentifier(tokens[item]) || item + 1 != j) {
+                                addDiagnostic("P0021", "capture entries must be identifiers optionally prefixed by '&'",
+                                              tokens[captureSegmentStart]);
+                            } else {
+                                hasCapture = true;
+                            }
+                        }
+                        if (atEnd) break;
+                        captureSegmentStart = j + 1;
+                        previousWasComma = true;
+                    }
+                }
+                bodyIndex = captureClose + 1;
+            }
+        }
+        if (bodyIndex < tokens.size() && isSyntaxOperator(tokens[bodyIndex], "->")) {
+            const size_t arrowIndex = bodyIndex++;
+            const bool referenceType = bodyIndex < tokens.size() && isSyntaxOperator(tokens[bodyIndex], "&");
+            if (referenceType) ++bodyIndex;
+            if (bodyIndex >= tokens.size() || !isSyntaxIdentifier(tokens[bodyIndex])) {
+                addDiagnostic("P0022", "expected a return type after '->'", tokens[arrowIndex]);
+            } else {
+                ++bodyIndex;
+            }
+            while (bodyIndex < tokens.size() && !isSyntaxOperator(tokens[bodyIndex], "{") &&
+                   !isSyntaxOperator(tokens[bodyIndex], ";")) {
+                ++bodyIndex;
+            }
+        }
+        if (forwardDeclaration) {
+            if (bodyIndex >= tokens.size() || !isSyntaxOperator(tokens[bodyIndex], ";")) {
+                addDiagnostic("P0023", "expected ';' after function forward declaration", tokens[i]);
+            }
+        } else {
+            if (bodyIndex >= tokens.size() || !isSyntaxOperator(tokens[bodyIndex], "{")) {
+                addDiagnostic("P0009", "expected a function body after the parameter list", tokens[i]);
+            }
+        }
+    }
+
+    // Required control-flow headers cannot be empty or omit their parentheses.
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (inOperatorName[i] || !std::holds_alternative<LexerType::Keyword>(tokens[i])) continue;
+        const std::string& keyword = std::get<LexerType::Keyword>(tokens[i]).name;
+        if (keyword != "if" && keyword != "for" && keyword != "with") continue;
+        if (isSyntaxMemberKeyword(tokens, i)) continue;
+        if (keyword == "with" && isSyntaxFunctionKeyword(tokens, i)) continue;
+        if (i + 1 >= tokens.size() || !isSyntaxOperator(tokens[i + 1], "(")) {
+            addDiagnostic("P0010", "expected '(' after '" + keyword + "'", tokens[i]);
+        } else if (i + 2 < tokens.size() && isSyntaxOperator(tokens[i + 2], ")")) {
+            addDiagnostic("P0011", "expected an expression inside '" + keyword + "' header", tokens[i + 1]);
+        } else if (keyword == "if") {
+            const size_t headerClose = matchingSyntaxDelimiter(tokens, i + 1);
+            if (headerClose != tokens.size()) {
+                const size_t body = headerClose + 1;
+                const bool missingBody = body >= tokens.size() ||
+                    isSyntaxOperator(tokens[body], ";") ||
+                    isSyntaxOperator(tokens[body], "}") ||
+                    (std::holds_alternative<LexerType::Keyword>(tokens[body]) &&
+                     std::get<LexerType::Keyword>(tokens[body]).name == "else");
+                if (missingBody) {
+                    addDiagnostic("P0032", "expected a statement or block after the 'if' header",
+                                  tokens[i]);
+                }
+            }
+        }
+    }
+
+    // `else` also requires a real branch. Empty statements are not part of
+    // the grammar and must not make an incomplete conditional look valid.
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (inOperatorName[i] || isSyntaxMemberKeyword(tokens, i) ||
+            !std::holds_alternative<LexerType::Keyword>(tokens[i]) ||
+            std::get<LexerType::Keyword>(tokens[i]).name != "else") {
+            continue;
+        }
+        if (i + 1 >= tokens.size() || isSyntaxOperator(tokens[i + 1], ";") ||
+            isSyntaxOperator(tokens[i + 1], "}") ||
+            (std::holds_alternative<LexerType::Keyword>(tokens[i + 1]) &&
+             std::get<LexerType::Keyword>(tokens[i + 1]).name == "else")) {
+            addDiagnostic("P0032", "expected a statement or block after 'else'", tokens[i]);
+        }
+    }
+
+    // Validate the complete catch header before TreeParser extracts only the
+    // first keyword it finds. Otherwise punctuation and extra names in
+    // `catch (...)` are silently discarded.
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (inOperatorName[i] || isSyntaxMemberKeyword(tokens, i) ||
+            !std::holds_alternative<LexerType::Keyword>(tokens[i]) ||
+            std::get<LexerType::Keyword>(tokens[i]).name != "catch") {
+            continue;
+        }
+
+        // A catch clause is valid only when it immediately follows a try
+        // block. TreeParser otherwise drops a stray catch from the AST before
+        // the parsed-tree validation can attach a useful source location.
+        bool followsTryBlock = false;
+        if (i > 0 && isSyntaxOperator(tokens[i - 1], "}")) {
+            size_t bodyOpen = tokens.size();
+            int braceDepth = 0;
+            for (size_t j = i; j-- > 0;) {
+                if (isSyntaxOperator(tokens[j], "}")) {
+                    ++braceDepth;
+                } else if (isSyntaxOperator(tokens[j], "{") && --braceDepth == 0) {
+                    bodyOpen = j;
+                    break;
+                }
+            }
+            followsTryBlock = bodyOpen > 0 && bodyOpen < tokens.size() &&
+                std::holds_alternative<LexerType::Keyword>(tokens[bodyOpen - 1]) &&
+                std::get<LexerType::Keyword>(tokens[bodyOpen - 1]).name == "try";
+        }
+        if (!followsTryBlock) {
+            addDiagnostic("P0031", "'catch' block must immediately follow a 'try' block", tokens[i]);
+        }
+
+        if (i + 1 >= tokens.size() || !isSyntaxOperator(tokens[i + 1], "(")) {
+            addDiagnostic("P0034", "expected '(' after 'catch'", tokens[i]);
+            continue;
+        }
+        const size_t close = matchingSyntaxDelimiter(tokens, i + 1);
+        if (close == tokens.size()) continue; // delimiter diagnostics are reported above
+
+        size_t position = i + 2;
+        const bool byReference = position < close && isSyntaxOperator(tokens[position], "&");
+        if (byReference) ++position;
+        bool hasCatchName = false;
+        if (position < close && isSyntaxIdentifier(tokens[position])) {
+            hasCatchName = true;
+            ++position;
+        }
+        const bool emptyCatch = !byReference && close == i + 2;
+        if ((!emptyCatch && !hasCatchName) || position != close) {
+            addDiagnostic("P0034", "catch accepts only an optional '&' and one variable name",
+                          position < tokens.size() ? tokens[position] : tokens[close]);
+            continue;
+        }
+        if (close + 1 >= tokens.size() || !isSyntaxOperator(tokens[close + 1], "{")) {
+            addDiagnostic("P0034", "expected a block after the catch header", tokens[close]);
+        }
+    }
+
+    // `with` and `for` have optional binding zones after their parenthesized
+    // expression. Validate those zones here because TreeParser currently
+    // keeps only recognized names and ignores other tokens in the brackets.
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (inOperatorName[i] || isSyntaxMemberKeyword(tokens, i) ||
+            !std::holds_alternative<LexerType::Keyword>(tokens[i])) {
+            continue;
+        }
+        const std::string& keyword = std::get<LexerType::Keyword>(tokens[i]).name;
+        if (keyword != "with" && keyword != "for") continue;
+        if (keyword == "with" && isSyntaxFunctionKeyword(tokens, i)) {
+            continue;
+        }
+        if (i + 1 >= tokens.size() || !isSyntaxOperator(tokens[i + 1], "(")) continue;
+        const size_t headerClose = matchingSyntaxDelimiter(tokens, i + 1);
+        if (headerClose == tokens.size()) continue; // delimiter diagnostics are reported above
+
+        size_t bodyIndex = headerClose + 1;
+        if (bodyIndex < tokens.size() && isSyntaxOperator(tokens[bodyIndex], "[")) {
+            const size_t bindingClose = matchingSyntaxDelimiter(tokens, bodyIndex);
+            if (bindingClose == tokens.size()) continue; // delimiter diagnostics are reported above
+
+            if (keyword == "with") {
+                size_t binding = bodyIndex + 1;
+                if (binding < bindingClose && isSyntaxOperator(tokens[binding], "&")) ++binding;
+                if (binding >= bindingClose || !isSyntaxIdentifier(tokens[binding]) ||
+                    binding + 1 != bindingClose) {
+                    addDiagnostic("P0035", "with capture must be one name optionally prefixed by '&'",
+                                  tokens[bodyIndex]);
+                }
+            } else {
+                auto isBinding = [&](size_t begin, size_t end) {
+                    if (begin < end && std::holds_alternative<LexerType::Keyword>(tokens[begin]) &&
+                        std::get<LexerType::Keyword>(tokens[begin]).name == "const") {
+                        ++begin;
+                    }
+                    if (begin < end && isSyntaxOperator(tokens[begin], "&")) ++begin;
+                    return begin < end && isSyntaxIdentifier(tokens[begin]) && begin + 1 == end;
+                };
+
+                size_t colon = bindingClose;
+                bool multipleColons = false;
+                for (size_t j = bodyIndex + 1; j < bindingClose; ++j) {
+                    if (!isSyntaxOperator(tokens[j], ":")) continue;
+                    if (colon != bindingClose) multipleColons = true;
+                    colon = j;
+                }
+
+                bool validBinding = false;
+                if (!multipleColons && colon == bindingClose) {
+                    validBinding = isBinding(bodyIndex + 1, bindingClose);
+                } else if (!multipleColons) {
+                    size_t valueBegin = colon + 1;
+                    // ZeusBuiltins.io uses `...` as an explicit separator in
+                    // its kwargs key/value binding; TreeParser treats it as a
+                    // separator and preserves the two bindings.
+                    if (valueBegin + 2 < bindingClose &&
+                        isSyntaxOperator(tokens[valueBegin], ".") &&
+                        isSyntaxOperator(tokens[valueBegin + 1], ".") &&
+                        isSyntaxOperator(tokens[valueBegin + 2], ".")) {
+                        valueBegin += 3;
+                    }
+                    validBinding = isBinding(bodyIndex + 1, colon) &&
+                                   isBinding(valueBegin, bindingClose);
+                }
+                if (!validBinding) {
+                    addDiagnostic("P0036", "for binding must be one name or a key/value pair",
+                                  tokens[bodyIndex]);
+                }
+            }
+            bodyIndex = bindingClose + 1;
+        }
+
+        if (bodyIndex >= tokens.size() || !isSyntaxOperator(tokens[bodyIndex], "{")) {
+            addDiagnostic(keyword == "with" ? "P0035" : "P0036",
+                          "expected a block after the '" + keyword + "' header",
+                          tokens[headerClose]);
+        }
+    }
+
+    // Decorator parsing is deliberately narrow today: @static decorates a
+    // function definition and @native("symbol") decorates a `decl func`.
+    // Validate the whole prefix so malformed/unknown annotations cannot be
+    // silently dropped by TreeParser::leadingDecorators().
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (!isSyntaxOperator(tokens[i], "@") || inOperatorName[i]) continue;
+
+        const std::vector<LexerType::Token> suffix(tokens.begin() + i, tokens.end());
+        const auto prefix = parseFunctionDecoratorPrefix(suffix);
+        if (!prefix.valid || prefix.decorators.empty()) {
+            addDiagnostic("P0038", "malformed function decorator prefix", tokens[i]);
+            continue;
+        }
+
+        size_t declarationIndex = i + prefix.nextToken;
+        bool isForwardDeclaration = false;
+        if (declarationIndex < tokens.size() &&
+            std::holds_alternative<LexerType::Keyword>(tokens[declarationIndex]) &&
+            std::get<LexerType::Keyword>(tokens[declarationIndex]).name == "decl") {
+            isForwardDeclaration = true;
+            ++declarationIndex;
+        }
+        if (declarationIndex >= tokens.size() ||
+            !std::holds_alternative<LexerType::Keyword>(tokens[declarationIndex]) ||
+            std::get<LexerType::Keyword>(tokens[declarationIndex]).name != "func") {
+            addDiagnostic("P0038", "function decorators must immediately precede 'func' or 'decl func'",
+                          tokens[i]);
+            continue;
+        }
+
+        bool sawNative = false;
+        bool sawStatic = false;
+        for (const auto& decorator : prefix.decorators) {
+            if (decorator.name == "native") {
+                if (sawNative || !decorator.hasArgument || decorator.argument.empty()) {
+                    addDiagnostic("P0038", "@native requires one non-empty string symbol",
+                                  tokens[i]);
+                }
+                if (!isForwardDeclaration) {
+                    addDiagnostic("P0038", "@native must decorate a 'decl func' declaration",
+                                  tokens[i]);
+                }
+                sawNative = true;
+            } else if (decorator.name == "static") {
+                if (sawStatic || decorator.hasArgument) {
+                    addDiagnostic("P0038", "@static does not accept an argument and may appear only once",
+                                  tokens[i]);
+                }
+                if (isForwardDeclaration) {
+                    addDiagnostic("P0038", "@static is only supported on function definitions",
+                                  tokens[i]);
+                }
+                sawStatic = true;
+            } else {
+                addDiagnostic("P0038", "unsupported function decorator '@" + decorator.name + "'",
+                              tokens[i]);
+            }
+        }
+        i = declarationIndex;
+    }
+
+    // `while` is not a Zeus control-flow keyword. Keep it usable as a dynamic
+    // name, but reject the familiar loop form instead of silently dropping it.
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (inOperatorName[i] || !std::holds_alternative<LexerType::Keyword>(tokens[i]) ||
+            std::get<LexerType::Keyword>(tokens[i]).name != "while" ||
+            isSyntaxMemberKeyword(tokens, i) ||
+            i + 1 >= tokens.size() || !isSyntaxOperator(tokens[i + 1], "(")) {
+            continue;
+        }
+
+        const bool functionName =
+            (i > 0 && std::holds_alternative<LexerType::Keyword>(tokens[i - 1]) &&
+             std::get<LexerType::Keyword>(tokens[i - 1]).name == "func") ||
+            (i > 1 && std::holds_alternative<LexerType::Keyword>(tokens[i - 1]) &&
+             std::get<LexerType::Keyword>(tokens[i - 1]).name == "static" &&
+             std::holds_alternative<LexerType::Keyword>(tokens[i - 2]) &&
+             std::get<LexerType::Keyword>(tokens[i - 2]).name == "func");
+        if (functionName) continue;
+
+        const size_t closeParen = matchingSyntaxDelimiter(tokens, i + 1);
+        if (closeParen + 1 < tokens.size() && isSyntaxOperator(tokens[closeParen + 1], "{")) {
+            addDiagnostic("P0001", "'while' loops are not supported by the current parser", tokens[i]);
+        }
+    }
+
+    // Validate the only two forms supported by `using` statements/blocks and
+    // class receiver aliases. It is otherwise a reserved statement keyword.
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (inOperatorName[i] || !std::holds_alternative<LexerType::Keyword>(tokens[i]) ||
+            std::get<LexerType::Keyword>(tokens[i]).name != "using" ||
+            isSyntaxMemberKeyword(tokens, i)) {
+            continue;
+        }
+        if (i + 1 < tokens.size() && std::holds_alternative<LexerType::Keyword>(tokens[i + 1]) &&
+            std::get<LexerType::Keyword>(tokens[i + 1]).name == "original") {
+            const size_t after = i + 2;
+            if (after >= tokens.size() ||
+                (!isSyntaxOperator(tokens[after], ";") && !isSyntaxOperator(tokens[after], "{"))) {
+                addDiagnostic("P0030", "expected ';' or '{' after 'using original'", tokens[i + 1]);
+            }
+        } else if (i + 2 >= tokens.size() || !isSyntaxOperator(tokens[i + 1], "&") ||
+                   !isSyntaxIdentifier(tokens[i + 2])) {
+            addDiagnostic("P0030", "expected 'original' or '&name' after 'using'", tokens[i]);
+        } else if (i + 3 >= tokens.size() || !isSyntaxOperator(tokens[i + 3], ";")) {
+            addDiagnostic("P0030", "expected ';' after class receiver alias", tokens[i + 2]);
+        }
+    }
+
+    return diagnostics;
+}
+
+// Compatibility for call sites that still use the former narrow name.
+inline std::vector<ZeusDiagnostics::Diagnostic> validateUnsupportedSyntax(
+    const std::vector<LexerType::Token>& tokens
+) {
+    return validateSyntax(tokens);
+}
+
+inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
+    const std::vector<TreeParser::NodeAndBlock>& ast
+) {
+    std::vector<ZeusDiagnostics::Diagnostic> diagnostics;
+    auto addDiagnostic = [&](const std::string& code, const std::string& message,
+                             int line, int column) {
+        diagnostics.push_back({ code, message, line, column });
+    };
+    const auto validateExpression = [&](const std::vector<LexerType::Token>& expression) {
+        if (!expression.empty()) {
+            ZeusDiagnostics::append(diagnostics, validateExpressionSyntax(expression));
+        }
+    };
+    const auto findTopLevelAssignment = [](const std::vector<LexerType::Token>& tokens) {
+        int parenDepth = 0;
+        int bracketDepth = 0;
+        int braceDepth = 0;
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (std::holds_alternative<LexerType::Operator>(tokens[i])) {
+                const std::string& symbol = std::get<LexerType::Operator>(tokens[i]).symbol;
+                if (symbol == "=" && parenDepth == 0 && bracketDepth == 0 && braceDepth == 0) return i;
+                if (symbol == "(") ++parenDepth;
+                else if (symbol == ")" && parenDepth > 0) --parenDepth;
+                else if (symbol == "[") ++bracketDepth;
+                else if (symbol == "]" && bracketDepth > 0) --bracketDepth;
+                else if (symbol == "{") ++braceDepth;
+                else if (symbol == "}" && braceDepth > 0) --braceDepth;
+            }
+        }
+        return tokens.size();
+    };
+    const auto expressionAfterAssignment = [&](const std::vector<LexerType::Token>& tokens) {
+        const size_t assignment = findTopLevelAssignment(tokens);
+        if (assignment == tokens.size() || assignment + 1 >= tokens.size()) {
+            return std::vector<LexerType::Token>{};
+        }
+        return std::vector<LexerType::Token>(tokens.begin() + assignment + 1, tokens.end());
+    };
+
+    const auto visit = [&](const auto& self,
+                           const std::vector<TreeParser::NodeAndBlock>& elements,
+                           bool parentIsTry,
+                           bool parentIsClass,
+                           const std::string& parentReceiverAlias,
+                           bool parentIsTopLevel) -> void {
+        for (const auto& element : elements) {
+            if (std::holds_alternative<TreeParser::Node>(element)) {
+                const auto& node = std::get<TreeParser::Node>(element);
+                if (node.type == NodeType::VAR_DECL_STMT || node.type == NodeType::VAR_ASSIGN_STMT) {
+                    const size_t assignment = findTopLevelAssignment(node.tokens);
+                    if (node.type == NodeType::VAR_DECL_STMT) {
+                        const size_t headerEnd = assignment == node.tokens.size() ? node.tokens.size() : assignment;
+                        size_t nameIndex = 1;
+                        if (!node.tokens.empty() && std::holds_alternative<LexerType::Keyword>(node.tokens[0]) &&
+                            (std::get<LexerType::Keyword>(node.tokens[0]).name == "let" ||
+                             std::get<LexerType::Keyword>(node.tokens[0]).name == "var")) {
+                            if (nameIndex < headerEnd && std::holds_alternative<LexerType::Keyword>(node.tokens[nameIndex]) &&
+                                std::get<LexerType::Keyword>(node.tokens[nameIndex]).name == "const") ++nameIndex;
+                            if (nameIndex < headerEnd && std::holds_alternative<LexerType::Keyword>(node.tokens[nameIndex]) &&
+                                std::get<LexerType::Keyword>(node.tokens[nameIndex]).name == "shared") ++nameIndex;
+                            if (nameIndex >= headerEnd || !isSyntaxIdentifier(node.tokens[nameIndex])) {
+                                addDiagnostic("P0024", "expected a variable name in declaration",
+                                              node.sourceLine, node.sourceColumn);
+                            } else {
+                                ++nameIndex;
+                                if (nameIndex < headerEnd && isSyntaxOperator(node.tokens[nameIndex], ":") &&
+                                    nameIndex + 1 >= headerEnd) {
+                                    addDiagnostic("P0024", "expected a type after ':' in declaration",
+                                                  syntaxTokenLine(node.tokens[nameIndex]),
+                                                  syntaxTokenColumn(node.tokens[nameIndex]));
+                                }
+                            }
+                        }
+                    } else if (assignment != node.tokens.size()) {
+                        const std::vector<LexerType::Token> left(node.tokens.begin(), node.tokens.begin() + assignment);
+                        bool validLValue = left.size() == 1 && isSyntaxIdentifier(left[0]);
+                        if (left.size() >= 2 && isSyntaxOperator(left.back(), "]")) {
+                            int depth = 0;
+                            size_t bracketOpen = left.size();
+                            for (size_t i = left.size(); i-- > 0;) {
+                                if (isSyntaxOperator(left[i], "]")) ++depth;
+                                else if (isSyntaxOperator(left[i], "[") && --depth == 0) {
+                                    bracketOpen = i;
+                                    break;
+                                }
+                            }
+                            if (bracketOpen > 0 && bracketOpen < left.size() - 1) {
+                                validateExpression(std::vector<LexerType::Token>(left.begin(), left.begin() + bracketOpen));
+                                validateExpression(std::vector<LexerType::Token>(left.begin() + bracketOpen + 1, left.end() - 1));
+                                validLValue = true;
+                            }
+                        } else if (left.size() >= 3 && isSyntaxOperator(left[left.size() - 2], ".") &&
+                                   isSyntaxIdentifier(left.back())) {
+                            validateExpression(std::vector<LexerType::Token>(left.begin(), left.end() - 2));
+                            validLValue = true;
+                        }
+                        if (!validLValue) {
+                            addDiagnostic("P0025", "left side of assignment must be a variable, member, or index",
+                                          node.sourceLine, node.sourceColumn);
+                        }
+                    }
+                    if (assignment != node.tokens.size()) {
+                        validateExpression(expressionAfterAssignment(node.tokens));
+                    }
+                } else if (node.type == NodeType::EXP_STMT) {
+                    const bool classUsingAlias = node.tokens.size() >= 3 &&
+                        std::holds_alternative<LexerType::Keyword>(node.tokens[0]) &&
+                        std::get<LexerType::Keyword>(node.tokens[0]).name == "using" &&
+                        isSyntaxOperator(node.tokens[1], "&");
+                    if (classUsingAlias) {
+                        if (node.tokens.size() != 3 || !isSyntaxIdentifier(node.tokens[2])) {
+                            addDiagnostic("P0026", "class receiver alias must be written as 'using &name'",
+                                          node.sourceLine, node.sourceColumn);
+                        } else if (!parentIsClass) {
+                            addDiagnostic("P0026", "'using &name' is only valid inside a class",
+                                          node.sourceLine, node.sourceColumn);
+                        }
+                    } else if (!node.tokens.empty()) {
+                        validateExpression(node.tokens);
+                    }
+                } else if (node.type == NodeType::RETURN_STMT && node.tokens.size() > 1) {
+                    validateExpression(std::vector<LexerType::Token>(node.tokens.begin() + 1, node.tokens.end()));
+                } else if (node.type == NodeType::THROW_STMT) {
+                    if (node.tokens.size() <= 1) {
+                        addDiagnostic("P0012", "expected an expression after 'throw'",
+                                      node.sourceLine, node.sourceColumn);
+                    } else {
+                        validateExpression(std::vector<LexerType::Token>(node.tokens.begin() + 1, node.tokens.end()));
+                    }
+                } else if (node.type == NodeType::BREAK_STMT && node.tokens.size() != 1) {
+                    addDiagnostic("P0027", "'break' does not take arguments", node.sourceLine, node.sourceColumn);
+                } else if (node.type == NodeType::DELETE_STMT) {
+                    bool expectName = true;
+                    for (size_t i = 1; i < node.tokens.size(); ++i) {
+                        if (expectName) {
+                            if (!isSyntaxIdentifier(node.tokens[i])) {
+                                addDiagnostic("P0028", "expected a variable name after 'delete' or ','",
+                                              syntaxTokenLine(node.tokens[i]), syntaxTokenColumn(node.tokens[i]));
+                                break;
+                            }
+                        } else if (!isSyntaxOperator(node.tokens[i], ",")) {
+                            addDiagnostic("P0028", "expected ',' between names in 'delete' statement",
+                                          syntaxTokenLine(node.tokens[i]), syntaxTokenColumn(node.tokens[i]));
+                            break;
+                        }
+                        expectName = !expectName;
+                    }
+                    if (node.tokens.size() <= 1 || expectName) {
+                        addDiagnostic("P0028", "expected a variable name after 'delete'",
+                                      node.sourceLine, node.sourceColumn);
+                    }
+                } else if (node.type == NodeType::IMPORT_STMT) {
+                    size_t position = 1;
+                    if (position >= node.tokens.size() || !isSyntaxIdentifier(node.tokens[position])) {
+                        addDiagnostic("P0029", "expected a package name after 'import'",
+                                      node.sourceLine, node.sourceColumn);
+                    } else {
+                        ++position;
+                        while (position < node.tokens.size() && isSyntaxOperator(node.tokens[position], ".")) {
+                            ++position;
+                            if (position >= node.tokens.size() || !isSyntaxIdentifier(node.tokens[position])) {
+                                addDiagnostic("P0029", "expected a package name after '.'",
+                                              syntaxTokenLine(node.tokens[position - 1]),
+                                              syntaxTokenColumn(node.tokens[position - 1]));
+                                break;
+                            }
+                            ++position;
+                        }
+                        if (position < node.tokens.size() && isSyntaxOperator(node.tokens[position], "[")) {
+                            ++position;
+                            if (position >= node.tokens.size() || !isSyntaxOperator(node.tokens[position], "&")) {
+                                addDiagnostic("P0029", "expected '&' in namespace import clause",
+                                              syntaxTokenLine(node.tokens[position - 1]),
+                                              syntaxTokenColumn(node.tokens[position - 1]));
+                            } else {
+                                ++position;
+                                if (position < node.tokens.size() && !isSyntaxOperator(node.tokens[position], "]")) {
+                                    if (!isSyntaxIdentifier(node.tokens[position])) {
+                                        addDiagnostic("P0029", "expected an alias name in namespace import clause",
+                                                      syntaxTokenLine(node.tokens[position]),
+                                                      syntaxTokenColumn(node.tokens[position]));
+                                    }
+                                    ++position;
+                                }
+                            }
+                            if (position >= node.tokens.size() || !isSyntaxOperator(node.tokens[position], "]")) {
+                                addDiagnostic("P0029", "expected ']' after namespace import clause",
+                                              node.sourceLine, node.sourceColumn);
+                            } else {
+                                ++position;
+                            }
+                        }
+                        if (position != node.tokens.size()) {
+                            addDiagnostic("P0029", "unexpected token in import statement",
+                                          syntaxTokenLine(node.tokens[position]),
+                                          syntaxTokenColumn(node.tokens[position]));
+                        }
+                    }
+                } else if (node.type == NodeType::USING_STMT) {
+                    const bool validUsingOriginal = node.tokens.size() == 2 &&
+                        std::holds_alternative<LexerType::Keyword>(node.tokens[1]) &&
+                        std::get<LexerType::Keyword>(node.tokens[1]).name == "original";
+                    if (!validUsingOriginal) {
+                        addDiagnostic("P0030", "expected 'using original'", node.sourceLine, node.sourceColumn);
+                    }
+                } else if (node.type == NodeType::FUNC_FWD_DECL_STMT) {
+                    bool hasDeclFunc = false;
+                    for (size_t i = 0; i + 1 < node.tokens.size(); ++i) {
+                        if (std::holds_alternative<LexerType::Keyword>(node.tokens[i]) &&
+                            std::get<LexerType::Keyword>(node.tokens[i]).name == "decl" &&
+                            std::holds_alternative<LexerType::Keyword>(node.tokens[i + 1]) &&
+                            std::get<LexerType::Keyword>(node.tokens[i + 1]).name == "func") {
+                            hasDeclFunc = true;
+                            break;
+                        }
+                    }
+                    if (!hasDeclFunc) {
+                        addDiagnostic("P0023", "expected 'decl func name(...)'", node.sourceLine, node.sourceColumn);
+                    }
+                } else if (node.type == NodeType::FOR_DECL_STMT) {
+                    addDiagnostic("P0013", "unsupported or malformed 'for' header",
+                                  node.sourceLine, node.sourceColumn);
+                } else if (node.type == NodeType::IF_DECL_STMT ||
+                           node.type == NodeType::FUNC_DECL_STMT ||
+                           node.type == NodeType::CLASS_DECL_STMT ||
+                           node.type == NodeType::IMPL_DECL_STMT ||
+                           node.type == NodeType::TRY_DECL_STMT ||
+                           node.type == NodeType::WITH_DECL_STMT ||
+                           node.type == NodeType::USING_BLOCK_STMT) {
+                    addDiagnostic("P0032", "expected a block for this declaration",
+                                  node.sourceLine, node.sourceColumn);
+                }
+                continue;
+            }
+
+            const auto& blockPtr = std::get<std::unique_ptr<TreeParser::CodeBlock>>(element);
+            if (!blockPtr) continue;
+            const auto& block = *blockPtr;
+            if (block.type == CodeBlockType::IMPL && !parentIsTopLevel) {
+                addDiagnostic("P0038", "impl declarations must appear at module scope",
+                              block.sourceLine, block.sourceColumn);
+            }
+            if (block.type == CodeBlockType::CATCH && !parentIsTry) {
+                addDiagnostic("P0031", "'catch' block must follow a 'try' block",
+                              block.sourceLine, block.sourceColumn);
+            }
+            if (block.type == CodeBlockType::FUNC && block.isClassMethod &&
+                !block.isStaticMethod && !parentReceiverAlias.empty()) {
+                const auto aliasCapture = std::find(
+                    block.captureVars.begin(), block.captureVars.end(),
+                    parentReceiverAlias
+                );
+                if (aliasCapture != block.captureVars.end() ||
+                    block.hasDuplicateInjectedReceiverParameter) {
+                    addDiagnostic("P0033",
+                                  "class receiver alias is already injected; do not capture or redeclare it",
+                                  block.sourceLine, block.sourceColumn);
+                }
+            }
+            if (block.type == CodeBlockType::FUNC && block.funcName.empty() && !block.isOperatorOverload) {
+                addDiagnostic("P0004", "function declarations require a name; anonymous functions are not supported",
+                              block.sourceLine, block.sourceColumn);
+            } else if (block.type == CodeBlockType::IF && block.conditionTokens.empty()) {
+                addDiagnostic("P0011", "expected an expression inside 'if' header",
+                              block.sourceLine, block.sourceColumn);
+            } else if (block.type == CodeBlockType::FOR && !block.forHeaderValid) {
+                addDiagnostic("P0013", "invalid or incomplete 'for' header",
+                              block.sourceLine, block.sourceColumn);
+            } else if (block.type == CodeBlockType::WITH && block.withExprTokens.empty()) {
+                addDiagnostic("P0011", "expected an expression inside 'with' header",
+                              block.sourceLine, block.sourceColumn);
+            } else if (block.type == CodeBlockType::CLASS && block.className.empty()) {
+                addDiagnostic("P0014", "class declarations require a name",
+                              block.sourceLine, block.sourceColumn);
+            } else if (block.type == CodeBlockType::IMPL && block.implTypeName.empty()) {
+                addDiagnostic("P0014", "impl declarations require a target type",
+                              block.sourceLine, block.sourceColumn);
+            } else if (block.type == CodeBlockType::IMPL &&
+                       !isSyntaxTypePath(block.implTypeName)) {
+                addDiagnostic("P0014", "impl target must be a valid type name",
+                              block.sourceLine, block.sourceColumn);
+            }
+
+            if (block.type == CodeBlockType::IMPL) {
+                for (const auto& member : block.nodes) {
+                    if (std::holds_alternative<TreeParser::Node>(member)) {
+                        const auto& node = std::get<TreeParser::Node>(member);
+                        const bool receiverAlias = node.type == NodeType::EXP_STMT &&
+                            node.tokens.size() == 3 &&
+                            std::holds_alternative<LexerType::Keyword>(node.tokens[0]) &&
+                            std::get<LexerType::Keyword>(node.tokens[0]).name == "using" &&
+                            isSyntaxOperator(node.tokens[1], "&") &&
+                            isSyntaxIdentifier(node.tokens[2]);
+                        if (!receiverAlias) {
+                            addDiagnostic("P0032", "impl blocks may only contain function declarations",
+                                          node.sourceLine, node.sourceColumn);
+                        }
+                        continue;
+                    }
+                    const auto& method = std::get<std::unique_ptr<TreeParser::CodeBlock>>(member);
+                    if (method && method->type != CodeBlockType::FUNC) {
+                        addDiagnostic("P0032", "impl blocks may only contain function declarations",
+                                      method->sourceLine, method->sourceColumn);
+                    }
+                }
+            }
+            if (block.type == CodeBlockType::FUNC && block.isClassMethod &&
+                !block.ownerClassName.empty() && !block.isStaticMethod &&
+                !block.isCompileTimeStatic && !block.paramNames.empty() &&
+                block.paramNames.front() == "this" &&
+                !block.paramTypeNames.empty() &&
+                !block.paramTypeNames.front().empty() &&
+                canonicalSyntaxTypeName(block.paramTypeNames.front()) !=
+                    canonicalSyntaxTypeName(block.ownerClassName)) {
+                addDiagnostic("P0039", "impl receiver parameter 'this' must use the implemented type",
+                              block.sourceLine, block.sourceColumn);
+            }
+
+            if (block.type == CodeBlockType::IF && !block.conditionTokens.empty()) {
+                validateExpression(block.conditionTokens);
+            } else if (block.type == CodeBlockType::WITH && !block.withExprTokens.empty()) {
+                validateExpression(block.withExprTokens);
+            } else if (block.type == CodeBlockType::FOR && block.forHeaderValid) {
+                switch (block.forKind) {
+                    case TreeParser::CodeBlock::ForKind::COND:
+                        validateExpression(block.condExprTokens);
+                        break;
+                    case TreeParser::CodeBlock::ForKind::LIST:
+                        validateExpression(block.listExprTokens);
+                        break;
+                    case TreeParser::CodeBlock::ForKind::DICT:
+                        validateExpression(block.dictExprTokens);
+                        break;
+                    case TreeParser::CodeBlock::ForKind::COUNT:
+                        validateExpression(block.countStartTokens);
+                        validateExpression(block.countEndTokens);
+                        if (!block.countStepTokens.empty()) validateExpression(block.countStepTokens);
+                        break;
+                    case TreeParser::CodeBlock::ForKind::COUNT_SIMPLE:
+                        validateExpression(block.countEndTokens);
+                        break;
+                    default:
+                        break;
+                }
+            } else if (block.type == CodeBlockType::FUNC) {
+                for (const auto& defaultValue : block.paramDefaults) {
+                    if (!defaultValue.empty()) validateExpression(defaultValue);
+                }
+            } else if (block.type == CodeBlockType::TRY) {
+                bool hasCatch = false;
+                for (const auto& child : block.nodes) {
+                    if (std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(child)) {
+                        const auto& childBlock = std::get<std::unique_ptr<TreeParser::CodeBlock>>(child);
+                        hasCatch = hasCatch || (childBlock && childBlock->type == CodeBlockType::CATCH);
+                    }
+                }
+                if (!hasCatch) {
+                    addDiagnostic("P0017", "'try' block requires a following 'catch' block",
+                                  block.sourceLine, block.sourceColumn);
+                }
+            }
+            self(self, block.nodes,
+                 block.type == CodeBlockType::TRY,
+                 block.type == CodeBlockType::CLASS || block.type == CodeBlockType::IMPL,
+                 (block.type == CodeBlockType::CLASS || block.type == CodeBlockType::IMPL)
+                     ? block.classDefaultAlias : std::string(),
+                 false);
+        }
+    };
+    // TreeParser wraps module statements in a synthetic BLOCK. Validate its
+    // children at module scope; nested blocks still lose that privilege.
+    if (ast.size() == 1 &&
+        std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(ast.front())) {
+        const auto& root = std::get<std::unique_ptr<TreeParser::CodeBlock>>(ast.front());
+        if (root && root->type == CodeBlockType::BLOCK) {
+            visit(visit, root->nodes, false, false, {}, true);
+        } else {
+            visit(visit, ast, false, false, {}, true);
+        }
+    } else {
+        visit(visit, ast, false, false, {}, true);
+    }
+    return diagnostics;
+}
+
+} // namespace ZeusParser
+
+#endif

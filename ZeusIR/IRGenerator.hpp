@@ -21,6 +21,7 @@
 #include "IRImport.hpp"
 #include "../ZeusRunner/ZeusBuiltins.hpp"
 #include "../ZeusBuiltins/BuiltinRegistry.hpp"
+#include "../ZeusBuiltins/NativeTypeABI.hpp"
 
 #include "IRFor.hpp"
 #include "IRUtils.hpp"
@@ -69,6 +70,11 @@ namespace IRGen {
 
     static std::string _opSym(const LexerType::Token& tk) {
         return std::get<LexerType::Operator>(tk).symbol;
+    }
+
+    static std::string _nativeConstructionType(const std::string& name) {
+        const auto* abi = ZeusBuiltins::findNativeTypeABI(name);
+        return abi == nullptr ? std::string() : std::string(abi->canonicalName);
     }
 
     static int _getTokenLine(const LexerType::Token& tk) {
@@ -200,12 +206,8 @@ namespace IRGen {
                 IRType::IRInstr ins;
                 ins.op = VMOperator::PUSH;
                 ins.line = tokenLine;
-                // 约定：使用一个特殊的字符串标签 "__nil__" 或直接 Variant Null。
-                // 目前 VM 侧判断 UniversalVariant 是否 ZeusType::Null 来打印/判真，
-                // 这里直接构造 ZeusType::Null UniversalVariant 需要指令 args 能携带该值。
-                // 现有 PUSH 使用 LexerType::Value / string / int。为了最小侵入，采用字符串占位然后在 VM 取值处识别。
-                // 简化：暂用一个标记 Value("__NIL__")，后续在执行 PUSH 时若遇到该占位转换为 ZeusType::Null。
-                ins.args.push_back(LexerType::Value(std::string("__NIL__")));
+                // Use a typed IR literal so no ordinary string can collide with nil.
+                ins.args.push_back(IRType::NullLiteral{});
                 out.push_back(ins);
                 return;
             }
@@ -353,14 +355,17 @@ namespace IRGen {
             if (i < codeBlock.paramTypeNames.size()) {
                 const std::string typeName = _canonicalIRTypeName(codeBlock.paramTypeNames[i]);
                 const std::string resolvedType =
-                    (i == 0 && codeBlock.isClassMethod && typeName.empty())
+                    (i == 0 && codeBlock.isClassMethod &&
+                     !codeBlock.isStaticMethod && !codeBlock.isCompileTimeStatic &&
+                     typeName.empty())
                         ? codeBlock.ownerClassName
                         : typeName;
                 annotation.args.push_back(resolvedType);
                 parameterTypes.push_back(resolvedType);
             } else {
                 const std::string resolvedType =
-                    (i == 0 && codeBlock.isClassMethod)
+                    (i == 0 && codeBlock.isClassMethod &&
+                     !codeBlock.isStaticMethod && !codeBlock.isCompileTimeStatic)
                         ? codeBlock.ownerClassName
                         : std::string();
                 annotation.args.push_back(resolvedType);
@@ -916,10 +921,19 @@ namespace IRGen {
             
             // 加载初始标识符
             IRScope::SymRef s = IRScope::resolve(name);
+            const bool hasMemberSuffix = pos < tokens.size() &&
+                _isOperator(tokens[pos]) && _opSym(tokens[pos]) == ".";
+            const std::string nativeConstructionType =
+                s.kind == IRScope::Kind::UNDEFINED && !hasMemberSuffix
+                    ? _nativeConstructionType(name)
+                    : std::string();
             IRType::IRInstr load;
             load.op = VMOperator::LOAD_VALUE;
             
-            if (s.kind != IRScope::Kind::UNDEFINED) {
+            if (!nativeConstructionType.empty()) {
+                // Native type constructors are encoded on OBJ_BUILD itself;
+                // they do not push a class handle onto the operand stack.
+            } else if (s.kind != IRScope::Kind::UNDEFINED) {
                 switch (s.kind) {
                     case IRScope::Kind::LOCAL:
                         load.args.push_back(std::string("local"));
@@ -947,7 +961,7 @@ namespace IRGen {
                 // 未解析的标识符，发出字符串（支持延迟解析）
                 load.args.push_back(LexerType::Value(name));
             }
-            out.push_back(load);
+            if (nativeConstructionType.empty()) out.push_back(load);
             
             // 处理属性访问链（如 .JSON）
             while (pos < tokens.size() && _isOperator(tokens[pos]) && _opSym(tokens[pos]) == ".") {
@@ -982,6 +996,9 @@ namespace IRGen {
             IRType::IRInstr build; 
             build.op = VMOperator::OBJ_BUILD; 
             build.args.push_back(LexerType::Value(argc)); // 传递参数个数
+            if (!nativeConstructionType.empty()) {
+                build.args.push_back(nativeConstructionType);
+            }
             out.push_back(build);
             return true;
         }
@@ -1003,7 +1020,7 @@ namespace IRGen {
                 IRType::IRInstr ins;
                 ins.op = VMOperator::PUSH;
                 ins.line = _getTokenLine(tk);
-                ins.args.push_back(LexerType::Value(std::string("__NIL__")));
+                ins.args.push_back(IRType::NullLiteral{});
                 out.push_back(ins);
                 pos++;
                 return true;
@@ -1333,6 +1350,14 @@ namespace IRGen {
                 if (!_parseUnary(ctx, tokens, pos, out)) return false;
                 // 发 SUBTRACT
                 out.push_back(IRType::IRInstr{ VMOperator::SUBTRACT, {} });
+                return true;
+            } else if (s == "!") {
+                const int sourceLine = _getTokenLine(tokens[pos]);
+                ++pos;
+                if (!_parseUnary(ctx, tokens, pos, out)) return false;
+                IRType::IRInstr ins = IRUtils::makeNotOp();
+                ins.line = sourceLine;
+                out.push_back(std::move(ins));
                 return true;
             }
         }
@@ -1975,13 +2000,25 @@ namespace IRGen {
             std::vector<LexerType::Token> classExprTokens(toks.begin() + 1, toks.begin() + lastOpenParen);
             
             if (classExprTokens.empty()) return 0;
+
+            std::string nativeConstructionType;
+            if (classExprTokens.size() == 1 &&
+                std::holds_alternative<LexerType::Keyword>(classExprTokens.front())) {
+                const std::string& targetName =
+                    std::get<LexerType::Keyword>(classExprTokens.front()).name;
+                if (IRScope::resolve(targetName).kind == IRScope::Kind::UNDEFINED) {
+                    nativeConstructionType = _nativeConstructionType(targetName);
+                }
+            }
             
             // 递归调用emitExprIR来计算类表达式（可能包含函数调用、属性访问等）
-            auto classExprIR = emitExprIR(status, strictDecl, futureFuncDefs, classExprTokens);
-            if (classExprIR.empty()) return 0;
+            if (nativeConstructionType.empty()) {
+                auto classExprIR = emitExprIR(status, strictDecl, futureFuncDefs, classExprTokens);
+                if (classExprIR.empty()) return 0;
             
-            // 将类表达式的IR添加到输出（结果在栈顶就是要实例化的类）
-            out.insert(out.end(), classExprIR.begin(), classExprIR.end());
+                // 将类表达式的IR添加到输出（结果在栈顶就是要实例化的类）
+                out.insert(out.end(), classExprIR.begin(), classExprIR.end());
+            }
             
             size_t pos2 = lastOpenParen;
             int argc = 0;
@@ -1999,6 +2036,9 @@ namespace IRGen {
             IRType::IRInstr build; 
             build.op = VMOperator::OBJ_BUILD; 
             build.args.push_back(LexerType::Value(argc));
+            if (!nativeConstructionType.empty()) {
+                build.args.push_back(nativeConstructionType);
+            }
             out.push_back(build);
             
             ZEUS_DEBUG_PRINT("[IRGen tryEmitLeadingNew] new (expression) with %d args", argc);
@@ -2531,31 +2571,40 @@ void parseVarDecl(
                 if (!hasParens) {
                     // 没有参数的构造函数: new ClassName
                     std::string clsName = std::get<LexerType::Keyword>(rightValue[1]).name;
+                    const std::string nativeConstructionType = rightValue.size() == 2 &&
+                        IRScope::resolve(clsName).kind == IRScope::Kind::UNDEFINED
+                            ? IRGen::_nativeConstructionType(clsName)
+                            : std::string();
                     // 生成：LOAD_VALUE class + OBJ_BUILD
                     // 优先尝试解析为符号，如果失败则使用类名字符串（支持 forward declaration）
                     IRScope::SymRef cls = IRScope::resolve(clsName);
-                    IRType::IRInstr load; load.op = VMOperator::LOAD_VALUE;
-                    if (cls.kind == IRScope::Kind::LOCAL) {
-                        load.args.push_back(std::string("local"));
-                        load.args.push_back(LexerType::Value((int)cls.index));
-                        load.args.push_back(clsName); // 添加类名用于错误报告
-                    } else if (cls.kind == IRScope::Kind::GLOBAL) {
-                        load.args.push_back(std::string("global"));
-                        load.args.push_back(LexerType::Value((int)cls.index));
-                        load.args.push_back(clsName); // 添加类名用于错误报告
-                    } else if (cls.kind == IRScope::Kind::UPVALUE) {
-                        load.args.push_back(std::string("upvalue"));
-                        load.args.push_back(LexerType::Value((int)cls.index));
-                        load.args.push_back(clsName); // 添加类名用于错误报告
-                    } else {
-                        // Forward declaration: 使用类名字符串，运行时解析
-                        // VM 会直接压入 args[0] 的值
-                        load.args.push_back(clsName);
-                        load.args.push_back(LexerType::Value(0)); // dummy arg[1]
+                    if (nativeConstructionType.empty()) {
+                        IRType::IRInstr load; load.op = VMOperator::LOAD_VALUE;
+                        if (cls.kind == IRScope::Kind::LOCAL) {
+                            load.args.push_back(std::string("local"));
+                            load.args.push_back(LexerType::Value((int)cls.index));
+                            load.args.push_back(clsName); // 添加类名用于错误报告
+                        } else if (cls.kind == IRScope::Kind::GLOBAL) {
+                            load.args.push_back(std::string("global"));
+                            load.args.push_back(LexerType::Value((int)cls.index));
+                            load.args.push_back(clsName); // 添加类名用于错误报告
+                        } else if (cls.kind == IRScope::Kind::UPVALUE) {
+                            load.args.push_back(std::string("upvalue"));
+                            load.args.push_back(LexerType::Value((int)cls.index));
+                            load.args.push_back(clsName); // 添加类名用于错误报告
+                        } else {
+                            // Forward declaration: 使用类名字符串，运行时解析
+                            // VM 会直接压入 args[0] 的值
+                            load.args.push_back(clsName);
+                            load.args.push_back(LexerType::Value(0)); // dummy arg[1]
+                        }
+                        instructions.push_back(load);
                     }
-                    instructions.push_back(load);
                     IRType::IRInstr build; build.op = VMOperator::OBJ_BUILD; 
                     build.args.push_back(LexerType::Value(0)); // 0 个参数
+                    if (!nativeConstructionType.empty()) {
+                        build.args.push_back(nativeConstructionType);
+                    }
                     instructions.push_back(build);
                     handledNew = true;
                 }
@@ -3716,7 +3765,7 @@ namespace IRGen {
                         } else {
                             IRType::IRInstr nil;
                             nil.op = VMOperator::PUSH;
-                            nil.args.push_back(LexerType::Value(std::string("__NIL__")));
+                            nil.args.push_back(IRType::NullLiteral{});
                             instructions.push_back(nil);
                         }
 
@@ -4465,7 +4514,7 @@ namespace IRGen {
                                 } else {
                                     IRType::IRInstr pushnil;
                                     pushnil.op = VMOperator::PUSH;
-                                    pushnil.args.push_back(LexerType::Value(std::string("__NIL__")));
+                                    pushnil.args.push_back(IRType::NullLiteral{});
                                     out.push_back(pushnil);
                                 }
                             }
@@ -4523,6 +4572,12 @@ namespace IRGen {
                                 } else if (field.defaultIR.size() == 1 &&
                                     field.defaultIR.front().op == VMOperator::PUSH &&
                                     !field.defaultIR.front().args.empty() &&
+                                    std::holds_alternative<IRType::NullLiteral>(
+                                        field.defaultIR.front().args.front())) {
+                                    defaultValue.kind = IRType::ClassFieldDefaultKind::Null;
+                                } else if (field.defaultIR.size() == 1 &&
+                                    field.defaultIR.front().op == VMOperator::PUSH &&
+                                    !field.defaultIR.front().args.empty() &&
                                     std::holds_alternative<LexerType::Value>(
                                         field.defaultIR.front().args.front())) {
                                     const auto& literal = std::get<LexerType::Value>(
@@ -4539,13 +4594,8 @@ namespace IRGen {
                                         defaultValue.kind = IRType::ClassFieldDefaultKind::Boolean;
                                         defaultValue.booleanValue = std::get<bool>(literal.data);
                                     } else if (std::holds_alternative<std::string>(literal.data)) {
-                                        const std::string& stringValue = std::get<std::string>(literal.data);
-                                        if (stringValue == "__NIL__") {
-                                            defaultValue.kind = IRType::ClassFieldDefaultKind::Null;
-                                        } else {
-                                            defaultValue.kind = IRType::ClassFieldDefaultKind::String;
-                                            defaultValue.stringValue = stringValue;
-                                        }
+                                        defaultValue.kind = IRType::ClassFieldDefaultKind::String;
+                                        defaultValue.stringValue = std::get<std::string>(literal.data);
                                     } else {
                                         defaultValue.kind = IRType::ClassFieldDefaultKind::Unsupported;
                                     }
@@ -4580,6 +4630,119 @@ namespace IRGen {
                         else { bytecodes.push_back(std::move(out)); }
 
                         ZEUS_DEBUG_PRINT("[IRGen] .. CLASS END name=%s", className.c_str());
+                        return;
+                    }
+
+                    case CodeBlockType::IMPL: {
+                        if (codeBlock.implTypeName.empty()) {
+                            TreeParser::Node dummy;
+                            IRExceptionNS::IRException ex(
+                                "impl declaration requires a target type", 0, dummy);
+                            ex._throw(status);
+                            return;
+                        }
+
+                        const auto* builtinType = ZeusBuiltins::findTypeImplementation(
+                            codeBlock.implTypeName);
+                        const std::string implTypeName = builtinType != nullptr
+                            ? std::string(builtinType->canonicalName)
+                            : codeBlock.implTypeName;
+
+                        std::unordered_map<std::string, int> staticMethods;
+                        std::unordered_map<std::string, int> instanceMethods;
+                        std::unordered_map<std::string, int> operatorMethods;
+
+                        for (const auto& node : codeBlock.nodes) {
+                            if (!std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(node)) {
+                                continue;
+                            }
+                            const auto& methodPtr =
+                                std::get<std::unique_ptr<TreeParser::CodeBlock>>(node);
+                            if (!methodPtr) continue;
+                            auto& method = *methodPtr;
+                            if (method.type != CodeBlockType::FUNC || method.funcName.empty()) {
+                                continue;
+                            }
+
+                            method.ownerClassName = implTypeName;
+                            method.isClassMethod = true;
+                            method.isStaticMethod =
+                                method.isStaticMethod || method.isCompileTimeStatic;
+                            const bool isStatic = method.isStaticMethod;
+
+                            const size_t before = bytecodes.size();
+                            parseCodeBlock(method);
+                            const size_t after = bytecodes.size();
+                            int foundChunk = -1;
+                            for (int index = static_cast<int>(after) - 1;
+                                 index >= static_cast<int>(before); --index) {
+                                if (!bytecodes[static_cast<size_t>(index)].empty() &&
+                                    bytecodes[static_cast<size_t>(index)].front().op ==
+                                        VMOperator::FUNC_BEGIN) {
+                                    foundChunk = index;
+                                    break;
+                                }
+                            }
+                            if (foundChunk < 0) {
+                                TreeParser::Node dummy;
+                                IRExceptionNS::IRException ex(
+                                    "failed to emit impl method '" + method.funcName + "'",
+                                    method.sourceLine, dummy);
+                                ex._throw(status);
+                                return;
+                            }
+
+                            int protoId = 0;
+                            for (int index = 0; index < foundChunk; ++index) {
+                                if (!bytecodes[static_cast<size_t>(index)].empty() &&
+                                    bytecodes[static_cast<size_t>(index)].front().op ==
+                                        VMOperator::FUNC_BEGIN) {
+                                    ++protoId;
+                                }
+                            }
+
+                            if (method.isOperatorOverload && !method.overloadedOps.empty()) {
+                                for (const auto& symbol : method.overloadedOps) {
+                                    if (!operatorMethods.emplace(symbol, protoId).second) {
+                                        TreeParser::Node dummy;
+                                        IRExceptionNS::IRException ex(
+                                            "duplicate impl operator '" + symbol +
+                                            "' for type '" + implTypeName + "'",
+                                            method.sourceLine, dummy);
+                                        ex._throw(status);
+                                        return;
+                                    }
+                                }
+                            } else {
+                                auto& methods = isStatic ? staticMethods : instanceMethods;
+                                if (!methods.emplace(method.funcName, protoId).second) {
+                                    TreeParser::Node dummy;
+                                    IRExceptionNS::IRException ex(
+                                        "duplicate impl method '" + method.funcName +
+                                        "' for type '" + implTypeName + "'",
+                                        method.sourceLine, dummy);
+                                    ex._throw(status);
+                                    return;
+                                }
+                            }
+                        }
+
+                        IRType::IRInstr registration;
+                        registration.op = VMOperator::TYPE_IMPL_BUILD;
+                        registration.line = codeBlock.sourceLine;
+                        registration.args.push_back(implTypeName);
+                        auto appendMethodMap = [&](const std::unordered_map<std::string, int>& methods) {
+                            registration.args.push_back(LexerType::Value(
+                                static_cast<int>(methods.size())));
+                            for (const auto& entry : methods) {
+                                registration.args.push_back(entry.first);
+                                registration.args.push_back(LexerType::Value(entry.second));
+                            }
+                        };
+                        appendMethodMap(instanceMethods);
+                        appendMethodMap(staticMethods);
+                        appendMethodMap(operatorMethods);
+                        bytecodes.push_back(std::vector<IRType::IRInstr>{std::move(registration)});
                         return;
                     }
 
@@ -5141,48 +5304,28 @@ namespace IRGen {
                 begin.args.push_back(codeBlock.variadicArgs); // variadicArgsName
                 begin.args.push_back(codeBlock.variadicKwargs); // variadicKwargsName
                 
-                // 传递默认参数信息
-                // 计算最少必需参数数量(不含有默认值的参数)
+                // Pass default parameter indices; their expressions are emitted in the function prologue.
                 int minRequired = 0;
+                int defaultCount = 0;
                 for (size_t i = 0; i < codeBlock.paramNames.size(); ++i) {
-                    if (i >= codeBlock.paramDefaults.size() || codeBlock.paramDefaults[i].empty()) {
+                    const bool hasDefault =
+                        i < codeBlock.paramDefaults.size() && !codeBlock.paramDefaults[i].empty();
+                    if (!hasDefault) {
                         minRequired++;
                     } else {
-                        break; // 有默认值的参数后面的都可选
+                        defaultCount++;
                     }
                 }
                 begin.args.push_back(LexerType::Value(minRequired)); // minRequiredParams
-                
-                // 传递默认值数量
-                int defaultCount = 0;
-                for (size_t i = 0; i < codeBlock.paramDefaults.size(); ++i) {
-                    if (!codeBlock.paramDefaults[i].empty()) defaultCount++;
-                }
                 begin.args.push_back(LexerType::Value(defaultCount)); // 默认参数数量
-                
-                // 传递每个默认值 (先传递索引,再传递值)
-                for (size_t i = 0; i < codeBlock.paramDefaults.size(); ++i) {
-                    if (!codeBlock.paramDefaults[i].empty()) {
-                        const auto& defTokens = codeBlock.paramDefaults[i];
-                        
-                        // 简化: 只支持单个常量token作为默认值
-                        if (defTokens.size() == 1) {
-                            begin.args.push_back(LexerType::Value((int)i)); // 参数索引
-                            
-                            if (std::holds_alternative<LexerType::Value>(defTokens[0])) {
-                                begin.args.push_back(std::get<LexerType::Value>(defTokens[0])); // 默认值
-                            } else if (std::holds_alternative<LexerType::Keyword>(defTokens[0])) {
-                                // 处理 nil 关键字作为默认值
-                                const auto& kw = std::get<LexerType::Keyword>(defTokens[0]);
-                                if (kw.name == "nil") {
-                                    begin.args.push_back(LexerType::Value(std::string("__NIL__")));
-                                } else if (kw.name == "true") {
-                                    begin.args.push_back(LexerType::Value(true));
-                                } else if (kw.name == "false") {
-                                    begin.args.push_back(LexerType::Value(false));
-                                }
-                            }
-                        }
+
+                // Keep the historical (parameter index, literal payload) pair layout.
+                // New bytecode evaluates the expression in the function prologue; the
+                // payload is ignored whenever JUMP_IF_PARAM_PROVIDED is present.
+                for (size_t i = 0; i < codeBlock.paramNames.size(); ++i) {
+                    if (i < codeBlock.paramDefaults.size() && !codeBlock.paramDefaults[i].empty()) {
+                        begin.args.push_back(LexerType::Value((int)i));
+                        begin.args.push_back(LexerType::Value(0));
                     }
                 }
                 
@@ -5223,6 +5366,39 @@ namespace IRGen {
 
                 auto* prevSink = funcSink;
                 funcSink = &funcIR;
+
+                // Evaluate omitted defaults in parameter order for every call.
+                for (size_t i = 0; i < codeBlock.paramNames.size(); ++i) {
+                    if (i >= codeBlock.paramDefaults.size() || codeBlock.paramDefaults[i].empty()) {
+                        continue;
+                    }
+
+                    auto defaultIR = IRGen::emitExprIR(
+                        status, strictDecl, futureFuncDefs, codeBlock.paramDefaults[i]);
+                    if (status != IRType::IRCompilerStatus::Running || defaultIR.empty()) {
+                        if (defaultIR.empty() && status == IRType::IRCompilerStatus::Running) {
+                            status = IRType::IRCompilerStatus::Error;
+                            ZEUS_DEBUG_PRINT(
+                                "[IRGen][Params] Failed to generate default expression for '%s.%s'",
+                                codeBlock.funcName.c_str(), codeBlock.paramNames[i].c_str());
+                        }
+                        break;
+                    }
+
+                    IRType::IRInstr skipDefault;
+                    skipDefault.op = VMOperator::JUMP_IF_PARAM_PROVIDED;
+                    skipDefault.args.push_back(LexerType::Value((int)i));
+                    skipDefault.args.push_back(LexerType::Value((int)defaultIR.size() + 1));
+                    funcIR.push_back(std::move(skipDefault));
+                    funcIR.insert(funcIR.end(), defaultIR.begin(), defaultIR.end());
+
+                    IRType::IRInstr assignDefault;
+                    assignDefault.op = VMOperator::STORE_VALUE_LOCAL;
+                    assignDefault.args.push_back(LexerType::Value((int)i));
+                    assignDefault.args.push_back(std::string("mutable"));
+                    funcIR.push_back(std::move(assignDefault));
+                }
+
                 // 为避免局部函数声明覆盖先前 let 变量：
                 // 在普通块（非函数、自身非 for 特殊处理）中，先预扫描子结点，若遇到函数 CodeBlock，且在局部环境(funcSink!=nullptr)，
                 // 先提前 declareLocal 它的 funcName（若还未声明），这样后续 let 变量将使用后续槽位而不会被 MAKE_FUNCTION 回写覆盖。

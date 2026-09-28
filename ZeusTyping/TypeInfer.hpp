@@ -248,6 +248,10 @@ namespace ZeusTypeInfer {
                 return inferBinaryType(selectedSymbol, left, right);
             }
 
+            if (isOperator(tokens[begin], "!")) {
+                return InferredType::Bool;
+            }
+
             if (isKeyword(tokens[begin], "new")) {
                 return InferredType::Object;
             }
@@ -392,7 +396,14 @@ namespace ZeusTypeInfer {
 
                 if (block->type == CodeBlockType::FUNC && !block->funcName.empty()) {
                     FunctionInfo info;
-                    info.name = block->funcName;
+                    std::string ownerType = block->ownerClassName;
+                    if (const auto* builtin =
+                            ZeusBuiltins::findTypeImplementation(ownerType)) {
+                        ownerType = builtin->canonicalName;
+                    }
+                    info.name = block->isClassMethod && !ownerType.empty()
+                        ? ownerType + "::" + block->funcName
+                        : block->funcName;
                     info.returnTypeName = block->returnTypeName;
                     if (block->returnTypeName.empty() &&
                         !TreeParser::hasExplicitReturnStatement(block->nodes)) {
@@ -476,7 +487,16 @@ namespace ZeusTypeInfer {
                 if (block == nullptr) continue;
 
                 if (block->type == CodeBlockType::FUNC) {
-                    auto function = functions.find(block->funcName);
+                    std::string ownerType = block->ownerClassName;
+                    if (const auto* builtin =
+                            ZeusBuiltins::findTypeImplementation(ownerType)) {
+                        ownerType = builtin->canonicalName;
+                    }
+                    const std::string functionKey =
+                        block->isClassMethod && !ownerType.empty()
+                            ? ownerType + "::" + block->funcName
+                            : block->funcName;
+                    auto function = functions.find(functionKey);
                     if (function == functions.end()) continue;
 
                     SymbolTable functionEnvironment = environment;

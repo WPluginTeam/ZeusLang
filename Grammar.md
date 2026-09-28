@@ -20,7 +20,7 @@ identifier ::= [A-Za-z_][A-Za-z0-9_]* ;
 
 实现中词法阶段将标识符与关键字都记为 `Keyword`，语义在语法/IR 阶段区分。常用语法关键字包括：
 
-`var let const shared if else for func class return break delete throw try catch with import using original decl static new true false nil and or`
+`var let const shared if else for func class impl return break delete throw try catch with import using original decl static new true false nil and or`
 
 ### 1.3 字面量
 
@@ -31,8 +31,8 @@ string_lit   ::= "\"" <char_or_escape>* "\"" ;
 bytes_lit    ::= ("b" | "B") ("\"" <byte_char_or_escape>* "\"" | "'" <byte_char_or_escape>* "'") ;
 bool_lit     ::= "true" | "false" ;
 nil_lit      ::= "nil" ;
-list_lit     ::= "[" [expr ("," expr)*] "]" ;
-dict_lit     ::= "{" [expr ":" expr ("," expr ":" expr)*] "}" ;
+list_lit     ::= "[" [expr {"," expr} [","]] "]" ;
+dict_lit     ::= "{" [expr ":" expr {"," expr ":" expr} [","]] "}" ;
 ```
 
 字符串支持转义：`\n \t \r \\ \" \' \0 \b \f \v`。  
@@ -41,7 +41,7 @@ dict_lit     ::= "{" [expr ":" expr ("," expr ":" expr)*] "}" ;
 ### 1.4 运算符与分隔符
 
 ```text
-+ - * / % = == != > < >= <= and or
++ - * / % = == != > < >= <= ! and or ||
 . , : ; ( ) [ ] { } &
 ```
 
@@ -142,11 +142,13 @@ numeric_expr  ::= expr ;
 count_expr ::= expr ".." expr [ ".." ["="] expr ] | numeric_expr ;
 
 for_binding_zone ::= "[" for_binding "]"
-                   | "[" dict_binding ":" dict_binding "]" ;
+                   | "[" dict_binding ":" ["..."] dict_binding "]" ;
 
 for_binding  ::= ["const"] ["&"] identifier ;
 dict_binding ::= ["const"] ["&"] identifier ;
 ```
+
+`for (init; condition; step) { ... }` 不属于 Zeus 语法；使用条件、迭代或范围计数形式。
 
 语义上可识别：
 
@@ -162,20 +164,21 @@ dict_binding ::= ["const"] ["&"] identifier ;
 ### 4.1 函数定义
 
 ```ebnf
-func_block ::= "func" ["static"] [func_name | operator_decl] ["static"] "(" [param_list] ")" [capture_list] block ;
+func_block ::= "func" ["static"] (func_name | operator_decl) ["static"] "(" [param_list] ")" [capture_list] block ;
 
 func_name ::= identifier ;
-param_list ::= param { "," param } ;
-param ::= identifier [ "=" default_expr ] | "*" identifier | "**" identifier ;
+param_list ::= param { "," param } [","] ;
+param ::= identifier [":" type_name] [ "=" default_expr ] | "*" identifier | "**" identifier ;
+type_name ::= ["&"] identifier {"." identifier} ;
 ```
 
-默认参数语法可写任意表达式 token；但当前 VM 侧稳定支持的是单字面量/`true`/`false`/`nil` 默认值。
+默认参数可以是表达式。参数未传入时，VM 会在每次调用中按参数顺序求值；已显式传入的参数（包括 `nil`）不会触发默认表达式。
 
 ### 4.2 捕获列表
 
 ```ebnf
 capture_list ::= "[" capture_items "]" ;
-capture_items ::= "" | "&" | capture_item { "," capture_item } ;
+capture_items ::= "" | "&" | capture_item { "," capture_item } [","] ;
 capture_item ::= ["&"] identifier ;
 ```
 
@@ -188,8 +191,17 @@ capture_item ::= ["&"] identifier ;
 ### 4.3 前向声明
 
 ```ebnf
-func_fwd_decl ::= "decl" "func" identifier "(" [identifier { "," identifier }] ")" ;
+func_fwd_decl ::= "decl" "func" identifier "(" [identifier { "," identifier } [","]] ")" ;
 ```
+
+### 4.4 函数修饰符
+
+```ebnf
+static_function ::= "@static" func_block ;
+native_function ::= "@native" "(" string_lit ")" func_fwd_decl ;
+```
+
+当前只接受 `@static` 函数定义和 `@native("symbol") decl func ...;` 原生函数声明。修饰符必须紧邻对应函数声明；未知修饰符、错误参数和不匹配的声明形式会产生语法诊断。
 
 ## 5. 类与对象
 
@@ -234,7 +246,7 @@ class Point {
 判定规则（普通方法与运算符一致，运算符没有例外）：
 
 - 类声明了 `using &alias`：没有 `static` 修饰的方法都是实例方法，别名注入为第一个形参；
-  此时再写 `[&alias]` 捕获是错误（会重复绑定并使所有实参错位）。
+  此时再写 `[&alias]` 捕获或再次声明同名形参都是错误（接收者会被重复绑定并使实参错位）。
 - 类未声明 `using &alias`：带显式捕获 `[&name]` 的方法是实例方法，别名为 `name`；
   其余方法按静态方法处理。
 - 标记 `static` 的方法不接收接收者。
@@ -245,6 +257,18 @@ class Point {
 
 > 注意：`init` 只在实例方法表中查找，因此需要构造函数的类必须使用写法一。
 
+### 5.1.2 为已有类型挂接方法
+
+```ebnf
+impl_block ::= "impl" type_path "{" [receiver_alias] { func_block | static_function } "}" ;
+receiver_alias ::= "using" "&" identifier ";" ;
+type_path ::= identifier { "." identifier } ;
+```
+
+`impl T` 使用与类相同的方法和运算符表，但不创建新类、不声明字段。写 `using &alias;` 后，未标记 `static` 的方法会以 `alias: T` 为接收者；没有声明接收者别名时，未标记 `static` 的方法按静态方法处理。`operator[new]` 始终是静态工厂。`impl` 可扩展原生类型和已有类；已有类会把这些方法并入它的类方法表。
+
+`operator[new]` 是静态工厂运算符，不接收隐式 `this`。`new T(args...)` 会调用 `T` 上登记的 `operator[new]` 并把它的返回值作为表达式结果；未定义工厂时，普通类仍按字段分配和 `init(...)` 构造。`impl T` 可以为原生类型登记工厂，例如 `impl string`。
+
 ### 5.2 对象创建
 
 ```ebnf
@@ -252,7 +276,9 @@ new_expr ::= "new" class_expr [ "(" [arg_list] ")" ] ;
 class_expr ::= identifier { "." identifier } ;
 ```
 
-当前实现支持 `new ClassName(args...)`，并走 `init(...)` 调用链（若类定义了 `init`）。
+当前实现支持 `new T(args...)`。若 `T` 定义 `operator[new]`，该工厂优先执行；否则类类型按字段分配，并在定义了 `init` 时调用它。原生类型通过 `impl T` 提供工厂。
+
+内置 `String` 是原生 `string` 的别名，没有独立包装对象；`new string(value)` 和 `new String(value)` 都调用 `impl string` 中的工厂并返回原生字符串。
 
 ## 6. 运算符重载
 
@@ -309,23 +335,24 @@ with_block  ::= "with" "(" expr ")" ["[" ["&"] identifier "]"] block ;
 
 ```ebnf
 expr          ::= logical_or_expr ;
-arg_list      ::= arg { "," arg } ;
+arg_list      ::= [arg { "," arg } [","]] ;
 arg           ::= [identifier "="] expr ;
 default_expr  ::= expr ;
 operator_symbol ::= <operator token or keyword token in operator[...]> ;
 ```
 
 1. 后缀：调用 `()`, 成员 `.`, 下标 `[]`
-2. 一元：`+x`, `-x`
+2. 一元：`+x`, `-x`, `!x`
 3. 乘除模：`* / %`
 4. 加减：`+ -`
 5. 比较：`== != > < >= <=`
 6. 逻辑与：`and`
-7. 逻辑或：`or`
+7. 逻辑或：`or`、`||`
 
 ## 10. 当前实现状态备注
 
 - `continue` 已有 `NodeType` 枚举，但当前解析流程未接入关键字识别与 IR 生成。
 - `while` 在当前解析器中未作为独立语法块接入（文档中的旧示例不代表当前可用）。
+- 不支持匿名函数或函数表达式；`func` 定义必须提供函数名或 `operator[...]`。
 - 部分旧文档提到 “构造函数参数不支持” 已过时；当前实现支持 `new Class(args...)`。
 - 运算符重载语法文档中 `operator[[]= ]` 的“必须空格”说法并非实现强约束，实际以解析结果为准。

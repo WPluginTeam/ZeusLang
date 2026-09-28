@@ -261,6 +261,12 @@ namespace IRUtils {
 		return ins;
 	}
 
+	inline IRType::IRInstr makeNotOp() {
+		IRType::IRInstr ins;
+		ins.op = VMOperator::LOGICAL_NOT;
+		return ins;
+	}
+
 	inline IRType::IRInstr makeBinaryOpBySymbol(const std::string& op) {
 		if (op == "+") return makeAddOp();
 		if (op == "-") return makeSubOp();

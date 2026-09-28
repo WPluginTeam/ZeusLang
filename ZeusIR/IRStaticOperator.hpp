@@ -216,6 +216,12 @@ namespace IRStaticOperator {
                     continue;
                 }
 
+                if (ins.op == VMOperator::PUSH && !ins.args.empty() &&
+                    std::holds_alternative<IRType::NullLiteral>(ins.args[0])) {
+                    stack.push_back("nil");
+                    continue;
+                }
+
                 int localIndex = -1;
                 if (isLocalLoad(ins, localIndex)) {
                     auto local = locals.find(localIndex);

@@ -72,14 +72,12 @@ inline void hotspot1(const IRType::IRInstr& instr, HotspotContext& ctx) {
         }
         // args[1] = pushValue
         const auto& pv = instr.args[1];
-        if (std::holds_alternative<LexerType::Value>(pv)) {
+        if (std::holds_alternative<IRType::NullLiteral>(pv)) {
+            newVal = ZeusType::Variant(ZeusType::Null());
+            tookValueFromArgs = true;
+        } else if (std::holds_alternative<LexerType::Value>(pv)) {
             const auto &val = std::get<LexerType::Value>(pv);
-            // 与 VM PUSH 规则一致："__NIL__" 表示 Null
-            if (std::holds_alternative<std::string>(val.data) && std::get<std::string>(val.data) == "__NIL__") {
-                newVal = ZeusType::Variant(ZeusType::Null());
-            } else {
-                newVal = val;
-            }
+            newVal = val;
             tookValueFromArgs = true;
         } else if (std::holds_alternative<ZeusType::Bytes>(pv)) {
             const auto &bytes = std::get<ZeusType::Bytes>(pv);
@@ -87,7 +85,7 @@ inline void hotspot1(const IRType::IRInstr& instr, HotspotContext& ctx) {
             tookValueFromArgs = true;
         } else {
             // 非 Value/Bytes 的内联值暂未支持
-            VMException::VMException exp("HOTSPOT(h1) pushValue must be Value or Bytes", ctx.__line, instr);
+            VMException::VMException exp("HOTSPOT(h1) pushValue must be NullLiteral, Value, or Bytes", ctx.__line, instr);
             exp._throw(ctx.vmstat);
             return;
         }
