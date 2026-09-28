@@ -3,22 +3,19 @@ using original;
 @native("zeus_value_has_dynamic_member")
 decl func __dict_has_to_string(value, method);
 
-func __dict_normalize_string(key: String) -> string {
-    return key.nativeString();
+func __dict_normalize_string(key: string) -> string {
+    return key;
 }
 
 func __dict_normalize_key(key) {
-    if (type(key) == "String") return __dict_normalize_string(key);
     if (type(key) == "string") return key;
     return __builtin_str(key);
 }
 
 func __dict_text(value) -> string {
-    if (type(value) == "String") return __dict_normalize_string(value);
     if (type(value) == "string") return value;
     if (__dict_has_to_string(value, "toString")) {
         let text = value.toString();
-        if (type(text) == "String") return __dict_normalize_string(text);
         if (type(text) == "string") return text;
         return __builtin_str(text);
     }

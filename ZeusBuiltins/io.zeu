@@ -7,23 +7,13 @@ func _toStr(val) {
         let valType = type(val);
         if (valType == "string") {
             return val;
-        } else if (valType == "String") {
-            return val.value;
         } else {
             try {
                 let converted = val.toString();
-                if (type(converted) == "String") {
-                    return converted.value;
-                } else {
-                    return converted;
-                }
+                if (type(converted) == "string") return converted;
+                return __builtin_str(converted);
             } catch (e) {
-                let converted = str(val);
-                if (type(converted) == "String") {
-                    return converted.value;
-                } else {
-                    return converted;
-                }
+                return str(val);
             }
         }
     }

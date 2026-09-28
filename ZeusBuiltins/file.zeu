@@ -10,14 +10,6 @@ class File {
             let pathStr = path;
             let modeStr = mode;
             
-            if (type(path) == "String") {
-                pathStr = path.value;
-            }
-            
-            if (type(mode) == "String") {
-                modeStr = mode.value;
-            }
-            
             this.path = path;
             this.mode = mode;
             this.handle = __file_open(pathStr, modeStr);
@@ -27,13 +19,6 @@ class File {
     func write (data) {
         using original {
             if (type(data) == "Byte") {
-                // Mode could be String wrapper or basic string
-                let modeVal = this.mode;
-                
-                if (type(this.mode) == "String") {
-                    modeVal = this.mode.value;
-                }
-                
                 // For now, just write the data
                 // Binary mode validation can be enhanced later
                 __file_write(this.handle, data.data);

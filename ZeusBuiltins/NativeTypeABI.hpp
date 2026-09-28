@@ -25,7 +25,7 @@ inline const std::vector<NativeTypeABI>& nativeTypeABIs() {
     static const std::vector<NativeTypeABI> types = {
         {"int", {"int32", "int64"}, "i64", NativeValueABI::Int64},
         {"bool", {}, "i1", NativeValueABI::Bool1},
-        {"string", {"str"}, "ptr", NativeValueABI::StringView},
+        {"string", {"str", "String"}, "ptr", NativeValueABI::StringView},
         {"bigint", {}, "ptr", NativeValueABI::ZeusValue},
         {"float", {"float32", "float64"}, "ptr", NativeValueABI::ZeusValue},
         {"nil", {}, "ptr", NativeValueABI::ZeusValue},

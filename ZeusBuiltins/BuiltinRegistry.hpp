@@ -65,8 +65,7 @@ inline const std::vector<ImplementationModule>& implementationModules() {
 
 inline const std::vector<TypeImplementation>& typeImplementations() {
     static const std::vector<TypeImplementation> types = {
-        {"String", {}, "ZeusBuiltins.string", TypeCategory::Opaque, false, true, true},
-        {"string", {"str"}, "ZeusBuiltins.string", TypeCategory::String, true, false},
+        {"string", {"str", "String"}, "ZeusBuiltins.string", TypeCategory::String, true, false},
         {"Array", {"list", "array"}, "ZeusBuiltins.list", TypeCategory::List, false, true},
         {"Dict", {}, "ZeusBuiltins.dict", TypeCategory::Opaque, false, true, true},
         {"Byte", {}, "ZeusBuiltins.byte", TypeCategory::Opaque, true, true},
@@ -78,8 +77,7 @@ inline const std::vector<TypeImplementation>& typeImplementations() {
 inline const std::vector<LiteralWrapper>& literalWrappers() {
     static const std::vector<LiteralWrapper> wrappers = {
         {BuiltinLiteralKind::Array, "list", "ZeusBuiltins.list.Array", "Array"},
-        {BuiltinLiteralKind::Bytes, "bytes", "ZeusBuiltins.byte.Byte", "Byte"},
-        {BuiltinLiteralKind::String, "string", "ZeusBuiltins.string.String", "String"}
+        {BuiltinLiteralKind::Bytes, "bytes", "ZeusBuiltins.byte.Byte", "Byte"}
     };
     return wrappers;
 }

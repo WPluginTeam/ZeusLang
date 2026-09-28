@@ -29,7 +29,7 @@ class Byte {
         let index = 0;
         let match = false;
 
-        for (i = 0; i < len(this.data); i = i + 1) {
+        for (0..len(this.data)) [i] {
             if (this.data[i] == bt) {
                 match = true;
             } else {

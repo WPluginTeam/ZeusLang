@@ -24,20 +24,12 @@ class Socket {
     func connect(host, port) {
         let hostStr = host;
 
-        if (type(host) == "String") {
-            hostStr = host.value;
-        }
-
         __socket_connect(this.handle, hostStr, port);
         this.isConnected = true;
     }
 
     func bind(host, port) {
         let hostStr = host;
-
-        if (type(host) == "String") {
-            hostStr = host.value;
-        }
 
         __socket_bind(this.handle, hostStr, port);
     }

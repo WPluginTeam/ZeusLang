@@ -42,11 +42,15 @@ class Array {
         let s = "[";
         
         for (this.data) [&item] {
-            s = s + str(item) + ", ";
+            let itemText = str(item);
+            if (type(itemText) != "string") {
+                itemText = __builtin_str(itemText);
+            }
+            s = s + itemText + ", ";
         }
         
         s = s + "]";
-        return new String(s);
+        return s;
     }
 
     func operator[+](other) {

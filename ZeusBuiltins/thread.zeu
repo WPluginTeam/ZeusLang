@@ -451,7 +451,7 @@ class ThreadPool {
     
     // 启动线程池
     func start() {
-        for (let i = 0; i < this._size; i = i + 1) {
+        for (0..this._size) [i] {
             let worker = new Thread(this._workerLoop);
             worker.start();
             this._workers.append(worker);
@@ -462,7 +462,7 @@ class ThreadPool {
     func shutdown(wait=true) {
         this._shutdown = true;
         if (wait) {
-            for (let i = 0; i < len(this._workers); i = i + 1) {
+            for (0..len(this._workers)) [i] {
                 this._workers[i].join();
             }
         }
