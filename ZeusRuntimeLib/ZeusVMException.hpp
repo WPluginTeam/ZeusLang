@@ -409,7 +409,7 @@ namespace VMException {
             ErrorCode::E1403_INVALID_ARGUMENT_TYPE,
             ErrorCategory::TYPE_ERROR,
             funcName + "(): argument " + std::to_string(argIndex + 1) + 
-            " must be " + expectedType + ", not " + actualType,
+            " must " + expectedType + ", not " + actualType,
             line, instr
         );
         ex.setDetails("Expected: " + expectedType + "\nGot: " + actualType);

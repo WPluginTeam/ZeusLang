@@ -352,7 +352,12 @@ namespace IRGen {
 
         std::vector<std::string> parameterTypes;
         parameterTypes.reserve(codeBlock.paramNames.size());
+        std::vector<std::string> parameterNames = codeBlock.paramNames;
+        std::vector<bool> parameterIsReference;
+        parameterIsReference.reserve(codeBlock.paramNames.size());
         for (size_t i = 0; i < codeBlock.paramNames.size(); ++i) {
+            parameterIsReference.push_back(
+                i < codeBlock.paramIsReference.size() && codeBlock.paramIsReference[i]);
             if (i < codeBlock.paramTypeNames.size()) {
                 const std::string typeName = _canonicalIRTypeName(codeBlock.paramTypeNames[i]);
                 const std::string resolvedType =
@@ -383,7 +388,9 @@ namespace IRGen {
             codeBlock.isOperatorOverload && !codeBlock.overloadedOps.empty()
                 ? _operatorSymbolName(codeBlock.overloadedOps.front())
                 : std::string(),
-            codeBlock.isClassMethod && codeBlock.isStaticMethod
+            codeBlock.isClassMethod && codeBlock.isStaticMethod,
+            std::move(parameterNames),
+            std::move(parameterIsReference)
         );
 
         return annotation;
@@ -410,17 +417,24 @@ namespace IRGen {
 
         std::vector<std::string> parameterTypes;
         parameterTypes.reserve(signature.parameters.size());
+        std::vector<std::string> parameterNames;
+        parameterNames.reserve(signature.parameters.size());
+        std::vector<bool> parameterIsReference;
+        parameterIsReference.reserve(signature.parameters.size());
         for (const auto& parameter : signature.parameters) {
             const std::string typeName = _canonicalIRTypeName(parameter.typeName);
             annotation.args.push_back(typeName);
             parameterTypes.push_back(typeName);
+            parameterNames.push_back(parameter.name);
+            parameterIsReference.push_back(parameter.isReference);
         }
         if (!signature.nativeSymbol.empty()) {
             annotation.args.push_back(signature.nativeSymbol);
         }
         annotation.metadata = IRType::IRMetadata::externalFunctionSignature(
             signatureName, returnType, std::move(parameterTypes),
-            signature.nativeSymbol
+            signature.nativeSymbol, std::move(parameterNames),
+            std::move(parameterIsReference)
         );
         return annotation;
     }
@@ -507,8 +521,16 @@ namespace IRGen {
         }
     }
 
-    static bool _parseArguments(ExprParseCtx& ctx, const std::vector<LexerType::Token>& tokens, size_t& pos, int& argc, std::vector<IRType::IRInstr>& out) {
+    static bool _parseArguments(
+        ExprParseCtx& ctx,
+        const std::vector<LexerType::Token>& tokens,
+        size_t& pos,
+        int& argc,
+        std::vector<IRType::IRInstr>& out,
+        std::vector<IRType::CallArgumentSource>* callArguments = nullptr
+    ) {
         argc = 0;
+        int positionalIndex = 0;
         // 当前 pos 指向 '('
         
         ZEUS_DEBUG_PRINT("[IRGen _parseArguments] Starting at pos=%zu, tokens.size()=%zu", pos, tokens.size());
@@ -589,12 +611,37 @@ namespace IRGen {
             }
             
             // 解析参数值表达式
+            const size_t expressionTokenStart = pos;
+            const size_t expressionInstructionStart = out.size();
             if (!_parseExpression(ctx, tokens, pos, 1, out)) {
                 ZEUS_DEBUG_PRINT("[IRGen _parseArguments] Failed to parse argument %d", argc + 1);
                 return false;
             }
             
             // 如果是命名参数,生成PUSH_NAMED指令
+            IRType::CallArgumentSource callArgument;
+            if (isNamedArg) {
+                callArgument.namedParameter = paramName;
+            } else {
+                callArgument.positionalIndex = positionalIndex++;
+            }
+            const bool isIdentifierExpression =
+                expressionTokenStart < tokens.size() &&
+                pos == expressionTokenStart + 1 &&
+                _isKeyword(tokens[expressionTokenStart]) &&
+                std::get<LexerType::Keyword>(tokens[expressionTokenStart]).name != "true" &&
+                std::get<LexerType::Keyword>(tokens[expressionTokenStart]).name != "false" &&
+                std::get<LexerType::Keyword>(tokens[expressionTokenStart]).name != "nil";
+            if (isIdentifierExpression &&
+                out.size() == expressionInstructionStart + 1 &&
+                out.back().op == VMOperator::LOAD_VALUE &&
+                out.back().metadata.kind == IRType::IRMetadataKind::Symbol) {
+                callArgument.source = out.back().metadata.symbol;
+                callArgument.isAssignable =
+                    callArgument.source.kind == IRType::SymbolRefKind::Local ||
+                    callArgument.source.kind == IRType::SymbolRefKind::Global ||
+                    callArgument.source.kind == IRType::SymbolRefKind::Upvalue;
+            }
             if (isNamedArg) {
                 IRType::IRInstr namedInstr;
                 namedInstr.op = VMOperator::PUSH_NAMED;
@@ -602,6 +649,8 @@ namespace IRGen {
                 out.push_back(namedInstr);
                 ZEUS_DEBUG_PRINT("[IRGen _parseArguments] Generated PUSH_NAMED for '%s'", paramName.c_str());
             }
+
+            if (callArguments) callArguments->push_back(std::move(callArgument));
             
             argc++;
             ZEUS_DEBUG_PRINT("[IRGen _parseArguments] Parsed argument %d (pos %zu -> %zu)", argc, argStart, pos);
@@ -651,13 +700,15 @@ namespace IRGen {
 
                 pos += 3;
                 int argc = 0;
-                if (!_parseArguments(ctx, tokens, pos, argc, out)) return false;
+                std::vector<IRType::CallArgumentSource> callArguments;
+                if (!_parseArguments(ctx, tokens, pos, argc, out, &callArguments)) return false;
 
                 out.push_back(makeDirectCallAnnotation(functionName));
                 IRType::IRInstr call;
                 call.op = VMOperator::CALL_CLOSURE;
                 call.line = _getTokenLine(tokens[pos - 1]);
                 call.args.push_back(LexerType::Value(argc));
+                call.metadata = IRType::IRMetadata::callArgumentSources(std::move(callArguments));
                 out.push_back(call);
                 return true;
             }
@@ -1119,6 +1170,7 @@ namespace IRGen {
                         ins.args.push_back(std::string("upvalue"));
                         ins.args.push_back(LexerType::Value((int)s.index));
                     }
+                    ins.metadata = IRType::IRMetadata::symbolRef(_makeSymbolRef(name, s));
                     out.push_back(ins);
                     calleeKind = CalleeKind::ClosureLike;
                     directFunctionCandidate = s.kind == IRScope::Kind::GLOBAL &&
@@ -1213,8 +1265,8 @@ namespace IRGen {
             while (pos < tokens.size() && _isOperator(tokens[pos]) && _opSym(tokens[pos]) == "(") {
                 int callLine = _getTokenLine(tokens[pos]);
                 int argc = 0;
-
-                if (!_parseArguments(ctx, tokens, pos, argc, out)) {
+                std::vector<IRType::CallArgumentSource> callArguments;
+                if (!_parseArguments(ctx, tokens, pos, argc, out, &callArguments)) {
                     return false;
                 }
 
@@ -1233,6 +1285,10 @@ namespace IRGen {
 
                 callInstr.line = callLine;
                 callInstr.args.push_back(LexerType::Value(argc));
+                if (calleeKind != CalleeKind::Native) {
+                    callInstr.metadata = IRType::IRMetadata::callArgumentSources(
+                        std::move(callArguments));
+                }
                 out.push_back(callInstr);
 
                 // 多次链式调用：后续都视为普通闭包调用（前一次返回值可能是闭包）
@@ -5418,6 +5474,8 @@ namespace IRGen {
                 std::vector<IRType::IRInstr> funcIR;
                 IRType::IRInstr begin;
                 begin.op = VMOperator::FUNC_BEGIN;
+                begin.line = codeBlock.sourceLine;
+                begin.column = codeBlock.sourceColumn;
                 begin.args.push_back(LexerType::Value((int)codeBlock.paramNames.size()));
                 // 传递变长参数元数据
                 begin.args.push_back(LexerType::Value(codeBlock.variadicArgs.empty() ? 0 : 1)); // hasVariadicArgs
@@ -5636,6 +5694,8 @@ namespace IRGen {
                     }
                     std::vector<IRType::IRInstr> seq;
                     IRType::IRInstr mk; mk.op = VMOperator::MAKE_FUNCTION; mk.args.push_back(LexerType::Value(protoId));
+                    mk.line = codeBlock.sourceLine;
+                    mk.column = codeBlock.sourceColumn;
                     seq.push_back(std::move(mk));
 
                     IRType::IRInstr st;

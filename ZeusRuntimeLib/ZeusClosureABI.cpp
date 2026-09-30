@@ -25,12 +25,19 @@ struct CaptureCell {
     bool deleted = false;
     std::mutex mutex;
 
-    CaptureCell() = default;
+    CaptureCell() {
+        zeus_value_init_nil(&value);
+        zeus_value_slot_register_gc_edge(&value);
+    }
     explicit CaptureCell(const ZeusValue* initial) {
         if (initial) zeus_value_clone_internal(&value, initial);
         else zeus_value_init_nil(&value);
+        zeus_value_slot_register_gc_edge(&value);
     }
-    ~CaptureCell() { zeus_value_release_internal(&value); }
+    ~CaptureCell() {
+        zeus_value_slot_unregister_gc_edge(&value);
+        zeus_value_release_internal(&value);
+    }
 };
 
 struct CaptureCellHandle {
@@ -254,6 +261,14 @@ void zeus_capture_cell_store(void* handle, const ZeusValue* value) {
     }
 }
 
+ZeusValue* zeus_capture_cell_value_slot(void* handle) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    auto* cell = requireCell(handle);
+    std::lock_guard<std::mutex> lock(cell->cell->mutex);
+    if (cell->cell->deleted) closurePanic("reference to deleted capture cell");
+    return &cell->cell->value;
+}
+
 void zeus_capture_cell_delete(void* handle) {
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     auto* cellHandle = requireCell(handle);
@@ -269,6 +284,7 @@ void zeus_capture_cell_delete(void* handle) {
         std::lock_guard<std::mutex> lock(cellHandle->cell->mutex);
         zeus_value_release_internal(&cellHandle->cell->value);
         zeus_value_init_nil(&cellHandle->cell->value);
+        cellHandle->cell->value.tag = ZEUS_VALUE_TAG_DELETED;
         cellHandle->cell->deleted = true;
     }
 }
@@ -350,9 +366,10 @@ void zeus_closure_call(
     ZeusValue* out,
     const ZeusValue* closure,
     int32_t argc,
-    const ZeusValue* const* values
+    const ZeusValue* const* values,
+    ZeusValue* const* referenceSlots
 ) {
-    zeus_closure_call_named(out, closure, argc, values, nullptr);
+    zeus_closure_call_named(out, closure, argc, values, referenceSlots, nullptr);
 }
 
 void zeus_closure_call_named(
@@ -360,6 +377,7 @@ void zeus_closure_call_named(
     const ZeusValue* closure,
     int32_t argc,
     const ZeusValue* const* values,
+    ZeusValue* const* referenceSlots,
     const char* const* argument_names
 ) {
     if (!out || argc < 0 || (argc != 0 && !values)) {
@@ -372,7 +390,7 @@ void zeus_closure_call_named(
         closurePanic("closure call arity mismatch");
     }
     zeus_value_init_nil(out);
-    record->invoke(out, record, argc, values, argument_names);
+    record->invoke(out, record, argc, values, referenceSlots, argument_names);
 }
 
 void zeus_closure_bind_arguments(
@@ -383,8 +401,10 @@ void zeus_closure_bind_arguments(
     int32_t has_variadic_kwargs,
     int32_t argc,
     const ZeusValue* const* values,
+    ZeusValue* const* referenceSlots,
     const char* const* argument_names,
     const ZeusValue** ordered_values,
+    ZeusValue** orderedReferenceSlots,
     uint64_t* provided_mask,
     ZeusValue* variadic_args,
     ZeusValue* variadic_kwargs
@@ -402,20 +422,28 @@ void zeus_closure_bind_arguments(
     *provided_mask = 0;
     for (int32_t i = 0; i < parameter_count; ++i) {
         ordered_values[i] = nullptr;
+        if (orderedReferenceSlots) orderedReferenceSlots[i] = nullptr;
     }
     if (has_variadic_args) zeus_value_init_nil(variadic_args);
     if (has_variadic_kwargs) zeus_value_init_nil(variadic_kwargs);
 
-    std::vector<const ZeusValue*> positional_arguments;
-    std::map<std::string, const ZeusValue*> named_arguments;
+    struct BoundArgument {
+        const ZeusValue* value = nullptr;
+        ZeusValue* referenceSlot = nullptr;
+    };
+    std::vector<BoundArgument> positional_arguments;
+    std::map<std::string, BoundArgument> named_arguments;
     for (int32_t i = 0; i < argc; ++i) {
         const char* rawName = argument_names ? argument_names[i] : nullptr;
+        const BoundArgument argument{
+            values[i], referenceSlots ? referenceSlots[i] : nullptr
+        };
         if (!rawName || !*rawName) {
-            positional_arguments.push_back(values[i]);
+            positional_arguments.push_back(argument);
         } else {
             // VM CALL_CLOSURE stores named arguments by name, so a later
             // occurrence replaces the previous value.
-            named_arguments[rawName] = values[i];
+            named_arguments[rawName] = argument;
         }
     }
 
@@ -423,7 +451,9 @@ void zeus_closure_bind_arguments(
     std::set<std::string> consumed_named_arguments;
     for (int32_t i = 0; i < parameter_count; ++i) {
         if (static_cast<size_t>(i) < positional_count) {
-            ordered_values[i] = positional_arguments[static_cast<size_t>(i)];
+            const BoundArgument& argument = positional_arguments[static_cast<size_t>(i)];
+            ordered_values[i] = argument.value;
+            if (orderedReferenceSlots) orderedReferenceSlots[i] = argument.referenceSlot;
             if (i < 64) *provided_mask |= uint64_t{1} << i;
             continue;
         }
@@ -433,7 +463,8 @@ void zeus_closure_bind_arguments(
         }
         const auto named = named_arguments.find(parameter_names[i]);
         if (named != named_arguments.end()) {
-            ordered_values[i] = named->second;
+            ordered_values[i] = named->second.value;
+            if (orderedReferenceSlots) orderedReferenceSlots[i] = named->second.referenceSlot;
             consumed_named_arguments.insert(named->first);
             if (i < 64) *provided_mask |= uint64_t{1} << i;
             continue;
@@ -464,7 +495,7 @@ void zeus_closure_bind_arguments(
         extra_positional.reserve(extra_count);
         for (size_t i = static_cast<size_t>(parameter_count);
              i < positional_count; ++i) {
-            extra_positional.push_back(positional_arguments[i]);
+            extra_positional.push_back(positional_arguments[i].value);
         }
         zeus_value_array_build(
             variadic_args,
@@ -476,7 +507,7 @@ void zeus_closure_bind_arguments(
         for (const auto& entry : named_arguments) {
             if (consumed_named_arguments.find(entry.first) ==
                 consumed_named_arguments.end()) {
-                extra_keywords.push_back(entry);
+                extra_keywords.emplace_back(entry.first, entry.second.value);
             }
         }
 
@@ -530,6 +561,14 @@ void zeus_closure_env_store(
     }
 }
 
+ZeusValue* zeus_closure_env_value_slot(void* environment, int32_t index) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    const auto cell = requireCapture(requireEnvironment(environment), index);
+    std::lock_guard<std::mutex> lock(cell->mutex);
+    if (cell->deleted) closurePanic("reference to deleted closure capture");
+    return &cell->value;
+}
+
 void zeus_closure_env_delete(void* environment, int32_t index) {
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     const auto cell = requireCapture(requireEnvironment(environment), index);
@@ -545,6 +584,7 @@ void zeus_closure_env_delete(void* environment, int32_t index) {
         std::lock_guard<std::mutex> lock(cell->mutex);
         zeus_value_release_internal(&cell->value);
         zeus_value_init_nil(&cell->value);
+        cell->value.tag = ZEUS_VALUE_TAG_DELETED;
         cell->deleted = true;
     }
 }

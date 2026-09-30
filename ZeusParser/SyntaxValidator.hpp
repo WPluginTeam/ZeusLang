@@ -315,6 +315,30 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
             parameterSegments.push_back({ segmentStart, paramsClose });
         }
 
+        const bool forwardDeclaration = i > 0 &&
+            std::holds_alternative<LexerType::Keyword>(tokens[i - 1]) &&
+            std::get<LexerType::Keyword>(tokens[i - 1]).name == "decl";
+        bool nativeForwardDeclaration = false;
+        if (forwardDeclaration) {
+            for (size_t prefixEnd = i; prefixEnd > 0; --prefixEnd) {
+                const size_t prefixStart = prefixEnd - 1;
+                if (!isSyntaxOperator(tokens[prefixStart], "@")) continue;
+                const std::vector<LexerType::Token> prefixTokens(
+                    tokens.begin() + prefixStart, tokens.begin() + i);
+                const auto prefix = parseFunctionDecoratorPrefix(prefixTokens);
+                const size_t declarationIndex = prefixStart + prefix.nextToken;
+                const bool namesThisDeclaration = prefix.valid &&
+                    declarationIndex + 1 == i &&
+                    std::holds_alternative<LexerType::Keyword>(tokens[declarationIndex]) &&
+                    std::get<LexerType::Keyword>(tokens[declarationIndex]).name == "decl";
+                nativeForwardDeclaration = namesThisDeclaration &&
+                    std::any_of(prefix.decorators.begin(), prefix.decorators.end(),
+                        [](const FunctionDecoratorSyntax& decorator) {
+                            return decorator.name == "native";
+                        });
+                break;
+            }
+        }
         for (const auto& segment : parameterSegments) {
             size_t position = segment.first;
             const size_t end = segment.second;
@@ -322,6 +346,14 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
             if (variadic) {
                 ++position;
                 if (position < end && isSyntaxOperator(tokens[position], "*")) ++position;
+            }
+            const bool byReference = position < end &&
+                isSyntaxOperator(tokens[position], "&");
+            if (byReference) ++position;
+            if (byReference && forwardDeclaration && !nativeForwardDeclaration) {
+                addDiagnostic("P0019",
+                              "non-native 'decl func' cannot declare reference parameters",
+                              tokens[segment.first]);
             }
             if (position >= end || !isSyntaxIdentifier(tokens[position])) {
                 addDiagnostic("P0019", "expected a parameter name", tokens[segment.first]);
@@ -340,6 +372,10 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
             }
 
             if (position < end && isSyntaxOperator(tokens[position], "=")) {
+                if (byReference) {
+                    addDiagnostic("P0019", "reference parameters cannot have default values",
+                                  tokens[position]);
+                }
                 ++position;
                 if (position == end) {
                     addDiagnostic("P0019", "expected a default expression after '=' in parameter declaration",
@@ -349,7 +385,10 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
                 position = end;
             }
 
-            if (variadic && position != end) {
+            if (byReference && variadic) {
+                addDiagnostic("P0019", "reference parameters cannot be variadic",
+                              tokens[segment.first]);
+            } else if (variadic && position != end) {
                 addDiagnostic("P0019", "variadic parameters cannot have a type or default value",
                               tokens[segment.first]);
             } else if (position != end) {
@@ -358,9 +397,6 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
             }
         }
 
-        const bool forwardDeclaration = i > 0 &&
-            std::holds_alternative<LexerType::Keyword>(tokens[i - 1]) &&
-            std::get<LexerType::Keyword>(tokens[i - 1]).name == "decl";
         size_t bodyIndex = paramsClose + 1;
         if (bodyIndex < tokens.size() && isSyntaxOperator(tokens[bodyIndex], "[")) {
             const size_t captureOpen = bodyIndex;

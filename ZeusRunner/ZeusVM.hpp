@@ -45,6 +45,7 @@
 #include "ZeusHotspot.hpp"
 #include "../ZeusRuntimeLib/ZeusGC.hpp"
 #include "../ZeusBuiltins/NativeTypeABI.hpp"
+#include "../ZeusRuntimeLib/ZeusRuntimeType.hpp"
 #if 0
 /* Computed-goto dispatch removed for MSVC builds. */
 #endif
@@ -946,6 +947,11 @@ class VM {
     struct Prototype { 
         std::vector<IRType::IRInstr> body; 
         std::vector<CaptureDesc> captures; 
+        std::string functionName;
+        std::string ownerType;
+        std::vector<std::string> paramTypes;
+        std::vector<bool> paramIsReference;
+        bool isStaticMethod = false;
         int paramCount = 0;
         std::vector<std::string> paramNames; // 参数名列表(用于命名参数匹配)
         bool hasVariadicArgs = false;   // 是否有*args
@@ -988,6 +994,7 @@ class VM {
         int                                 savedLine;                // 保存的行号
         int                                 calleeAutoReleaseId = -1; // 如果为函数调用传递的临时闭包, 返回时自动 release id
         std::vector<bool>                   paramProvided;           // supplied positional/named arguments for default prologue
+        std::vector<bool>                   referenceParameterSlots;
     };
 
     std::vector<Prototype> prototypes; // 为外部函数/闭包注册的原型列表
@@ -2039,9 +2046,25 @@ class VM {
                 Prototype proto;
                 proto.body = bc;
                 for (const auto& bodyInstr : bc) {
+                    if (bodyInstr.op == VMOperator::IR_ANNOTATION &&
+                        bodyInstr.metadata.kind == IRType::IRMetadataKind::FunctionSignature) {
+                        std::string returnType;
+                        int captureCount = 0;
+                        bodyInstr.metadata.readFunctionSignature(
+                            proto.functionName,
+                            returnType,
+                            captureCount,
+                            proto.paramTypes,
+                            &proto.ownerType,
+                            nullptr,
+                            nullptr,
+                            nullptr,
+                            &proto.paramIsReference
+                        );
+                        proto.isStaticMethod = bodyInstr.metadata.isStaticMethod;
+                    }
                     if (bodyInstr.op == VMOperator::JUMP_IF_PARAM_PROVIDED) {
                         proto.hasRuntimeDefaultPrologue = true;
-                        break;
                     }
                 }
 
@@ -2805,6 +2828,29 @@ class VM {
         
         // 栈布局: [..., closure, (this?), arg0, arg1, ..., arg{n-1}]
         size_t calleeIndex = stack.size() - (actualArgc + 1);
+
+        const IRType::IRInstr noInstruction{};
+        for (int i = 0; i < actualArgc && i < proto.paramCount; ++i) {
+            if (!validateFunctionArgument(
+                    proto, i, stack[calleeIndex + 1 + i], noInstruction)) {
+                shrinkStackWithRelease(calleeIndex);
+                stack.push_back(LexerType::Value(0));
+                return false;
+            }
+        }
+        if (!proto.hasRuntimeDefaultPrologue) {
+            for (int i = actualArgc; i < proto.paramCount; ++i) {
+                if (i < static_cast<int>(proto.paramHasDefault.size()) &&
+                    proto.paramHasDefault[i] &&
+                    i < static_cast<int>(proto.paramDefaultValues.size()) &&
+                    !validateFunctionArgument(
+                        proto, i, proto.paramDefaultValues[i], noInstruction)) {
+                    shrinkStackWithRelease(calleeIndex);
+                    stack.push_back(LexerType::Value(0));
+                    return false;
+                }
+            }
+        }
         
         // 保存当前环境
         auto oldLocal = local;
@@ -2867,6 +2913,7 @@ class VM {
         syncFrame.savedLocal = oldLocal;
         syncFrame.savedUpvalue = oldUpvalue;
         syncFrame.paramProvided.assign(proto.paramCount, false);
+        syncFrame.referenceParameterSlots = proto.paramIsReference;
         for (int i = 0; i < actualArgc && i < proto.paramCount; ++i) {
             syncFrame.paramProvided[i] = true;
         }
@@ -2897,18 +2944,254 @@ class VM {
         return true;
     }
 
+    std::string sharedObjectTypeName(
+        const ZeusType::SharedObjectHandle& handle
+    ) const {
+        // Resolve through the generation-tagged source slot. A stale handle
+        // must never inherit the type of a later value stored under the same name.
+        auto cell = ZeusShared::getGlobalHeap().find(handle.name, handle.generation);
+        if (!cell) return {};
+
+        const ZeusType::UniversalVariant sharedValue = cell->read();
+        const auto* variant = std::get_if<ZeusType::Variant>(&sharedValue);
+        if (!variant) return {};
+        const auto* object = std::get_if<ZeusType::Object>(variant);
+        if (!object || !object->impl) return {};
+
+        const auto classNameIt = object->impl->data.find("__className__");
+        if (classNameIt == object->impl->data.end()) return {};
+        const auto* classNameValue = std::get_if<LexerType::Value>(&classNameIt->second);
+        if (!classNameValue) return {};
+        const auto* className = std::get_if<std::string>(&classNameValue->data);
+        return className ? *className : std::string();
+    }
+
     std::string typeImplementationName(
         const ZeusType::UniversalVariant& value
     ) const {
-        const ZeusType::UniversalVariant typeValue = ZeusBuiltins::builtin_type(
-            std::vector<ZeusType::UniversalVariant>{value});
-        const auto* typeName = std::get_if<std::string>(&typeValue);
-        if (!typeName) return {};
+        std::string resolvedTypeName;
+        if (const auto* sharedObject =
+                std::get_if<ZeusType::SharedObjectHandle>(&value)) {
+            resolvedTypeName = sharedObjectTypeName(*sharedObject);
+            if (resolvedTypeName.empty()) return "unknown";
+        } else {
+            const ZeusType::UniversalVariant typeValue = ZeusBuiltins::builtin_type(
+                std::vector<ZeusType::UniversalVariant>{value});
+            const auto* typeName = std::get_if<std::string>(&typeValue);
+            if (!typeName) return {};
+            resolvedTypeName = *typeName;
+        }
 
-        const auto* builtinType = ZeusBuiltins::findTypeImplementation(*typeName);
+        const auto* builtinType = ZeusBuiltins::findTypeImplementation(resolvedTypeName);
         return builtinType
             ? std::string(builtinType->canonicalName)
-            : *typeName;
+            : resolvedTypeName;
+    }
+
+    std::string runtimeValueTypeName(
+        const ZeusType::UniversalVariant& value
+    ) const {
+        if (const auto* reference = std::get_if<ZeusType::ReferenceHandle>(&value)) {
+            return "&" + reference->typeName;
+        }
+        return ZeusRuntimeType::canonicalTypeName(typeImplementationName(value));
+    }
+
+    bool resolveReferenceArgument(
+        const IRType::IRInstr& callInstruction,
+        const Prototype& proto,
+        const std::vector<Cell*>& callerLocals,
+        const std::vector<Cell*>& callerUpvalues,
+        int parameterIndex,
+        int positionalSourceIndex,
+        const std::string& parameterName,
+        const ZeusType::UniversalVariant& value,
+        ZeusType::UniversalVariant& referenceValue
+    ) {
+        if (const auto* existing =
+                std::get_if<ZeusType::ReferenceHandle>(&value)) {
+            if (existing->typeName == "cell" && existing->address) {
+                referenceValue = *existing;
+                return true;
+            }
+        }
+
+        const IRType::CallArgumentSource* source = nullptr;
+        for (const auto& argument : callInstruction.metadata.callArguments) {
+            const bool matches = argument.namedParameter.empty()
+                ? argument.positionalIndex == positionalSourceIndex
+                : argument.namedParameter == parameterName;
+            if (matches) {
+                source = &argument;
+                break;
+            }
+        }
+
+        Cell* target = nullptr;
+        if (source && source->isAssignable && !source->source.isConst) {
+            const auto& symbol = source->source;
+            if (symbol.kind == IRType::SymbolRefKind::Local &&
+                symbol.index >= 0 &&
+                symbol.index < static_cast<int>(callerLocals.size())) {
+                target = callerLocals[symbol.index];
+            } else if (symbol.kind == IRType::SymbolRefKind::Global &&
+                       symbol.index >= 0 && symbol.index < static_cast<int>(global.size())) {
+                target = global[symbol.index];
+            } else if (symbol.kind == IRType::SymbolRefKind::Upvalue &&
+                       symbol.index >= 0 &&
+                       symbol.index < static_cast<int>(callerUpvalues.size())) {
+                target = callerUpvalues[symbol.index];
+            }
+        }
+        if (target && (target->flags & 0x1)) target = nullptr;
+
+        if (!target) {
+            ZEUS_DEBUG_PRINT(
+                "[ReferenceArgument] unresolved source: metadata_kind=%d count=%zu found=%d assignable=%d kind=%d index=%d const=%d",
+                static_cast<int>(callInstruction.metadata.kind),
+                callInstruction.metadata.callArguments.size(),
+                source ? 1 : 0,
+                source && source->isAssignable ? 1 : 0,
+                source ? static_cast<int>(source->source.kind) : -1,
+                source ? source->source.index : -1,
+                source && source->source.isConst ? 1 : 0
+            );
+            const std::string functionName = proto.functionName.empty()
+                ? "<anonymous>"
+                : proto.functionName;
+            const std::string expected = parameterIndex >= 0 &&
+                    parameterIndex < static_cast<int>(proto.paramTypes.size())
+                ? "variable reference to " + ZeusRuntimeType::canonicalTypeName(
+                    proto.paramTypes[parameterIndex])
+                : "variable reference";
+            const std::string actual = runtimeValueTypeName(value);
+            const int receiverOffset = !proto.ownerType.empty() &&
+                !proto.isStaticMethod ? 1 : 0;
+            VMException::typeError_InvalidArgument(
+                functionName,
+                std::max(0, parameterIndex - receiverOffset),
+                expected,
+                actual,
+                __line,
+                callInstruction
+            )._throw(vmstat, currentChunk);
+            return false;
+        }
+
+        if (const auto* forwarded =
+                std::get_if<ZeusType::ReferenceHandle>(&target->value)) {
+            if (forwarded->typeName == "cell" && forwarded->address) {
+                referenceValue = *forwarded;
+                return true;
+            }
+        }
+        referenceValue = ZeusType::ReferenceHandle{target, "cell"};
+        return true;
+    }
+
+    bool isValueCompatibleWithType(
+        const ZeusType::UniversalVariant& value,
+        const std::string& expectedType
+    ) const {
+        if (expectedType.empty()) return true;
+        return ZeusRuntimeType::isCompatible(
+            expectedType,
+            runtimeValueTypeName(value)
+        );
+    }
+
+    bool validateFunctionArgument(
+        const Prototype& proto,
+        int parameterIndex,
+        const ZeusType::UniversalVariant& value,
+        const IRType::IRInstr& instr = {}
+    ) {
+        if (parameterIndex >= 0 &&
+            parameterIndex < static_cast<int>(proto.paramIsReference.size()) &&
+            proto.paramIsReference[parameterIndex]) {
+            const auto* reference =
+                std::get_if<ZeusType::ReferenceHandle>(&value);
+            if (!reference || reference->typeName != "cell" || !reference->address) {
+                const std::string functionName = proto.functionName.empty()
+                    ? "<anonymous>"
+                    : proto.functionName;
+                const std::string expected = parameterIndex <
+                        static_cast<int>(proto.paramTypes.size())
+                    ? "variable reference to " + ZeusRuntimeType::canonicalTypeName(
+                        proto.paramTypes[parameterIndex])
+                    : "variable reference";
+                VMException::typeError_InvalidArgument(
+                    functionName,
+                    std::max(0, parameterIndex),
+                    expected,
+                    runtimeValueTypeName(value),
+                    __line,
+                    instr
+                )._throw(vmstat, currentChunk);
+                return false;
+            }
+            if (parameterIndex >= static_cast<int>(proto.paramTypes.size()) ||
+                proto.paramTypes[parameterIndex].empty()) {
+                return true;
+            }
+            ZeusType::UniversalVariant referencedValue;
+            try {
+                const auto* target = static_cast<const Cell*>(reference->address);
+                referencedValue = loadCellValue(target);
+            } catch (const std::exception& error) {
+                VMException::VMException exp(
+                    std::string("Invalid reference argument: ") + error.what(),
+                    __line,
+                    instr
+                );
+                exp._throw(vmstat, currentChunk);
+                return false;
+            }
+            if (isValueCompatibleWithType(
+                    referencedValue, proto.paramTypes[parameterIndex])) {
+                return true;
+            }
+            const std::string functionName = proto.functionName.empty()
+                ? "<anonymous>"
+                : proto.functionName;
+            const int receiverOffset = !proto.ownerType.empty() &&
+                !proto.isStaticMethod ? 1 : 0;
+            VMException::typeError_InvalidArgument(
+                functionName,
+                std::max(0, parameterIndex - receiverOffset),
+                ZeusRuntimeType::canonicalTypeName(proto.paramTypes[parameterIndex]),
+                runtimeValueTypeName(referencedValue),
+                __line,
+                instr
+            )._throw(vmstat, currentChunk);
+            return false;
+        }
+        if (parameterIndex < 0 ||
+            parameterIndex >= static_cast<int>(proto.paramTypes.size()) ||
+            proto.paramTypes[parameterIndex].empty() ||
+            isValueCompatibleWithType(value, proto.paramTypes[parameterIndex])) {
+            return true;
+        }
+
+        const std::string functionName = proto.functionName.empty()
+            ? "<anonymous>"
+            : proto.functionName;
+        const std::string expected = ZeusRuntimeType::canonicalTypeName(
+            proto.paramTypes[parameterIndex]);
+        const std::string actual = runtimeValueTypeName(value);
+        const int receiverOffset = !proto.ownerType.empty() &&
+            !proto.isStaticMethod ? 1 : 0;
+        const int userArgumentIndex = std::max(
+            0, parameterIndex - receiverOffset);
+        VMException::typeError_InvalidArgument(
+            functionName,
+            userArgumentIndex,
+            expected,
+            actual,
+            __line,
+            instr
+        )._throw(vmstat, currentChunk);
+        return false;
     }
 
     bool tryDispatchTypeImplementationOperator(
@@ -3882,6 +4165,7 @@ class VM {
                         constructorFrame.stackBase = calleeIndex;
                         constructorFrame.savedLine = __line;
                         constructorFrame.paramProvided = std::move(paramProvided);
+                        constructorFrame.referenceParameterSlots = proto.paramIsReference;
                         callFrames.push_back(std::move(constructorFrame));
                         FrameLoopOptions constructorOptions;
                         constructorOptions.stopFrameDepth = constructorFrameDepth;
@@ -6175,6 +6459,30 @@ class VM {
 
                 const Prototype& proto = *protoPtr;
 
+                bool capturesReferenceParameter = false;
+                if (!callFrames.empty()) {
+                    const auto& currentFrame = callFrames.back();
+                    for (const auto& capture : proto.captures) {
+                        if (capture.fromKind == "local" && capture.srcIndex >= 0 &&
+                            capture.srcIndex < static_cast<int>(
+                                currentFrame.referenceParameterSlots.size()) &&
+                            currentFrame.referenceParameterSlots[
+                                static_cast<size_t>(capture.srcIndex)]) {
+                            capturesReferenceParameter = true;
+                            break;
+                        }
+                    }
+                }
+                if (capturesReferenceParameter) {
+                    VMException::VMException exp(
+                        "a by-reference parameter cannot be captured by a nested function; reference parameters are valid only for the duration of the call",
+                        __line,
+                        instr
+                    );
+                    exp._throw(vmstat, currentChunk);
+                    break;
+                }
+
                 Closure clos;
                 clos.protoId = protoId;
                 clos.upvalues.resize(proto.captures.size());
@@ -6467,12 +6775,38 @@ class VM {
                 // 填充常规参数
                 std::set<std::string> consumedNamedArgs; // 记录已使用的命名参数
                 
+                bool parameterTypeMismatch = false;
                 for (int i = 0; i < regularParamCount; ++i) {
                     bool filled = false;
                     
                     // 优先使用位置参数
                     if (i < positionalCount) {
-                        assignCellValue(local[i], positionalArgs[i]);
+                        ZeusType::UniversalVariant argumentValue = positionalArgs[i];
+                        if (i < static_cast<int>(proto.paramIsReference.size()) &&
+                            proto.paramIsReference[i]) {
+                            const int receiverOffset = clos.boundThis.has_value() ? 1 : 0;
+                            const int positionalSourceIndex = i - receiverOffset;
+                            if (!resolveReferenceArgument(
+                                    instr,
+                                    proto,
+                                    oldLocal,
+                                    oldUpvalue,
+                                    i,
+                                    positionalSourceIndex,
+                                    i < static_cast<int>(proto.paramNames.size())
+                                        ? proto.paramNames[i]
+                                        : std::string(),
+                                    positionalArgs[i],
+                                    argumentValue)) {
+                                parameterTypeMismatch = true;
+                                break;
+                            }
+                        }
+                        if (!validateFunctionArgument(proto, i, argumentValue, instr)) {
+                            parameterTypeMismatch = true;
+                            break;
+                        }
+                        assignCellValue(local[i], argumentValue);
                         paramProvided[i] = true;
                         filled = true;
                     }
@@ -6482,7 +6816,22 @@ class VM {
                         const std::string& paramName = proto.paramNames[i];
                         auto it = namedArgs.find(paramName);
                         if (it != namedArgs.end()) {
-                            assignCellValue(local[i], it->second);
+                            ZeusType::UniversalVariant argumentValue = it->second;
+                            if (i < static_cast<int>(proto.paramIsReference.size()) &&
+                                proto.paramIsReference[i]) {
+                                if (!resolveReferenceArgument(
+                                        instr, proto, oldLocal, oldUpvalue,
+                                        i, -1, paramName,
+                                        it->second, argumentValue)) {
+                                    parameterTypeMismatch = true;
+                                    break;
+                                }
+                            }
+                            if (!validateFunctionArgument(proto, i, argumentValue, instr)) {
+                                parameterTypeMismatch = true;
+                                break;
+                            }
+                            assignCellValue(local[i], argumentValue);
                             consumedNamedArgs.insert(paramName);
                             paramProvided[i] = true;
                             filled = true;
@@ -6493,6 +6842,11 @@ class VM {
                     if (!filled && !proto.hasRuntimeDefaultPrologue &&
                         i < (int)proto.paramHasDefault.size() && proto.paramHasDefault[i] &&
                         i < (int)proto.paramDefaultValues.size()) {
+                        if (!validateFunctionArgument(
+                                proto, i, proto.paramDefaultValues[i], instr)) {
+                            parameterTypeMismatch = true;
+                            break;
+                        }
                         assignCellValue(local[i], proto.paramDefaultValues[i]);
                         filled = true;
                     }
@@ -6501,6 +6855,15 @@ class VM {
                     if (!filled) {
                         assignCellValue(local[i], LexerType::Value(0));
                     }
+                }
+
+                if (parameterTypeMismatch) {
+                    releaseCurrentFrameEnvironment();
+                    local = std::move(oldLocal);
+                    upvalue = std::move(oldUpvalue);
+                    shrinkStackWithRelease(calleeIndex);
+                    stack.push_back(LexerType::Value(0));
+                    break;
                 }
 
                 for (int i = 0; i < regularParamCount; ++i) {
@@ -6618,6 +6981,7 @@ class VM {
                 newFrame.stackBase = callFrameBase;
                 newFrame.savedLine = __line;
                 newFrame.paramProvided = std::move(paramProvided);
+                newFrame.referenceParameterSlots = proto.paramIsReference;
                 
                  // callee closure 的生命周期由栈收缩（RETURN -> shrinkStackWithRelease(stackBase)）统一处理。
                  // 这里不再基于 refCount 推断“临时闭包”，避免与栈/容器 retain 语义冲突。

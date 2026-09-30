@@ -1,0 +1,57 @@
+func add_to(&value: int, delta: int) {
+    value = value + delta;
+}
+
+func forward_add(&value: int, delta: int) {
+    add_to(value, delta);
+}
+
+func replace_text(&value: string) {
+    value = "updated";
+}
+
+func invert(&value: bool) {
+    value = !value;
+}
+
+func local_text_test() -> string {
+    let local_text = "local";
+    replace_text(local_text);
+    return local_text;
+}
+
+func require_int_reference(&value: int) {
+}
+
+func check_dynamic_mismatch(value) {
+    try {
+        require_int_reference(value);
+    } catch (&error) {
+        print("mismatch", error.getType());
+        print(error.getMessage());
+    }
+}
+
+var GLOBAL_VALUE = 5;
+let local_value = 3;
+var GLOBAL_TEXT = "initial";
+var GLOBAL_FLAG = false;
+
+forward_add(local_value, 10);
+print("local", local_value);
+
+add_to(value = GLOBAL_VALUE, delta = 7);
+print("global", GLOBAL_VALUE);
+
+replace_text(GLOBAL_TEXT);
+print("string-global", GLOBAL_TEXT);
+print("string-local", local_text_test());
+
+invert(GLOBAL_FLAG);
+print("bool-global", GLOBAL_FLAG);
+
+try {
+    check_dynamic_mismatch("not an int");
+} catch (&error) {
+    print("unexpected", error.getType());
+}

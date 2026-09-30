@@ -1,0 +1,15 @@
+class EntryProbe {
+    using &this;
+    let id = 0;
+
+    func init(value: int) {
+        this.id = value;
+    }
+
+    func operator[~]() {
+        print("destroy entry", this.id);
+    }
+}
+
+let entryObject = new EntryProbe(20);
+throw "entry failure";

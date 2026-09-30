@@ -54,6 +54,7 @@ namespace IRType {
         FunctionSignature,
         ExternalFunctionSignature,
         DirectCall,
+        CallArguments,
         IntrinsicOperator,
         CallTarget,
         Symbol,
@@ -81,6 +82,13 @@ namespace IRType {
         std::string bytesValue;
     };
 
+    struct CallArgumentSource {
+        int positionalIndex = -1;
+        std::string namedParameter;
+        SymbolRef source;
+        bool isAssignable = false;
+    };
+
     // 指令旁路元信息。它不参与 VM 执行，只为 LLVM lowering、调试和后续后端提供结构化信息。
     struct IRMetadata {
         IRMetadataKind kind = IRMetadataKind::None;
@@ -88,6 +96,9 @@ namespace IRType {
         SymbolRef symbol;
         std::string typeName;
         std::vector<std::string> typeNames;
+        std::vector<std::string> parameterNames;
+        std::vector<bool> parameterIsReference;
+        std::vector<CallArgumentSource> callArguments;
         std::vector<std::string> fieldNames;
         std::vector<bool> fieldConstness;
         std::vector<ClassFieldDefault> fieldDefaults;
@@ -106,7 +117,9 @@ namespace IRType {
             std::vector<std::string> parameterTypes,
             std::string owner = {},
             std::string op = {},
-            bool staticMethod = false
+            bool staticMethod = false,
+            std::vector<std::string> names = {},
+            std::vector<bool> byReference = {}
         ) {
             IRMetadata result;
             result.kind = IRMetadataKind::FunctionSignature;
@@ -114,6 +127,8 @@ namespace IRType {
             result.symbol = SymbolRef::function(name);
             result.typeName = returnType;
             result.typeNames = std::move(parameterTypes);
+            result.parameterNames = std::move(names);
+            result.parameterIsReference = std::move(byReference);
             result.ownerType = std::move(owner);
             result.operatorSymbol = std::move(op);
             result.captureCount = captures;
@@ -126,10 +141,13 @@ namespace IRType {
             const std::string& name,
             const std::string& returnType,
             std::vector<std::string> parameterTypes,
-            std::string nativeSymbol = {}
+            std::string nativeSymbol = {},
+            std::vector<std::string> names = {},
+            std::vector<bool> byReference = {}
         ) {
             IRMetadata result = functionSignature(
-                name, returnType, 0, std::move(parameterTypes)
+                name, returnType, 0, std::move(parameterTypes), {}, {}, false,
+                std::move(names), std::move(byReference)
             );
             result.kind = IRMetadataKind::ExternalFunctionSignature;
             result.tag = "external_function_signature";
@@ -156,7 +174,9 @@ namespace IRType {
             const std::string& name,
             const std::string& returnType,
             int captures,
-            std::vector<std::string> parameterTypes
+            std::vector<std::string> parameterTypes,
+            std::vector<std::string> parameterNames = {},
+            std::vector<bool> parameterIsReference = {}
         ) {
             IRMetadata result;
             result.kind = IRMetadataKind::CallTarget;
@@ -164,8 +184,18 @@ namespace IRType {
             result.symbol = SymbolRef::function(name);
             result.typeName = returnType;
             result.typeNames = std::move(parameterTypes);
+            result.parameterNames = std::move(parameterNames);
+            result.parameterIsReference = std::move(parameterIsReference);
             result.captureCount = captures;
             result.hasCaptureCount = true;
+            return result;
+        }
+
+        static IRMetadata callArgumentSources(std::vector<CallArgumentSource> arguments) {
+            IRMetadata result;
+            result.kind = IRMetadataKind::CallArguments;
+            result.tag = "call_arguments";
+            result.callArguments = std::move(arguments);
             return result;
         }
 
@@ -211,7 +241,9 @@ namespace IRType {
             std::vector<std::string>& parameterTypes,
             std::string* owner = nullptr,
             std::string* op = nullptr,
-            std::string* native = nullptr
+            std::string* native = nullptr,
+            std::vector<std::string>* names = nullptr,
+            std::vector<bool>* byReference = nullptr
         ) const {
             if ((kind != IRMetadataKind::FunctionSignature &&
                  kind != IRMetadataKind::ExternalFunctionSignature) ||
@@ -225,6 +257,8 @@ namespace IRType {
             returnType = typeName;
             captures = captureCount;
             parameterTypes = typeNames;
+            if (names) *names = parameterNames;
+            if (byReference) *byReference = parameterIsReference;
             if (owner) *owner = ownerType;
             if (op) *op = operatorSymbol;
             if (native) *native = nativeSymbol;

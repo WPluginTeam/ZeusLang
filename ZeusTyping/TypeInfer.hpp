@@ -32,10 +32,14 @@ namespace ZeusTypeInfer {
 
     struct FunctionInfo {
         std::string name;
+        std::vector<std::string> parameterNames;
         std::vector<InferredType> parameterTypes;
         std::vector<std::string> parameterTypeNames;
         InferredType returnType = InferredType::Unknown;
         std::string returnTypeName;
+        std::string ownerType;
+        bool isClassMethod = false;
+        bool isStaticMethod = false;
         bool returnsReference = false;
         bool dynamicReturn = false;
     };
@@ -378,6 +382,7 @@ namespace ZeusTypeInfer {
                                 signature.returnTypeName
                             ).isReference;
                             for (const auto& parameter : signature.parameters) {
+                                info.parameterNames.push_back(parameter.name);
                                 info.parameterTypes.push_back(
                                     parseTypeName(parameter.typeName)
                                 );
@@ -404,6 +409,9 @@ namespace ZeusTypeInfer {
                     info.name = block->isClassMethod && !ownerType.empty()
                         ? ownerType + "::" + block->funcName
                         : block->funcName;
+                    info.ownerType = ownerType;
+                    info.isClassMethod = block->isClassMethod;
+                    info.isStaticMethod = block->isStaticMethod || block->isCompileTimeStatic;
                     info.returnTypeName = block->returnTypeName;
                     if (block->returnTypeName.empty() &&
                         !TreeParser::hasExplicitReturnStatement(block->nodes)) {
@@ -421,6 +429,7 @@ namespace ZeusTypeInfer {
                         info.parameterTypes.push_back(parseTypeName(typeName));
                         info.parameterTypeNames.push_back(typeName);
                     }
+                    info.parameterNames = block->paramNames;
 
                     functions[info.name] = std::move(info);
                 }
@@ -573,6 +582,7 @@ namespace ZeusTypeInfer {
             for (const auto& parameterType : parameterTypes) {
                 info.parameterTypes.push_back(ZeusTypeInfer::parseTypeName(parameterType));
                 info.parameterTypeNames.push_back(parameterType);
+                info.parameterNames.emplace_back();
             }
             externalFunctions[name] = std::move(info);
         }

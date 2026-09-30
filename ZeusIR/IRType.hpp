@@ -38,6 +38,7 @@ namespace IRType {
         int line = -1;  // Source code line number
         int sourceFileId = 0;  // Source file ID (0 = main file)
         IRMetadata metadata;
+        int column = 0;  // Source code column when available
 
         std::string toString() const {
             std::string result = VMO_toString(op);

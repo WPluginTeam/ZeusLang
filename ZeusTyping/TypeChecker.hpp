@@ -23,12 +23,18 @@ namespace ZeusTypeInfer {
         Error
     };
 
+    enum class TypeCheckDiagnosticCode {
+        General,
+        CallArgumentTypeMismatch
+    };
+
     struct TypeCheckDiagnostic {
         int nodeIndex = -1;
         TypeCheckSeverity severity = TypeCheckSeverity::Error;
         std::string message;
         int line = 0;
         int column = 0;
+        TypeCheckDiagnosticCode code = TypeCheckDiagnosticCode::General;
     };
 
     struct TypeCheckOptions {
@@ -433,14 +439,16 @@ namespace ZeusTypeInfer {
         void addDiagnostic(
             int nodeIndex,
             TypeCheckSeverity severity,
-            std::string message
+            std::string message,
+            TypeCheckDiagnosticCode code = TypeCheckDiagnosticCode::General
         ) {
             diagnostics.push_back({
                 nodeIndex,
                 severity,
                 std::move(message),
                 currentSourceLine,
-                currentSourceColumn
+                currentSourceColumn,
+                code
             });
         }
 
@@ -475,6 +483,174 @@ namespace ZeusTypeInfer {
                     valueDescription + "类型不匹配: 需要 " + typeName(expected) +
                     ", 实际是 " + typeName(actual)
                 );
+            }
+        }
+
+        static bool hasSameDeclaredType(
+            const TypeInfo& expected,
+            const TypeInfo& actual
+        ) {
+            if (expected.type.isReference && !actual.type.isReference) return false;
+            if (!expected.type.isReference && actual.type.isReference &&
+                expected.type.kind != InferredType::Int &&
+                expected.type.kind != InferredType::Bool) {
+                return false;
+            }
+            if (expected.type.kind != actual.type.kind) return false;
+            if (expected.type.kind == InferredType::Object &&
+                !expected.type.namedType.empty()) {
+                return expected.type.namedType == actual.type.namedType;
+            }
+            return true;
+        }
+
+        static bool splitCallArguments(
+            const std::vector<LexerType::Token>& tokens,
+            size_t openParen,
+            size_t& closeParen,
+            std::vector<std::vector<LexerType::Token>>& arguments
+        ) {
+            arguments.clear();
+            if (openParen >= tokens.size() || !isOperator(tokens[openParen], "(")) {
+                return false;
+            }
+
+            int parenDepth = 1;
+            int bracketDepth = 0;
+            int braceDepth = 0;
+            size_t segmentBegin = openParen + 1;
+            for (size_t i = openParen + 1; i < tokens.size(); ++i) {
+                if (isOperator(tokens[i], "(")) {
+                    ++parenDepth;
+                } else if (isOperator(tokens[i], ")")) {
+                    --parenDepth;
+                    if (parenDepth == 0) {
+                        closeParen = i;
+                        if (segmentBegin < i) {
+                            arguments.emplace_back(tokens.begin() + segmentBegin,
+                                                   tokens.begin() + i);
+                        }
+                        return true;
+                    }
+                } else if (isOperator(tokens[i], "[")) {
+                    ++bracketDepth;
+                } else if (isOperator(tokens[i], "]")) {
+                    --bracketDepth;
+                } else if (isOperator(tokens[i], "{")) {
+                    ++braceDepth;
+                } else if (isOperator(tokens[i], "}")) {
+                    --braceDepth;
+                } else if (isOperator(tokens[i], ",") && parenDepth == 1 &&
+                           bracketDepth == 0 && braceDepth == 0) {
+                    arguments.emplace_back(tokens.begin() + segmentBegin,
+                                           tokens.begin() + i);
+                    segmentBegin = i + 1;
+                }
+            }
+            return false;
+        }
+
+        void checkCallArgumentTypes(
+            const std::vector<LexerType::Token>& tokens,
+            const Environment& environment,
+            int nodeIndex
+        ) {
+            const auto& functions = inferer.getFunctions();
+            for (size_t openParen = 0; openParen < tokens.size(); ++openParen) {
+                if (!isOperator(tokens[openParen], "(") || openParen == 0) continue;
+
+                const FunctionInfo* function = nullptr;
+                size_t parameterOffset = 0;
+                std::string callName;
+
+                if (openParen >= 3 &&
+                    std::holds_alternative<LexerType::Keyword>(tokens[openParen - 1]) &&
+                    isOperator(tokens[openParen - 2], ".") &&
+                    std::holds_alternative<LexerType::Keyword>(tokens[openParen - 3])) {
+                    const std::string methodName =
+                        std::get<LexerType::Keyword>(tokens[openParen - 1]).name;
+                    const std::vector<LexerType::Token> receiverTokens{
+                        tokens[openParen - 3]};
+                    const TypeInfo receiver = inferExpressionInfo(receiverTokens, environment);
+                    std::string receiverType = receiver.type.namedType;
+                    if (receiverType.empty() && receiverTokens.size() == 1 &&
+                        std::holds_alternative<LexerType::Keyword>(receiverTokens.front())) {
+                        const std::string& identifier =
+                            std::get<LexerType::Keyword>(receiverTokens.front()).name;
+                        if (classNames.count(identifier) != 0) receiverType = identifier;
+                    }
+
+                    if (!receiverType.empty()) {
+                        auto method = functions.find(receiverType + "::" + methodName);
+                        if (method == functions.end()) {
+                            method = functions.find(receiverType + "." + methodName);
+                        }
+                        if (method != functions.end()) {
+                            function = &method->second;
+                            callName = method->second.name;
+                            if (method->second.isClassMethod &&
+                                !method->second.isStaticMethod) {
+                                parameterOffset = 1;
+                            }
+                        }
+                    }
+                } else if (std::holds_alternative<LexerType::Keyword>(tokens[openParen - 1])) {
+                    const std::string& name =
+                        std::get<LexerType::Keyword>(tokens[openParen - 1]).name;
+                    const auto found = functions.find(name);
+                    if (found != functions.end()) {
+                        function = &found->second;
+                        callName = found->second.name;
+                    }
+                }
+
+                if (!function || function->parameterTypeNames.empty()) continue;
+
+                size_t closeParen = openParen;
+                std::vector<std::vector<LexerType::Token>> arguments;
+                if (!splitCallArguments(tokens, openParen, closeParen, arguments)) continue;
+
+                size_t positionalIndex = 0;
+                for (const auto& rawArgument : arguments) {
+                    if (rawArgument.empty()) continue;
+
+                    size_t parameterIndex = positionalIndex++ + parameterOffset;
+                    std::vector<LexerType::Token> expression = rawArgument;
+                    if (rawArgument.size() >= 3 &&
+                        std::holds_alternative<LexerType::Keyword>(rawArgument[0]) &&
+                        isOperator(rawArgument[1], "=")) {
+                        const std::string& name =
+                            std::get<LexerType::Keyword>(rawArgument[0]).name;
+                        const auto named = std::find(
+                            function->parameterNames.begin(),
+                            function->parameterNames.end(), name);
+                        if (named == function->parameterNames.end()) continue;
+                        parameterIndex = static_cast<size_t>(named - function->parameterNames.begin());
+                        expression.assign(rawArgument.begin() + 2, rawArgument.end());
+                    }
+
+                    if (parameterIndex >= function->parameterTypeNames.size()) continue;
+                    const std::string& expectedName =
+                        function->parameterTypeNames[parameterIndex];
+                    if (expectedName.empty()) continue;
+
+                    const TypeInfo expected = TypeInfo::fromType(
+                        parseDeclaredTypeRef(expectedName), false, true);
+                    const TypeInfo actual = inferExpressionInfo(expression, environment);
+                    if (!actual.isKnown() || !expected.isKnown() ||
+                        hasSameDeclaredType(expected, actual)) {
+                        continue;
+                    }
+
+                    const size_t displayIndex = parameterIndex - parameterOffset + 1;
+                    addDiagnostic(
+                        nodeIndex,
+                        TypeCheckSeverity::Error,
+                        callName + "(): argument " + std::to_string(displayIndex) +
+                            " must " + expected.toString() + ", not " + actual.toString(),
+                        TypeCheckDiagnosticCode::CallArgumentTypeMismatch
+                    );
+                }
             }
         }
 
@@ -1021,6 +1197,35 @@ namespace ZeusTypeInfer {
                 );
             }
 
+            const size_t receiverParameterOffset = receiverAlias.empty() ? 0 : 1;
+            for (size_t i = 0; i < block.paramDefaults.size(); ++i) {
+                if (block.paramDefaults[i].empty()) continue;
+                checkCallArgumentTypes(block.paramDefaults[i], environment, nodeIndex);
+                if (i >= block.paramTypeNames.size() ||
+                    block.paramTypeNames[i].empty() ||
+                    i < receiverParameterOffset) {
+                    continue;
+                }
+
+                const TypeInfo expected = TypeInfo::fromType(
+                    parseDeclaredTypeRef(block.paramTypeNames[i]), false, true);
+                const TypeInfo actual = inferExpressionInfo(
+                    block.paramDefaults[i], environment);
+                if (!actual.isKnown() || !expected.isKnown() ||
+                    hasSameDeclaredType(expected, actual)) {
+                    continue;
+                }
+
+                addDiagnostic(
+                    nodeIndex,
+                    TypeCheckSeverity::Error,
+                    block.funcName + "(): argument " +
+                        std::to_string(i - receiverParameterOffset + 1) +
+                        " must " + expected.toString() + ", not " + actual.toString(),
+                    TypeCheckDiagnosticCode::CallArgumentTypeMismatch
+                );
+            }
+
             bool hasReturnAnnotation = !block.returnTypeName.empty();
             function.expectedReturnIsReference = parseTypeRef(
                 block.returnTypeName
@@ -1116,6 +1321,8 @@ namespace ZeusTypeInfer {
                         checkReturn(statement, environment, currentFunction, nodeIndex, options);
                     }
 
+                    checkCallArgumentTypes(statement.tokens, environment, nodeIndex);
+
                     continue;
                 }
 
@@ -1123,6 +1330,7 @@ namespace ZeusTypeInfer {
                 if (block == nullptr) continue;
                 currentSourceLine = block->sourceLine;
                 currentSourceColumn = block->sourceColumn;
+                checkCallArgumentTypes(block->conditionTokens, environment, nodeIndex);
 
                 if (block->type == CodeBlockType::FUNC) {
                     checkFunction(*block, environment, nodeIndex);

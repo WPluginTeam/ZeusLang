@@ -1,0 +1,54 @@
+class SharedBox {
+    using &this;
+    let value = 0;
+
+    func init(v) {
+        this.value = v;
+    }
+
+    func get() {
+        return this.value;
+    }
+
+    func set(v) {
+        this.value = v;
+    }
+}
+
+var shared shared_box: SharedBox = new SharedBox(3);
+
+func read_shared_box() {
+    return shared_box.get();
+}
+
+func update_shared_box(value) {
+    shared_box.set(value);
+}
+
+if (read_shared_box() != 3) {
+    throw new Exception("shared class initial value mismatch");
+}
+print("PASS shared class receiver type");
+
+update_shared_box(12);
+if (read_shared_box() != 12) {
+    throw new Exception("shared class update mismatch");
+}
+print("PASS shared class cross-function update");
+
+let stale_shared_box = shared_box;
+delete shared_box;
+var shared shared_box: SharedBox = new SharedBox(99);
+var staleHandleCaught = false;
+try {
+    stale_shared_box.get();
+} catch (&error) {
+    staleHandleCaught = true;
+}
+if (!staleHandleCaught) {
+    throw new Exception("stale shared handle rebound to the recreated slot");
+}
+if (read_shared_box() != 99) {
+    throw new Exception("recreated shared class value mismatch");
+}
+print("PASS stale shared handle stays invalid after slot recreation");

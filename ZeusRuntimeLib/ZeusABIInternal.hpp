@@ -41,3 +41,6 @@ struct ZeusBox {
 // Internal capture-cell values are graph edges rather than collector roots.
 void zeus_value_clone_internal(ZeusValue* out, const ZeusValue* value);
 void zeus_value_release_internal(ZeusValue* value);
+void zeus_value_slot_register_gc_edge(ZeusValue* slot);
+void zeus_value_slot_unregister_gc_edge(ZeusValue* slot);
+bool zeus_value_slot_is_gc_edge(const ZeusValue* slot);

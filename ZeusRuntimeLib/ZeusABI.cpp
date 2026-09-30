@@ -12,6 +12,7 @@
 
 #include "ZeusABI.hpp"
 #include "ZeusObjectLifetime.hpp"
+#include "ZeusRuntimeType.hpp"
 
 #include "ZeusABIInternal.hpp"
 #include "ZeusDynamicBinaryABI.hpp"
@@ -53,6 +54,18 @@ struct ZeusRaisedValue {
     }
     ~ZeusRaisedValue() { zeus_value_release(&value); }
 };
+
+class ZeusTypeError : public std::runtime_error {
+public:
+    explicit ZeusTypeError(const std::string& message)
+        : std::runtime_error(message) {}
+};
+
+ZeusValue* abiResolveGlobalValueSlot(int idx, bool recreateDeleted);
+void abiStoreGlobalValue(int idx, ZeusValue* value);
+void abiLoadGlobalValue(ZeusValue* out, int idx);
+void abiClearGlobalValue(int idx);
+void abiDeleteGlobalValue(int idx);
 }
 
 extern "C" void zeus_exception_raise(const ZeusValue* value) noexcept(false) {
@@ -68,7 +81,10 @@ extern "C" void zeus_exception_raise_owned(ZeusValue* value) noexcept(false) {
 }
 
 extern "C" void zeus_exception_capture(
-    ZeusValue* out, ZeusRuntimeErrorFactory factory) noexcept(false) {
+    ZeusValue* out,
+    ZeusRuntimeErrorFactory runtimeFactory,
+    ZeusRuntimeErrorFactory typeErrorFactory
+) noexcept(false) {
     if (!out) return;
     const std::exception_ptr current = std::current_exception();
     if (!current) throw std::runtime_error("catch has no active exception");
@@ -76,14 +92,18 @@ extern "C" void zeus_exception_capture(
         std::rethrow_exception(current);
     } catch (const ZeusRaisedValue& raised) {
         zeus_value_clone(out, &raised.value);
+    } catch (const ZeusTypeError& error) {
+        const char* message = error.what();
+        if (!typeErrorFactory) throw std::runtime_error("TypeError factory is unavailable");
+        typeErrorFactory(out, message, static_cast<int64_t>(std::strlen(message)));
     } catch (const std::exception& error) {
         const char* message = error.what();
-        if (!factory) throw std::runtime_error("RuntimeError factory is unavailable");
-        factory(out, message, static_cast<int64_t>(std::strlen(message)));
+        if (!runtimeFactory) throw std::runtime_error("RuntimeError factory is unavailable");
+        runtimeFactory(out, message, static_cast<int64_t>(std::strlen(message)));
     } catch (...) {
         static constexpr char message[] = "Unknown runtime error";
-        if (!factory) throw std::runtime_error("RuntimeError factory is unavailable");
-        factory(out, message, sizeof(message) - 1);
+        if (!runtimeFactory) throw std::runtime_error("RuntimeError factory is unavailable");
+        runtimeFactory(out, message, sizeof(message) - 1);
     }
 }
 
@@ -141,6 +161,23 @@ void setNilValue(ZeusValue* out) {
     out->tag = ZEUS_VALUE_TAG_NIL;
     out->flags = 0;
     out->payload = 0;
+}
+
+std::unordered_set<const ZeusValue*>& gcEdgeValueSlots() {
+    // Slot owners can be torn down from static runtime objects in other
+    // translation units; keep this registry alive until process exit.
+    static auto* slots = new std::unordered_set<const ZeusValue*>();
+    return *slots;
+}
+
+void releaseSlotValue(ZeusValue* slot) {
+    if (!slot) dynamicValuePanic("null value slot");
+    if (slot->flags == ZEUS_VALUE_FLAG_OWNS_BOX) {
+        zeus_value_release_internal(slot);
+        return;
+    }
+    if (slot->flags != 0) dynamicValuePanic("invalid value-slot ownership flags");
+    setNilValue(slot);
 }
 
 void setSignedPayload(ZeusValue* out, int64_t value) {
@@ -459,6 +496,84 @@ ZeusBox* valueReference(const ZeusValue* value) {
     return reinterpret_cast<ZeusBox*>(static_cast<uintptr_t>(value->payload));
 }
 
+std::string universalValueTypeName(const ZeusType::UniversalVariant& value) {
+    if (isStringUniversalValue(value)) return "string";
+    if (isBigIntegerValue(value)) return "bigint";
+    if (isBigDecimalValue(value)) return "float";
+    if (std::holds_alternative<bool>(value)) return "bool";
+    if (std::holds_alternative<char>(value)) return "char";
+    if (std::holds_alternative<ZeusType::BigInteger>(value)) return "bigint";
+    if (std::holds_alternative<ZeusType::BigDecimal>(value)) return "float";
+    if (std::holds_alternative<ZeusType::Bytes>(value)) return "bytes";
+    if (std::holds_alternative<ZeusType::ReferenceHandle>(value)) {
+        return "&" + std::get<ZeusType::ReferenceHandle>(value).typeName;
+    }
+    if (const auto* handle = std::get_if<ZeusType::LLVMClassHandle>(&value)) {
+        return handle->state && !handle->state->typeName.empty()
+            ? handle->state->typeName
+            : "object";
+    }
+    if (std::holds_alternative<ZeusType::Variant>(value)) {
+        const auto& variant = std::get<ZeusType::Variant>(value);
+        if (std::holds_alternative<ZeusType::Null>(variant)) return "nil";
+        if (std::holds_alternative<ZeusType::Array>(variant)) return "Array";
+        if (std::holds_alternative<ZeusType::Bytes>(variant)) return "bytes";
+        if (std::holds_alternative<ZeusType::Object>(variant)) return "object";
+    }
+    if (std::holds_alternative<ZeusType::ClosureHandle>(value) ||
+        std::holds_alternative<ZeusType::NativeClosureHandle>(value) ||
+        std::holds_alternative<ZeusType::NativeFuncHandle>(value)) {
+        return "function";
+    }
+    if (std::holds_alternative<ZeusType::ClassHandle>(value) ||
+        std::holds_alternative<ZeusType::SharedClassHandle>(value)) {
+        return "class";
+    }
+    if (std::holds_alternative<ZeusType::NamespaceHandle>(value)) return "namespace";
+    if (std::holds_alternative<ZeusType::ObjectHandle>(value) ||
+        std::holds_alternative<ZeusType::SharedObjectHandle>(value)) {
+        return "object";
+    }
+    if (std::holds_alternative<LexerType::Value>(value)) {
+        const auto& literal = std::get<LexerType::Value>(value);
+        if (std::holds_alternative<ZeusType::BigInteger>(literal.data)) return "int";
+        if (std::holds_alternative<ZeusType::BigDecimal>(literal.data)) return "float";
+        if (std::holds_alternative<bool>(literal.data)) return "bool";
+        if (std::holds_alternative<std::string>(literal.data)) return "string";
+    }
+    return "unknown";
+}
+
+std::string dynamicValueTypeName(const ZeusValue* value) {
+    if (!value) return "unknown";
+    switch (value->tag) {
+        case ZEUS_VALUE_TAG_NIL:
+            return "nil";
+        case ZEUS_VALUE_TAG_BOOL:
+        case ZEUS_VALUE_TAG_REF_BOOL:
+            return "bool";
+        case ZEUS_VALUE_TAG_INT64:
+            return "int";
+        case ZEUS_VALUE_TAG_REF_INT64:
+            return "&int";
+        case ZEUS_VALUE_TAG_DELETED:
+            return "deleted";
+        case ZEUS_VALUE_TAG_BIGINT:
+            return "bigint";
+        case ZEUS_VALUE_TAG_BIGDECIMAL:
+            return "float";
+        case ZEUS_VALUE_TAG_STRING:
+            return "string";
+        case ZEUS_VALUE_TAG_BOXED:
+            if (value->flags == ZEUS_VALUE_FLAG_OWNS_BOX) {
+                return universalValueTypeName(valueReference(value)->v);
+            }
+            return "unknown";
+        default:
+            return "unknown";
+    }
+}
+
 // 空值装箱（解释器内对应 Variant(Null)，打印为 nil）。
 ZeusType::UniversalVariant nullVariant() {
     return ZeusType::UniversalVariant(ZeusType::Variant(ZeusType::Null()));
@@ -610,6 +725,9 @@ void zeus_value_from_bool_ptr(ZeusValue* out, void* value) {
 static void cloneDynamicValue(ZeusValue* out, const ZeusValue* value, bool rooted) {
     if (!out || !value) dynamicValuePanic("null clone pointer");
     if (out == value) return;
+    if (value->tag == ZEUS_VALUE_TAG_DELETED) {
+        throw std::runtime_error("read from deleted variable");
+    }
     setNilValue(out);
 
     try {
@@ -658,6 +776,23 @@ void zeus_value_clone_internal(ZeusValue* out, const ZeusValue* value) {
 
 void zeus_value_clone(ZeusValue* out, const ZeusValue* value) {
     cloneDynamicValue(out, value, true);
+}
+
+void zeus_value_slot_register_gc_edge(ZeusValue* slot) {
+    if (!slot) dynamicValuePanic("cannot register a null GC-edge value slot");
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    gcEdgeValueSlots().insert(slot);
+}
+
+void zeus_value_slot_unregister_gc_edge(ZeusValue* slot) {
+    if (!slot) return;
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    gcEdgeValueSlots().erase(slot);
+}
+
+bool zeus_value_slot_is_gc_edge(const ZeusValue* slot) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    return gcEdgeValueSlots().find(slot) != gcEdgeValueSlots().end();
 }
 
 void zeus_value_from_box(ZeusValue* out, const ZeusBox* box) {
@@ -765,7 +900,57 @@ void zeus_class_pointer_invalidate(void* object) {
     registry.erase(found);
 }
 
+void zeus_value_validate_argument_type(
+    const ZeusValue* value,
+    const char* functionName,
+    int32_t argumentIndex,
+    const char* expectedType
+) {
+    if (!value || !functionName || !expectedType || argumentIndex < 0) {
+        dynamicValuePanic("invalid typed-call argument validation input");
+    }
+    const std::string expected = ZeusRuntimeType::canonicalTypeName(expectedType);
+    const std::string actual = ZeusRuntimeType::canonicalTypeName(
+        dynamicValueTypeName(value));
+    if (ZeusRuntimeType::isCompatible(expected, actual)) return;
+
+    throw ZeusTypeError(
+        std::string(functionName) + "(): argument " +
+        std::to_string(argumentIndex + 1) + " must " + expected + ", not " + actual);
+}
+
+void zeus_value_slot_validate_argument_type(
+    const ZeusValue* slot,
+    const ZeusValue* value,
+    const char* functionName,
+    int32_t argumentIndex,
+    const char* expectedType
+) {
+    if (!value || !functionName || !expectedType || argumentIndex < 0) {
+        dynamicValuePanic("invalid reference-call argument validation input");
+    }
+
+    if (!slot) {
+        const std::string expected = ZeusRuntimeType::canonicalTypeName(expectedType);
+        const std::string actual = ZeusRuntimeType::canonicalTypeName(
+            dynamicValueTypeName(value));
+        throw ZeusTypeError(
+            std::string(functionName) + "(): argument " +
+            std::to_string(argumentIndex + 1) + " must variable reference to " +
+            expected + ", not " + actual);
+    }
+
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (slot->tag == ZEUS_VALUE_TAG_DELETED) {
+        throw std::runtime_error("read from deleted variable");
+    }
+    zeus_value_validate_argument_type(slot, functionName, argumentIndex, expectedType);
+}
+
 int64_t zeus_value_require_i64(const ZeusValue* value) {
+    if (value && value->tag == ZEUS_VALUE_TAG_DELETED) {
+        throw std::runtime_error("read from deleted variable");
+    }
     if (!value || value->flags != 0 ||
         (value->tag != ZEUS_VALUE_TAG_INT64 && value->tag != ZEUS_VALUE_TAG_REF_INT64)) {
         dynamicValuePanic("expected an inline int64 value");
@@ -778,6 +963,9 @@ int64_t zeus_value_require_i64(const ZeusValue* value) {
 }
 
 int32_t zeus_value_require_bool(const ZeusValue* value) {
+    if (value && value->tag == ZEUS_VALUE_TAG_DELETED) {
+        throw std::runtime_error("read from deleted variable");
+    }
     if (!value || value->flags != 0 ||
         (value->tag != ZEUS_VALUE_TAG_BOOL && value->tag != ZEUS_VALUE_TAG_REF_BOOL) ||
         (value->tag == ZEUS_VALUE_TAG_BOOL && value->payload > 1)) {
@@ -919,6 +1107,9 @@ void* zeus_value_require_bool_ptr(const ZeusValue* value) {
 
 ZeusBox* zeus_value_to_box(const ZeusValue* value) {
     if (!value) dynamicValuePanic("null input pointer");
+    if (value->tag == ZEUS_VALUE_TAG_DELETED) {
+        throw std::runtime_error("read from deleted variable");
+    }
 
     try {
         switch (value->tag) {
@@ -1384,9 +1575,7 @@ void zeus_value_print_call(
 void zeus_value_global_store(int idx, ZeusValue* value) {
     if (!value) dynamicValuePanic("null value pointer");
     try {
-        ZeusBox* box = zeus_value_to_box(value);
-        zeus_value_release(value);
-        zeus_global_store(idx, box);
+        abiStoreGlobalValue(idx, value);
     } catch (...) {
         dynamicValuePanic("failed to store dynamic global");
     }
@@ -1394,14 +1583,80 @@ void zeus_value_global_store(int idx, ZeusValue* value) {
 
 void zeus_value_global_load(ZeusValue* out, int idx) {
     if (!out) dynamicValuePanic("null output pointer");
-    setNilValue(out);
     try {
-        ZeusBox* box = zeus_global_load(idx);
-        zeus_value_from_box(out, box);
-        zeus_box_release(box);
+        abiLoadGlobalValue(out, idx);
     } catch (...) {
         dynamicValuePanic("failed to load dynamic global");
     }
+}
+
+ZeusValue* zeus_value_global_slot(int idx) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    ZeusValue* slot = abiResolveGlobalValueSlot(idx, false);
+    if (!slot) dynamicValuePanic("invalid global reference slot");
+    return slot;
+}
+
+void zeus_value_slot_load(ZeusValue* out, const ZeusValue* slot) {
+    if (!out || !slot) dynamicValuePanic("invalid value-slot load");
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (slot->tag == ZEUS_VALUE_TAG_DELETED) {
+        throw std::runtime_error("read from deleted variable");
+    }
+    if (out == slot) return;
+    setNilValue(out);
+    zeus_value_clone(out, slot);
+}
+
+int64_t zeus_value_slot_load_i64(const ZeusValue* slot) {
+    if (!slot) dynamicValuePanic("null int64 value slot");
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    return zeus_value_require_i64(slot);
+}
+
+int32_t zeus_value_slot_load_bool(const ZeusValue* slot) {
+    if (!slot) dynamicValuePanic("null bool value slot");
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    return zeus_value_require_bool(slot);
+}
+
+void zeus_value_slot_store(ZeusValue* slot, const ZeusValue* value) {
+    if (!slot || !value) dynamicValuePanic("invalid value-slot store");
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (slot->tag == ZEUS_VALUE_TAG_DELETED) {
+        throw std::runtime_error("write to deleted variable");
+    }
+    if (slot == value) return;
+    ZeusValue replacement{};
+    zeus_value_init_nil(&replacement);
+    if (zeus_value_slot_is_gc_edge(slot)) {
+        zeus_value_clone_internal(&replacement, value);
+    } else {
+        zeus_value_clone(&replacement, value);
+    }
+    releaseSlotValue(slot);
+    *slot = replacement;
+    setNilValue(&replacement);
+}
+
+void zeus_value_slot_store_i64(ZeusValue* slot, int64_t value) {
+    if (!slot) dynamicValuePanic("null int64 value slot");
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (slot->tag == ZEUS_VALUE_TAG_DELETED) {
+        throw std::runtime_error("write to deleted variable");
+    }
+    releaseSlotValue(slot);
+    zeus_value_init_i64(slot, value);
+}
+
+void zeus_value_slot_store_bool(ZeusValue* slot, int32_t value) {
+    if (!slot) dynamicValuePanic("null bool value slot");
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (slot->tag == ZEUS_VALUE_TAG_DELETED) {
+        throw std::runtime_error("write to deleted variable");
+    }
+    releaseSlotValue(slot);
+    zeus_value_init_bool(slot, value);
 }
 
 void zeus_value_local_store(int idx, ZeusValue* value) {
@@ -1572,18 +1827,21 @@ void zeus_print(const ZeusBox* box) {
     std::puts(ZeusVMUtils::valueToDebugString(u).c_str());
 }
 
-// ---- 全局量槽（Phase A 极简版） ----
-
 namespace {
 
-std::vector<Cell*>& abiGlobals() {
-    static std::vector<Cell*> globals;
+struct GlobalValueSlot {
+    ZeusValue value{};
+    GlobalValueSlot() { zeus_value_init_nil(&value); }
+};
+
+std::vector<GlobalValueSlot*>& abiGlobalValueSlots() {
+    static std::vector<GlobalValueSlot*> globals;
     return globals;
 }
 
-std::unordered_set<int>& deletedGlobalSlots() {
-    static std::unordered_set<int> deleted;
-    return deleted;
+std::vector<GlobalValueSlot*>& retiredGlobalValueSlots() {
+    static std::vector<GlobalValueSlot*> retired;
+    return retired;
 }
 
 std::unordered_set<int>& deletedLocalSlots() {
@@ -1591,73 +1849,105 @@ std::unordered_set<int>& deletedLocalSlots() {
     return deleted;
 }
 
-Cell* abiEnsureGlobal(int idx) {
+GlobalValueSlot* abiEnsureGlobalValueSlot(int idx, bool recreateDeleted) {
     if (idx < 0) return nullptr;
 
-    auto& globals = abiGlobals();
+    auto& globals = abiGlobalValueSlots();
 
     if (idx >= (int)globals.size()) {
         globals.resize(idx + 1, nullptr);
     }
 
-    if (!globals[idx]) {
-        globals[idx] = new Cell{nullVariant(), 0, __nextCellId()};
-        globals[idx]->createdBy = "zeus_abi_global";
-        HeapStats::recordCreate();
-        HeapStats::registerCell(globals[idx]);
-        ZeusGC::addPermanentRootVariant(&globals[idx]->value);
+    if (globals[idx] && globals[idx]->value.tag == ZEUS_VALUE_TAG_DELETED) {
+        if (!recreateDeleted) {
+            throw std::runtime_error("read from deleted global variable");
+        }
+        retiredGlobalValueSlots().push_back(globals[idx]);
+        globals[idx] = nullptr;
     }
 
+    if (!globals[idx]) globals[idx] = new GlobalValueSlot();
     return globals[idx];
+}
+
+ZeusValue* abiResolveGlobalValueSlot(int idx, bool recreateDeleted) {
+    GlobalValueSlot* slot = abiEnsureGlobalValueSlot(idx, recreateDeleted);
+    if (!slot) return nullptr;
+    return &slot->value;
+}
+
+void abiStoreGlobalValue(int idx, ZeusValue* value) {
+    if (!value) dynamicValuePanic("null global value");
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    ZeusValue* slot = abiResolveGlobalValueSlot(idx, true);
+    if (!slot) {
+        zeus_value_release(value);
+        return;
+    }
+    zeus_value_slot_store(slot, value);
+    if (value != slot) zeus_value_release(value);
+}
+
+void abiLoadGlobalValue(ZeusValue* out, int idx) {
+    if (!out) dynamicValuePanic("null global value output");
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    ZeusValue* slot = abiResolveGlobalValueSlot(idx, false);
+    if (!slot) {
+        setNilValue(out);
+        return;
+    }
+    zeus_value_slot_load(out, slot);
+}
+
+void abiClearGlobalValue(int idx) {
+    if (idx < 0) return;
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    auto& globals = abiGlobalValueSlots();
+    if (idx >= static_cast<int>(globals.size()) || !globals[idx]) return;
+    if (globals[idx]->value.tag == ZEUS_VALUE_TAG_DELETED) return;
+    releaseSlotValue(&globals[idx]->value);
+}
+
+void abiDeleteGlobalValue(int idx) {
+    if (idx < 0) return;
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    auto& globals = abiGlobalValueSlots();
+    if (idx >= static_cast<int>(globals.size()) || !globals[idx]) return;
+    ZeusValue* value = &globals[idx]->value;
+    if (value->tag == ZEUS_VALUE_TAG_DELETED) return;
+    zeus_value_delete_object(value);
+    releaseSlotValue(value);
+    value->tag = ZEUS_VALUE_TAG_DELETED;
+    value->flags = 0;
+    value->payload = 0;
 }
 
 } // namespace
 
 void zeus_global_store(int idx, ZeusBox* box) {
     if (!box) return;
-    deletedGlobalSlots().erase(idx);
-
-    Cell* cell = abiEnsureGlobal(idx);
-
-    if (!cell) {
-        delete box;
-        return;
-    }
-
-    // variant 赋值自动释放旧字符串；对象/句柄随 Phase B 到来。
-    cell->value = box->v;
+    ZeusValue value{};
+    zeus_value_init_nil(&value);
+    zeus_value_from_box(&value, box);
     delete box;
+    abiStoreGlobalValue(idx, &value);
 }
 
 ZeusBox* zeus_global_load(int idx) {
-    if (deletedGlobalSlots().find(idx) != deletedGlobalSlots().end()) {
-        throw std::runtime_error("read from deleted global variable");
-    }
-    Cell* cell = abiEnsureGlobal(idx);
-
-    if (!cell) return nullBox();
-
-    ZeusBox* box = new ZeusBox();
-    box->v = cell->value; // 只复制值，不共享句柄/引用计数
+    ZeusValue value{};
+    zeus_value_init_nil(&value);
+    abiLoadGlobalValue(&value, idx);
+    ZeusBox* box = zeus_value_to_box(&value);
+    zeus_value_release(&value);
     return box;
 }
 
 void zeus_global_clear(int idx) {
-    if (idx < 0) return;
-    auto& globals = abiGlobals();
-    if (idx >= static_cast<int>(globals.size()) || !globals[idx]) return;
-    deletedGlobalSlots().erase(idx);
-    globals[idx]->value = nullVariant();
+    abiClearGlobalValue(idx);
 }
 
 void zeus_value_global_delete(int idx) {
-    if (idx < 0) return;
-    auto& globals = abiGlobals();
-    if (idx < static_cast<int>(globals.size()) && globals[idx]) {
-        destroyLLVMClassValue(globals[idx]->value);
-        globals[idx]->value = nullVariant();
-    }
-    deletedGlobalSlots().insert(idx);
+    abiDeleteGlobalValue(idx);
 }
 
 namespace {
@@ -1742,43 +2032,27 @@ int32_t zeus_shared_value_delete(const char* name) {
 // directly. A type mismatch aborts instead of silently reinterpreting a value.
 
 void zeus_global_store_i64(int idx, int64_t value) {
-    deletedGlobalSlots().erase(idx);
-    Cell* cell = abiEnsureGlobal(idx);
-    if (!cell) dynamicValuePanic("global slot is unavailable");
-    cell->value = LexerType::Value(value);
+    ZeusValue* slot = abiResolveGlobalValueSlot(idx, true);
+    if (!slot) dynamicValuePanic("global slot is unavailable");
+    zeus_value_slot_store_i64(slot, value);
 }
 
 int64_t zeus_global_load_i64(int idx) {
-    if (deletedGlobalSlots().find(idx) != deletedGlobalSlots().end()) {
-        throw std::runtime_error("read from deleted global variable");
-    }
-    Cell* cell = abiEnsureGlobal(idx);
-    if (!cell) dynamicValuePanic("global slot is unavailable");
-    int64_t result = 0;
-    if (!ZeusVMUtils::tryGetInt64(cell->value, result)) {
-        dynamicValuePanic("global slot does not hold an integer");
-    }
-    return result;
+    ZeusValue* slot = abiResolveGlobalValueSlot(idx, false);
+    if (!slot) dynamicValuePanic("global slot is unavailable");
+    return zeus_value_slot_load_i64(slot);
 }
 
 void zeus_global_store_bool(int idx, int32_t value) {
-    deletedGlobalSlots().erase(idx);
-    Cell* cell = abiEnsureGlobal(idx);
-    if (!cell) dynamicValuePanic("global slot is unavailable");
-    cell->value = LexerType::Value(value != 0);
+    ZeusValue* slot = abiResolveGlobalValueSlot(idx, true);
+    if (!slot) dynamicValuePanic("global slot is unavailable");
+    zeus_value_slot_store_bool(slot, value);
 }
 
 int32_t zeus_global_load_bool(int idx) {
-    if (deletedGlobalSlots().find(idx) != deletedGlobalSlots().end()) {
-        throw std::runtime_error("read from deleted global variable");
-    }
-    Cell* cell = abiEnsureGlobal(idx);
-    if (!cell) dynamicValuePanic("global slot is unavailable");
-    const auto* literal = std::get_if<LexerType::Value>(&cell->value);
-    if (!literal || !std::holds_alternative<bool>(literal->data)) {
-        dynamicValuePanic("global slot does not hold a boolean");
-    }
-    return std::get<bool>(literal->data) ? 1 : 0;
+    ZeusValue* slot = abiResolveGlobalValueSlot(idx, false);
+    if (!slot) dynamicValuePanic("global slot is unavailable");
+    return zeus_value_slot_load_bool(slot);
 }
 
 

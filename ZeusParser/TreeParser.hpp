@@ -31,6 +31,7 @@ namespace TreeParser {
         int sourceLine = 0;
         int sourceColumn = 0;
         CodeBlockType type;
+        std::vector<bool> paramIsReference;
         // 函数/类公共元数据
         std::string funcName; // 如果是函数块,这里记录函数名
         std::string ownerClassName; // 如果是类方法,这里记录所属类名
@@ -1465,12 +1466,15 @@ namespace TreeParser {
 
                                 std::string paramName;
                                 std::string typeName;
+                                bool isReference = false;
                                 size_t colon = end;
 
                                 for (size_t i = begin; i < end; ++i) {
                                     if (std::holds_alternative<LexerType::Keyword>(stack[i])) {
                                         if (paramName.empty()) {
                                             paramName = std::get<LexerType::Keyword>(stack[i]).name;
+                                            isReference = i > begin &&
+                                                isFunctionOperator(stack[i - 1], "&");
                                         } else if (colon < end && typeName.empty()) {
                                             typeName = std::get<LexerType::Keyword>(stack[i]).name;
                                         }
@@ -1487,6 +1491,7 @@ namespace TreeParser {
                                 }
 
                                 newBlock->paramTypeNames.push_back(typeName);
+                                newBlock->paramIsReference.push_back(isReference);
                             };
 
                             size_t paramBegin = openParen + 1;
@@ -1665,12 +1670,17 @@ namespace TreeParser {
                                         newBlock->paramTypeNames.insert(
                                             newBlock->paramTypeNames.begin(),
                                             parentCb->implTypeName);
+                                        newBlock->paramIsReference.insert(
+                                            newBlock->paramIsReference.begin(), false);
                                         newBlock->paramDefaults.insert(
                                             newBlock->paramDefaults.begin(),
                                             std::vector<Token>());
                                     } else {
                                         if (newBlock->paramTypeNames.size() < oldParameterCount) {
                                             newBlock->paramTypeNames.resize(oldParameterCount);
+                                        }
+                                        if (newBlock->paramIsReference.size() < oldParameterCount) {
+                                            newBlock->paramIsReference.resize(oldParameterCount, false);
                                         }
                                         if (newBlock->paramTypeNames.front().empty()) {
                                             newBlock->paramTypeNames.front() =
@@ -1716,6 +1726,7 @@ namespace TreeParser {
                                                    newBlock->paramNames.front() != aliasToInsert) {
                                             newBlock->paramNames.insert(newBlock->paramNames.begin(), aliasToInsert);
                                             newBlock->paramTypeNames.insert(newBlock->paramTypeNames.begin(), std::string());
+                                             newBlock->paramIsReference.insert(newBlock->paramIsReference.begin(), false);
                                             // 同时为 this 参数插入一个空的默认值，保持与 paramNames 对齐
                                             newBlock->paramDefaults.insert(newBlock->paramDefaults.begin(), std::vector<Token>());
                                             ZEUS_DEBUG_PRINT("[Parser   ]   -> Injected! paramNames.size=%zu", newBlock->paramNames.size());

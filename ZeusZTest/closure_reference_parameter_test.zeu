@@ -1,0 +1,96 @@
+func increment(&value: int) {
+    value = value + 1;
+}
+
+func closure_reference_test() {
+    let local_value = 1;
+    func local_increment(&value: int) {
+        value = value + 1;
+    }
+    let action = local_increment;
+    action(local_value);
+    print("local-positional", local_value);
+    action(value = local_value);
+    print("local-named", local_value);
+}
+
+func closure_reference_forward_test() {
+    let local_value = 10;
+    func forward(&value: int) {
+        func local_increment(&target: int) {
+            target = target + 1;
+        }
+        let action = local_increment;
+        action(value);
+    }
+    let action = forward;
+    action(local_value);
+    print("forwarded", local_value);
+}
+
+var GLOBAL_VALUE = 20;
+func closure_reference_global_test() {
+    func local_increment(&value: int) {
+        value = value + 1;
+    }
+    let action = local_increment;
+    action(GLOBAL_VALUE);
+    print("global", GLOBAL_VALUE);
+}
+
+func closure_string_reference_test() {
+    let local_text = "before";
+    func replace_text(&value: string) {
+        value = "after";
+    }
+    let action = replace_text;
+    action(local_text);
+    print("string", local_text);
+}
+
+func closure_bool_reference_test() {
+    let local_flag = false;
+    func invert(&value: bool) {
+        value = !value;
+    }
+    let action = invert;
+    action(local_flag);
+    print("bool", local_flag);
+}
+
+func closure_value_parameter_test() {
+    func add(value: int) -> int {
+        return value + 1;
+    }
+    let action = add;
+    print("by-value", action(30));
+}
+
+func closure_reference_error_test() {
+    func requires_reference(&value: int) {
+    }
+    let action = requires_reference;
+    try {
+        action(7);
+    } catch (&error) {
+        print("rvalue-error", error.getType());
+        print(error.getMessage());
+    }
+    let wrong_type = "text";
+    try {
+        action(wrong_type);
+    } catch (&error) {
+        print("type-error", error.getType());
+        print(error.getMessage());
+    }
+}
+
+closure_reference_test();
+increment(GLOBAL_VALUE);
+print("direct-global", GLOBAL_VALUE);
+closure_reference_forward_test();
+closure_reference_global_test();
+closure_string_reference_test();
+closure_bool_reference_test();
+closure_value_parameter_test();
+closure_reference_error_test();

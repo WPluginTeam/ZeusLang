@@ -20,6 +20,7 @@
 #include "./ZeusIR/IRGenerator.hpp"
 #include "./ZeusIR/IRStaticOperator.hpp"
 #include "./ZeusIR/IRStaticCall.hpp"
+#include "./ZeusIR/IRReferenceValidation.hpp"
 #include "./ZeusIRReader/IRWrite.hpp"
 #include "./ZeusIRReader/IRRead.hpp"
 #include "./ZeusRunner/ZeusVM.hpp"
@@ -155,6 +156,26 @@ namespace ZeusCompile {
         }
         ZeusTypeInfer::TypeChecker returnTypeChecker(ast);
         returnTypeChecker.check(ZeusTypeInfer::TypeCheckOptions::llvm());
+        bool hasCallArgumentTypeErrors = false;
+        for (const auto& diagnostic : returnTypeChecker.getDiagnostics()) {
+            if (diagnostic.code !=
+                ZeusTypeInfer::TypeCheckDiagnosticCode::CallArgumentTypeMismatch) {
+                continue;
+            }
+            hasCallArgumentTypeErrors = true;
+            r.diagnostics.push_back({
+                "type",
+                diagnostic.message,
+                diagnostic.line,
+                diagnostic.column
+            });
+        }
+        if (hasCallArgumentTypeErrors) {
+            r.hasReportedErrors = true;
+            r.lexTimeMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            r.parseTimeMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+            return r;
+        }
         IRGen::IRGenerator irGen;
         irGen.strictDecl = strictDecl;
         irGen.inferredFunctionReturnTypes =
@@ -163,6 +184,26 @@ namespace ZeusCompile {
         irGen.parse(ast);
         r.hasReportedErrors = ZeusDiagnostics::reportedCount > reportCountBeforeIR;
         auto t3 = std::chrono::steady_clock::now();
+
+        if (irGen.status == IRType::IRCompilerStatus::Running) {
+            const auto referenceCaptureDiagnostics =
+                IRReferenceValidation::validateNoReferenceParameterCaptures(irGen.bytecodes);
+            if (!referenceCaptureDiagnostics.empty()) {
+                for (const auto& diagnostic : referenceCaptureDiagnostics) {
+                    r.diagnostics.push_back({
+                        "type",
+                        diagnostic.message,
+                        diagnostic.line,
+                        diagnostic.column
+                    });
+                }
+                r.hasReportedErrors = true;
+                r.lexTimeMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                r.parseTimeMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+                r.irTimeMs = std::chrono::duration<double, std::milli>(t3 - t2).count();
+                return r;
+            }
+        }
 
         r.program = irGen.bytecodes;
         r.globalNames = irGen.globalNamesByIndex;
@@ -176,9 +217,9 @@ namespace ZeusCompile {
 
         if (!r.program.empty()) {
             // 类型已明确的类运算符复用函数签名/DirectCall 元信息；VM 忽略该标注。
-            IRStaticOperator::annotate(r.program);
             // 普通静态函数调用补齐目标签名；VM 继续执行原 CALL_CLOSURE，LLVM 使用 typed call。
             IRStaticCall::annotate(r.program);
+            IRStaticOperator::annotate(r.program);
             indexifyLateResolves(r);
         }
 

@@ -15,6 +15,8 @@ namespace IRStaticCall {
         std::string returnType;
         int captureCount = 0;
         std::vector<std::string> parameterTypes;
+        std::vector<std::string> parameterNames;
+        std::vector<bool> parameterIsReference;
     };
 
     class Annotator {
@@ -62,7 +64,12 @@ namespace IRStaticCall {
                     signature.name,
                     signature.returnType,
                     signature.captureCount,
-                    signature.parameterTypes
+                    signature.parameterTypes,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    &signature.parameterNames,
+                    &signature.parameterIsReference
                 );
             }
 
@@ -170,7 +177,9 @@ namespace IRStaticCall {
                         target->second.name,
                         target->second.returnType,
                         target->second.captureCount,
-                        target->second.parameterTypes
+                        target->second.parameterTypes,
+                        target->second.parameterNames,
+                        target->second.parameterIsReference
                     );
                     if (pendingTargetIsStatic) ins.metadata = pendingTarget;
                     hasPendingTarget = true;
@@ -178,7 +187,9 @@ namespace IRStaticCall {
                 }
 
                 if (hasPendingTarget && ins.op == VMOperator::CALL_CLOSURE) {
+                    const auto callArguments = ins.metadata.callArguments;
                     ins.metadata = pendingTarget;
+                    ins.metadata.callArguments = callArguments;
                     hasPendingTarget = false;
                     pendingTargetIsStatic = false;
                     continue;

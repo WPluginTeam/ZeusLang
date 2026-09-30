@@ -1,0 +1,6 @@
+@native("zeus_test_native_reference_increment")
+decl func native_increment(&value: int) -> int;
+
+var VALUE = 41;
+print("return", native_increment(VALUE));
+print("slot", VALUE);

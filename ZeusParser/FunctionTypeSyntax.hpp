@@ -12,6 +12,7 @@ namespace ZeusParser {
     struct FunctionParameterSyntax {
         std::string name;
         std::string typeName;
+        bool isReference = false;
     };
 
     struct FunctionDecoratorSyntax {
@@ -166,6 +167,7 @@ namespace ZeusParser {
             if (begin >= end) return;
 
             FunctionParameterSyntax parameter;
+            parameter.isReference = isOperator(tokens[begin], "&");
             size_t colon = end;
             for (size_t i = begin; i < end; ++i) {
                 if (isOperator(tokens[i], ":") && colon == end) {

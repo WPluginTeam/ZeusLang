@@ -97,6 +97,7 @@ struct FunctionSignature {
     std::string returnType;
     std::vector<std::string> parameterTypes;
     std::vector<std::string> parameterNames;
+    std::vector<bool> parameterIsReference;
     bool hasVariadicArgs = false;
     bool hasVariadicKwargs = false;
     int minRequiredParams = 0;
@@ -146,6 +147,7 @@ public:
         bool ownsDynamic = false;
         std::string namedArgument;
         bool ownsClass = false;
+        bool isReference = false;
     };
 
     struct NativeSlot {
@@ -693,6 +695,9 @@ public:
     bool needsClosureAdapter(size_t chunkIndex) const {
         if (!programChunks) return false;
         for (const auto& chunk : *programChunks) {
+            if (chunk.empty() || chunk.front().op != VMOperator::FUNC_BEGIN) {
+                continue;
+            }
             for (const auto& ins : chunk) {
                 if (ins.op != VMOperator::MAKE_FUNCTION || ins.args.empty() ||
                     !std::holds_alternative<LexerType::Value>(ins.args[0])) {
@@ -1052,7 +1057,11 @@ public:
         return true;
     }
 
-    std::string functionParameterABIType(const std::string& typeName) const {
+    std::string functionParameterABIType(
+        const std::string& typeName,
+        bool byReference = false
+    ) const {
+        if (byReference) return "ptr";
         return usesZeusValueABI(typeName) ? "ptr" : llvmType(typeName);
     }
 
@@ -1201,7 +1210,9 @@ public:
                             signature.parameterTypes,
                             &signature.ownerType,
                             &signature.operatorSymbol,
-                            &signature.nativeSymbol)) {
+                            &signature.nativeSymbol,
+                            &signature.parameterNames,
+                            &signature.parameterIsReference)) {
                         result.error = "[emit-llvm] 结构化函数签名元信息无效";
                         return false;
                     }
@@ -1284,13 +1295,23 @@ public:
                         result.error = "[emit-llvm] function parameter-name count is invalid";
                         return false;
                     }
+                    std::vector<std::string> headerParameterNames;
+                    headerParameterNames.reserve(static_cast<size_t>(nameCount));
                     for (int i = 0; i < nameCount; ++i) {
                         const auto& name = header.args[namesOffset + 1 + static_cast<size_t>(i)];
                         if (!std::holds_alternative<std::string>(name)) {
                             result.error = "[emit-llvm] function parameter name is invalid";
                             return false;
                         }
-                        signature.parameterNames.push_back(std::get<std::string>(name));
+                        headerParameterNames.push_back(std::get<std::string>(name));
+                    }
+                    if (!signature.parameterNames.empty() &&
+                        signature.parameterNames != headerParameterNames) {
+                        result.error = "[emit-llvm] function parameter-name metadata disagrees with FUNC_BEGIN";
+                        return false;
+                    }
+                    if (signature.parameterNames.empty()) {
+                        signature.parameterNames = std::move(headerParameterNames);
                     }
                     signature.hasVariadicArgs = VMHelpers::getIntFromValue(
                         std::get<LexerType::Value>(header.args[1])) != 0;
@@ -1359,8 +1380,11 @@ public:
             if (returnsDynamic) externalDeclarations += "ptr";
             for (size_t i = 0; i < signature.parameterTypes.size(); ++i) {
                 if (i > 0 || returnsDynamic) externalDeclarations += ", ";
+                const bool byReference = i < signature.parameterIsReference.size() &&
+                    signature.parameterIsReference[i];
                 const std::string parameterType =
-                    functionParameterABIType(signature.parameterTypes[i]);
+                    functionParameterABIType(
+                        signature.parameterTypes[i], byReference);
                 if (parameterType.empty()) {
                     result.error = "[emit-llvm] decl 函数 '" + signature.name +
                                    "' 的参数类型没有 LLVM ABI 映射";
@@ -2282,6 +2306,50 @@ public:
         return nativeValue;
     }
 
+    template <typename EmitLine>
+    void emitDynamicArgumentTypeCheck(
+        const std::string& dynamicValue,
+        const FunctionSignature& signature,
+        size_t parameterIndex,
+        EmitLine&& emit
+    ) {
+        if (dynamicValue.empty() || parameterIndex >= signature.parameterTypes.size() ||
+            signature.parameterTypes[parameterIndex].empty()) {
+            return;
+        }
+        const size_t receiverOffset =
+            !signature.ownerType.empty() && !signature.isStaticMethod ? 1 : 0;
+        const size_t userArgumentIndex = parameterIndex > receiverOffset
+            ? parameterIndex - receiverOffset
+            : 0;
+        emit("call void @zeus_value_validate_argument_type(ptr " + dynamicValue +
+             ", ptr " + poolStr(signature.name) + ", i32 " +
+             std::to_string(userArgumentIndex) + ", ptr " +
+             poolStr(signature.parameterTypes[parameterIndex]) + ")");
+    }
+
+    template <typename EmitLine>
+    void emitReferenceArgumentTypeCheck(
+        const std::string& slot,
+        const FunctionSignature& signature,
+        size_t parameterIndex,
+        EmitLine&& emit
+    ) {
+        if (slot.empty() || parameterIndex >= signature.parameterTypes.size() ||
+            signature.parameterTypes[parameterIndex].empty()) {
+            return;
+        }
+        const size_t receiverOffset =
+            !signature.ownerType.empty() && !signature.isStaticMethod ? 1 : 0;
+        const size_t userArgumentIndex = parameterIndex > receiverOffset
+            ? parameterIndex - receiverOffset
+            : 0;
+        emit("call void @zeus_value_slot_validate_argument_type(ptr " + slot +
+             ", ptr " + slot + ", ptr " + poolStr(signature.name) + ", i32 " +
+             std::to_string(userArgumentIndex) + ", ptr " +
+             poolStr(signature.parameterTypes[parameterIndex]) + ")");
+    }
+
     // Global/local slot access has to be emitted into whichever function body
     // is currently being built. The legacy top-level path uses emitLine, while a
     // native function must write into its own functionText: leaking the load
@@ -2425,6 +2493,9 @@ public:
                 continue;
             }
             const std::string argumentType = functionParameterABIType(called.parameterTypes[i]);
+            emitDynamicArgumentTypeCheck(
+                dynamicArguments[i], called, i,
+                [this](const std::string& line) { emitLine(line); });
             if (usesZeusValueABI(called.parameterTypes[i])) {
                 nativeArguments.push_back(dynamicArguments[i]);
                 nativeArgumentTypes.push_back(argumentType);
@@ -3633,6 +3704,61 @@ public:
             }
         }
 
+        std::set<int> addressableLocalIndices;
+        for (const auto& instruction : chunk) {
+            if (instruction.op != VMOperator::CALL_CLOSURE) continue;
+
+            const bool hasStaticReferenceSignature =
+                instruction.metadata.kind == IRType::IRMetadataKind::CallTarget;
+            if (!hasStaticReferenceSignature) {
+                // An indirect closure has no statically-known signature here.
+                // Keep each mutable local argument addressable so the runtime
+                // adapter can decide whether it needs the value or its slot.
+                for (const auto& argument : instruction.metadata.callArguments) {
+                    if (!argument.isAssignable || argument.source.isConst ||
+                        argument.source.kind != IRType::SymbolRefKind::Local ||
+                        argument.source.index < 0) {
+                        continue;
+                    }
+                    const size_t sourceIndex =
+                        static_cast<size_t>(argument.source.index);
+                    if (sourceIndex < signature.parameterIsReference.size() &&
+                        signature.parameterIsReference[sourceIndex]) {
+                        continue;
+                    }
+                    addressableLocalIndices.insert(argument.source.index);
+                }
+                continue;
+            }
+
+            for (size_t parameterIndex = 0;
+                 parameterIndex < instruction.metadata.parameterIsReference.size();
+                 ++parameterIndex) {
+                if (!instruction.metadata.parameterIsReference[parameterIndex]) continue;
+                const std::string parameterName = parameterIndex <
+                        instruction.metadata.parameterNames.size()
+                    ? instruction.metadata.parameterNames[parameterIndex]
+                    : std::string();
+                for (const auto& argument : instruction.metadata.callArguments) {
+                    const bool matches = argument.namedParameter.empty()
+                        ? argument.positionalIndex == static_cast<int>(parameterIndex)
+                        : argument.namedParameter == parameterName;
+                    if (!matches || !argument.isAssignable ||
+                        argument.source.kind != IRType::SymbolRefKind::Local ||
+                        argument.source.index < 0) {
+                        continue;
+                    }
+                    const size_t sourceIndex =
+                        static_cast<size_t>(argument.source.index);
+                    if (sourceIndex < signature.parameterIsReference.size() &&
+                        signature.parameterIsReference[sourceIndex]) {
+                        continue;
+                    }
+                    addressableLocalIndices.insert(argument.source.index);
+                }
+            }
+        }
+
         const bool returnsDynamic = usesZeusValueABI(signature.returnType);
         const std::string returnType = returnsDynamic ? "void" : llvmType(signature.returnType);
         if (returnType.empty()) {
@@ -3642,8 +3768,11 @@ public:
         }
 
         std::vector<std::string> parameterLLVMTypes;
-        for (const auto& typeName : signature.parameterTypes) {
-            const std::string type = functionParameterABIType(typeName);
+        for (size_t i = 0; i < signature.parameterTypes.size(); ++i) {
+            const bool byReference = i < signature.parameterIsReference.size() &&
+                signature.parameterIsReference[i];
+            const std::string type = functionParameterABIType(
+                signature.parameterTypes[i], byReference);
             if (type.empty()) {
                 result.error = "[emit-llvm] 函数 '" + signature.name +
                                "' 的参数类型没有 LLVM ABI 映射";
@@ -3690,6 +3819,19 @@ public:
         auto freshNativeTmp = [&]() {
             return std::string("%n") + std::to_string(nativeTmpCount++);
         };
+        std::map<int, std::string> addressableLocalSlots;
+        std::string addressableLocalSlotPrologue;
+        for (const int localIndex : addressableLocalIndices) {
+            const std::string slot = freshNativeTmp();
+            addressableLocalSlots.emplace(localIndex, slot);
+            addressableLocalSlotPrologue += "  " + slot +
+                " = alloca %ZeusValue, align 8\n";
+            addressableLocalSlotPrologue +=
+                "  call void @zeus_value_init_nil(ptr " + slot + ")\n";
+        }
+        if (!addressableLocalSlotPrologue.empty()) {
+            functionText.insert(nativeEntryBody, addressableLocalSlotPrologue);
+        }
         struct NativeExceptionPad {
             std::string switchLabel;
             std::string padLabel;
@@ -3772,6 +3914,7 @@ public:
         std::vector<std::string> exceptionCallDynamicValues;
         std::map<int, NativeValue> locals;
         std::map<int, std::string> closureLocalCells;
+        std::set<int> referenceParameterLocals;
         auto exceptionCallScope = [&](bool begin,
                                       const std::vector<NativeValue>& arguments,
                                       const std::vector<std::string>& dynamicValues) {
@@ -3813,6 +3956,56 @@ public:
             return cleanupCalls;
         };
         for (size_t i = 0; i < parameterLLVMTypes.size(); ++i) {
+            const bool byReference = i < signature.parameterIsReference.size() &&
+                signature.parameterIsReference[i];
+            if (byReference) {
+                referenceParameterLocals.insert(static_cast<int>(i));
+                locals[static_cast<int>(i)] = NativeValue{
+                    "%arg" + std::to_string(i),
+                    "ptr",
+                    false,
+                    false,
+                    signature.parameterTypes[i],
+                    false
+                };
+                locals[static_cast<int>(i)].isReference = true;
+                continue;
+            }
+            const auto addressableParameter =
+                addressableLocalSlots.find(static_cast<int>(i));
+            if (addressableParameter != addressableLocalSlots.end()) {
+                const std::string& slot = addressableParameter->second;
+                const std::string& parameterType = signature.parameterTypes[i];
+                if (usesZeusValueABI(parameterType)) {
+                    emitNativeLine("call void @zeus_value_clone(ptr " + slot +
+                                   ", ptr %arg" + std::to_string(i) + ")");
+                } else if (llvmType(parameterType) == "i64") {
+                    emitNativeLine("call void @zeus_value_init_i64(ptr " + slot +
+                                   ", i64 %arg" + std::to_string(i) + ")");
+                } else if (llvmType(parameterType) == "i1") {
+                    const std::string raw = freshNativeTmp();
+                    emitNativeLine(raw + " = zext i1 %arg" + std::to_string(i) + " to i32");
+                    emitNativeLine("call void @zeus_value_init_bool(ptr " + slot +
+                                   ", i32 " + raw + ")");
+                } else if (isClassType(parameterType)) {
+                    emitNativeLine("call void @zeus_value_from_class_ptr(ptr " + slot +
+                                   ", ptr %arg" + std::to_string(i) + ", ptr " +
+                                   poolStr(parameterType) + ")");
+                } else if (const auto* abi = ZeusBuiltins::findNativeTypeABI(parameterType);
+                           ZeusBuiltins::isNativeViewABI(abi)) {
+                    emitNativeLine("call void @" +
+                        std::string(ZeusBuiltins::nativeViewToDynamicHelper(abi)) +
+                        "(ptr " + slot + ", ptr %arg" + std::to_string(i) + ")");
+                } else {
+                    result.error = "[emit-llvm] cannot materialize reference slot for parameter type '" +
+                        parameterType + "'";
+                    return false;
+                }
+                locals[static_cast<int>(i)] = NativeValue{
+                    slot, "ptr", false, true, parameterType, true
+                };
+                continue;
+            }
             const bool dynamicParameter = usesZeusValueABI(signature.parameterTypes[i]);
             locals[static_cast<int>(i)] = NativeValue{
                 "%arg" + std::to_string(i),
@@ -3822,7 +4015,7 @@ public:
                 signature.parameterTypes[i],
                 false
             };
-            if (isClassType(signature.parameterTypes[i])) {
+            if (isClassType(signature.parameterTypes[i]) && !byReference) {
                 const bool destructorReceiver = signature.operatorSymbol == "~" && i == 0;
                 locals[static_cast<int>(i)].ownsClass = !destructorReceiver;
                 if (!destructorReceiver) {
@@ -4026,6 +4219,62 @@ public:
             return failNative(ins, "[emit-llvm] 原生函数参数无法映射为 ZeusValue");
         };
 
+        auto emitReferenceForSymbol = [&] (
+            const IRType::SymbolRef& symbol,
+            const IRType::IRInstr& ins,
+            std::string& reference
+        ) {
+            if (symbol.isConst) {
+                return failNative(ins,
+                    "[emit-llvm] a const variable cannot be passed to a mutable reference parameter");
+            }
+
+            if (symbol.kind == IRType::SymbolRefKind::Global) {
+                reference = freshNativeTmp();
+                emitNativeLine(reference + " = call ptr @zeus_value_global_slot(i32 " +
+                    std::to_string(symbol.index) + ")");
+                return true;
+            }
+
+            if (symbol.kind == IRType::SymbolRefKind::Upvalue) {
+                reference = freshNativeTmp();
+                emitNativeLine(reference + " = call ptr @zeus_closure_env_value_slot(ptr %closure.env, i32 " +
+                    std::to_string(symbol.index) + ")");
+                return true;
+            }
+
+            if (symbol.kind == IRType::SymbolRefKind::Local) {
+                if (referenceParameterLocals.find(symbol.index) !=
+                    referenceParameterLocals.end()) {
+                    reference = "%arg" + std::to_string(symbol.index);
+                    return true;
+                }
+                const auto captured = closureLocalCells.find(symbol.index);
+                if (captured != closureLocalCells.end()) {
+                    reference = freshNativeTmp();
+                    emitNativeLine(reference + " = call ptr @zeus_capture_cell_value_slot(ptr " +
+                        captured->second + ")");
+                    return true;
+                }
+                const auto slot = addressableLocalSlots.find(symbol.index);
+                if (slot == addressableLocalSlots.end()) {
+                    return failNative(ins,
+                        "[emit-llvm] local reference argument has no stable storage slot");
+                }
+                auto local = locals.find(symbol.index);
+                if (local == locals.end()) {
+                    return failNative(ins,
+                        "[emit-llvm] local reference argument is not initialized");
+                }
+                local->second.sourceType.clear();
+                reference = slot->second;
+                return true;
+            }
+
+            return failNative(ins,
+                "[emit-llvm] reference parameter requires a local, global, or captured variable");
+        };
+
         auto cloneNativeDynamicValue = [&](
             const IRType::IRInstr& ins,
             const NativeValue& value,
@@ -4174,22 +4423,49 @@ public:
                 }
             }
 
+            std::vector<std::string> referenceArguments(arguments.size(), "null");
+            const size_t sourceCount = std::min(
+                arguments.size(), ins.metadata.callArguments.size());
+            for (size_t i = 0; i < sourceCount; ++i) {
+                const auto& source = ins.metadata.callArguments[i];
+                if (!source.isAssignable || source.source.isConst) continue;
+                if (source.source.kind != IRType::SymbolRefKind::Local &&
+                    source.source.kind != IRType::SymbolRefKind::Global &&
+                    source.source.kind != IRType::SymbolRefKind::Upvalue) {
+                    continue;
+                }
+                if (!emitReferenceForSymbol(source.source, ins, referenceArguments[i])) {
+                    return false;
+                }
+            }
+
             std::string argumentArray = "null";
+            std::string argumentReferenceArray = "null";
             std::string argumentNameArray = "null";
             if (!dynamicArguments.empty()) {
                 argumentArray = freshNativeTmp();
+                argumentReferenceArray = freshNativeTmp();
                 argumentNameArray = freshNativeTmp();
                 emitNativeLine(argumentArray + " = alloca ptr, i64 " +
+                               std::to_string(dynamicArguments.size()) + ", align 8");
+                emitNativeLine(argumentReferenceArray + " = alloca ptr, i64 " +
                                std::to_string(dynamicArguments.size()) + ", align 8");
                 emitNativeLine(argumentNameArray + " = alloca ptr, i64 " +
                                std::to_string(dynamicArguments.size()) + ", align 8");
                 for (size_t i = 0; i < dynamicArguments.size(); ++i) {
                     const std::string slot = freshNativeTmp();
+                    const std::string referenceSlot = freshNativeTmp();
                     const std::string nameSlot = freshNativeTmp();
                     emitNativeLine(slot + " = getelementptr inbounds ptr, ptr " +
                                    argumentArray + ", i64 " + std::to_string(i));
                     emitNativeLine("store ptr " + dynamicArguments[i] + ", ptr " + slot +
                                    ", align 8");
+                    emitNativeLine(referenceSlot +
+                                   " = getelementptr inbounds ptr, ptr " +
+                                   argumentReferenceArray + ", i64 " +
+                                   std::to_string(i));
+                    emitNativeLine("store ptr " + referenceArguments[i] +
+                                   ", ptr " + referenceSlot + ", align 8");
                     emitNativeLine(nameSlot + " = getelementptr inbounds ptr, ptr " +
                                    argumentNameArray + ", i64 " + std::to_string(i));
                     if (arguments[i].namedArgument.empty()) {
@@ -4211,7 +4487,8 @@ public:
             emitNativeLine("call void @zeus_closure_call_named(ptr " + output + ", ptr " +
                            callee.value + ", i32 " +
                            std::to_string(dynamicArguments.size()) + ", ptr " +
-                           argumentArray + ", ptr " + argumentNameArray + ")");
+                           argumentArray + ", ptr " + argumentReferenceArray +
+                           ", ptr " + argumentNameArray + ")");
             exceptionCallScope(false, {}, {});
             for (size_t i = 0; i < dynamicArguments.size(); ++i) {
                 if (ownsDynamicArguments[i]) {
@@ -5296,6 +5573,45 @@ public:
                     }
 
                     if (kind == "local") {
+                        if (referenceParameterLocals.find(static_cast<int>(index)) !=
+                            referenceParameterLocals.end()) {
+                            const std::string& parameterType =
+                                signature.parameterTypes[static_cast<size_t>(index)];
+                            if (!usesZeusValueABI(parameterType) &&
+                                llvmType(parameterType) == "i64") {
+                                const std::string loaded = freshNativeTmp();
+                                emitNativeLine(loaded +
+                                    " = call i64 @zeus_value_slot_load_i64(ptr %arg" +
+                                    std::to_string(index) + ")");
+                                valueStack.push_back(NativeValue{
+                                    loaded, "i64", false, false, parameterType, false
+                                });
+                                break;
+                            }
+                            if (!usesZeusValueABI(parameterType) &&
+                                llvmType(parameterType) == "i1") {
+                                const std::string raw = freshNativeTmp();
+                                emitNativeLine(raw +
+                                    " = call i32 @zeus_value_slot_load_bool(ptr %arg" +
+                                    std::to_string(index) + ")");
+                                const std::string loaded = freshNativeTmp();
+                                emitNativeLine(loaded + " = trunc i32 " + raw + " to i1");
+                                valueStack.push_back(NativeValue{
+                                    loaded, "i1", false, false, parameterType, false
+                                });
+                                break;
+                            }
+                            const std::string loaded = freshNativeTmp();
+                            emitNativeLine(loaded + " = alloca %ZeusValue, align 8");
+                            emitNativeLine("call void @zeus_value_init_nil(ptr " + loaded + ")");
+                            emitNativeLine("call void @zeus_value_slot_load(ptr " + loaded +
+                                ", ptr %arg" + std::to_string(index) + ")");
+                            valueStack.push_back(NativeValue{
+                                loaded, "ptr", false, true,
+                                signature.parameterTypes[static_cast<size_t>(index)], true
+                            });
+                            break;
+                        }
                         const auto capturedCell = closureLocalCells.find(static_cast<int>(index));
                         if (capturedCell != closureLocalCells.end()) {
                             const std::string loaded = freshNativeTmp();
@@ -5763,6 +6079,14 @@ public:
                     if (childSignature->second.captureCount != static_cast<int>(captures.size())) {
                         return failNative(ins, "[emit-llvm] closure capture metadata count mismatch");
                     }
+                    for (const auto& capture : captures) {
+                        if (capture.sourceKind == "local" &&
+                            referenceParameterLocals.find(capture.sourceIndex) !=
+                                referenceParameterLocals.end()) {
+                            return failNative(ins,
+                                "[emit-llvm] a by-reference parameter cannot escape through a closure");
+                        }
+                    }
 
                     std::vector<std::string> cells;
                     std::vector<std::string> temporaryCells;
@@ -5865,6 +6189,46 @@ public:
                     if (!tryArgInt(ins, 0, index) || !popNative(ins, value)) {
                         return failNative(ins, "[emit-llvm] 原生函数局部变量存储失败");
                     }
+                    if (referenceParameterLocals.find(static_cast<int>(index)) !=
+                        referenceParameterLocals.end()) {
+                        if (!value.dynamic && value.type == "i64") {
+                            emitNativeLine("call void @zeus_value_slot_store_i64(ptr %arg" +
+                                std::to_string(index) + ", i64 " + value.value + ")");
+                            if (value.ownsClass && isManagedClassValue(value)) {
+                                emitNativeLine("call void @zeus_class_ref_release(ptr " +
+                                               value.value + ")");
+                            }
+                            break;
+                        }
+                        if (!value.dynamic && value.type == "i1") {
+                            const std::string raw = freshNativeTmp();
+                            emitNativeLine(raw + " = zext i1 " + value.value + " to i32");
+                            emitNativeLine("call void @zeus_value_slot_store_bool(ptr %arg" +
+                                std::to_string(index) + ", i32 " + raw + ")");
+                            if (value.ownsClass && isManagedClassValue(value)) {
+                                emitNativeLine("call void @zeus_class_ref_release(ptr " +
+                                               value.value + ")");
+                            }
+                            break;
+                        }
+                        std::string dynamicValue;
+                        bool ownsDynamic = false;
+                        if (!emitNativeDynamicValue(
+                                ins, value, dynamicValue, ownsDynamic)) {
+                            return false;
+                        }
+                        emitNativeLine("call void @zeus_value_slot_store(ptr %arg" +
+                            std::to_string(index) + ", ptr " + dynamicValue + ")");
+                        if (ownsDynamic) {
+                            emitNativeLine("call void @zeus_value_release(ptr " +
+                                           dynamicValue + ")");
+                        }
+                        if (value.ownsClass && isManagedClassValue(value)) {
+                            emitNativeLine("call void @zeus_class_ref_release(ptr " +
+                                           value.value + ")");
+                        }
+                        break;
+                    }
                     const auto capturedCell = closureLocalCells.find(static_cast<int>(index));
                     if (capturedCell != closureLocalCells.end()) {
                         std::string dynamicValue;
@@ -5879,6 +6243,34 @@ public:
                             emitNativeLine("call void @zeus_class_ref_release(ptr " +
                                            value.value + ")");
                         }
+                        break;
+                    }
+                    const auto addressableSlot =
+                        addressableLocalSlots.find(static_cast<int>(index));
+                    if (addressableSlot != addressableLocalSlots.end()) {
+                        std::string dynamicValue;
+                        bool ownsDynamic = false;
+                        if (!emitNativeDynamicValue(
+                                ins, value, dynamicValue, ownsDynamic)) {
+                            return false;
+                        }
+                        emitNativeLine("call void @zeus_value_release(ptr " +
+                                       addressableSlot->second + ")");
+                        emitNativeLine("call void @zeus_value_clone(ptr " +
+                                       addressableSlot->second + ", ptr " +
+                                       dynamicValue + ")");
+                        if (ownsDynamic) {
+                            emitNativeLine("call void @zeus_value_release(ptr " +
+                                           dynamicValue + ")");
+                        }
+                        if (value.ownsClass && isManagedClassValue(value)) {
+                            emitNativeLine("call void @zeus_class_ref_release(ptr " +
+                                           value.value + ")");
+                        }
+                        locals[static_cast<int>(index)] = NativeValue{
+                            addressableSlot->second, "ptr", false, true,
+                            std::string(), true
+                        };
                         break;
                     }
                     if (value.functionRef) {
@@ -6939,7 +7331,13 @@ public:
                     std::vector<std::string> dynamicCallArguments;
                     std::vector<bool> ownsDynamicCallArguments;
                     for (size_t i = 0; i < called.parameterTypes.size(); ++i) {
+                        const bool byReference = i < called.parameterIsReference.size() &&
+                            called.parameterIsReference[i];
                         if (!providedArguments[i]) {
+                            if (byReference) {
+                                return failNative(ins,
+                                    "[emit-llvm] a reference parameter cannot use a default argument");
+                            }
                             NativeValue placeholder;
                             if (!emitOptionalArgumentPlaceholder(
                                     called.parameterTypes[i], placeholder,
@@ -6948,24 +7346,58 @@ public:
                                     "[emit-llvm] optional argument has no native ABI placeholder");
                             }
                             if (i > 0 || calledReturnsDynamic) callText += ", ";
-                            callText += functionParameterABIType(called.parameterTypes[i]) +
+                            callText += functionParameterABIType(
+                                            called.parameterTypes[i], byReference) +
                                         " " + placeholder.value;
                             continue;
                         }
                         if (i > 0 || calledReturnsDynamic) callText += ", ";
                         std::string nativeArgument;
                         bool ownsDynamicArgument = false;
-                        if (!emitFunctionABIArgument(
-                                ins,
-                                orderedArguments[i],
-                                called.parameterTypes[i],
-                                nativeArgument,
-                                ownsDynamicArgument)) {
-                            return false;
+                        if (byReference) {
+                            const std::string parameterName = i < called.parameterNames.size()
+                                ? called.parameterNames[i]
+                                : std::string();
+                            const IRType::CallArgumentSource* source = nullptr;
+                            for (const auto& candidate : ins.metadata.callArguments) {
+                                const bool matches = candidate.namedParameter.empty()
+                                    ? candidate.positionalIndex == static_cast<int>(i)
+                                    : candidate.namedParameter == parameterName;
+                                if (matches) {
+                                    source = &candidate;
+                                    break;
+                                }
+                            }
+                            if (!source || !source->isAssignable) {
+                                return failNative(ins,
+                                    "[emit-llvm] a reference parameter requires a variable argument");
+                            }
+                            if (!emitReferenceForSymbol(source->source, ins, nativeArgument)) {
+                                return false;
+                            }
+                            emitReferenceArgumentTypeCheck(
+                                nativeArgument, called, i, emitNativeLine);
+                        } else {
+                            if (orderedArguments[i].dynamic) {
+                                emitDynamicArgumentTypeCheck(
+                                    orderedArguments[i].value,
+                                    called,
+                                    i,
+                                    emitNativeLine);
+                            }
+                            if (!emitFunctionABIArgument(
+                                    ins,
+                                    orderedArguments[i],
+                                    called.parameterTypes[i],
+                                    nativeArgument,
+                                    ownsDynamicArgument)) {
+                                return false;
+                            }
                         }
-                        callText += functionParameterABIType(called.parameterTypes[i]) +
+                        callText += functionParameterABIType(
+                                        called.parameterTypes[i], byReference) +
                                     " " + nativeArgument;
-                        if (usesZeusValueABI(called.parameterTypes[i])) {
+                        if (!byReference && usesZeusValueABI(called.parameterTypes[i])) {
                             dynamicCallArguments.push_back(nativeArgument);
                             ownsDynamicCallArguments.push_back(ownsDynamicArgument);
                             if (ownsDynamicArgument) {
@@ -7504,7 +7936,7 @@ public:
             functionText += "  " + catchToken + " = catchpad within " + switchToken +
                 " [ptr null, i32 64, ptr null]\n";
             functionText += "  call void @zeus_exception_capture(ptr " + pad.valueSlot +
-                ", ptr @__zeus_make_runtime_error) [ \"funclet\"(token " + catchToken + ") ]\n";
+                ", ptr @__zeus_make_runtime_error, ptr @__zeus_make_type_error) [ \"funclet\"(token " + catchToken + ") ]\n";
             for (const auto& cleanupCall : pad.cleanupCalls) {
                 functionText += "  " + cleanupCall +
                     " [ \"funclet\"(token " + catchToken + ") ]\n";
@@ -7526,7 +7958,7 @@ public:
         if (needsClosureAdapter(ci)) {
         std::string adapterText;
         adapterText += "define void " + closureAdapterSymbol(ci) +
-            "(ptr %out, ptr %env, i32 %argc, ptr %args, ptr %argument.names) {\nentry:\n";
+            "(ptr %out, ptr %env, i32 %argc, ptr %args, ptr %argument.refs, ptr %argument.names) {\nentry:\n";
         std::vector<std::string> adapterArguments;
         adapterArguments.reserve(signature.parameterTypes.size());
         int adapterTmp = 0;
@@ -7539,7 +7971,10 @@ public:
 
         const size_t regularParameterCount = signature.parameterTypes.size();
         if (signature.parameterNames.size() != regularParameterCount) {
-            result.error = "[emit-llvm] closure signature has incomplete parameter-name metadata";
+            result.error = "[emit-llvm] closure signature '" + signature.name +
+                "' has incomplete parameter-name metadata (names=" +
+                std::to_string(signature.parameterNames.size()) + ", parameters=" +
+                std::to_string(regularParameterCount) + ")";
             return false;
         }
 
@@ -7547,6 +7982,12 @@ public:
         if (regularParameterCount != 0) {
             orderedArgumentArray = freshAdapterTmp();
             emitAdapterLine(orderedArgumentArray + " = alloca ptr, i64 " +
+                            std::to_string(regularParameterCount) + ", align 8");
+        }
+        std::string orderedReferenceArray = "null";
+        if (regularParameterCount != 0) {
+            orderedReferenceArray = freshAdapterTmp();
+            emitAdapterLine(orderedReferenceArray + " = alloca ptr, i64 " +
                             std::to_string(regularParameterCount) + ", align 8");
         }
         std::string parameterNameArray = "null";
@@ -7587,8 +8028,9 @@ public:
                 signature.defaultParameterMask)) +
             ", i32 " + std::to_string(signature.hasVariadicArgs ? 1 : 0) +
             ", i32 " + std::to_string(signature.hasVariadicKwargs ? 1 : 0) +
-            ", i32 %argc, ptr %args, ptr %argument.names, ptr " +
-            orderedArgumentArray + ", ptr " + providedMaskStorage +
+            ", i32 %argc, ptr %args, ptr %argument.refs, ptr %argument.names, ptr " +
+            orderedArgumentArray + ", ptr " + orderedReferenceArray +
+            ", ptr " + providedMaskStorage +
             ", ptr " + variadicArgsValue + ", ptr " + variadicKwargsValue + ")");
         const std::string providedMaskValue = freshAdapterTmp();
         emitAdapterLine(providedMaskValue + " = load i64, ptr " +
@@ -7596,13 +8038,38 @@ public:
 
         for (size_t i = 0; i < signature.parameterTypes.size(); ++i) {
             const std::string& declaredType = signature.parameterTypes[i];
-            const std::string abiType = functionParameterABIType(declaredType);
+            const bool byReference = i < signature.parameterIsReference.size() &&
+                signature.parameterIsReference[i];
+            const std::string abiType = functionParameterABIType(
+                declaredType, byReference);
             auto emitProvidedArgument = [&](std::string& nativeArgument) {
                 const std::string slot = freshAdapterTmp();
                 const std::string dynamicArgument = freshAdapterTmp();
                 emitAdapterLine(slot + " = getelementptr inbounds ptr, ptr " +
                                 orderedArgumentArray + ", i64 " + std::to_string(i));
                 emitAdapterLine(dynamicArgument + " = load ptr, ptr " + slot + ", align 8");
+                if (byReference) {
+                    const std::string referenceSlot = freshAdapterTmp();
+                    nativeArgument = freshAdapterTmp();
+                    emitAdapterLine(referenceSlot +
+                        " = getelementptr inbounds ptr, ptr " +
+                        orderedReferenceArray + ", i64 " + std::to_string(i));
+                    emitAdapterLine(nativeArgument + " = load ptr, ptr " +
+                        referenceSlot + ", align 8");
+                    const size_t receiverOffset =
+                        !signature.ownerType.empty() && !signature.isStaticMethod
+                            ? 1 : 0;
+                    const size_t userArgumentIndex = i > receiverOffset
+                        ? i - receiverOffset
+                        : 0;
+                    emitAdapterLine(
+                        "call void @zeus_value_slot_validate_argument_type(ptr " +
+                        nativeArgument + ", ptr " + dynamicArgument + ", ptr " +
+                        poolStr(signature.name) + ", i32 " +
+                        std::to_string(userArgumentIndex) + ", ptr " +
+                        poolStr(declaredType) + ")");
+                    return true;
+                }
                 nativeArgument = dynamicArgument;
                 if (usesZeusValueABI(declaredType)) return true;
 
@@ -7632,8 +8099,8 @@ public:
                             " = call ptr @zeus_value_require_class_ptr(ptr " + dynamicArgument +
                             ", ptr " + typeName + ")");
                     } else {
-                        result.error = "[emit-llvm] closure ABI cannot unbox reference parameter '" +
-                            declaredType + "'";
+                        result.error = "[emit-llvm] dynamic closure ABI cannot pass reference parameter '" +
+                            declaredType + "': it transports ZeusValue arguments, not a caller variable slot";
                         return false;
                     }
                 } else if (expectedType == "ptr" && isClassType(declaredType)) {
@@ -7686,22 +8153,46 @@ public:
 
                 adapterText += missingLabel + ":\n";
                 NativeValue placeholder;
-                if (!emitOptionalArgumentPlaceholder(
-                        declaredType,
-                        placeholder,
-                        emitAdapterLine,
-                        freshAdapterTmp)) {
-                    result.error = "[emit-llvm] closure ABI has no default placeholder for '" +
-                        declaredType + "'";
-                    return false;
+                if (byReference) {
+                    const std::string missingValue = freshAdapterTmp();
+                    emitAdapterLine(missingValue + " = alloca %ZeusValue, align 8");
+                    emitAdapterLine("call void @zeus_value_init_nil(ptr " +
+                                    missingValue + ")");
+                    const size_t receiverOffset =
+                        !signature.ownerType.empty() && !signature.isStaticMethod
+                            ? 1 : 0;
+                    const size_t userArgumentIndex = i > receiverOffset
+                        ? i - receiverOffset
+                        : 0;
+                    emitAdapterLine(
+                        "call void @zeus_value_slot_validate_argument_type(ptr null, ptr " +
+                        missingValue + ", ptr " + poolStr(signature.name) +
+                        ", i32 " + std::to_string(userArgumentIndex) + ", ptr " +
+                        poolStr(declaredType) + ")");
+                    emitAdapterLine("unreachable");
+                } else {
+                    if (!emitOptionalArgumentPlaceholder(
+                            declaredType,
+                            placeholder,
+                            emitAdapterLine,
+                            freshAdapterTmp)) {
+                        result.error = "[emit-llvm] closure ABI has no default placeholder for '" +
+                            declaredType + "'";
+                        return false;
+                    }
+                    emitAdapterLine("br label %" + joinLabel);
                 }
-                emitAdapterLine("br label %" + joinLabel);
 
                 adapterText += joinLabel + ":\n";
                 nativeArgument = freshAdapterTmp();
-                emitAdapterLine(nativeArgument + " = phi " + abiType + " [ " +
-                    providedValue + ", %" + providedLabel + " ], [ " +
-                    placeholder.value + ", %" + missingLabel + " ]");
+                if (byReference) {
+                    emitAdapterLine(nativeArgument + " = phi " + abiType + " [ " +
+                        providedValue + ", %" + providedLabel + " ]");
+                } else {
+                    emitAdapterLine(nativeArgument + " = phi " + abiType + " [ " +
+                        providedValue + ", %" + providedLabel + " ], [ " +
+                        placeholder.value + ", %" + missingLabel + " ]");
+                }
             } else if (!emitProvidedArgument(nativeArgument)) {
                 return false;
             }
@@ -8036,6 +8527,91 @@ public:
             return true;
         };
 
+        auto flushNativeGlobalForReference = [&](int index,
+                                                  const IRType::IRInstr& ins) {
+            auto native = nativeGlobals.find(index);
+            if (native != nativeGlobals.end()) {
+                const NativeValue value = native->second;
+                if (value.type == "i64" && !value.dynamic) {
+                    emitLine("call void @zeus_global_store_i64(i32 " +
+                             std::to_string(index) + ", i64 " + value.value + ")");
+                } else if (value.type == "i1" && !value.dynamic) {
+                    const std::string raw = freshTmp();
+                    emitLine(raw + " = zext i1 " + value.value + " to i32");
+                    emitLine("call void @zeus_global_store_bool(i32 " +
+                             std::to_string(index) + ", i32 " + raw + ")");
+                } else if (isManagedClassValue(value)) {
+                    const std::string boxed = freshTmp();
+                    emitLine(boxed + " = alloca %ZeusValue, align 8");
+                    emitLine("call void @zeus_value_from_class_ptr(ptr " + boxed +
+                             ", ptr " + value.value + ", ptr " +
+                             poolStr(value.sourceType) + ")");
+                    emitLine("call void @zeus_value_global_store(i32 " +
+                             std::to_string(index) + ", ptr " + boxed + ")");
+                } else if (value.dynamic) {
+                    const std::string boxed = freshTmp();
+                    emitLine(boxed + " = alloca %ZeusValue, align 8");
+                    emitLine("call void @zeus_value_init_nil(ptr " + boxed + ")");
+                    emitLine("call void @zeus_value_clone(ptr " + boxed +
+                             ", ptr " + value.value + ")");
+                    emitLine("call void @zeus_value_global_store(i32 " +
+                             std::to_string(index) + ", ptr " + boxed + ")");
+                    if (value.ownsDynamic) {
+                        emitRelease(value.value);
+                    }
+                } else {
+                    failNativeTopLevel(ins,
+                        "[emit-llvm] cannot flush this global representation before passing it by reference");
+                    return false;
+                }
+                if (value.ownsClass && isManagedClassValue(value)) {
+                    emitLine("call void @zeus_class_ref_release(ptr " +
+                             value.value + ")");
+                }
+                nativeGlobals.erase(native);
+            }
+
+            auto slot = nativeGlobalSlots.find(index);
+            if (slot != nativeGlobalSlots.end()) {
+                NativeValue value;
+                value.type = slot->second.type;
+                value.sourceType = slot->second.sourceType;
+                value.value = freshTmp();
+                emitLine(value.value + " = load " + value.type + ", ptr " +
+                         slot->second.address);
+                if (value.type == "i64") {
+                    emitLine("call void @zeus_global_store_i64(i32 " +
+                             std::to_string(index) + ", i64 " + value.value + ")");
+                } else if (value.type == "i1") {
+                    const std::string raw = freshTmp();
+                    emitLine(raw + " = zext i1 " + value.value + " to i32");
+                    emitLine("call void @zeus_global_store_bool(i32 " +
+                             std::to_string(index) + ", i32 " + raw + ")");
+                } else if (isManagedClassValue(value)) {
+                    const std::string boxed = freshTmp();
+                    emitLine(boxed + " = alloca %ZeusValue, align 8");
+                    emitLine("call void @zeus_value_from_class_ptr(ptr " + boxed +
+                             ", ptr " + value.value + ", ptr " +
+                             poolStr(value.sourceType) + ")");
+                    emitLine("call void @zeus_value_global_store(i32 " +
+                             std::to_string(index) + ", ptr " + boxed + ")");
+                    emitLine("call void @zeus_class_ref_release(ptr " +
+                             value.value + ")");
+                } else {
+                    failNativeTopLevel(ins,
+                        "[emit-llvm] cannot flush this global slot before passing it by reference");
+                    return false;
+                }
+                nativeGlobalSlots.erase(slot);
+            }
+
+            nativeGlobalScalarTypes.erase(index);
+            nativeGlobalClassTypes.erase(index);
+            prescanGlobalClassTypes.erase(index);
+            entryDynamicValueGlobals.insert(index);
+            return true;
+        };
+
         std::vector<int64_t> nativeEntryExceptionTarget(chunk.size(), -1);
         std::vector<size_t> nativeEntryExceptionStack;
         std::vector<size_t> nativeEntryCatchStack;
@@ -8263,6 +8839,13 @@ public:
                     }
 
                     std::string nativeArgument;
+                    if (arguments[i].dynamic) {
+                        emitDynamicArgumentTypeCheck(
+                            arguments[i].value,
+                            *nativeDeclaration,
+                            i,
+                            [this](const std::string& line) { emitLine(line); });
+                    }
                     if (usesZeusValueABI(parameterType)) {
                         if (!emitNativeValueAsDynamic(
                                 arguments[i], ins, nativeArgument)) return false;
@@ -8407,29 +8990,71 @@ public:
             }
             std::vector<std::string> dynamicArguments(arguments.size());
             std::vector<bool> ownsDynamicArguments(arguments.size(), false);
-            for (size_t i = 0; i < arguments.size(); ++i) {
-                if (!emitNativeValueAsDynamic(arguments[i], ins, dynamicArguments[i])) {
+            std::vector<std::string> referenceArguments(arguments.size(), "null");
+            std::vector<int> referencedGlobalIndices(arguments.size(), -1);
+            const size_t sourceCount = std::min(
+                arguments.size(), ins.metadata.callArguments.size());
+            for (size_t i = 0; i < sourceCount; ++i) {
+                const auto& source = ins.metadata.callArguments[i];
+                if (!source.isAssignable || source.source.isConst ||
+                    source.source.kind != IRType::SymbolRefKind::Global) {
+                    continue;
+                }
+                if (!flushNativeGlobalForReference(source.source.index, ins)) {
                     return false;
                 }
-                ownsDynamicArguments[i] = arguments[i].dynamic
-                    ? arguments[i].ownsDynamic : true;
+                referencedGlobalIndices[i] = source.source.index;
+                referenceArguments[i] = freshTmp();
+                emitLine(referenceArguments[i] +
+                         " = call ptr @zeus_value_global_slot(i32 " +
+                         std::to_string(source.source.index) + ")");
+            }
+            for (size_t i = 0; i < arguments.size(); ++i) {
+                if (referencedGlobalIndices[i] >= 0) {
+                    dynamicArguments[i] = freshTmp();
+                    emitLine(dynamicArguments[i] + " = alloca %ZeusValue, align 8");
+                    emitLine("call void @zeus_value_init_nil(ptr " +
+                             dynamicArguments[i] + ")");
+                    emitLine("call void @zeus_value_global_load(ptr " +
+                             dynamicArguments[i] + ", i32 " +
+                             std::to_string(referencedGlobalIndices[i]) + ")");
+                    ownsDynamicArguments[i] = true;
+                } else {
+                    if (!emitNativeValueAsDynamic(
+                            arguments[i], ins, dynamicArguments[i])) {
+                        return false;
+                    }
+                    ownsDynamicArguments[i] = arguments[i].dynamic
+                        ? arguments[i].ownsDynamic : true;
+                }
             }
             std::string argumentArray = "null";
+            std::string argumentReferenceArray = "null";
             std::string argumentNameArray = "null";
             if (!dynamicArguments.empty()) {
                 argumentArray = freshTmp();
+                argumentReferenceArray = freshTmp();
                 argumentNameArray = freshTmp();
                 emitLine(argumentArray + " = alloca ptr, i64 " +
+                         std::to_string(dynamicArguments.size()) + ", align 8");
+                emitLine(argumentReferenceArray + " = alloca ptr, i64 " +
                          std::to_string(dynamicArguments.size()) + ", align 8");
                 emitLine(argumentNameArray + " = alloca ptr, i64 " +
                          std::to_string(dynamicArguments.size()) + ", align 8");
                 for (size_t i = 0; i < dynamicArguments.size(); ++i) {
                     const std::string slot = freshTmp();
+                    const std::string referenceSlot = freshTmp();
                     const std::string nameSlot = freshTmp();
                     emitLine(slot + " = getelementptr inbounds ptr, ptr " +
                              argumentArray + ", i64 " + std::to_string(i));
                     emitLine("store ptr " + dynamicArguments[i] + ", ptr " + slot +
                              ", align 8");
+                    emitLine(referenceSlot +
+                             " = getelementptr inbounds ptr, ptr " +
+                             argumentReferenceArray + ", i64 " +
+                             std::to_string(i));
+                    emitLine("store ptr " + referenceArguments[i] +
+                             ", ptr " + referenceSlot + ", align 8");
                     emitLine(nameSlot + " = getelementptr inbounds ptr, ptr " +
                              argumentNameArray + ", i64 " + std::to_string(i));
                     if (arguments[i].namedArgument.empty()) {
@@ -8450,7 +9075,8 @@ public:
             emitLine("call void @zeus_closure_call_named(ptr " + output + ", ptr " +
                      callee.value + ", i32 " +
                      std::to_string(dynamicArguments.size()) + ", ptr " +
-                     argumentArray + ", ptr " + argumentNameArray + ")");
+                     argumentArray + ", ptr " + argumentReferenceArray +
+                     ", ptr " + argumentNameArray + ")");
             for (size_t i = 0; i < dynamicArguments.size(); ++i) {
                 if (ownsDynamicArguments[i]) emitRelease(dynamicArguments[i]);
             }
@@ -8528,6 +9154,13 @@ public:
                 std::vector<bool> ownsDynamicArguments;
                 for (size_t i = 0; i < 2; ++i) {
                     const std::string& parameterType = signature.parameterTypes[i];
+                    if (arguments[i].dynamic) {
+                        emitDynamicArgumentTypeCheck(
+                            arguments[i].value,
+                            signature,
+                            i,
+                            [this](const std::string& line) { emitLine(line); });
+                    }
                     if (usesZeusValueABI(parameterType)) {
                         if (!emitNativeValueAsDynamic(
                                 arguments[i], ins, nativeArguments[i])) {
@@ -10210,7 +10843,16 @@ public:
                         std::vector<std::string> dynamicArguments;
                         std::vector<bool> ownsDynamicArguments;
                         for (size_t i = 0; i < function->second.parameterTypes.size(); ++i) {
+                            const bool byReference =
+                                i < function->second.parameterIsReference.size() &&
+                                function->second.parameterIsReference[i];
                             if (!providedArguments[i]) {
+                                if (byReference) {
+                                    failNativeTopLevel(ins,
+                                        "[emit-llvm] a reference parameter cannot use a default argument");
+                                    rollback();
+                                    return false;
+                                }
                                 NativeValue placeholder;
                                 if (!emitOptionalArgumentPlaceholder(
                                         function->second.parameterTypes[i], placeholder,
@@ -10231,17 +10873,63 @@ public:
                             std::string nativeArgument;
                             const std::string& parameterType =
                                 function->second.parameterTypes[i];
-                            if (usesZeusValueABI(parameterType)) {
-                                if (!emitNativeValueAsDynamic(
-                                        orderedArguments[i], ins, nativeArgument)) {
+                            if (byReference) {
+                                const std::string parameterName = i <
+                                        function->second.parameterNames.size()
+                                    ? function->second.parameterNames[i]
+                                    : std::string();
+                                const IRType::CallArgumentSource* source = nullptr;
+                                for (const auto& candidate : ins.metadata.callArguments) {
+                                    const bool matches = candidate.namedParameter.empty()
+                                        ? candidate.positionalIndex == static_cast<int>(i)
+                                        : candidate.namedParameter == parameterName;
+                                    if (matches) {
+                                        source = &candidate;
+                                        break;
+                                    }
+                                }
+                                if (!source || !source->isAssignable ||
+                                    source->source.kind != IRType::SymbolRefKind::Global ||
+                                    source->source.isConst) {
+                                    failNativeTopLevel(ins,
+                                        "[emit-llvm] a top-level reference argument must be a mutable global variable");
                                     rollback();
                                     return false;
                                 }
-                                dynamicArguments.push_back(nativeArgument);
-                                ownsDynamicArguments.push_back(
-                                    orderedArguments[i].dynamic ? orderedArguments[i].ownsDynamic : true);
+                                if (!flushNativeGlobalForReference(
+                                        source->source.index, ins)) {
+                                    rollback();
+                                    return false;
+                                }
+                                nativeArgument = freshTmp();
+                                emitLine(nativeArgument +
+                                    " = call ptr @zeus_value_global_slot(i32 " +
+                                    std::to_string(source->source.index) + ")");
+                                emitReferenceArgumentTypeCheck(
+                                    nativeArgument,
+                                    function->second,
+                                    i,
+                                    [this](const std::string& line) { emitLine(line); });
                             } else {
-                                if (!emitNativeValueAsType(
+                                if (orderedArguments[i].dynamic) {
+                                    emitDynamicArgumentTypeCheck(
+                                        orderedArguments[i].value,
+                                        function->second,
+                                        i,
+                                        [this](const std::string& line) { emitLine(line); });
+                                }
+                                if (usesZeusValueABI(parameterType)) {
+                                    if (!emitNativeValueAsDynamic(
+                                            orderedArguments[i], ins, nativeArgument)) {
+                                        rollback();
+                                        return false;
+                                    }
+                                    dynamicArguments.push_back(nativeArgument);
+                                    ownsDynamicArguments.push_back(
+                                        orderedArguments[i].dynamic
+                                            ? orderedArguments[i].ownsDynamic
+                                            : true);
+                                } else if (!emitNativeValueAsType(
                                         orderedArguments[i], llvmType(parameterType), ins,
                                         nativeArgument, parameterType)) {
                                     rollback();
@@ -10264,7 +10952,9 @@ public:
                         for (size_t i = 0; i < nativeArguments.size(); ++i) {
                             if (i > 0 || returnsDynamic) callText += ", ";
                             callText += functionParameterABIType(
-                                            function->second.parameterTypes[i]) +
+                                            function->second.parameterTypes[i],
+                                            i < function->second.parameterIsReference.size() &&
+                                                function->second.parameterIsReference[i]) +
                                         " " + nativeArguments[i];
                         }
                         std::string packedArgs;
@@ -11518,6 +12208,35 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
         }
         runtimeErrorMessageField = static_cast<size_t>(message - names.begin());
         runtimeErrorTypeField = static_cast<size_t>(type - names.begin());
+
+        const auto typeErrorLayout = e.classLayouts.find("TypeError");
+        if (typeErrorLayout == e.classLayouts.end() ||
+            typeErrorLayout->second.fieldNames.size() != 2 ||
+            typeErrorLayout->second.fieldTypes.size() != 2) {
+            res.ok = false;
+            res.error = "[emit-llvm] TypeError class must have _message and _type string fields";
+            return res;
+        }
+        const auto& typeErrorNames = typeErrorLayout->second.fieldNames;
+        const auto typeErrorMessage = std::find(
+            typeErrorNames.begin(), typeErrorNames.end(), "_message");
+        const auto typeErrorType = std::find(
+            typeErrorNames.begin(), typeErrorNames.end(), "_type");
+        if (typeErrorMessage == typeErrorNames.end() ||
+            typeErrorType == typeErrorNames.end() ||
+            typeErrorMessage == typeErrorType ||
+            e.llvmFieldType(typeErrorLayout->second.fieldTypes[
+                typeErrorMessage - typeErrorNames.begin()]) != "ptr" ||
+            e.llvmFieldType(typeErrorLayout->second.fieldTypes[
+                typeErrorType - typeErrorNames.begin()]) != "ptr") {
+            res.ok = false;
+            res.error = "[emit-llvm] TypeError fields have incompatible LLVM types";
+            return res;
+        }
+        typeErrorMessageField = static_cast<size_t>(
+            typeErrorMessage - typeErrorNames.begin());
+        typeErrorTypeField = static_cast<size_t>(
+            typeErrorType - typeErrorNames.begin());
     }
 
     // 组装：声明+ 字符串池 + 入口。
@@ -11564,12 +12283,15 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
     out += "declare void @zeus_value_print_call(ptr, i32, ptr)\n";
     out += "declare void @zeus_value_native_call(ptr, ptr, i32, ptr)\n";
     out += "declare void @zeus_dynamic_member_register(ptr, ptr, ptr)\n";
+    out += "declare void @zeus_dynamic_field_register(ptr, ptr, ptr)\n";
+    out += "declare void @zeus_value_dynamic_field_load(ptr, ptr, ptr, i32)\n";
     out += "declare i32 @zeus_value_try_dynamic_member_call(ptr, ptr, ptr, i32, ptr)\n";
     out += "declare void @zeus_value_dynamic_member_call(ptr, ptr, ptr, i32, ptr)\n";
     out += "declare void @zeus_dynamic_member_arity_error(ptr, i32, i32)\n";
     out += "declare void @zeus_dynamic_member_arity_range_error(ptr, i32, i32, i32)\n";
     out += "declare void @zeus_value_global_store(i32, ptr)\n";
     out += "declare void @zeus_value_global_load(ptr, i32)\n";
+    out += "declare ptr @zeus_value_global_slot(i32)\n";
     out += "declare void @zeus_global_clear(i32)\n";
     out += "declare void @zeus_value_global_delete(i32)\n";
     out += "declare void @zeus_value_local_delete(i32)\n";
@@ -11590,15 +12312,24 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
     out += "declare void @zeus_capture_cell_release(ptr)\n";
     out += "declare void @zeus_capture_cell_load(ptr, ptr)\n";
     out += "declare void @zeus_capture_cell_store(ptr, ptr)\n";
+    out += "declare ptr @zeus_capture_cell_value_slot(ptr)\n";
+    out += "declare ptr @zeus_closure_env_value_slot(ptr, i32)\n";
+    out += "declare void @zeus_value_slot_load(ptr, ptr)\n";
+    out += "declare i64 @zeus_value_slot_load_i64(ptr)\n";
+    out += "declare i32 @zeus_value_slot_load_bool(ptr)\n";
+    out += "declare void @zeus_value_slot_store(ptr, ptr)\n";
+    out += "declare void @zeus_value_slot_store_i64(ptr, i64)\n";
+    out += "declare void @zeus_value_slot_store_bool(ptr, i32)\n";
+    out += "declare void @zeus_value_slot_validate_argument_type(ptr, ptr, ptr, i32, ptr)\n";
     out += "declare void @zeus_capture_cell_delete(ptr)\n";
     out += "declare ptr @zeus_closure_capture_ref(ptr, i32)\n";
     out += "declare ptr @zeus_closure_capture_copy(ptr, i32)\n";
     out += "declare void @zeus_closure_env_delete(ptr, i32)\n";
     out += "declare void @zeus_closure_create(ptr, ptr, i32, i32, ptr)\n";
     out += "declare void @zeus_closure_create_range(ptr, ptr, i32, i32, i32, ptr)\n";
-    out += "declare void @zeus_closure_call(ptr, ptr, i32, ptr)\n";
-    out += "declare void @zeus_closure_call_named(ptr, ptr, i32, ptr, ptr)\n";
-    out += "declare void @zeus_closure_bind_arguments(i32, ptr, i64, i32, i32, i32, ptr, ptr, ptr, ptr, ptr, ptr)\n";
+    out += "declare void @zeus_closure_call(ptr, ptr, i32, ptr, ptr)\n";
+    out += "declare void @zeus_closure_call_named(ptr, ptr, i32, ptr, ptr, ptr)\n";
+    out += "declare void @zeus_closure_bind_arguments(i32, ptr, i64, i32, i32, i32, ptr, ptr, ptr, ptr, ptr, ptr, ptr, ptr)\n";
     out += "declare void @zeus_closure_env_load(ptr, ptr, i32)\n";
     out += "declare void @zeus_closure_env_store(ptr, i32, ptr)\n";
     out += "declare void @zeus_gc_collect()\n";
@@ -11611,7 +12342,8 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
     out += "declare void @zeus_class_field_require_initialized(i32, ptr, ptr, i32)\n";
     out += "declare void @zeus_exception_raise(ptr)\n";
     out += "declare void @zeus_exception_raise_owned(ptr)\n";
-    out += "declare void @zeus_exception_capture(ptr, ptr)\n";
+    out += "declare void @zeus_exception_capture(ptr, ptr, ptr)\n";
+    out += "declare void @zeus_value_validate_argument_type(ptr, ptr, i32, ptr)\n";
     out += "declare void @zeus_i64_check_division(i64, i64, i32)\n";
     out += "declare i32 @__CxxFrameHandler3(...)\n";
     out += "declare void @llvm.trap()\n\n";
@@ -11670,6 +12402,30 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
         out += "  %type.view = call ptr @zeus_string_view_from_data(ptr @.zeus_runtime_error_type, i64 12)\n";
         out += "  store ptr %type.view, ptr %type.field\n";
         out += "  call void @zeus_value_from_class_ptr(ptr %out, ptr %object, ptr @.zeus_runtime_error_type)\n";
+        out += "  ret void\n";
+        out += "}\n\n";
+
+        out += "@.zeus_type_error_type = private unnamed_addr constant [10 x i8] c\"TypeError\\00\", align 1\n\n";
+        out += "define void @__zeus_make_type_error(ptr %out, ptr %message, i64 %length) {\n";
+        out += "entry:\n";
+        out += "  %size.ptr = getelementptr %zeus_TypeError, ptr null, i32 1\n";
+        out += "  %size = ptrtoint ptr %size.ptr to i64\n";
+        out += "  %object = call ptr @malloc(i64 %size)\n";
+        out += "  %failed = icmp eq ptr %object, null\n";
+        out += "  br i1 %failed, label %out.of.memory, label %ready\n";
+        out += "out.of.memory:\n";
+        out += "  call void @llvm.trap()\n";
+        out += "  unreachable\n";
+        out += "ready:\n";
+        out += "  %message.field = getelementptr inbounds %zeus_TypeError, ptr %object, i32 0, i32 " +
+            std::to_string(typeErrorMessageField) + "\n";
+        out += "  %message.view = call ptr @zeus_string_view_from_data(ptr %message, i64 %length)\n";
+        out += "  store ptr %message.view, ptr %message.field\n";
+        out += "  %type.field = getelementptr inbounds %zeus_TypeError, ptr %object, i32 0, i32 " +
+            std::to_string(typeErrorTypeField) + "\n";
+        out += "  %type.view = call ptr @zeus_string_view_from_data(ptr @.zeus_type_error_type, i64 9)\n";
+        out += "  store ptr %type.view, ptr %type.field\n";
+        out += "  call void @zeus_value_from_class_ptr(ptr %out, ptr %object, ptr @.zeus_type_error_type)\n";
         out += "  ret void\n";
         out += "}\n\n";
     }
@@ -11784,7 +12540,7 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
         out += "  " + catchToken + " = catchpad within " + switchToken +
             " [ptr null, i32 64, ptr null]\n";
         out += "  call void @zeus_exception_capture(ptr " + pad.valueSlot +
-            ", ptr @__zeus_make_runtime_error) [ \"funclet\"(token " + catchToken + ") ]\n";
+            ", ptr @__zeus_make_runtime_error, ptr @__zeus_make_type_error) [ \"funclet\"(token " + catchToken + ") ]\n";
         out += "  catchret from " + catchToken + " to label " + pad.resumeLabel + "\n";
         out += pad.resumeLabel.substr(1) + ":\n";
         out += "  br label " + detail::Emitter::labelFor(pad.catchChunk, pad.catchPc) + "\n";

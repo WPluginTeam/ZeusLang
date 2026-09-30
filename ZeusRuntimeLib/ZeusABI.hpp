@@ -52,6 +52,7 @@ typedef enum ZeusValueTag {
     ZEUS_VALUE_TAG_STRING = 5,
     ZEUS_VALUE_TAG_REF_INT64 = 6,
     ZEUS_VALUE_TAG_REF_BOOL = 7,
+    ZEUS_VALUE_TAG_DELETED = 8,
     ZEUS_VALUE_TAG_BOXED = 255
 } ZeusValueTag;
 
@@ -82,12 +83,14 @@ typedef struct ZeusBytesView {
 
 // Native closure ABI used by LLVM-generated functions. Captured values are
 // held in reference-counted cells; copy captures allocate a new cell at closure
-// creation while reference captures retain the parent's cell.
+// creation while reference captures retain the parent's cell. Argument values
+// and optional variable references are borrowed for the synchronous call.
 typedef void (*ZeusClosureInvoke)(
     ZeusValue* out,
     void* environment,
     int32_t argc,
     const ZeusValue* const* values,
+    ZeusValue* const* reference_slots,
     const char* const* argument_names
 );
 void* zeus_capture_cell_create(const ZeusValue* initial);
@@ -96,6 +99,13 @@ void* zeus_capture_cell_retain(void* cell);
 void zeus_capture_cell_release(void* cell);
 void zeus_capture_cell_load(ZeusValue* out, void* cell);
 void zeus_capture_cell_store(void* cell, const ZeusValue* value);
+ZeusValue* zeus_capture_cell_value_slot(void* cell);
+void zeus_value_slot_load(ZeusValue* out, const ZeusValue* slot);
+int64_t zeus_value_slot_load_i64(const ZeusValue* slot);
+int32_t zeus_value_slot_load_bool(const ZeusValue* slot);
+void zeus_value_slot_store(ZeusValue* slot, const ZeusValue* value);
+void zeus_value_slot_store_i64(ZeusValue* slot, int64_t value);
+void zeus_value_slot_store_bool(ZeusValue* slot, int32_t value);
 void zeus_capture_cell_delete(void* cell);
 void* zeus_closure_capture_ref(void* environment, int32_t index);
 void* zeus_closure_capture_copy(void* environment, int32_t index);
@@ -118,15 +128,19 @@ void zeus_closure_call(
     ZeusValue* out,
     const ZeusValue* closure,
     int32_t argc,
-    const ZeusValue* const* values
+    const ZeusValue* const* values,
+    ZeusValue* const* reference_slots
 );
 void zeus_closure_call_named(
     ZeusValue* out,
     const ZeusValue* closure,
     int32_t argc,
     const ZeusValue* const* values,
+    ZeusValue* const* reference_slots,
     const char* const* argument_names
 );
+// Reference entries are null for rvalues and point directly to stable mutable
+// ZeusValue slots for assignable variables. They are borrowed for this call.
 void zeus_closure_bind_arguments(
     int32_t parameter_count,
     const char* const* parameter_names,
@@ -135,14 +149,17 @@ void zeus_closure_bind_arguments(
     int32_t has_variadic_kwargs,
     int32_t argc,
     const ZeusValue* const* values,
+    ZeusValue* const* reference_slots,
     const char* const* argument_names,
     const ZeusValue** ordered_values,
+    ZeusValue** ordered_reference_slots,
     uint64_t* provided_mask,
     ZeusValue* variadic_args,
     ZeusValue* variadic_kwargs
 );
 void zeus_closure_env_load(ZeusValue* out, void* environment, int32_t index);
 void zeus_closure_env_store(void* environment, int32_t index, const ZeusValue* value);
+ZeusValue* zeus_closure_env_value_slot(void* environment, int32_t index);
 void zeus_closure_env_delete(void* environment, int32_t index);
 
 // Dynamic variadic call ABI. Arguments are borrowed ZeusValue pointers for the
@@ -180,9 +197,26 @@ void zeus_class_field_require_initialized(
 void zeus_exception_raise(const ZeusValue* value) noexcept(false);
 void zeus_exception_raise_owned(ZeusValue* value) noexcept(false);
 using ZeusRuntimeErrorFactory = void (*)(ZeusValue*, const char*, int64_t);
-void zeus_exception_capture(ZeusValue* out, ZeusRuntimeErrorFactory factory) noexcept(false);
+void zeus_exception_capture(
+    ZeusValue* out,
+    ZeusRuntimeErrorFactory runtime_factory,
+    ZeusRuntimeErrorFactory type_error_factory
+) noexcept(false);
 void zeus_exception_report_current() noexcept;
 void zeus_i64_check_division(int64_t left, int64_t right, int32_t line) noexcept(false);
+void zeus_value_validate_argument_type(
+    const ZeusValue* value,
+    const char* function_name,
+    int32_t argument_index,
+    const char* expected_type
+) noexcept(false);
+void zeus_value_slot_validate_argument_type(
+    const ZeusValue* slot,
+    const ZeusValue* value,
+    const char* function_name,
+    int32_t argument_index,
+    const char* expected_type
+) noexcept(false);
 int64_t zeus_value_require_i64(const ZeusValue* value);
 int32_t zeus_value_require_bool(const ZeusValue* value);
 const ZeusStringView* zeus_value_intern_string_view(const ZeusValue* value);
@@ -271,6 +305,7 @@ void zeus_value_native_call(
 );
 void zeus_value_global_store(int idx, ZeusValue* value);
 void zeus_value_global_load(ZeusValue* out, int idx);
+ZeusValue* zeus_value_global_slot(int idx);
 void zeus_global_clear(int idx);
 void zeus_value_global_delete(int idx);
 void zeus_value_local_store(int idx, ZeusValue* value);

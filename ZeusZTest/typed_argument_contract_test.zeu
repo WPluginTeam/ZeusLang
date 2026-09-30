@@ -1,0 +1,27 @@
+func require_int(value: int) {
+    return value;
+}
+
+func forward_int(value) {
+    require_int(value);
+    return nil;
+}
+
+func require_string(value: string) {
+    print(value);
+    return value;
+}
+
+func forward_string(value) {
+    require_string(value);
+    return nil;
+}
+
+forward_string("boxed-string");
+
+try {
+    forward_int("wrong-type");
+} catch (&error) {
+    print(error.getType());
+    print(error.getMessage());
+}
