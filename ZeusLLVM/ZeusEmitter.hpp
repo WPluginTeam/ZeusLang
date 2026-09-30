@@ -36,6 +36,7 @@
 #include "ZeusDynamicABI.hpp"
 #include "ZeusDynamicBinaryABI.hpp"
 #include "ZeusDynamicMemberBridge.hpp"
+#include "ZeusDynamicFieldBridge.hpp"
 #include "ZeusContainerABI.hpp"
 #include "../ZeusRuntimeLib/ZeusRangeCheckABI.hpp"
 
@@ -650,6 +651,8 @@ public:
     bool needsRuntimeErrorFactory = false;
     std::string externalDeclarations;
     DynamicMemberBridge::GeneratedIR dynamicMemberBridge;
+    DynamicFieldBridge::GeneratedIR dynamicFieldBridge;
+    std::set<std::string> dynamicFieldLoads;
 
     struct ClosureCaptureDescriptor {
         std::string sourceKind;
@@ -1165,6 +1168,8 @@ public:
         namespaceExportsByPackage.clear();
         dynamicMemberMethodNames.clear();
         dynamicMemberBridge = {};
+        dynamicFieldBridge = {};
+        dynamicFieldLoads.clear();
         structTypes.clear();
         classLayouts.clear();
         externalDeclarations.clear();
@@ -2060,6 +2065,54 @@ public:
         dynamicMemberBridge = DynamicMemberBridge::generate(bindings, rules);
         if (!dynamicMemberBridge.error.empty()) {
             result.error = "[emit-llvm] " + dynamicMemberBridge.error;
+            return false;
+        }
+        return true;
+    }
+
+    bool buildDynamicFieldBridge() {
+        std::vector<DynamicFieldBridge::FieldBinding> bindings;
+        for (const std::string& fieldName : dynamicFieldLoads) {
+            for (const auto& entry : classLayouts) {
+                const ClassLayout& layout = entry.second;
+                const int fieldIndex = findFieldIndex(layout, fieldName);
+                if (fieldIndex < 0 ||
+                    static_cast<size_t>(fieldIndex) >= layout.fieldTypes.size()) {
+                    continue;
+                }
+
+                DynamicFieldBridge::FieldBinding binding;
+                binding.typeName = entry.first;
+                binding.fieldName = fieldName;
+                binding.fieldTypeName =
+                    layout.fieldTypes[static_cast<size_t>(fieldIndex)];
+                binding.fieldIndex = static_cast<size_t>(fieldIndex);
+                const auto initializedFlag = layout.inferredFieldFlags.find(fieldName);
+                if (initializedFlag != layout.inferredFieldFlags.end()) {
+                    binding.hasInitializationFlag = true;
+                    binding.initializationFlagIndex = initializedFlag->second;
+                }
+                bindings.push_back(std::move(binding));
+            }
+        }
+
+        DynamicFieldBridge::TypeRules rules;
+        rules.llvmFieldType = [this](const std::string& typeName) {
+            return llvmFieldType(typeName);
+        };
+        rules.llvmStructType = [this](const std::string& typeName) {
+            return llvmStructType(typeName);
+        };
+        rules.usesZeusValueABI = [this](const std::string& typeName) {
+            return usesZeusValueABI(typeName);
+        };
+        rules.isClassType = [this](const std::string& typeName) {
+            return isClassType(typeName);
+        };
+
+        dynamicFieldBridge = DynamicFieldBridge::generate(bindings, rules);
+        if (!dynamicFieldBridge.error.empty()) {
+            result.error = "[emit-llvm] " + dynamicFieldBridge.error;
             return false;
         }
         return true;
@@ -6553,12 +6606,30 @@ public:
                     if (!popNative(ins, object) || object.functionRef) {
                         return failNative(ins, "[emit-llvm] 原生函数字段读取的对象无效");
                     }
+                    const std::string& fieldName = std::get<std::string>(ins.args[0]);
+                    if (object.dynamic && object.type == "ptr") {
+                        dynamicFieldLoads.insert(fieldName);
+                        const std::string loaded = freshNativeTmp();
+                        const std::string fieldSymbol = poolStr(fieldName);
+                        emitNativeLine(loaded + " = alloca %ZeusValue, align 8");
+                        emitNativeLine("call void @zeus_value_dynamic_field_load(ptr " +
+                                       loaded + ", ptr " + object.value + ", ptr " +
+                                       fieldSymbol + ", i32 " +
+                                       std::to_string(ins.line > 0 ? ins.line : 0) + ")");
+                        if (object.ownsDynamic) {
+                            emitNativeLine("call void @zeus_value_release(ptr " +
+                                           object.value + ")");
+                        }
+                        valueStack.push_back(NativeValue{
+                            loaded, "ptr", false, true, std::string(), true
+                        });
+                        break;
+                    }
                     if (isManagedClassValue(object)) {
                         emitNativeLine("call void @zeus_class_ref_require_live(ptr " +
                                        object.value + ")");
                     }
 
-                    const std::string& fieldName = std::get<std::string>(ins.args[0]);
                     if (object.type == "namespace") {
                         const auto exports =
                             namespaceExportsByPackage.find(object.sourceType);
@@ -9820,12 +9891,29 @@ public:
                         rollback();
                         return false;
                     }
+                    const std::string& memberName =
+                        std::get<std::string>(ins.args[0]);
+                    if (object.dynamic && object.type == "ptr") {
+                        dynamicFieldLoads.insert(memberName);
+                        const std::string loaded = freshTmp();
+                        emitLine(loaded + " = alloca %ZeusValue, align 8");
+                        emitLine("call void @zeus_value_dynamic_field_load(ptr " +
+                                 loaded + ", ptr " + object.value + ", ptr " +
+                                 poolStr(memberName) + ", i32 " +
+                                 std::to_string(ins.line > 0 ? ins.line : 0) + ")");
+                        if (object.ownsDynamic) {
+                            emitLine("call void @zeus_value_release(ptr " +
+                                     object.value + ")");
+                        }
+                        valueStack.push_back(NativeValue{
+                            loaded, "ptr", false, true, std::string(), true
+                        });
+                        break;
+                    }
                     if (isManagedClassValue(object)) {
                         emitLine("call void @zeus_class_ref_require_live(ptr " +
                                  object.value + ")");
                     }
-                    const std::string& memberName =
-                        std::get<std::string>(ins.args[0]);
                     if (object.type == "namespace") {
                         const auto exports =
                             namespaceExportsByPackage.find(object.sourceType);
@@ -12184,9 +12272,18 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
         res.warnings = e.result.warnings;
         return res;
     }
+    if (!e.buildDynamicFieldBridge()) {
+        res.ok = false;
+        res.error = e.result.error;
+        res.errorLine = e.result.errorLine;
+        res.warnings = e.result.warnings;
+        return res;
+    }
 
     size_t runtimeErrorMessageField = 0;
     size_t runtimeErrorTypeField = 0;
+    size_t typeErrorMessageField = 0;
+    size_t typeErrorTypeField = 0;
     if (e.needsRuntimeErrorFactory) {
         const auto layout = e.classLayouts.find("RuntimeError");
         if (layout == e.classLayouts.end() || layout->second.fieldNames.size() != 2 ||
@@ -12378,6 +12475,8 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
     if (!e.strPool.empty()) out += "\n";
     out += e.dynamicMemberBridge.constants;
     if (!e.dynamicMemberBridge.constants.empty()) out += "\n";
+    out += e.dynamicFieldBridge.constants;
+    if (!e.dynamicFieldBridge.constants.empty()) out += "\n";
 
     out += e.externalDeclarations;
     if (e.needsRuntimeErrorFactory) {
@@ -12432,6 +12531,7 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
     out += e.emitClassLifetimeFinalizers();
     out += e.nativeFunctions;
     out += e.dynamicMemberBridge.adapters;
+    out += e.dynamicFieldBridge.adapters;
 
     out += "define i32 @zeus_entry() personality ptr @__CxxFrameHandler3 {\nentry:\n";
     // The top-level statements all end up in this one function, so their
@@ -12443,6 +12543,9 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
     out += hoistedAllocas;
     if (!e.dynamicMemberBridge.empty()) {
         out += "  call void @__zeus_register_dynamic_members()\n";
+    }
+    if (!e.dynamicFieldBridge.empty()) {
+        out += "  call void @__zeus_register_dynamic_fields()\n";
     }
     out += "  br label %L0_0\n";
     out += hoistedBody;

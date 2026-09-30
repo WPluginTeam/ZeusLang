@@ -17,6 +17,7 @@ namespace IRStaticOperator {
         std::string ownerType;
         std::string operatorSymbol;
         std::vector<std::string> parameterTypes;
+        bool isStaticMethod = false;
     };
 
     struct ClassLayout {
@@ -134,6 +135,7 @@ namespace IRStaticOperator {
         ) const {
             if (lhsType.empty() || rhsType.empty()) return nullptr;
 
+            const FunctionSignature* untypedRightOperandMatch = nullptr;
             for (const auto& entry : functions) {
                 const auto& signature = entry.second;
                 if (signature.ownerType != lhsType ||
@@ -142,15 +144,21 @@ namespace IRStaticOperator {
                     continue;
                 }
 
-                if (signature.parameterTypes[0] != lhsType ||
-                    signature.parameterTypes[1] != rhsType) {
+                // Class operators may declare the VM-injected receiver as an
+                // ordinary, untyped first parameter (`func operator[+](this,
+                // other)`). Its owner metadata still proves the receiver type.
+                if ((!signature.parameterTypes[0].empty() &&
+                     signature.parameterTypes[0] != lhsType) ||
+                    (!signature.parameterTypes[1].empty() &&
+                     signature.parameterTypes[1] != rhsType)) {
                     continue;
                 }
 
-                return &signature;
+                if (signature.parameterTypes[1] == rhsType) return &signature;
+                untypedRightOperandMatch = &signature;
             }
 
-            return nullptr;
+            return untypedRightOperandMatch;
         }
 
         const FunctionSignature* findIndexOperator(
@@ -178,6 +186,35 @@ namespace IRStaticOperator {
                     }
                 }
                 if (matches) return &signature;
+            }
+            return nullptr;
+        }
+
+        const FunctionSignature* findClassMethod(
+            const std::string& ownerType,
+            const std::string& methodName,
+            size_t argumentCount,
+            bool staticMethod
+        ) const {
+            const std::string prefix = ownerType + "::";
+            for (const auto& entry : functions) {
+                const FunctionSignature& signature = entry.second;
+                if (signature.ownerType != ownerType ||
+                    signature.isStaticMethod != staticMethod ||
+                    signature.name.rfind(prefix, 0) != 0 ||
+                    signature.name.substr(prefix.size()) != methodName) {
+                    continue;
+                }
+                const size_t receiverCount = staticMethod ? 0 : 1;
+                if (signature.parameterTypes.size() < argumentCount + receiverCount) {
+                    continue;
+                }
+                if (!staticMethod &&
+                    (signature.parameterTypes.empty() ||
+                     signature.parameterTypes.front() != ownerType)) {
+                    continue;
+                }
+                return &signature;
             }
             return nullptr;
         }
@@ -234,6 +271,7 @@ namespace IRStaticOperator {
                             &signature.operatorSymbol)) {
                         continue;
                     }
+                    signature.isStaticMethod = ins.metadata.isStaticMethod;
 
                     functions[signature.name] = std::move(signature);
                 }
@@ -290,9 +328,36 @@ namespace IRStaticOperator {
                 return result;
             };
 
+            auto readOperandCount = [](
+                const IRType::IRInstr& instruction,
+                size_t argumentIndex,
+                int64_t& count
+            ) {
+                if (argumentIndex >= instruction.args.size() ||
+                    !std::holds_alternative<LexerType::Value>(
+                        instruction.args[argumentIndex])) {
+                    return false;
+                }
+                const auto& value = std::get<LexerType::Value>(
+                    instruction.args[argumentIndex]);
+                return std::holds_alternative<ZeusType::BigInteger>(value.data) &&
+                    std::get<ZeusType::BigInteger>(value.data).tryToInt64(count) &&
+                    count >= 0;
+            };
+
+            auto popValues = [&](int64_t count) {
+                if (count < 0 || static_cast<uint64_t>(count) > stack.size()) {
+                    stack.clear();
+                    return false;
+                }
+                for (int64_t i = 0; i < count; ++i) popType();
+                return true;
+            };
+
             for (auto& ins : chunk) {
                 if (ins.op == VMOperator::IR_ANNOTATION) {
-                    if (ins.metadata.kind == IRType::IRMetadataKind::DirectCall) {
+                    if (ins.metadata.kind == IRType::IRMetadataKind::DirectCall ||
+                        ins.metadata.kind == IRType::IRMetadataKind::CallTarget) {
                         ins.metadata.readDirectCall(pendingDirectCall);
                     }
                     continue;
@@ -313,6 +378,56 @@ namespace IRStaticOperator {
                 if (ins.op == VMOperator::PUSH && !ins.args.empty() &&
                     std::holds_alternative<IRType::NullLiteral>(ins.args[0])) {
                     stack.push_back("nil");
+                    continue;
+                }
+
+                if (ins.op == VMOperator::OBJ_BUILD ||
+                    ins.op == VMOperator::OBJ_BUILD_SHARED ||
+                    ins.op == VMOperator::NEW_OBJ) {
+                    int64_t argumentCount = 0;
+                    if (!readOperandCount(ins, 0, argumentCount) ||
+                        !popValues(argumentCount)) {
+                        continue;
+                    }
+                    std::string classType = popType();
+                    if (ins.args.size() > 1 &&
+                        std::holds_alternative<std::string>(ins.args[1])) {
+                        const std::string& explicitType = std::get<std::string>(ins.args[1]);
+                        if (classLayouts.find(explicitType) != classLayouts.end()) {
+                            classType = explicitType;
+                        }
+                    }
+                    const std::string classPrefix = "class:";
+                    if (classType.rfind(classPrefix, 0) == 0) {
+                        classType.erase(0, classPrefix.size());
+                    }
+                    stack.push_back(classLayouts.find(classType) == classLayouts.end()
+                        ? std::string() : classType);
+                    continue;
+                }
+
+                if (ins.op == VMOperator::OBJ_CALL_METHOD) {
+                    int64_t argumentCount = 0;
+                    if (ins.args.empty() ||
+                        !std::holds_alternative<std::string>(ins.args[0]) ||
+                        !readOperandCount(ins, 1, argumentCount)) {
+                        stack.clear();
+                        continue;
+                    }
+                    if (!popValues(argumentCount)) continue;
+                    const std::string receiverType = popType();
+                    const std::string classPrefix = "class:";
+                    const bool staticMethod = receiverType.rfind(classPrefix, 0) == 0;
+                    const std::string ownerType = staticMethod
+                        ? receiverType.substr(classPrefix.size()) : receiverType;
+                    const FunctionSignature* method = findClassMethod(
+                        ownerType,
+                        std::get<std::string>(ins.args[0]),
+                        static_cast<size_t>(argumentCount),
+                        staticMethod
+                    );
+                    stack.push_back(method == nullptr
+                        ? std::string() : method->returnType);
                     continue;
                 }
 
@@ -349,9 +464,17 @@ namespace IRStaticOperator {
                 if (ins.op == VMOperator::STORE_VALUE_GLOBAL ||
                     ins.op == VMOperator::ASSIGN_VALUE_GLOBAL) {
                     const std::string valueType = popType();
-                    if (!isFunctionChunk &&
-                        readGlobalStoreIndex(ins, globalIndex)) {
-                        globalTypes[globalIndex] = valueType;
+                    if (!isFunctionChunk && readGlobalStoreIndex(ins, globalIndex)) {
+                        std::string storedClassType;
+                        for (const auto& argument : ins.args) {
+                            if (!std::holds_alternative<std::string>(argument)) continue;
+                            const std::string& candidate = std::get<std::string>(argument);
+                            if (classLayouts.find(candidate) != classLayouts.end()) {
+                                storedClassType = "class:" + candidate;
+                            }
+                        }
+                        globalTypes[globalIndex] = storedClassType.empty()
+                            ? valueType : storedClassType;
                     }
                     continue;
                 }

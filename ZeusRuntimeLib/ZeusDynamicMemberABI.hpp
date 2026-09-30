@@ -11,12 +11,34 @@ typedef void (*ZeusDynamicMemberFunction)(
     const ZeusValue* const* arguments
 );
 
+typedef void (*ZeusDynamicFieldGetter)(
+    ZeusValue* out,
+    const ZeusValue* receiver,
+    int32_t line
+);
+
 extern "C" {
 
 void zeus_dynamic_member_register(
     const char* type_name,
     const char* method_name,
     ZeusDynamicMemberFunction function
+);
+
+void zeus_dynamic_field_register(
+    const char* type_name,
+    const char* field_name,
+    ZeusDynamicFieldGetter getter
+);
+
+// Loads a field from a dynamically typed native class receiver. The generated
+// class adapter writes an owned dynamic value to `out` or throws on invalid
+// receivers, deleted objects, uninitialized fields, and missing fields.
+void zeus_value_dynamic_field_load(
+    ZeusValue* out,
+    const ZeusValue* receiver,
+    const char* field_name,
+    int32_t line
 );
 
 // Reports whether a method adapter is registered for a runtime class.

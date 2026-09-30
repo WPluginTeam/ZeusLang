@@ -1,0 +1,33 @@
+class Box {
+    using &this;
+    let value = 0;
+
+    func init(v) {
+        this.value = v;
+    }
+
+    func get() {
+        return this.value;
+    }
+
+    func operator[+] (other) {
+        return new Box(this.value + other.value);
+    }
+}
+
+class OtherValue {
+    using &this;
+    let value = 0;
+
+    func init(v) {
+        this.value = v;
+    }
+}
+
+let left = new Box(2);
+let right = new OtherValue(3);
+let sum = left + right;
+if (sum.get() != 5) {
+    throw new Exception("dynamic class field read mismatch");
+}
+print("PASS dynamic class field read");

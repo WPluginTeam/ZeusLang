@@ -985,8 +985,8 @@ int main(int argc, char* argv[]) {
         }
 
         if (emitLLVM) {
-            IRStaticOperator::annotate(cr.program);
             IRStaticCall::annotate(cr.program);
+            IRStaticOperator::annotate(cr.program);
             ZeusLLVM::EmitResult emitted = ZeusLLVM::emit(cr);
             for (const auto& warning : emitted.warnings) {
                 std::cout << "[emit-llvm] warning: " << warning << std::endl;

@@ -18,6 +18,7 @@
 namespace {
 
 using MethodMap = std::unordered_map<std::string, ZeusDynamicMemberFunction>;
+using FieldMap = std::unordered_map<std::string, ZeusDynamicFieldGetter>;
 
 std::shared_mutex& dynamicMemberMutex() {
     static std::shared_mutex mutex;
@@ -27,6 +28,11 @@ std::shared_mutex& dynamicMemberMutex() {
 std::unordered_map<std::string, MethodMap>& dynamicMemberFunctions() {
     static std::unordered_map<std::string, MethodMap> methods;
     return methods;
+}
+
+std::unordered_map<std::string, FieldMap>& dynamicFieldGetters() {
+    static std::unordered_map<std::string, FieldMap> fields;
+    return fields;
 }
 
 [[noreturn]] void dynamicMemberPanic(const char* method, const char* reason) {
@@ -87,6 +93,58 @@ void zeus_dynamic_member_register(
     } catch (...) {
         dynamicMemberPanic(method_name, "failed to register method");
     }
+}
+
+void zeus_dynamic_field_register(
+    const char* type_name,
+    const char* field_name,
+    ZeusDynamicFieldGetter getter
+) {
+    if (!type_name || !*type_name || !field_name || !*field_name || !getter) {
+        dynamicMemberPanic(field_name, "invalid dynamic field registration");
+    }
+
+    try {
+        std::unique_lock<std::shared_mutex> lock(dynamicMemberMutex());
+        dynamicFieldGetters()[type_name][field_name] = getter;
+    } catch (...) {
+        dynamicMemberPanic(field_name, "failed to register dynamic field");
+    }
+}
+
+void zeus_value_dynamic_field_load(
+    ZeusValue* out,
+    const ZeusValue* receiver,
+    const char* field_name,
+    int32_t line
+) {
+    if (!out || !receiver || !field_name || !*field_name) {
+        dynamicMemberPanic(field_name, "invalid dynamic field load");
+    }
+
+    zeus_value_init_nil(out);
+
+    std::string typeName;
+    if (!getDynamicTypeName(receiver, typeName)) {
+        dynamicMemberPanic(field_name, "receiver has no dynamic type");
+    }
+
+    ZeusDynamicFieldGetter getter = nullptr;
+    {
+        std::shared_lock<std::shared_mutex> lock(dynamicMemberMutex());
+        const auto type = dynamicFieldGetters().find(typeName);
+        if (type != dynamicFieldGetters().end()) {
+            const auto field = type->second.find(field_name);
+            if (field != type->second.end()) getter = field->second;
+        }
+    }
+
+    if (!getter) {
+        dynamicMemberPanic(field_name,
+            ("field is not available on dynamic receiver type '" + typeName + "'").c_str());
+    }
+
+    getter(out, receiver, line);
 }
 
 int32_t zeus_dynamic_member_has_method(
