@@ -4,6 +4,7 @@
 #pragma once
 
 #include "core.hpp"
+#include "ThreadNativeBuiltins.hpp"
 #include "../ZeusThread.hpp"
 #include "../../ZeusRuntimeLib/ZeusSharedHeap.hpp"
 
@@ -108,144 +109,6 @@ namespace ZeusBuiltins {
 
         bool exists = ZeusShared::getGlobalHeap().exists(varName);
         return ZeusType::UniversalVariant(exists);
-    }
-
-    // ===== Mutex 操作函数 =====
-    
-    // 全局 mutex 管理器
-    inline std::unordered_map<int, std::unique_ptr<std::mutex>> g_mutexPool;
-    inline std::mutex g_mutexPoolMutex;
-    inline int g_nextMutexId = 1;
-    
-    // __mutex_create(): 创建新的 mutex，返回 mutex ID
-    inline ZeusType::UniversalVariant builtin_mutex_create(const std::vector<ZeusType::UniversalVariant>& args) {
-        std::lock_guard<std::mutex> lock(g_mutexPoolMutex);
-        int mutexId = g_nextMutexId++;
-        g_mutexPool[mutexId] = std::make_unique<std::mutex>();
-        return ZeusType::UniversalVariant(LexerType::Value(mutexId));
-    }
-    
-    // __mutex_lock(mutexId): 获取锁（阻塞）
-    inline ZeusType::UniversalVariant builtin_mutex_lock(const std::vector<ZeusType::UniversalVariant>& args) {
-        if (args.empty()) {
-            throw std::runtime_error("__mutex_lock requires 1 argument (mutexId)");
-        }
-        
-        int mutexId = -1;
-        if (std::holds_alternative<LexerType::Value>(args[0])) {
-            const auto& v = std::get<LexerType::Value>(args[0]);
-            if (std::holds_alternative<ZeusType::BigInteger>(v.data)) {
-                mutexId = static_cast<int>(std::get<ZeusType::BigInteger>(v.data).toInt64());
-            }
-        }
-        
-        if (mutexId < 0) {
-            throw std::runtime_error("__mutex_lock: invalid mutexId");
-        }
-        
-        std::mutex* mtx = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(g_mutexPoolMutex);
-            auto it = g_mutexPool.find(mutexId);
-            if (it == g_mutexPool.end()) {
-                throw std::runtime_error("__mutex_lock: mutex not found: " + std::to_string(mutexId));
-            }
-            mtx = it->second.get();
-        }
-        
-        mtx->lock();
-        return ZeusType::UniversalVariant(LexerType::Value(true));
-    }
-    
-    // __mutex_trylock(mutexId): 尝试获取锁（非阻塞），返回是否成功
-    inline ZeusType::UniversalVariant builtin_mutex_trylock(const std::vector<ZeusType::UniversalVariant>& args) {
-        if (args.empty()) {
-            throw std::runtime_error("__mutex_trylock requires 1 argument (mutexId)");
-        }
-        
-        int mutexId = -1;
-        if (std::holds_alternative<LexerType::Value>(args[0])) {
-            const auto& v = std::get<LexerType::Value>(args[0]);
-            if (std::holds_alternative<ZeusType::BigInteger>(v.data)) {
-                mutexId = static_cast<int>(std::get<ZeusType::BigInteger>(v.data).toInt64());
-            }
-        }
-        
-        if (mutexId < 0) {
-            throw std::runtime_error("__mutex_trylock: invalid mutexId");
-        }
-        
-        std::mutex* mtx = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(g_mutexPoolMutex);
-            auto it = g_mutexPool.find(mutexId);
-            if (it == g_mutexPool.end()) {
-                throw std::runtime_error("__mutex_trylock: mutex not found: " + std::to_string(mutexId));
-            }
-            mtx = it->second.get();
-        }
-        
-        bool acquired = mtx->try_lock();
-        return ZeusType::UniversalVariant(acquired);
-    }
-    
-    // __mutex_unlock(mutexId): 释放锁
-    inline ZeusType::UniversalVariant builtin_mutex_unlock(const std::vector<ZeusType::UniversalVariant>& args) {
-        if (args.empty()) {
-            throw std::runtime_error("__mutex_unlock requires 1 argument (mutexId)");
-        }
-        
-        int mutexId = -1;
-        if (std::holds_alternative<LexerType::Value>(args[0])) {
-            const auto& v = std::get<LexerType::Value>(args[0]);
-            if (std::holds_alternative<ZeusType::BigInteger>(v.data)) {
-                mutexId = static_cast<int>(std::get<ZeusType::BigInteger>(v.data).toInt64());
-            }
-        }
-        
-        if (mutexId < 0) {
-            throw std::runtime_error("__mutex_unlock: invalid mutexId");
-        }
-        
-        std::mutex* mtx = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(g_mutexPoolMutex);
-            auto it = g_mutexPool.find(mutexId);
-            if (it == g_mutexPool.end()) {
-                throw std::runtime_error("__mutex_unlock: mutex not found: " + std::to_string(mutexId));
-            }
-            mtx = it->second.get();
-        }
-        
-        mtx->unlock();
-        return ZeusType::UniversalVariant(LexerType::Value(true));
-    }
-    
-    // __mutex_destroy(mutexId): 销毁 mutex
-    inline ZeusType::UniversalVariant builtin_mutex_destroy(const std::vector<ZeusType::UniversalVariant>& args) {
-        if (args.empty()) {
-            throw std::runtime_error("__mutex_destroy requires 1 argument (mutexId)");
-        }
-        
-        int mutexId = -1;
-        if (std::holds_alternative<LexerType::Value>(args[0])) {
-            const auto& v = std::get<LexerType::Value>(args[0]);
-            if (std::holds_alternative<ZeusType::BigInteger>(v.data)) {
-                mutexId = static_cast<int>(std::get<ZeusType::BigInteger>(v.data).toInt64());
-            }
-        }
-        
-        if (mutexId < 0) {
-            throw std::runtime_error("__mutex_destroy: invalid mutexId");
-        }
-        
-        std::lock_guard<std::mutex> lock(g_mutexPoolMutex);
-        auto it = g_mutexPool.find(mutexId);
-        if (it == g_mutexPool.end()) {
-            throw std::runtime_error("__mutex_destroy: mutex not found: " + std::to_string(mutexId));
-        }
-        g_mutexPool.erase(it);
-        return ZeusType::UniversalVariant(LexerType::Value(true));
     }
 
     // ===== 线程操作函数 =====
@@ -436,39 +299,6 @@ namespace ZeusBuiltins {
         return ZeusType::UniversalVariant(LexerType::Value(true));
     }
 
-    // __thread_sleep(ms): 当前线程休眠指定毫秒数
-    inline ZeusType::UniversalVariant builtin_thread_sleep(const std::vector<ZeusType::UniversalVariant>& args) {
-        if (args.empty()) {
-            throw std::runtime_error("__thread_sleep requires 1 argument (milliseconds)");
-        }
-
-        int ms = 0;
-
-        if (std::holds_alternative<LexerType::Value>(args[0])) {
-            const auto& v = std::get<LexerType::Value>(args[0]);
-
-            if (std::holds_alternative<ZeusType::BigInteger>(v.data)) {
-                ms = static_cast<int>(std::get<ZeusType::BigInteger>(v.data).toInt64());
-            } else if (std::holds_alternative<ZeusType::BigDecimal>(v.data)) {
-                ms = static_cast<int>(std::get<ZeusType::BigDecimal>(v.data).toDouble());
-            }
-        }
-
-        if (ms > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-        }
-
-        return ZeusType::UniversalVariant(LexerType::Value(true));
-    }
-
-    // __thread_current_id(): 获取当前线程的原生 ID（哈希值）
-    inline ZeusType::UniversalVariant builtin_thread_current_id(const std::vector<ZeusType::UniversalVariant>& args) {
-        auto id = std::this_thread::get_id();
-        std::hash<std::thread::id> hasher;
-        size_t hashVal = hasher(id);
-        return ZeusType::UniversalVariant(LexerType::Value(static_cast<int64_t>(hashVal)));
-    }
-
     // __thread_set_name(threadId, name): 设置线程名
     inline ZeusType::UniversalVariant builtin_thread_set_name(const std::vector<ZeusType::UniversalVariant>& args) {
         if (args.size() < 2) {
@@ -558,14 +388,10 @@ namespace ZeusBuiltins {
         registerBuiltin("__heap_lock", builtin_heap_lock, 1, 1);
         registerBuiltin("__heap_unlock", builtin_heap_unlock, 1, 1);
         registerBuiltin("__heap_exists", builtin_heap_exists, 1, 1);
-        
-        // Mutex 操作（用于线程同步）
-        registerBuiltin("__mutex_create", builtin_mutex_create, 0, 0);
-        registerBuiltin("__mutex_lock", builtin_mutex_lock, 1, 1);
-        registerBuiltin("__mutex_trylock", builtin_mutex_trylock, 1, 1);
-        registerBuiltin("__mutex_unlock", builtin_mutex_unlock, 1, 1);
-        registerBuiltin("__mutex_destroy", builtin_mutex_destroy, 1, 1);
-        
+
+        // Keep the VM builtin registration order stable.
+        registerStandaloneMutexBuiltins();
+
         // 线程操作（用于多线程支持）
         registerBuiltin("__thread_create", builtin_thread_create, 0, 0);
         registerBuiltin("__thread_start", builtin_thread_start, 2, -1);  // 可变参数
@@ -574,8 +400,8 @@ namespace ZeusBuiltins {
         registerBuiltin("__thread_count", builtin_thread_count, 0, 0);
         registerBuiltin("__thread_active_count", builtin_thread_active_count, 0, 0);
         registerBuiltin("__thread_join_all", builtin_thread_join_all, 0, 0);
-        registerBuiltin("__thread_sleep", builtin_thread_sleep, 1, 1);
-        registerBuiltin("__thread_current_id", builtin_thread_current_id, 0, 0);
+        registerStandaloneThreadSleepBuiltin();
+        registerStandaloneThreadIdBuiltin();
         registerBuiltin("__thread_eliminate", builtin_thread_eliminate, 1, 1);
         registerBuiltin("__thread_set_name", builtin_thread_set_name, 2, 2);
         registerBuiltin("__thread_get_name", builtin_thread_get_name, 1, 1);
