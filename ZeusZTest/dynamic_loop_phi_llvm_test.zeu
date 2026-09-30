@@ -1,0 +1,15 @@
+func main() {
+    let values = {1: 1, 2: 2};
+    let total = 0;
+
+    for (values) [key: value] {
+        total = total + value;
+    }
+
+    if (total != 3) {
+        throw new Exception("dynamic loop accumulator mismatch");
+    }
+    print("PASS dynamic loop phi");
+}
+
+main();

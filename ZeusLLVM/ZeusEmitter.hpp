@@ -1939,15 +1939,9 @@ public:
                     }
                 }
             };
-            std::set<std::string> destructorTypes;
-            for (const auto& layout : classLayouts) {
-                destructorTypes.insert(layout.first);
-            }
             addLifecycleFunctions(constructedTypes, true, false);
+            addLifecycleFunctions(constructedTypes, false, true);
             addLifecycleFunctions(deletedTypes, false, true);
-            // Every emitted class finalizer contains a direct destructor call,
-            // even when source code never spells `delete` for that class.
-            addLifecycleFunctions(destructorTypes, false, true);
 
             if (usesSubscriptLoad || usesSubscriptStore) {
                 for (const auto& function : functionSignatures) {
@@ -3140,6 +3134,11 @@ public:
                     destructor = &candidate.second;
                     break;
                 }
+            }
+            if (destructor != nullptr && !destructor->isExternal &&
+                reachableFunctionChunks.find(destructor->chunkIndex) ==
+                    reachableFunctionChunks.end()) {
+                destructor = nullptr;
             }
 
             generated += "define void " + classLifetimeFinalizer(className) +
@@ -4432,6 +4431,88 @@ public:
                 }
             }
         }
+
+        // A collection element read has the dynamic ZeusValue ABI. If a loop
+        // writes one of its pre-existing locals while reading dynamic elements,
+        // keep that local in the dynamic ABI from its first assignment. This
+        // gives the loop header and backedge one stable LLVM type and one clear
+        // owner for values that may carry a boxed payload.
+        std::set<int> nativeDynamicLoopLocals;
+        std::map<size_t, std::set<int>> nativeDynamicLoopHeaderLocals;
+        std::map<size_t, std::set<int>> nativeDynamicLoopStoreLocals;
+        for (const auto& loop : nativeLoopBackedgePcs) {
+            if (loop.second.empty()) continue;
+            const size_t headerPc = loop.first;
+            const size_t lastBackedgePc = *loop.second.rbegin();
+            if (headerPc > lastBackedgePc || lastBackedgePc >= chunk.size()) continue;
+
+            bool readsDynamicElement = false;
+            std::set<int> initializedBeforeHeader;
+            std::set<int> writtenInLoop;
+            for (size_t pc = 0; pc < headerPc; ++pc) {
+                const auto& instruction = chunk[pc];
+                if (instruction.op != VMOperator::STORE_VALUE_LOCAL &&
+                    instruction.op != VMOperator::ASSIGN_VALUE_LOCAL) {
+                    continue;
+                }
+                int64_t localIndex = -1;
+                if (tryArgInt(instruction, 0, localIndex) && localIndex >= 0 &&
+                    localIndex >= static_cast<int64_t>(signature.parameterTypes.size())) {
+                    initializedBeforeHeader.insert(static_cast<int>(localIndex));
+                }
+            }
+            for (size_t pc = headerPc; pc <= lastBackedgePc; ++pc) {
+                const auto& instruction = chunk[pc];
+                if (instruction.op == VMOperator::LIST_LOAD_ELEM ||
+                    instruction.op == VMOperator::DICT_LOAD_VALUE) {
+                    readsDynamicElement = true;
+                }
+                if (instruction.op != VMOperator::STORE_VALUE_LOCAL &&
+                    instruction.op != VMOperator::ASSIGN_VALUE_LOCAL) {
+                    continue;
+                }
+                int64_t localIndex = -1;
+                if (tryArgInt(instruction, 0, localIndex) && localIndex >= 0 &&
+                    localIndex >= static_cast<int64_t>(signature.parameterTypes.size())) {
+                    writtenInLoop.insert(static_cast<int>(localIndex));
+                }
+            }
+            if (!readsDynamicElement) continue;
+            for (const int localIndex : writtenInLoop) {
+                if (initializedBeforeHeader.find(localIndex) !=
+                    initializedBeforeHeader.end()) {
+                    nativeDynamicLoopLocals.insert(localIndex);
+                    nativeDynamicLoopHeaderLocals[headerPc].insert(localIndex);
+                    for (size_t pc = headerPc; pc <= lastBackedgePc; ++pc) {
+                        const auto& instruction = chunk[pc];
+                        if (instruction.op != VMOperator::STORE_VALUE_LOCAL &&
+                            instruction.op != VMOperator::ASSIGN_VALUE_LOCAL) {
+                            continue;
+                        }
+                        int64_t storedLocal = -1;
+                        if (tryArgInt(instruction, 0, storedLocal) &&
+                            storedLocal == localIndex) {
+                            nativeDynamicLoopStoreLocals[pc].insert(localIndex);
+                        }
+                    }
+                }
+            }
+        }
+
+        std::map<int, std::string> nativeDynamicLoopLocalSlots;
+        std::string nativeDynamicLoopSlotPrologue;
+        for (const int localIndex : nativeDynamicLoopLocals) {
+            const std::string slot = freshNativeTmp();
+            nativeDynamicLoopLocalSlots.emplace(localIndex, slot);
+            nativeDynamicLoopSlotPrologue += "  " + slot +
+                " = alloca %ZeusValue, align 8\n";
+            nativeDynamicLoopSlotPrologue +=
+                "  call void @zeus_value_init_nil(ptr " + slot + ")\n";
+        }
+        if (!nativeDynamicLoopSlotPrologue.empty()) {
+            functionText.insert(nativeEntryBody, nativeDynamicLoopSlotPrologue);
+        }
+
         IRType::IRInstr captureInitializationInstruction;
         if (!chunk.empty()) captureInitializationInstruction = chunk.front();
         for (const int localIndex : referenceCapturedLocals) {
@@ -4514,6 +4595,46 @@ public:
             }
 
             std::map<int, NativeValue> edgeLocals = locals;
+
+            // Copy preheader values into dedicated storage before entering a
+            // dynamic loop. Backedges already carry this stable slot.
+            const auto dynamicLoopHeader = nativeDynamicLoopHeaderLocals.find(target);
+            if (dynamicLoopHeader != nativeDynamicLoopHeaderLocals.end() &&
+                (sourcePc < target || currentNativeBlock == "%entry")) {
+                for (const int index : dynamicLoopHeader->second) {
+                    const auto slot = nativeDynamicLoopLocalSlots.find(index);
+                    const auto edgeValue = edgeLocals.find(index);
+                    if (slot == nativeDynamicLoopLocalSlots.end() ||
+                        edgeValue == edgeLocals.end()) {
+                        return failNative(ins,
+                            "dynamic loop local has no preheader value or stable slot");
+                    }
+                    const NativeValue original = edgeValue->second;
+                    if (original.value != slot->second) {
+                        std::string dynamicValue;
+                        bool ownsDynamic = false;
+                        if (!emitNativeDynamicValue(
+                                ins, original, dynamicValue, ownsDynamic)) {
+                            return false;
+                        }
+                        emitNativeLine("call void @zeus_value_release(ptr " +
+                                       slot->second + ")");
+                        emitNativeLine("call void @zeus_value_clone(ptr " +
+                                       slot->second + ", ptr " + dynamicValue + ")");
+                        if (ownsDynamic) {
+                            emitNativeLine("call void @zeus_value_release(ptr " +
+                                           dynamicValue + ")");
+                        }
+                        if (original.ownsClass && isManagedClassValue(original)) {
+                            emitNativeLine("call void @zeus_class_ref_release(ptr " +
+                                           original.value + ")");
+                        }
+                    }
+                    edgeValue->second = NativeValue{
+                        slot->second, "ptr", false, true, std::string(), true
+                    };
+                }
+            }
 
             const auto loopHeaderLocals = nativeLoopHeaderLocals.find(target);
             if (loopHeaderLocals != nativeLoopHeaderLocals.end()) {
@@ -4636,6 +4757,19 @@ public:
                 if (hasBackedges && !presentOnEveryEdge) {
                     return failNative(ins,
                         "loop-carried local is not initialized on every loop entry");
+                }
+
+                const auto stableLoopLocal = nativeDynamicLoopLocalSlots.find(index);
+                const auto dynamicLoopHeader = nativeDynamicLoopHeaderLocals.find(pc);
+                if (hasBackedges && stableLoopLocal != nativeDynamicLoopLocalSlots.end() &&
+                    dynamicLoopHeader != nativeDynamicLoopHeaderLocals.end() &&
+                    dynamicLoopHeader->second.find(index) !=
+                        dynamicLoopHeader->second.end()) {
+                    mergedLocals[index] = NativeValue{
+                        stableLoopLocal->second, "ptr", false, true,
+                        std::string(), true
+                    };
+                    continue;
                 }
 
                 auto compatible = [&](const NativeValue& value) {
@@ -5780,6 +5914,65 @@ public:
                         };
                         value.ownsClass = acquiredClassOwnership;
                     }
+
+                    if (nativeDynamicLoopLocals.find(static_cast<int>(index)) !=
+                        nativeDynamicLoopLocals.end()) {
+                        std::string dynamicValue;
+                        bool ownsDynamic = false;
+                        if (!emitNativeDynamicValue(
+                                ins, value, dynamicValue, ownsDynamic)) {
+                            return false;
+                        }
+                        if (value.ownsClass && isManagedClassValue(value)) {
+                            emitNativeLine("call void @zeus_class_ref_release(ptr " +
+                                           value.value + ")");
+                        }
+                        value = NativeValue{
+                            dynamicValue, "ptr", false, true, std::string(),
+                            ownsDynamic
+                        };
+                    }
+
+                    const auto dynamicLoopStores =
+                        nativeDynamicLoopStoreLocals.find(pc);
+                    if (dynamicLoopStores != nativeDynamicLoopStoreLocals.end() &&
+                        dynamicLoopStores->second.find(static_cast<int>(index)) !=
+                            dynamicLoopStores->second.end()) {
+                        const auto slot = nativeDynamicLoopLocalSlots.find(
+                            static_cast<int>(index));
+                        if (slot == nativeDynamicLoopLocalSlots.end()) {
+                            return failNative(ins,
+                                "dynamic loop assignment has no stable local slot");
+                        }
+                        NativeValue stableValue;
+                        if (!cloneNativeDynamicValue(ins, value, stableValue)) {
+                            return false;
+                        }
+                        emitNativeLine("call void @zeus_value_release(ptr " +
+                                       slot->second + ")");
+                        emitNativeLine("call void @zeus_value_clone(ptr " +
+                                       slot->second + ", ptr " + stableValue.value + ")");
+                        emitNativeLine("call void @zeus_value_release(ptr " +
+                                       stableValue.value + ")");
+                        if (value.dynamic && value.ownsDynamic) {
+                            emitNativeLine("call void @zeus_value_release(ptr " +
+                                           value.value + ")");
+                        }
+                        locals[static_cast<int>(index)] = NativeValue{
+                            slot->second, "ptr", false, true, std::string(), true
+                        };
+                        break;
+                    }
+
+                    // Clone borrowed dynamic values before releasing the value
+                    // already held by the local. This also makes self-assigns
+                    // safe when both paths name the same ZeusValue pointer.
+                    if (value.dynamic && !value.ownsDynamic) {
+                        NativeValue owned;
+                        if (!cloneNativeDynamicValue(ins, value, owned)) return false;
+                        value = std::move(owned);
+                    }
+
                     auto existing = locals.find(static_cast<int>(index));
                     if (existing != locals.end() && existing->second.dynamic &&
                         existing->second.ownsDynamic) {
@@ -5805,13 +5998,7 @@ public:
                             emitNativeLine("call void @zeus_class_ref_release(ptr " +
                                            existing->second.value + ")");
                         }
-                        if (value.dynamic && !value.ownsDynamic) {
-                        NativeValue owned;
-                        if (!cloneNativeDynamicValue(ins, value, owned)) return false;
-                        locals[static_cast<int>(index)] = std::move(owned);
-                        } else {
-                            locals[static_cast<int>(index)] = value;
-                        }
+                        locals[static_cast<int>(index)] = value;
                     }
                     break;
                 }
