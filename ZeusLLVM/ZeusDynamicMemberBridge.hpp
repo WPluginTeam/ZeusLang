@@ -75,7 +75,7 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
         if (method.parameterTypes.empty() ||
             method.parameterTypes.front() != method.typeName) {
             generated.error = "dynamic method '" + method.typeName + "::" +
-                method.methodName + "' must use its class as the first parameter";
+                method.methodName + "' must use its owner type as the first parameter";
             return generated;
         }
 
@@ -98,11 +98,50 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
             ", i32 %argc)\n  unreachable\n";
         generated.adapters += "arguments.valid:\n";
         generated.adapters += "  call void @zeus_value_init_nil(ptr %out)\n";
-        generated.adapters += "  %receiver.native = call ptr @zeus_value_require_class_ptr(ptr %receiver, ptr " +
-            typeString + ")\n";
+
+        const std::string receiverType = method.typeName;
+        const std::string receiverABIType = rules.parameterABIType(receiverType);
+        if (receiverABIType.empty()) {
+            generated.error = "dynamic method '" + method.typeName + "::" +
+                method.methodName + "' has no receiver ABI";
+            return generated;
+        }
+
+        std::string receiverNative = "%receiver";
+        if (rules.usesZeusValueABI(receiverType)) {
+            // Dynamic-only native types are already represented by ZeusValue.
+        } else if (receiverType == "int" || receiverType == "int32" ||
+                   receiverType == "int64") {
+            receiverNative = "%receiver.native";
+            generated.adapters += "  " + receiverNative +
+                " = call i64 @zeus_value_require_i64(ptr %receiver)\n";
+        } else if (receiverType == "bool") {
+            const std::string rawBool = "%receiver.bool.raw";
+            receiverNative = "%receiver.native";
+            generated.adapters += "  " + rawBool +
+                " = call i32 @zeus_value_require_bool(ptr %receiver)\n";
+            generated.adapters += "  " + receiverNative + " = icmp ne i32 " +
+                rawBool + ", 0\n";
+        } else if (const auto* abi = ZeusBuiltins::findNativeTypeABI(receiverType);
+                   ZeusBuiltins::isNativeViewABI(abi)) {
+            receiverNative = "%receiver.native";
+            generated.adapters += "  " + receiverNative + " = call ptr @" +
+                std::string(ZeusBuiltins::nativeViewFromDynamicHelper(abi)) +
+                "(ptr %receiver)\n";
+        } else if (rules.isClassType(receiverType)) {
+            receiverNative = "%receiver.native";
+            generated.adapters += "  " + receiverNative +
+                " = call ptr @zeus_value_require_class_ptr(ptr %receiver, ptr " +
+                typeString + ")\n";
+        } else {
+            generated.error = "dynamic method '" + method.typeName + "::" +
+                method.methodName + "' cannot adapt receiver type '" +
+                receiverType + "'";
+            return generated;
+        }
 
         std::vector<std::pair<std::string, std::string>> nativeArguments;
-        nativeArguments.emplace_back("ptr", "%receiver.native");
+        nativeArguments.emplace_back(receiverABIType, receiverNative);
 
         for (size_t parameterIndex = 1;
              parameterIndex < method.parameterTypes.size();
@@ -160,10 +199,10 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
                     generated.adapters += "  " + native + " = icmp ne i32 " + raw + ", 0\n";
                 }
             } else if (const auto* abi = ZeusBuiltins::findNativeTypeABI(conversionType);
-                       abi != nullptr &&
-                       abi->valueABI == ZeusBuiltins::NativeValueABI::StringView) {
-                generated.adapters += "  " + native +
-                    " = call ptr @zeus_value_intern_string_view(ptr " + boxed + ")\n";
+                       ZeusBuiltins::isNativeViewABI(abi)) {
+                generated.adapters += "  " + native + " = call ptr @" +
+                    std::string(ZeusBuiltins::nativeViewFromDynamicHelper(abi)) +
+                    "(ptr " + boxed + ")\n";
             } else if (rules.isClassType(conversionType)) {
                 const std::string classString =
                     "@.zeus_dynamic_member_" + std::to_string(methodIndex) +
@@ -237,10 +276,10 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
                         rawBool + ")\n";
                 }
             } else if (const auto* abi = ZeusBuiltins::findNativeTypeABI(resultType);
-                       abi != nullptr &&
-                       abi->valueABI == ZeusBuiltins::NativeValueABI::StringView) {
-                generated.adapters += "  call void @zeus_value_from_string_view(ptr %out, ptr " +
-                    rawResult + ")\n";
+                       ZeusBuiltins::isNativeViewABI(abi)) {
+                generated.adapters += "  call void @" +
+                    std::string(ZeusBuiltins::nativeViewToDynamicHelper(abi)) +
+                    "(ptr %out, ptr " + rawResult + ")\n";
             } else if (rules.isClassType(resultType)) {
                 const std::string resultClassString =
                     "@.zeus_dynamic_member_" + std::to_string(methodIndex) +

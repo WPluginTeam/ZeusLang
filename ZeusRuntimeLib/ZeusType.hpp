@@ -994,12 +994,13 @@ namespace ZeusType {
 
     using Variant = std::variant<String, Integer, Float, Boolean, Null, Object, Array, Function, Bytes>;
 
-    // Non-owning pointer to an object laid out and allocated by the LLVM emitter.
-    // The shared state tracks deletion; copying a dynamic value never owns the object.
+    // Pointer to an object laid out by the LLVM emitter. Managed allocations
+    // carry a lifetime lease so dynamic ZeusValue copies keep the object alive.
     struct LLVMClassObjectState {
         std::atomic<void*> object{ nullptr };
         std::string typeName;
         uint64_t debugId = 0;
+        std::shared_ptr<void> lifetime;
     };
     struct LLVMClassHandle {
         std::shared_ptr<LLVMClassObjectState> state;
@@ -1015,7 +1016,10 @@ namespace ZeusType {
     
     // 共享类/对象句柄：存储在共享堆上，通过名称访问
     struct SharedClassHandle { std::string name; };   // 共享类定义
-    struct SharedObjectHandle { std::string name; };  // 共享对象实例
+    struct SharedObjectHandle {
+        std::string name;
+        uint64_t generation = 0;
+    };  // 共享对象实例，删除并重建同名对象后旧句柄保持失效
     
     // Socket 句柄：网络套接字
     struct SocketHandle { int id; };

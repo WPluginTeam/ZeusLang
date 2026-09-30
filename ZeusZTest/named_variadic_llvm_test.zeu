@@ -1,0 +1,35 @@
+func combine(a, b = 2, c = 3) {
+    return a + b + c;
+}
+
+func count_args(*args) {
+    return len(args);
+}
+
+func pick_any(**kwargs) {
+    return kwargs["x"];
+}
+
+func typed(a: int, b: int = 2) -> int {
+    return a + b;
+}
+
+func count_plus(base: int, *args) {
+    return base + len(args);
+}
+
+func make_counter() {
+    func inner(*args) {
+        return len(args);
+    }
+    return inner;
+}
+
+print("named default hole", combine(c = 10, a = 1));
+print("named order", combine(c = 10, a = 1, b = 4));
+print("variadic args", count_args(1, 2, 3, 4));
+print("variadic kwargs", pick_any(x = 77, y = 88));
+print("typed named arguments", typed(b = 4, a = 3));
+print("fixed plus variadic", count_plus(10, 1, 2, 3));
+let indirect_counter = make_counter();
+print("indirect variadic args", indirect_counter(1, 2, 3));

@@ -51,6 +51,20 @@ void zeus_value_dynamic_member_call(
     const ZeusValue* const* arguments
 );
 
+// DICT_LOAD_VALUE and DICT_STORE_VALUE can represent a runtime class
+// subscript as well as a built-in array or dictionary operation.
+void zeus_value_subscript_load(
+    ZeusValue* out,
+    const ZeusValue* container,
+    const ZeusValue* key
+);
+void zeus_value_subscript_store(
+    ZeusValue* out,
+    const ZeusValue* container,
+    const ZeusValue* key,
+    const ZeusValue* value
+);
+
 [[noreturn]] void zeus_dynamic_member_arity_error(
     const char* method_name,
     int32_t expected,

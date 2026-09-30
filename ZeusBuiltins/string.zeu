@@ -1,7 +1,6 @@
 using original;
 
-// These declarations use the dynamic ZeusValue callback ABI. The methods below
-// keep their public receiver and return types as native `string` values.
+// Generic value conversion and list-producing split keep the dynamic ABI.
 @native("zeus_string_builtin_str")
 decl func __builtin_str(value);
 
@@ -11,38 +10,42 @@ decl func type(value);
 @native("zeus_string_builtin_len")
 decl func len(value);
 
-@native("zeus_string_get")
-decl func __str_get(value, index);
+// Text-only operations cross the LLVM boundary as typed StringView values.
+@native("zeus_string_length_view")
+decl func __str_length(value: string) -> int;
 
-@native("zeus_string_slice")
-decl func __str_slice(value, start, end);
+@native("zeus_string_get_view")
+decl func __str_get(value: string, index: int) -> string;
 
-@native("zeus_string_index")
-decl func __str_index(value, substring);
+@native("zeus_string_slice_view")
+decl func __str_slice(value: string, start: int, end: int) -> string;
 
-@native("zeus_string_rindex")
-decl func __str_rindex(value, substring);
+@native("zeus_string_index_view")
+decl func __str_index(value: string, substring: string) -> int;
 
-@native("zeus_string_replace")
-decl func __str_replace(value, old, replacement);
+@native("zeus_string_rindex_view")
+decl func __str_rindex(value: string, substring: string) -> int;
+
+@native("zeus_string_replace_view")
+decl func __str_replace(value: string, old: string, replacement: string) -> string;
 
 @native("zeus_string_split")
 decl func __str_split(value, separator);
 
-@native("zeus_string_startswith")
-decl func __str_startswith(value, prefix);
+@native("zeus_string_startswith_view")
+decl func __str_startswith(value: string, prefix: string) -> bool;
 
-@native("zeus_string_endswith")
-decl func __str_endswith(value, suffix);
+@native("zeus_string_endswith_view")
+decl func __str_endswith(value: string, suffix: string) -> bool;
 
-@native("zeus_string_lower")
-decl func __str_lower(value);
+@native("zeus_string_lower_view")
+decl func __str_lower(value: string) -> string;
 
-@native("zeus_string_upper")
-decl func __str_upper(value);
+@native("zeus_string_upper_view")
+decl func __str_upper(value: string) -> string;
 
-@native("zeus_string_count")
-decl func __str_count(value, substring);
+@native("zeus_string_count_view")
+decl func __str_count(value: string, substring: string) -> int;
 
 // String literals and all methods use the native `string` representation.
 impl string {
@@ -57,7 +60,7 @@ impl string {
     }
 
     func length() -> int {
-        return len(this);
+        return __str_length(this);
     }
 
     func toString() -> string {
@@ -69,7 +72,7 @@ impl string {
     }
 
     func isEmpty() -> bool {
-        return len(this) == 0;
+        return __str_length(this) == 0;
     }
 
     func clone() -> string {

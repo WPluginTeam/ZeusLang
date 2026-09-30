@@ -72,6 +72,14 @@ typedef struct ZeusStringView {
     uint64_t length;
 } ZeusStringView;
 
+// Native Bytes ABI: immutable byte span with an explicit length. Views
+// returned by zeus_bytes_view_* and zeus_value_intern_bytes_view remain valid
+// for the runtime process lifetime.
+typedef struct ZeusBytesView {
+    const uint8_t* data;
+    uint64_t length;
+} ZeusBytesView;
+
 // Native closure ABI used by LLVM-generated functions. Captured values are
 // held in reference-counted cells; copy captures allocate a new cell at closure
 // creation while reference captures retain the parent's cell.
@@ -79,7 +87,8 @@ typedef void (*ZeusClosureInvoke)(
     ZeusValue* out,
     void* environment,
     int32_t argc,
-    const ZeusValue* const* values
+    const ZeusValue* const* values,
+    const char* const* argument_names
 );
 void* zeus_capture_cell_create(const ZeusValue* initial);
 void* zeus_capture_cell_clone(void* cell);
@@ -87,6 +96,7 @@ void* zeus_capture_cell_retain(void* cell);
 void zeus_capture_cell_release(void* cell);
 void zeus_capture_cell_load(ZeusValue* out, void* cell);
 void zeus_capture_cell_store(void* cell, const ZeusValue* value);
+void zeus_capture_cell_delete(void* cell);
 void* zeus_closure_capture_ref(void* environment, int32_t index);
 void* zeus_closure_capture_copy(void* environment, int32_t index);
 void zeus_closure_create(
@@ -110,8 +120,30 @@ void zeus_closure_call(
     int32_t argc,
     const ZeusValue* const* values
 );
+void zeus_closure_call_named(
+    ZeusValue* out,
+    const ZeusValue* closure,
+    int32_t argc,
+    const ZeusValue* const* values,
+    const char* const* argument_names
+);
+void zeus_closure_bind_arguments(
+    int32_t parameter_count,
+    const char* const* parameter_names,
+    uint64_t default_parameter_mask,
+    int32_t has_variadic_args,
+    int32_t has_variadic_kwargs,
+    int32_t argc,
+    const ZeusValue* const* values,
+    const char* const* argument_names,
+    const ZeusValue** ordered_values,
+    uint64_t* provided_mask,
+    ZeusValue* variadic_args,
+    ZeusValue* variadic_kwargs
+);
 void zeus_closure_env_load(ZeusValue* out, void* environment, int32_t index);
 void zeus_closure_env_store(void* environment, int32_t index, const ZeusValue* value);
+void zeus_closure_env_delete(void* environment, int32_t index);
 
 // Dynamic variadic call ABI. Arguments are borrowed ZeusValue pointers for the
 // duration of the call; the callback initializes an owned result in `out`.
@@ -132,19 +164,33 @@ void zeus_value_from_i64_ptr(ZeusValue* out, void* value);
 void zeus_value_from_bool_ptr(ZeusValue* out, void* value);
 void zeus_value_clone(ZeusValue* out, const ZeusValue* value);
 void zeus_value_from_box(ZeusValue* out, const ZeusBox* box);
-// LLVM class references are non-owning. Boxing retains only a typed handle; it
-// does not extend object lifetime. delete invalidates all copies of that handle.
+// Managed LLVM class handles share one lifetime lease. Explicit delete still
+// invalidates every copied handle; the lease only defers freeing its tombstone
+// allocation until the last boxed handle is released.
 void zeus_value_from_class_ptr(ZeusValue* out, void* object, const char* type_name);
 void* zeus_value_require_class_ptr(const ZeusValue* value, const char* type_name);
 // Like zeus_value_require_class_ptr, but a nil value returns nullptr instead of
 // aborting. A non-nil value of the wrong class still aborts.
 void* zeus_value_try_class_ptr(const ZeusValue* value, const char* type_name);
 void zeus_class_pointer_invalidate(void* object);
+void zeus_class_field_require_initialized(
+    int32_t initialized, const char* class_name, const char* field_name, int32_t line) noexcept(false);
+// These functions are allowed to throw a C++ exception across generated LLVM
+// frames. A catchpad calls capture while its native exception is active.
+void zeus_exception_raise(const ZeusValue* value) noexcept(false);
+void zeus_exception_raise_owned(ZeusValue* value) noexcept(false);
+using ZeusRuntimeErrorFactory = void (*)(ZeusValue*, const char*, int64_t);
+void zeus_exception_capture(ZeusValue* out, ZeusRuntimeErrorFactory factory) noexcept(false);
+void zeus_exception_report_current() noexcept;
+void zeus_i64_check_division(int64_t left, int64_t right, int32_t line) noexcept(false);
 int64_t zeus_value_require_i64(const ZeusValue* value);
 int32_t zeus_value_require_bool(const ZeusValue* value);
 const ZeusStringView* zeus_value_intern_string_view(const ZeusValue* value);
 const ZeusStringView* zeus_string_view_intern(const ZeusStringView* view);
 const ZeusStringView* zeus_string_view_from_data(const char* data, int64_t length);
+const ZeusBytesView* zeus_value_intern_bytes_view(const ZeusValue* value);
+const ZeusBytesView* zeus_bytes_view_intern(const ZeusBytesView* view);
+const ZeusBytesView* zeus_bytes_view_from_data(const uint8_t* data, int64_t length);
 void* zeus_value_require_i64_ptr(const ZeusValue* value);
 void* zeus_value_require_bool_ptr(const ZeusValue* value);
 ZeusBox* zeus_value_to_box(const ZeusValue* value);
@@ -152,7 +198,54 @@ void zeus_value_release(ZeusValue* value);
 void zeus_value_from_cstr(ZeusValue* out, const char* text);
 void zeus_value_from_string_data(ZeusValue* out, const char* data, int64_t length);
 void zeus_value_from_string_view(ZeusValue* out, const ZeusStringView* view);
+void zeus_value_from_bytes_view(ZeusValue* out, const ZeusBytesView* view);
 void zeus_value_from_bytes(ZeusValue* out, const uint8_t* data, int64_t length);
+int64_t zeus_bytes_get(const ZeusBytesView* bytes, int64_t index);
+int64_t zeus_bytes_len(const ZeusBytesView* bytes);
+const ZeusBytesView* zeus_bytes_slice(
+    const ZeusBytesView* bytes,
+    int64_t start,
+    int64_t end
+);
+const ZeusStringView* zeus_bytes_decode(
+    const ZeusBytesView* bytes,
+    const ZeusStringView* encoding
+);
+void zeus_bytes_to_list(ZeusValue* out, const ZeusBytesView* bytes);
+int64_t zeus_string_length_view(const ZeusStringView* value);
+const ZeusStringView* zeus_string_get_view(const ZeusStringView* value, int64_t index);
+const ZeusStringView* zeus_string_slice_view(
+    const ZeusStringView* value,
+    int64_t start,
+    int64_t end
+);
+int64_t zeus_string_index_view(
+    const ZeusStringView* value,
+    const ZeusStringView* substring
+);
+int64_t zeus_string_rindex_view(
+    const ZeusStringView* value,
+    const ZeusStringView* substring
+);
+const ZeusStringView* zeus_string_replace_view(
+    const ZeusStringView* value,
+    const ZeusStringView* old_value,
+    const ZeusStringView* replacement
+);
+bool zeus_string_startswith_view(
+    const ZeusStringView* value,
+    const ZeusStringView* prefix
+);
+bool zeus_string_endswith_view(
+    const ZeusStringView* value,
+    const ZeusStringView* suffix
+);
+const ZeusStringView* zeus_string_lower_view(const ZeusStringView* value);
+const ZeusStringView* zeus_string_upper_view(const ZeusStringView* value);
+int64_t zeus_string_count_view(
+    const ZeusStringView* value,
+    const ZeusStringView* substring
+);
 void zeus_value_from_bigint_decimal(ZeusValue* out, const char* decimalText);
 void zeus_value_from_bigdecimal_decimal(ZeusValue* out, const char* decimalText);
 void zeus_value_push(ZeusValue* value);
@@ -174,8 +267,16 @@ void zeus_value_native_call(
 );
 void zeus_value_global_store(int idx, ZeusValue* value);
 void zeus_value_global_load(ZeusValue* out, int idx);
+void zeus_global_clear(int idx);
+void zeus_value_global_delete(int idx);
 void zeus_value_local_store(int idx, ZeusValue* value);
 void zeus_value_local_load(ZeusValue* out, int idx);
+void zeus_value_local_delete(int idx);
+void zeus_value_delete_object(ZeusValue* value);
+void zeus_shared_value_store(const char* name, const ZeusValue* value);
+void zeus_shared_value_assign(const char* name, const ZeusValue* value);
+void zeus_shared_value_load(ZeusValue* out, const char* name);
+int32_t zeus_shared_value_delete(const char* name);
 // Scalar fast path for the same global slots. A top-level loop that bumps a
 // scalar global uses these instead of boxing a ZeusValue per access; a type
 // mismatch aborts rather than reinterpreting the stored value.

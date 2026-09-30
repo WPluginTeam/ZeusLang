@@ -138,8 +138,7 @@ void consume(ZeusBox* box) {
 using OwnedZeusBox = std::unique_ptr<ZeusBox, decltype(&zeus_box_release)>;
 
 [[noreturn]] void valueContainerPanic(const char* message) {
-    std::fprintf(stderr, "[ZeusValue container ABI] %s\n", message);
-    std::abort();
+    throw std::runtime_error(std::string("[ZeusValue container ABI] ") + message);
 }
 
 OwnedZeusBox boxFromValue(const ZeusValue* value) {
@@ -365,6 +364,8 @@ void zeus_value_array_build(
         }
         for (auto& value : ownedValues) value.release();
         writeValueFromBox(out, zeus_array_build(count, rawValues.data()));
+    } catch (const std::exception&) {
+        throw;
     } catch (...) {
         valueContainerPanic("failed to build dynamic array");
     }
@@ -396,6 +397,8 @@ void zeus_value_dict_build(
         }
         for (auto& value : ownedValues) value.release();
         writeValueFromBox(out, zeus_dict_build(pairCount, rawValues.data()));
+    } catch (const std::exception&) {
+        throw;
     } catch (...) {
         valueContainerPanic("failed to build dynamic dictionary");
     }
@@ -407,6 +410,8 @@ void zeus_value_array_length(ZeusValue* out, const ZeusValue* array) {
     try {
         OwnedZeusBox boxedArray = boxFromValue(array);
         zeus_value_init_i64(out, zeus_array_length(boxedArray.get()));
+    } catch (const std::exception&) {
+        throw;
     } catch (...) {
         valueContainerPanic("failed to read dynamic array length");
     }
@@ -436,6 +441,8 @@ void zeus_value_array_load(
             return;
         }
         writeValueFromBox(out, zeus_array_load(boxedArray.get(), arrayElement));
+    } catch (const std::exception&) {
+        throw;
     } catch (...) {
         valueContainerPanic("failed to read dynamic array element");
     }
@@ -458,6 +465,8 @@ void zeus_value_array_store(
                                   arrayIndex(boxedIndex->v),
                                   boxedValue.release())
         );
+    } catch (const std::exception&) {
+        throw;
     } catch (...) {
         valueContainerPanic("failed to write dynamic array element");
     }
@@ -469,6 +478,8 @@ void zeus_value_dict_keys(ZeusValue* out, const ZeusValue* dict) {
     try {
         OwnedZeusBox boxedDict = boxFromValue(dict);
         writeValueFromBox(out, zeus_dict_keys(boxedDict.get()));
+    } catch (const std::exception&) {
+        throw;
     } catch (...) {
         valueContainerPanic("failed to build dynamic dictionary keys");
     }
@@ -501,6 +512,8 @@ void zeus_value_dict_load(
             }
         }
         writeValueFromBox(out, zeus_dict_load(boxedDict.get(), boxedKey.get()));
+    } catch (const std::exception&) {
+        throw;
     } catch (...) {
         valueContainerPanic("failed to read dynamic dictionary value");
     }
@@ -523,6 +536,8 @@ void zeus_value_dict_store(
             zeus_dict_store(
                 boxedDict.get(), boxedKey.release(), boxedValue.release())
         );
+    } catch (const std::exception&) {
+        throw;
     } catch (...) {
         valueContainerPanic("failed to write dynamic dictionary value");
     }

@@ -101,7 +101,7 @@ namespace IRFor {
         {
             out.push_back(IRUtils::makeLoadLocal(idxSlot));
             out.push_back(IRUtils::makeLoadLocal(lenSlot));
-            out.push_back(IRUtils::makeLessThan());
+            out.push_back(IRUtils::makeIntrinsicOperator(IRUtils::makeLessThan()));
             out.push_back(IRUtils::makeJumpIfFalsePlaceholder());
         }
 
@@ -127,7 +127,7 @@ namespace IRFor {
         {
             out.push_back(IRUtils::makeLoadLocal(idxSlot));
             out.push_back(IRUtils::makePushInt(1));
-            out.push_back(IRUtils::makeAdd());
+            out.push_back(IRUtils::makeIntrinsicOperator(IRUtils::makeAdd()));
             out.push_back(IRUtils::makeStoreLocal(idxSlot, false));
         }
 
@@ -218,7 +218,7 @@ namespace IRFor {
         // 6. 条件 idx < len
         out.push_back(IRUtils::makeLoadLocal(idxSlot));
         out.push_back(IRUtils::makeLoadLocal(lenSlot));
-        out.push_back(IRUtils::makeLessThan());
+        out.push_back(IRUtils::makeIntrinsicOperator(IRUtils::makeLessThan()));
         out.push_back(IRUtils::makeJumpIfFalsePlaceholder());
         size_t jfalseIndex = out.size() - 1;
 
@@ -256,7 +256,7 @@ namespace IRFor {
         // 11. idx++
         out.push_back(IRUtils::makeLoadLocal(idxSlot));
         out.push_back(IRUtils::makePushInt(1));
-        out.push_back(IRUtils::makeAdd());
+        out.push_back(IRUtils::makeIntrinsicOperator(IRUtils::makeAdd()));
         out.push_back(IRUtils::makeStoreLocal(idxSlot, false));
 
         // 12. 回跳
@@ -370,13 +370,15 @@ namespace IRFor {
                 // idx < end  or idx <= end
                 out.push_back(IRUtils::makeLoadLocal(idxSlot));
                 out.push_back(IRUtils::makeLoadLocal(endSlot));
-                out.push_back(inclusive ? IRUtils::makeLeOp() : IRUtils::makeLessThan());
+                out.push_back(IRUtils::makeIntrinsicOperator(
+                    inclusive ? IRUtils::makeLeOp() : IRUtils::makeLessThan()));
                 out.push_back(IRUtils::makeJumpIfFalsePlaceholder());
             } else {
                 // idx > end or idx >= end
                 out.push_back(IRUtils::makeLoadLocal(idxSlot));
                 out.push_back(IRUtils::makeLoadLocal(endSlot));
-                out.push_back(inclusive ? IRUtils::makeGeOp() : IRUtils::makeGtOp());
+                out.push_back(IRUtils::makeIntrinsicOperator(
+                    inclusive ? IRUtils::makeGeOp() : IRUtils::makeGtOp()));
                 out.push_back(IRUtils::makeJumpIfFalsePlaceholder());
             }
             return out.size() - 1;
@@ -430,7 +432,7 @@ namespace IRFor {
             // Route positive and negative steps to separate bound checks.
             out.push_back(IRUtils::makeLoadLocal(stepSlot));
             out.push_back(IRUtils::makePushInt(0));
-            out.push_back(IRUtils::makeGtOp());
+            out.push_back(IRUtils::makeIntrinsicOperator(IRUtils::makeGtOp()));
             out.push_back(IRUtils::makeJumpIfFalsePlaceholder());
             const size_t jumpToNegativeCheck = out.size() - 1;
 
@@ -448,7 +450,7 @@ namespace IRFor {
 
             out.push_back(IRUtils::makeLoadLocal(stepSlot));
             out.push_back(IRUtils::makePushInt(0));
-            out.push_back(IRUtils::makeLtOp());
+            out.push_back(IRUtils::makeIntrinsicOperator(IRUtils::makeLtOp()));
             out.push_back(IRUtils::makeJumpIfFalsePlaceholder());
             exitJumpIndices.push_back(out.size() - 1);
 
@@ -480,7 +482,7 @@ namespace IRFor {
         {
             out.push_back(IRUtils::makeLoadLocal(idxSlot));
             out.push_back(IRUtils::makeLoadLocal(stepSlot));
-            out.push_back(IRUtils::makeAdd());
+            out.push_back(IRUtils::makeIntrinsicOperator(IRUtils::makeAdd()));
             out.push_back(IRUtils::makeStoreLocal(idxSlot, false));
         }
 

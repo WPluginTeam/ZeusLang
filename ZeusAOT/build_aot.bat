@@ -22,36 +22,39 @@ cd /d "%~dp0demo"
 
 REM ---- runtime lib (built once, linked everywhere) ----
 REM NOTE: /std:c++17 is mandatory (MSVC defaults to C++14, which hides <variant>).
-cl /c /MT /O2 /EHsc /nologo /utf-8 /std:c++17 ..\runtime\zeus_rt.cpp /Fozeus_rt.obj
+cl /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 ..\runtime\zeus_rt.cpp /Fozeus_rt.obj
 if errorlevel 1 exit /b 1
 
-cl /c /MT /O2 /EHsc /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusABI.cpp /Fozeus_abi.obj
+cl /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusABI.cpp /Fozeus_abi.obj
 if errorlevel 1 exit /b 1
 
-cl /c /MT /O2 /EHsc /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusNativeABI.cpp /Fozeus_native_abi.obj
+cl /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusNativeABI.cpp /Fozeus_native_abi.obj
 if errorlevel 1 exit /b 1
 
-cl /c /MT /O2 /EHsc /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusStringNativeABI.cpp /Fozeus_string_native_abi.obj
+cl /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusStringNativeABI.cpp /Fozeus_string_native_abi.obj
 if errorlevel 1 exit /b 1
 
-cl /c /MT /O2 /EHsc /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusDynamicABI.cpp /Fozeus_dynamic_abi.obj
+cl /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusDynamicABI.cpp /Fozeus_dynamic_abi.obj
 if errorlevel 1 exit /b 1
 
-cl /c /MT /O2 /EHsc /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusDynamicBinaryABI.cpp /Fozeus_dynamic_binary_abi.obj
+cl /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusDynamicBinaryABI.cpp /Fozeus_dynamic_binary_abi.obj
 if errorlevel 1 exit /b 1
 
-cl /c /MT /O2 /EHsc /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusDynamicMemberABI.cpp /Fozeus_dynamic_member_abi.obj
+cl /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusDynamicMemberABI.cpp /Fozeus_dynamic_member_abi.obj
 if errorlevel 1 exit /b 1
 
-cl /c /MT /O2 /EHsc /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusRangeCheckABI.cpp /Fozeus_range_check_abi.obj
+cl /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusRangeCheckABI.cpp /Fozeus_range_check_abi.obj
 if errorlevel 1 exit /b 1
 
-cl /c /MT /O2 /EHsc /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusClosureABI.cpp /Fozeus_closure_abi.obj
+cl /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusClosureABI.cpp /Fozeus_closure_abi.obj
 if errorlevel 1 exit /b 1
-cl /c /MT /O2 /EHsc /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusGCABI.cpp /Fozeus_gc_abi.obj
+cl /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusGCABI.cpp /Fozeus_gc_abi.obj
 if errorlevel 1 exit /b 1
 
-lib zeus_rt.obj zeus_abi.obj zeus_native_abi.obj zeus_string_native_abi.obj zeus_dynamic_abi.obj zeus_dynamic_binary_abi.obj zeus_dynamic_member_abi.obj zeus_range_check_abi.obj zeus_closure_abi.obj zeus_gc_abi.obj /OUT:libzeus_rt.lib /NOLOGO
+cl /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusObjectLifetime.cpp /Fozeus_object_lifetime.obj
+if errorlevel 1 exit /b 1
+
+lib zeus_rt.obj zeus_abi.obj zeus_native_abi.obj zeus_string_native_abi.obj zeus_dynamic_abi.obj zeus_dynamic_binary_abi.obj zeus_dynamic_member_abi.obj zeus_range_check_abi.obj zeus_closure_abi.obj zeus_gc_abi.obj zeus_object_lifetime.obj /OUT:libzeus_rt.lib /NOLOGO
 if errorlevel 1 exit /b 1
 
 REM ---- demo 1: print("hello") ----
@@ -84,8 +87,14 @@ if not exist ..\..\Zeus.exe (
   exit /b 0
 )
 
-..\..\Zeus.exe --emit-llvm hello.zeu hello_gen.ll
+pushd "%~dp0..\.."
 if errorlevel 1 exit /b 1
+Zeus.exe --emit-llvm ZeusAOT\demo\hello.zeu ZeusAOT\demo\hello_gen.ll
+if errorlevel 1 (
+  popd
+  exit /b 1
+)
+popd
 
 clang -Wno-override-module -c hello_gen.ll -o hello_gen.obj
 if errorlevel 1 exit /b 1
@@ -98,8 +107,14 @@ hello_gen.exe
 echo [AOT] exit code: %errorlevel%
 if errorlevel 1 exit /b 1
 
-..\..\Zeus.exe --emit-llvm add.zeu add_gen.ll
+pushd "%~dp0..\.."
 if errorlevel 1 exit /b 1
+Zeus.exe --emit-llvm ZeusAOT\demo\add.zeu ZeusAOT\demo\add_gen.ll
+if errorlevel 1 (
+  popd
+  exit /b 1
+)
+popd
 
 clang -Wno-override-module -c add_gen.ll -o add_gen.obj
 if errorlevel 1 exit /b 1
@@ -113,8 +128,14 @@ echo [AOT] exit code: %errorlevel%
 if errorlevel 1 exit /b 1
 
 REM ---- emitter demo 3: for-loop benchmark, PK vs interpreter (~92ms in ben.exe) ----
-..\..\Zeus.exe --emit-llvm loop.zeu loop_gen.ll
+pushd "%~dp0..\.."
 if errorlevel 1 exit /b 1
+Zeus.exe --emit-llvm ZeusAOT\demo\loop.zeu ZeusAOT\demo\loop_gen.ll
+if errorlevel 1 (
+  popd
+  exit /b 1
+)
+popd
 
 clang -Wno-override-module -c loop_gen.ll -o loop_gen.obj
 if errorlevel 1 exit /b 1

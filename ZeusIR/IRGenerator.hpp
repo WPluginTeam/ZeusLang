@@ -2,6 +2,7 @@
 #ifndef IRGenerator_hpp
 #define IRGenerator_hpp
 
+#include <cstddef>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -381,7 +382,8 @@ namespace IRGen {
             codeBlock.ownerClassName,
             codeBlock.isOperatorOverload && !codeBlock.overloadedOps.empty()
                 ? _operatorSymbolName(codeBlock.overloadedOps.front())
-                : std::string()
+                : std::string(),
+            codeBlock.isClassMethod && codeBlock.isStaticMethod
         );
 
         return annotation;
@@ -1333,6 +1335,98 @@ namespace IRGen {
         return false;
     }
 
+    static bool _parsePostfix(ExprParseCtx& ctx, const std::vector<LexerType::Token>& tokens, size_t& pos, std::vector<IRType::IRInstr>& out) {
+        while (pos < tokens.size()) {
+            if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == "(") {
+                const int callLine = _getTokenLine(tokens[pos]);
+                int argc = 0;
+                if (!_parseArguments(ctx, tokens, pos, argc, out)) return false;
+                IRType::IRInstr call;
+                call.op = VMOperator::CALL_CLOSURE;
+                call.line = callLine;
+                call.args.push_back(LexerType::Value(argc));
+                out.push_back(std::move(call));
+                continue;
+            }
+
+            if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == ".") {
+                if (pos + 2 < tokens.size() && _isKeyword(tokens[pos + 1]) &&
+                    _isOperator(tokens[pos + 2]) && _opSym(tokens[pos + 2]) == "(") {
+                    ++pos;
+                    const std::string method =
+                        std::get<LexerType::Keyword>(tokens[pos]).name;
+                    const int methodLine = _getTokenLine(tokens[pos]);
+                    ++pos;
+                    int argc = 0;
+                    if (!_parseArguments(ctx, tokens, pos, argc, out)) return false;
+                    IRType::IRInstr call;
+                    call.op = VMOperator::OBJ_CALL_METHOD;
+                    call.line = methodLine;
+                    call.args.push_back(method);
+                    call.args.push_back(LexerType::Value(argc));
+                    out.push_back(std::move(call));
+                } else {
+                    ++pos;
+                    if (pos >= tokens.size() || !_isKeyword(tokens[pos])) return false;
+                    const std::string attr =
+                        std::get<LexerType::Keyword>(tokens[pos]).name;
+                    IRType::IRInstr load;
+                    load.op = VMOperator::OBJ_LOAD_ATTR;
+                    load.line = _getTokenLine(tokens[pos]);
+                    load.args.push_back(attr);
+                    out.push_back(std::move(load));
+                    ++pos;
+                }
+                continue;
+            }
+
+            if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == "[") {
+                const int bracketLine = _getTokenLine(tokens[pos]);
+                ++pos;
+                int depth = 1;
+                const size_t keyStart = pos;
+                size_t keyEnd = pos;
+                while (pos < tokens.size() && depth > 0) {
+                    if (_isOperator(tokens[pos])) {
+                        const std::string symbol = _opSym(tokens[pos]);
+                        if (symbol == "[") ++depth;
+                        else if (symbol == "]" && --depth == 0) {
+                            keyEnd = pos;
+                            break;
+                        }
+                    }
+                    ++pos;
+                }
+                if (depth != 0) return false;
+
+                std::vector<LexerType::Token> keyTokens(
+                    tokens.begin() + static_cast<std::ptrdiff_t>(keyStart),
+                    tokens.begin() + static_cast<std::ptrdiff_t>(keyEnd));
+                ++pos;
+                if (!keyTokens.empty()) {
+                    auto keyIR = emitExprIR(
+                        ctx.status, ctx.strictDecl, ctx.futureFuncDefs, keyTokens);
+                    out.insert(out.end(), keyIR.begin(), keyIR.end());
+                } else {
+                    IRType::IRInstr zero;
+                    zero.op = VMOperator::PUSH;
+                    zero.args.push_back(LexerType::Value(0));
+                    zero.line = bracketLine;
+                    out.push_back(std::move(zero));
+                }
+
+                IRType::IRInstr load;
+                load.op = VMOperator::DICT_LOAD_VALUE;
+                load.line = bracketLine;
+                out.push_back(std::move(load));
+                continue;
+            }
+
+            break;
+        }
+        return true;
+    }
+
     static bool _parseUnary(ExprParseCtx& ctx, const std::vector<LexerType::Token>& tokens, size_t& pos, std::vector<IRType::IRInstr>& out) {
         if (pos < tokens.size() && _isOperator(tokens[pos])) {
             std::string s = _opSym(tokens[pos]);
@@ -1361,7 +1455,8 @@ namespace IRGen {
                 return true;
             }
         }
-        return _parsePrimary(ctx, tokens, pos, out);
+        if (!_parsePrimary(ctx, tokens, pos, out)) return false;
+        return _parsePostfix(ctx, tokens, pos, out);
     }
 
     static bool _parseExpression(ExprParseCtx& ctx, const std::vector<LexerType::Token>& tokens, size_t& pos, int minPrec, std::vector<IRType::IRInstr>& out) {
@@ -1446,6 +1541,21 @@ namespace IRGen {
                 }
 
                 if (std::holds_alternative<LexerType::BytesLiteral>(token)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        auto hasDeclaredOperatorOverload = [&]() {
+            static const std::string markerPrefix =
+                "__zeus_internal_operator_overload__:";
+            for (const auto& token : inTokens) {
+                if (!std::holds_alternative<LexerType::Operator>(token)) continue;
+                const std::string& symbol =
+                    std::get<LexerType::Operator>(token).symbol;
+                if (futureFuncDefs.find(markerPrefix + symbol) !=
+                    futureFuncDefs.end()) {
                     return true;
                 }
             }
@@ -1648,8 +1758,10 @@ namespace IRGen {
 
         std::vector<LexerType::Token> tokens;
         
-        // 只对纯算术表达式(不含 [], {}, () 的简单运算)执行 fold 优化
-        if (!hasComplexStructure()) {
+        // Keep overloadable operators in IR so the static operator pass can
+        // dispatch impl/class operators before any literal folding removes them.
+        const bool preserveOverloadedOperator = hasDeclaredOperatorOverload();
+        if (!hasComplexStructure() && !preserveOverloadedOperator) {
             ZEUS_DEBUG_PRINT("[IRGen] emitExprIR: Pure arithmetic, applying fold optimization");
             // Use the overall parser status so that fold-time errors (e.g. division by zero)
             // update the real compiler status and abort emission instead of only printing.
@@ -1661,8 +1773,11 @@ namespace IRGen {
                 return out;
             }
         } else {
-            // 包含复杂结构,跳过 fold 优化以避免 token 丢失
-            ZEUS_DEBUG_PRINT("[IRGen] emitExprIR: Complex expression detected, skipping fold");
+            // Complex expressions can lose tokens during folding. Expressions
+            // using a declared overloaded operator must also remain intact for
+            // IRStaticOperator to resolve them.
+            ZEUS_DEBUG_PRINT(
+                "[IRGen] emitExprIR: preserving expression for complex syntax or operator overload");
             tokens = inTokens;
         }
 
@@ -2676,30 +2791,6 @@ void parseVarDecl(
 
             if (injectedEmptyDict) {
                 ZEUS_DEBUG_PRINT("[IRGen    ] {VarDecl} RV IR: (empty dict injected)");
-            } else if (rightValue.size()>=2 && std::holds_alternative<LexerType::Operator>(rightValue.front()) && std::get<LexerType::Operator>(rightValue.front()).symbol=="{" && std::holds_alternative<LexerType::Operator>(rightValue.back()) && std::get<LexerType::Operator>(rightValue.back()).symbol=="}") {
-                // 如果 emitExprIR 仍然没有输出（rhs 空），尝试再次手动解析字典字面量（退化路径）
-                bool hasColon=false; for(size_t i=1;i+1<rightValue.size();++i){ if(std::holds_alternative<LexerType::Operator>(rightValue[i]) && std::get<LexerType::Operator>(rightValue[i]).symbol==":"){ hasColon=true; break; } }
-                if(hasColon) {
-                    // 简单单次线性解析：keyExpr ':' valExpr 以 ',' 分隔
-                    size_t pos=1; size_t end=rightValue.size()-1; int pairCount=0; std::vector<IRType::IRInstr> manual;
-                    auto emitExpr=[&](size_t start,size_t stop){ // [start,stop)
-                        std::vector<LexerType::Token> seg; for(size_t k=start;k<stop;k++) seg.push_back(rightValue[k]);
-                        auto segIR = IRGen::emitExprIR(status, strictDecl, futureFuncDefs, seg);
-                        manual.insert(manual.end(), segIR.begin(), segIR.end());
-                    };
-                    while(pos<end){ size_t keyStart=pos; // 找到 ':'
-                        size_t colonPos=end; for(size_t t=pos;t<end;++t){ if(std::holds_alternative<LexerType::Operator>(rightValue[t]) && std::get<LexerType::Operator>(rightValue[t]).symbol==":"){ colonPos=t; break; } }
-                        if(colonPos==end) break; // 失败退出
-                        emitExpr(keyStart, colonPos);
-                        // value
-                        size_t valStart=colonPos+1; size_t valEnd=end; bool hasComma=false; size_t commaPos=end; for(size_t t=valStart;t<end;++t){ if(std::holds_alternative<LexerType::Operator>(rightValue[t]) && std::get<LexerType::Operator>(rightValue[t]).symbol==",") { hasComma=true; commaPos=t; break; } }
-                        if(hasComma){ valEnd=commaPos; }
-                        emitExpr(valStart, valEnd);
-                        pairCount++;
-                        if(hasComma) pos=commaPos+1; else break;
-                    }
-                    if(pairCount>0){ manual.push_back(IRUtils::makeDictBuild(pairCount)); instructions.insert(instructions.end(), manual.begin(), manual.end()); ZEUS_DEBUG_PRINT("[IRGen    ] {VarDecl} RV IR: (manual dict fallback, pairs=%d)", pairCount); }
-                }
             }
         }
 
@@ -2983,6 +3074,7 @@ void parseVarAssignStmt(
         {
             IRType::IRInstr store; store.op = VMOperator::DICT_STORE_VALUE; instructions.push_back(store);
         }
+        instructions.push_back(IRUtils::makePop());
         return;
     }
 
@@ -3270,6 +3362,7 @@ void parseVarAssignStmt(
                 store.op = VMOperator::DICT_STORE_VALUE;
                 instructions.push_back(store);
             }
+            instructions.push_back(IRUtils::makePop());
             
             return;
         }
@@ -3298,6 +3391,7 @@ void parseVarAssignStmt(
         instructions.insert(instructions.end(), rhsIR.begin(), rhsIR.end());
 
         IRType::IRInstr store; store.op = VMOperator::LIST_STORE_ELEM; instructions.push_back(store);
+        instructions.push_back(IRUtils::makePop());
         return;
     }
 
@@ -3323,6 +3417,7 @@ void parseVarAssignStmt(
         {
             IRType::IRInstr store; store.op = VMOperator::DICT_STORE_VALUE; instructions.push_back(store);
         }
+        instructions.push_back(IRUtils::makePop());
         return;
     }
 
@@ -3856,6 +3951,9 @@ namespace IRGen {
                                     case IRScope::Kind::GLOBAL:
                                         kindStr = "global";
                                         break;
+                                    case IRScope::Kind::SHARED:
+                                        kindStr = "shared";
+                                        break;
                                     default:
                                         kindStr = "global"; // 未定义变量默认按全局处理
                                         varIndex = -1;
@@ -4123,6 +4221,30 @@ namespace IRGen {
                 if (funcSink == nullptr && codeBlock.type == CodeBlockType::BLOCK && strictDecl) {
                     futureFuncDefs.clear();
                     for (const auto& n : codeBlock.nodes) {
+                        if (std::holds_alternative<
+                                std::unique_ptr<TreeParser::CodeBlock>>(n)) {
+                            const auto& typeBlock = std::get<
+                                std::unique_ptr<TreeParser::CodeBlock>>(n);
+                            if (typeBlock &&
+                                (typeBlock->type == CodeBlockType::CLASS ||
+                                 typeBlock->type == CodeBlockType::IMPL)) {
+                                for (const auto& member : typeBlock->nodes) {
+                                    if (!std::holds_alternative<std::unique_ptr<
+                                            TreeParser::CodeBlock>>(member)) {
+                                        continue;
+                                    }
+                                    const auto& method = std::get<std::unique_ptr<
+                                        TreeParser::CodeBlock>>(member);
+                                    if (!method || !method->isOperatorOverload) continue;
+                                    for (const auto& overload : method->overloadedOps) {
+                                        futureFuncDefs.insert(
+                                            "__zeus_internal_operator_overload__:" +
+                                            _operatorSymbolName(overload));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         if (!std::holds_alternative<TreeParser::Node>(n)) continue;
 
                         const auto& ndPre = std::get<TreeParser::Node>(n);
@@ -4188,6 +4310,7 @@ namespace IRGen {
                         // unordered map remains the VM's name-based field collector.
                         struct FieldInfo {
                             std::vector<IRType::IRInstr> defaultIR;
+                            std::vector<LexerType::Token> defaultTokens;
                             std::string typeName;
                             bool isConst = false;
                         };
@@ -4261,10 +4384,20 @@ namespace IRGen {
                                             finfo.typeName = "string";
                                         }
                                     }
+                                    if (finfo.typeName.empty() && rhs.size() == 2 &&
+                                        std::holds_alternative<LexerType::Operator>(rhs[0]) &&
+                                        (std::get<LexerType::Operator>(rhs[0]).symbol == "+" ||
+                                         std::get<LexerType::Operator>(rhs[0]).symbol == "-") &&
+                                        std::holds_alternative<LexerType::Value>(rhs[1]) &&
+                                        std::holds_alternative<ZeusType::BigInteger>(
+                                            std::get<LexerType::Value>(rhs[1]).data)) {
+                                        finfo.typeName = "int";
+                                    }
                                     if (!rhs.empty()) {
                                         auto ir = emitExprIR(status, strictDecl, futureFuncDefs, rhs);
                                         finfo.defaultIR = std::move(ir);
                                     }
+                                    finfo.defaultTokens = rhs;
                                     if (fieldsMap.find(vname) == fieldsMap.end()) {
                                         fieldOrder.push_back(vname);
                                     }
@@ -4367,6 +4500,7 @@ namespace IRGen {
                                             }
                                         }
 
+                                        cbPtr->isStaticMethod = !classifyAsInstance;
                                         size_t before = bytecodes.size();
 
                                         if (classifyAsInstance) {
@@ -4549,7 +4683,37 @@ namespace IRGen {
 
                             IRType::ClassFieldDefault defaultValue;
                             if (!field.defaultIR.empty()) {
-                                if (field.defaultIR.size() == 1 &&
+                                const auto& defaultTokens = field.defaultTokens;
+                                bool classifiedSignedInteger = false;
+                                if (defaultTokens.size() == 2 &&
+                                    std::holds_alternative<LexerType::Operator>(defaultTokens[0]) &&
+                                    (std::get<LexerType::Operator>(defaultTokens[0]).symbol == "+" ||
+                                     std::get<LexerType::Operator>(defaultTokens[0]).symbol == "-") &&
+                                    std::holds_alternative<LexerType::Value>(defaultTokens[1]) &&
+                                    std::holds_alternative<ZeusType::BigInteger>(
+                                        std::get<LexerType::Value>(defaultTokens[1]).data)) {
+                                    ZeusType::BigInteger integerValue =
+                                        std::get<ZeusType::BigInteger>(
+                                            std::get<LexerType::Value>(defaultTokens[1]).data);
+                                    if (std::get<LexerType::Operator>(defaultTokens[0]).symbol == "-") {
+                                        integerValue = ZeusType::BigInteger(0) - integerValue;
+                                    }
+                                    int64_t signedValue = 0;
+                                    if (integerValue.tryToInt64(signedValue)) {
+                                        defaultValue.kind =
+                                            IRType::ClassFieldDefaultKind::Integer;
+                                        defaultValue.integerValue = signedValue;
+                                    } else {
+                                        defaultValue.kind =
+                                            IRType::ClassFieldDefaultKind::Unsupported;
+                                    }
+                                    classifiedSignedInteger = true;
+                                }
+
+                                if (classifiedSignedInteger) {
+                                    // Unary signed integer defaults are constants even when
+                                    // the expression IR is not a single PUSH instruction.
+                                } else if (field.defaultIR.size() == 1 &&
                                     (field.defaultIR.front().op == VMOperator::LIST_BUILD ||
                                      field.defaultIR.front().op == VMOperator::DICT_BUILD) &&
                                     !field.defaultIR.front().args.empty() &&
@@ -4575,6 +4739,16 @@ namespace IRGen {
                                     std::holds_alternative<IRType::NullLiteral>(
                                         field.defaultIR.front().args.front())) {
                                     defaultValue.kind = IRType::ClassFieldDefaultKind::Null;
+                                } else if (field.defaultIR.size() == 1 &&
+                                    field.defaultIR.front().op == VMOperator::PUSH &&
+                                    !field.defaultIR.front().args.empty() &&
+                                    std::holds_alternative<ZeusType::Bytes>(
+                                        field.defaultIR.front().args.front())) {
+                                    const auto& bytes = std::get<ZeusType::Bytes>(
+                                        field.defaultIR.front().args.front());
+                                    defaultValue.kind = IRType::ClassFieldDefaultKind::Bytes;
+                                    defaultValue.bytesValue.assign(
+                                        bytes.data.begin(), bytes.data.end());
                                 } else if (field.defaultIR.size() == 1 &&
                                     field.defaultIR.front().op == VMOperator::PUSH &&
                                     !field.defaultIR.front().args.empty() &&

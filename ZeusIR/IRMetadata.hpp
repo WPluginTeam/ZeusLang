@@ -54,6 +54,7 @@ namespace IRType {
         FunctionSignature,
         ExternalFunctionSignature,
         DirectCall,
+        IntrinsicOperator,
         CallTarget,
         Symbol,
         ClassLayout,
@@ -65,6 +66,7 @@ namespace IRType {
         Integer,
         Boolean,
         String,
+        Bytes,
         Null,
         EmptyArray,
         EmptyDict,
@@ -76,6 +78,7 @@ namespace IRType {
         int64_t integerValue = 0;
         bool booleanValue = false;
         std::string stringValue;
+        std::string bytesValue;
     };
 
     // 指令旁路元信息。它不参与 VM 执行，只为 LLVM lowering、调试和后续后端提供结构化信息。
@@ -94,6 +97,7 @@ namespace IRType {
         std::string moduleName;
         int captureCount = 0;
         bool hasCaptureCount = false;
+        bool isStaticMethod = false;
 
         static IRMetadata functionSignature(
             const std::string& name,
@@ -101,7 +105,8 @@ namespace IRType {
             int captures,
             std::vector<std::string> parameterTypes,
             std::string owner = {},
-            std::string op = {}
+            std::string op = {},
+            bool staticMethod = false
         ) {
             IRMetadata result;
             result.kind = IRMetadataKind::FunctionSignature;
@@ -113,6 +118,7 @@ namespace IRType {
             result.operatorSymbol = std::move(op);
             result.captureCount = captures;
             result.hasCaptureCount = true;
+            result.isStaticMethod = staticMethod;
             return result;
         }
 
@@ -136,6 +142,13 @@ namespace IRType {
             result.kind = IRMetadataKind::DirectCall;
             result.tag = "direct_call";
             result.symbol = SymbolRef::function(name);
+            return result;
+        }
+
+        static IRMetadata intrinsicOperator() {
+            IRMetadata result;
+            result.kind = IRMetadataKind::IntrinsicOperator;
+            result.tag = "intrinsic_operator";
             return result;
         }
 

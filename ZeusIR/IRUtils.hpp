@@ -163,6 +163,11 @@ namespace IRUtils {
 		return ins;
 	}
 
+	inline IRType::IRInstr makeIntrinsicOperator(IRType::IRInstr ins) {
+		ins.metadata = IRType::IRMetadata::intrinsicOperator();
+		return ins;
+	}
+
 	inline IRType::IRInstr makeLessThan() {
 		IRType::IRInstr ins;
 		ins.op = VMOperator::LESS_THAN;

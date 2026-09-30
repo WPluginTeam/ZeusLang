@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -77,6 +78,55 @@ namespace IRStaticOperator {
             return true;
         }
 
+        static bool isGlobalLoad(const IRType::IRInstr& ins, int& index) {
+            if (ins.op != VMOperator::LOAD_VALUE || ins.args.size() < 2 ||
+                !std::holds_alternative<std::string>(ins.args[0]) ||
+                !std::holds_alternative<LexerType::Value>(ins.args[1]) ||
+                std::get<std::string>(ins.args[0]) != "global") {
+                return false;
+            }
+
+            const auto& value = std::get<LexerType::Value>(ins.args[1]);
+            if (!std::holds_alternative<ZeusType::BigInteger>(value.data)) {
+                return false;
+            }
+
+            int64_t raw = 0;
+            if (!std::get<ZeusType::BigInteger>(value.data).tryToInt64(raw) ||
+                raw < 0 || raw > std::numeric_limits<int>::max()) {
+                return false;
+            }
+
+            index = static_cast<int>(raw);
+            return true;
+        }
+
+        static bool readGlobalStoreIndex(
+            const IRType::IRInstr& ins,
+            int& index
+        ) {
+            if ((ins.op != VMOperator::STORE_VALUE_GLOBAL &&
+                 ins.op != VMOperator::ASSIGN_VALUE_GLOBAL) ||
+                ins.args.empty() ||
+                !std::holds_alternative<LexerType::Value>(ins.args[0])) {
+                return false;
+            }
+
+            const auto& value = std::get<LexerType::Value>(ins.args[0]);
+            if (!std::holds_alternative<ZeusType::BigInteger>(value.data)) {
+                return false;
+            }
+
+            int64_t raw = 0;
+            if (!std::get<ZeusType::BigInteger>(value.data).tryToInt64(raw) ||
+                raw < 0 || raw > std::numeric_limits<int>::max()) {
+                return false;
+            }
+
+            index = static_cast<int>(raw);
+            return true;
+        }
+
         const FunctionSignature* findOperator(
             const std::string& lhsType,
             const std::string& rhsType,
@@ -100,6 +150,35 @@ namespace IRStaticOperator {
                 return &signature;
             }
 
+            return nullptr;
+        }
+
+        const FunctionSignature* findIndexOperator(
+            const std::string& containerType,
+            const std::vector<std::string>& argumentTypes,
+            const std::string& op
+        ) const {
+            if (containerType.empty() || argumentTypes.empty()) return nullptr;
+
+            for (const auto& entry : functions) {
+                const auto& signature = entry.second;
+                if (signature.ownerType != containerType ||
+                    signature.operatorSymbol != op ||
+                    signature.parameterTypes.size() != argumentTypes.size() + 1 ||
+                    signature.parameterTypes[0] != containerType) {
+                    continue;
+                }
+
+                bool matches = true;
+                for (size_t i = 0; i < argumentTypes.size(); ++i) {
+                    if (argumentTypes[i].empty() ||
+                        signature.parameterTypes[i + 1] != argumentTypes[i]) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches) return &signature;
+            }
             return nullptr;
         }
 
@@ -161,28 +240,37 @@ namespace IRStaticOperator {
             }
         }
 
-        void resolveChunk(std::vector<IRType::IRInstr>& chunk) const {
-            if (chunk.empty() || chunk.front().op != VMOperator::FUNC_BEGIN) return;
+        void resolveChunk(
+            std::vector<IRType::IRInstr>& chunk,
+            std::unordered_map<int, std::string>& globalTypes
+        ) const {
+            if (chunk.empty()) return;
+            const bool isFunctionChunk =
+                chunk.front().op == VMOperator::FUNC_BEGIN;
 
             const IRType::IRInstr* signatureInstruction = nullptr;
-            for (const auto& ins : chunk) {
-                if (ins.op == VMOperator::IR_ANNOTATION &&
-                    ins.metadata.kind == IRType::IRMetadataKind::FunctionSignature) {
-                    signatureInstruction = &ins;
-                    break;
+            if (isFunctionChunk) {
+                for (const auto& ins : chunk) {
+                    if (ins.op == VMOperator::IR_ANNOTATION &&
+                        ins.metadata.kind == IRType::IRMetadataKind::FunctionSignature) {
+                        signatureInstruction = &ins;
+                        break;
+                    }
                 }
             }
 
-            if (signatureInstruction == nullptr) return;
+            if (isFunctionChunk && signatureInstruction == nullptr) return;
 
             FunctionSignature signature;
-            int captures = 0;
-            if (!signatureInstruction->metadata.readFunctionSignature(
-                    signature.name,
-                    signature.returnType,
-                    captures,
-                    signature.parameterTypes)) {
-                return;
+            if (signatureInstruction != nullptr) {
+                int captures = 0;
+                if (!signatureInstruction->metadata.readFunctionSignature(
+                        signature.name,
+                        signature.returnType,
+                        captures,
+                        signature.parameterTypes)) {
+                    return;
+                }
             }
 
             std::unordered_map<int, std::string> locals;
@@ -229,6 +317,15 @@ namespace IRStaticOperator {
                     continue;
                 }
 
+                int globalIndex = -1;
+                if (isGlobalLoad(ins, globalIndex)) {
+                    auto global = globalTypes.find(globalIndex);
+                    stack.push_back(global == globalTypes.end()
+                        ? std::string()
+                        : global->second);
+                    continue;
+                }
+
                 if (ins.op == VMOperator::STORE_VALUE_LOCAL ||
                     ins.op == VMOperator::ASSIGN_VALUE_LOCAL) {
                     std::string valueType = popType();
@@ -239,6 +336,16 @@ namespace IRStaticOperator {
                         if (std::get<ZeusType::BigInteger>(indexValue.data).tryToInt64(raw)) {
                             locals[static_cast<int>(raw)] = valueType;
                         }
+                    }
+                    continue;
+                }
+
+                if (ins.op == VMOperator::STORE_VALUE_GLOBAL ||
+                    ins.op == VMOperator::ASSIGN_VALUE_GLOBAL) {
+                    const std::string valueType = popType();
+                    if (!isFunctionChunk &&
+                        readGlobalStoreIndex(ins, globalIndex)) {
+                        globalTypes[globalIndex] = valueType;
                     }
                     continue;
                 }
@@ -259,9 +366,52 @@ namespace IRStaticOperator {
                     continue;
                 }
 
+                if (ins.op == VMOperator::DICT_LOAD_VALUE) {
+                    const std::string keyType = popType();
+                    const std::string containerType = popType();
+                    const FunctionSignature* target = isFunctionChunk
+                        ? nullptr
+                        : findIndexOperator(containerType, { keyType }, "[]");
+                    if (target != nullptr) {
+                        ins.metadata = IRType::IRMetadata::directCall(target->name);
+                        stack.push_back(target->returnType);
+                    } else {
+                        stack.push_back({});
+                    }
+                    pendingDirectCall.clear();
+                    continue;
+                }
+
+                if (ins.op == VMOperator::DICT_STORE_VALUE) {
+                    const std::string valueType = popType();
+                    const std::string keyType = popType();
+                    const std::string containerType = popType();
+                    const FunctionSignature* target = isFunctionChunk
+                        ? nullptr
+                        : findIndexOperator(
+                            containerType, { keyType, valueType }, "[]=");
+                    if (target != nullptr) {
+                        ins.metadata = IRType::IRMetadata::directCall(target->name);
+                    }
+                    pendingDirectCall.clear();
+                    continue;
+                }
+
                 if (isBinaryOperator(ins.op)) {
                     const std::string rhsType = popType();
                     const std::string lhsType = popType();
+
+                    if (ins.metadata.kind ==
+                        IRType::IRMetadataKind::IntrinsicOperator) {
+                        const std::string symbol = operatorSymbol(ins.op);
+                        const bool isComparison = symbol == "==" || symbol == "!=" ||
+                            symbol == ">" || symbol == "<" || symbol == ">=" ||
+                            symbol == "<=";
+                        stack.push_back(isComparison ? "bool" : lhsType);
+                        pendingDirectCall.clear();
+                        continue;
+                    }
+
                     const FunctionSignature* target = findOperator(
                         lhsType,
                         rhsType,
@@ -305,7 +455,8 @@ namespace IRStaticOperator {
     public:
         void annotate(std::vector<std::vector<IRType::IRInstr>>& program) {
             collectSignatures(program);
-            for (auto& chunk : program) resolveChunk(chunk);
+            std::unordered_map<int, std::string> globalTypes;
+            for (auto& chunk : program) resolveChunk(chunk, globalTypes);
         }
     };
 

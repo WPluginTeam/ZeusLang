@@ -6,6 +6,9 @@
 #include "core.hpp"
 #include "array.hpp"
 
+#include <cstdint>
+#include <limits>
+
 namespace ZeusBuiltins {
 
     // ===== String 操作函数 =====
@@ -199,6 +202,10 @@ namespace ZeusBuiltins {
         }
         if (!new_str) throw std::runtime_error("__str_replace: third argument must be string");
 
+        if (old_str->empty()) {
+            throw std::runtime_error("__str_replace: old substring cannot be empty");
+        }
+
         std::string result = *str;
         size_t pos = 0;
         while ((pos = result.find(*old_str, pos)) != std::string::npos) {
@@ -207,6 +214,25 @@ namespace ZeusBuiltins {
         }
 
         return ZeusType::UniversalVariant(result);
+    }
+
+    inline ZeusType::UniversalVariant builtin_str_length(const std::vector<ZeusType::UniversalVariant>& args) {
+        if (args.size() != 1) throw std::runtime_error("__str_length expects 1 argument");
+
+        const std::string* str = nullptr;
+        if (const std::string* value = std::get_if<std::string>(&args[0])) {
+            str = value;
+        } else if (const LexerType::Value* value = std::get_if<LexerType::Value>(&args[0])) {
+            if (std::holds_alternative<std::string>(value->data)) {
+                str = &std::get<std::string>(value->data);
+            }
+        }
+        if (!str) throw std::runtime_error("__str_length: argument must be string");
+        if (str->size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+            throw std::runtime_error("__str_length: string is too large");
+        }
+        return ZeusType::UniversalVariant(
+            ZeusType::BigInteger(static_cast<int64_t>(str->size())));
     }
 
     // __str_split(string, separator): 分割字符串，返回数组
@@ -398,6 +424,7 @@ namespace ZeusBuiltins {
 
     // ===== 注册函数 =====
     inline void registerStringBuiltins() {
+        registerBuiltin("__str_length", builtin_str_length, 1, 1);
         registerBuiltin("__str_get", builtin_str_get, 2, 2);
         registerBuiltin("__str_slice", builtin_str_slice, 3, 3);
         registerBuiltin("__str_index", builtin_str_index, 2, 3);

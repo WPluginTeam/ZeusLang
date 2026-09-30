@@ -1018,7 +1018,46 @@ namespace ZeusPackage {
                     }
                     
                     if (namespaceClassIdx < 0) {
-                        ZEUS_DEBUG_PRINT("[PackageLoader] Error: Namespace class not found in any globals");
+                        // LLVM does not need a runtime Namespace object for a
+                        // namespace import: the emitter resolves exported class
+                        // members from this marker. Keep the import and exports
+                        // in a metadata-only chunk instead of dropping it.
+                        ZEUS_DEBUG_PRINT("[PackageLoader] Building static namespace import marker for '%s'",
+                            packageName.c_str());
+                        std::string markerAlias = importIt->second.alias;
+                        if (markerAlias.empty()) {
+                            markerAlias = packageName;
+                            const size_t lastDot = markerAlias.find_last_of('.');
+                            if (lastDot != std::string::npos) {
+                                markerAlias = markerAlias.substr(lastDot + 1);
+                            }
+                        }
+
+                        int aliasIndex = -1;
+                        for (size_t i = 0; i < originalMainGlobals.size(); ++i) {
+                            if (originalMainGlobals[i] == markerAlias) {
+                                aliasIndex = static_cast<int>(i);
+                                break;
+                            }
+                        }
+                        if (aliasIndex < 0) {
+                            ZEUS_DEBUG_PRINT("[PackageLoader] Namespace alias '%s' has no global slot",
+                                markerAlias.c_str());
+                            continue;
+                        }
+
+                        std::vector<IRType::IRInstr> markerChunk;
+                        IRType::IRInstr marker = importInstr;
+                        marker.metadata = IRType::IRMetadata::moduleImportInit(packageName);
+                        marker.args.push_back(LexerType::Value(
+                            ZeusType::BigInteger(totalPackageGlobals + aliasIndex)));
+                        markerChunk.push_back(std::move(marker));
+                        for (const auto& name : targetPkg->globalNames) {
+                            markerChunk.push_back(IRType::IRInstr{
+                                VMOperator::PUSH, {LexerType::Value(name)}
+                            });
+                        }
+                        newChunks.push_back(std::move(markerChunk));
                         continue;
                     }
                     

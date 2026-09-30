@@ -377,12 +377,12 @@ namespace ZeusCompile {
 }
 
 namespace Test {
-    inline void testLexerParserIRGen(bool enableHotspot = true) {
+    inline bool testLexerParserIRGen(bool enableHotspot = true) {
         ZEUS_DEBUG_PRINT("===== Lexer, Parser and IR Generator Tests =====");
         std::string testStr = R"(
 
 
-print("use --debug-channels=IR/PARSE to see IR details");
+__builtin_print("use --debug-channels=IR/PARSE to see IR details");
 )";
         using clock = std::chrono::steady_clock;
         auto t0 = clock::now();
@@ -411,7 +411,7 @@ print("use --debug-channels=IR/PARSE to see IR details");
         auto t3 = clock::now();
         if (irGen.status != IRType::IRCompilerStatus::Running) {
             ZEUS_DEBUG_PRINT("IR Generation failed.");
-            return;
+            return false;
         }
 
         // 对内置测试的 IR 做热点优化（可开关）
@@ -510,6 +510,7 @@ print("use --debug-channels=IR/PARSE to see IR details");
 
         ZEUS_DEBUG_PRINT("------------------ Delayed Print Output ------------------");
         ZeusBuiltins::printAll();
+        return vm.vmstat == ZeusType::VMStatus::Running;
     }
 }
 

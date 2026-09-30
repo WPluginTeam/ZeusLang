@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <optional>
 #include <shared_mutex>
+#include <limits>
 
 // Windows Socket headers
 #ifdef _WIN32
@@ -1544,11 +1545,37 @@ class VM {
         }
     }
     
+    // Explicit delete invalidates the source object immediately. The storage
+    // remains as a tombstone until every old handle releases its reference.
+    void destroyObjectSource(const ZeusType::ObjectHandle& handle) {
+        auto* obj = getValidObject(handle);
+        if (!obj) return;
+        auto* classInfo = getClass(obj->classId);
+        if (classInfo && classInfo->name == "Namespace") return;
+
+        // Keep a temporary reference while dropping fields: a self-reference
+        // or closure field may release the object recursively.
+        retainObject(handle.id);
+        std::vector<ZeusType::UniversalVariant> nestedValues;
+        nestedValues.reserve(obj->values.size());
+        for (auto& entry : obj->values) {
+            nestedValues.push_back(std::move(entry.second));
+        }
+        obj->values.clear();
+        obj->flags.clear();
+        obj->markedForDeletion = true;
+        for (auto& value : nestedValues) {
+            ZeusGC::releaseVariantDeep(*this, value);
+        }
+        releaseObject(handle.id); // release the temporary reference
+    }
+
     // 减少对象引用计数，必要时释放
     void releaseObject(int objId) {
         auto* obj = getMutableObject(objId);
-        
-        if (!obj || obj->markedForDeletion) return;
+
+        if (!obj) return;
+        if (obj->markedForDeletion && obj->refCount <= 0) return;
 
         // 永久保留 Namespace 对象，避免全局命名空间被误释放
         if (obj->classId >= 0 && obj->classId < (int)classes.size()) {
@@ -2870,6 +2897,64 @@ class VM {
         return true;
     }
 
+    bool tryDispatchTypeImplementationOperator(
+        const std::string& operatorName,
+        const ZeusType::UniversalVariant* const* arguments,
+        size_t argumentCount,
+        const IRType::IRInstr& instr
+    ) {
+        if (instr.metadata.kind == IRType::IRMetadataKind::IntrinsicOperator ||
+            arguments == nullptr || argumentCount == 0 || arguments[0] == nullptr ||
+            std::holds_alternative<ZeusType::ObjectHandle>(*arguments[0]) ||
+            std::holds_alternative<ZeusType::SharedObjectHandle>(*arguments[0])) {
+            return false;
+        }
+
+        LexerType::Value receiverValue(0);
+        if (!ZeusVMUtils::convertToValue(*arguments[0], receiverValue)) return false;
+
+        const auto implementation = typeImplementations.find(receiverValue.getStringType());
+        if (implementation == typeImplementations.end()) return false;
+        const auto op = implementation->second.operatorMethods.find(operatorName);
+        if (op == implementation->second.operatorMethods.end()) return false;
+
+        if (argumentCount > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            getPrototype(op->second) == nullptr) {
+            VMException::VMException exp(
+                "TYPE_IMPL_BUILD registered an invalid operator prototype",
+                __line, instr);
+            exp._throw(vmstat, currentChunk);
+            return true;
+        }
+
+        Closure closure;
+        closure.protoId = op->second;
+        closure.autoRelease = true;
+        const int closureId = allocClosure(std::move(closure));
+        stack.push_back(ZeusType::ClosureHandle{closureId});
+        for (size_t i = 0; i < argumentCount; ++i) {
+            if (arguments[i] == nullptr) {
+                VMException::VMException exp(
+                    "type implementation operator received a null argument",
+                    __line, instr);
+                exp._throw(vmstat, currentChunk);
+                return true;
+            }
+            ZeusGC::retainVariantDeep(*this, *arguments[i]);
+            stack.push_back(*arguments[i]);
+        }
+
+        if (!executeClosureSync(closureId, static_cast<int>(argumentCount))) {
+            if (vmstat == ZeusType::VMStatus::Running) {
+                VMException::VMException exp(
+                    "[execute] type implementation operator dispatch failed",
+                    __line, instr);
+                exp._throw(vmstat, currentChunk);
+            }
+        }
+        return true;
+    }
+
     // P1：按 const 引用接收指令，避免每次 dispatch 深拷贝
     // 整个 vector<IRArgs>（含 string/Value/Bytes）。实测前这是每条指令
     // 一次堆分配，是循环基准的最大头。
@@ -3920,6 +4005,7 @@ class VM {
                 // 将对象序列化为 ObjectData 存储到共享堆
                 auto sharedObjData = std::make_shared<ZeusType::ObjectData>();
                 sharedObjData->data["__obj_id__"] = LexerType::Value(objId);
+                sharedObjData->data["__obj_generation__"] = LexerType::Value(objHandle.generation);
                 sharedObjData->data["__class_id__"] = LexerType::Value(classId);
                 sharedObjData->data["__class_name__"] = LexerType::Value(ci.name);
                 
@@ -3934,7 +4020,7 @@ class VM {
                 ZeusType::Object sharedObj;
                 sharedObj.impl = sharedObjData;
 
-                ZeusShared::getGlobalHeap().getOrCreate(
+                auto sharedCell = ZeusShared::getGlobalHeap().getOrCreate(
                     objName,
                     ZeusType::Variant(sharedObj)
                 );
@@ -3947,7 +4033,7 @@ class VM {
                 }
 
                 // 返回 SharedObjectHandle
-                stack.push_back(ZeusType::SharedObjectHandle{objName});
+                stack.push_back(ZeusType::SharedObjectHandle{objName, sharedCell->generation});
                 printStack();
                 break;
             }
@@ -4015,9 +4101,11 @@ class VM {
 
                 // 处理 SharedObjectHandle：从共享堆读取属性
                 if (std::holds_alternative<ZeusType::SharedObjectHandle>(objU)) {
-                    std::string sharedName = std::get<ZeusType::SharedObjectHandle>(objU).name;
+                    const auto sharedHandle = std::get<ZeusType::SharedObjectHandle>(objU);
+                    const std::string& sharedName = sharedHandle.name;
                     
-                    auto cell = ZeusShared::getGlobalHeap().find(sharedName);
+                    auto cell = ZeusShared::getGlobalHeap().find(
+                        sharedName, sharedHandle.generation);
                     if (!cell) {
                         VMException::VMException exp("OBJ_LOAD_ATTR: undefined shared object '" + sharedName + "'", __line, instr);
                         exp._throw(vmstat, currentChunk);
@@ -4294,9 +4382,11 @@ class VM {
 
                 // 处理 SharedObjectHandle：写入共享堆中的对象属性
                 if (std::holds_alternative<ZeusType::SharedObjectHandle>(objU)) {
-                    std::string sharedName = std::get<ZeusType::SharedObjectHandle>(objU).name;
+                    const auto sharedHandle = std::get<ZeusType::SharedObjectHandle>(objU);
+                    const std::string& sharedName = sharedHandle.name;
                     
-                    auto cell = ZeusShared::getGlobalHeap().find(sharedName);
+                    auto cell = ZeusShared::getGlobalHeap().find(
+                        sharedName, sharedHandle.generation);
                     if (!cell) {
                         VMException::VMException exp("OBJ_STORE_ATTR: undefined shared object '" + sharedName + "'", __line, instr);
                         exp._throw(vmstat, currentChunk);
@@ -4575,9 +4665,11 @@ class VM {
 
                 // 处理 SharedObjectHandle：从共享堆读取对象并调用方法
                 if (std::holds_alternative<ZeusType::SharedObjectHandle>(callee)) {
-                    std::string sharedName = std::get<ZeusType::SharedObjectHandle>(callee).name;
+                    const auto sharedHandle = std::get<ZeusType::SharedObjectHandle>(callee);
+                    const std::string& sharedName = sharedHandle.name;
                     
-                    auto cell = ZeusShared::getGlobalHeap().find(sharedName);
+                    auto cell = ZeusShared::getGlobalHeap().find(
+                        sharedName, sharedHandle.generation);
                     if (!cell) {
                         VMException::VMException exp("SharedObjectHandle: undefined shared object '" + sharedName + "'", __line, instr);
                         exp._throw(vmstat, currentChunk);
@@ -4672,7 +4764,8 @@ class VM {
                     // 在参数列表开头插入 this (SharedObjectHandle)
                     // 需要将 this 插入到 args 之前
                     // 栈变为: [closure, this, arg0, arg1, ...]
-                    stack.insert(stack.begin() + calleeIndex + 1, ZeusType::SharedObjectHandle{sharedName});
+                    stack.insert(stack.begin() + calleeIndex + 1,
+                        ZeusType::SharedObjectHandle{sharedName, sharedHandle.generation});
                     
                     // 调用闭包，argc + 1 因为添加了 this
                     // Dispatch through a real frame so the callee gets its own local
@@ -4978,6 +5071,10 @@ class VM {
                 ZeusType::UniversalVariant left  = std::move(stack.back());
                 stack.pop_back();
 
+                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
+                if (tryDispatchTypeImplementationOperator(
+                        "[+]", operatorArguments, 2, instr)) break;
+
                 // P0 fast path: int + int（覆盖 x=x+1 与 for 计数器自增）
                 // 跳过 operator重载 / Bytes / convertToValue / getStringType 全套慢路径
                 {
@@ -5232,6 +5329,12 @@ class VM {
                         if (vm && b) vm->dropStackItem(*b);
                     }
                 } dropInputs{this, &keyItem, &dictItem};
+
+                const ZeusType::UniversalVariant* operatorArguments[] = {
+                    &dictVar, &keyVar
+                };
+                if (tryDispatchTypeImplementationOperator(
+                        "[[]]", operatorArguments, 2, instr)) break;
                  
                 // default missing value -> nil (ZeusType::Null)
                 ZeusType::UniversalVariant valueOut = ZeusType::Null();
@@ -5375,6 +5478,12 @@ class VM {
                 ZeusType::UniversalVariant newVal = stack.back(); stack.pop_back();
                 ZeusType::UniversalVariant keyVar = stack.back(); stack.pop_back();
                 ZeusType::UniversalVariant dictVar = stack.back(); stack.pop_back();
+
+                const ZeusType::UniversalVariant* operatorArguments[] = {
+                    &dictVar, &keyVar, &newVal
+                };
+                if (tryDispatchTypeImplementationOperator(
+                        "[[]=]", operatorArguments, 3, instr)) break;
                 
                 if (std::holds_alternative<ZeusType::Variant>(dictVar)) {
                     ZeusType::Variant &dv = std::get<ZeusType::Variant>(dictVar);
@@ -5640,6 +5749,10 @@ class VM {
                 ZeusType::UniversalVariant left  = stack.back();
                 stack.pop_back();
 
+                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
+                if (tryDispatchTypeImplementationOperator(
+                        "[-]", operatorArguments, 2, instr)) break;
+
                 // 3. 检查左操作数是否为对象（支持operator[-]重载）
                 if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
                     int objId = std::get<ZeusType::ObjectHandle>(left).id;
@@ -5721,6 +5834,10 @@ class VM {
                 ZeusType::UniversalVariant left  = stack.back();
                 stack.pop_back();
 
+                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
+                if (tryDispatchTypeImplementationOperator(
+                        "[*]", operatorArguments, 2, instr)) break;
+
                 // 3. 检查左操作数是否为对象（支持operator[*]重载）
                 if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
                     int objId = std::get<ZeusType::ObjectHandle>(left).id;
@@ -5801,6 +5918,10 @@ class VM {
 
                 ZeusType::UniversalVariant left  = stack.back();
                 stack.pop_back();
+
+                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
+                if (tryDispatchTypeImplementationOperator(
+                        "[/]", operatorArguments, 2, instr)) break;
 
                 // 3. 检查左操作数是否为对象（支持operator[/]重载）
                 if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
@@ -5885,6 +6006,10 @@ class VM {
 
                 ZeusType::UniversalVariant left = stack.back();
                 stack.pop_back();
+
+                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
+                if (tryDispatchTypeImplementationOperator(
+                        "[%]", operatorArguments, 2, instr)) break;
 
                 // 3. 检查左操作数是否为对象（支持operator[%]重载）
                 if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
@@ -7099,7 +7224,7 @@ class VM {
                         
                         if (obj.impl && obj.impl->data.find("__className__") != obj.impl->data.end()) {
                             // 这是一个共享对象，返回 SharedObjectHandle
-                            stack.push_back(ZeusType::SharedObjectHandle{varName});
+                            stack.push_back(ZeusType::SharedObjectHandle{varName, cell->generation});
                             
                             ZEUS_DEBUG_PRINT("[VM] LOAD_VALUE_SHARED: name='%s' (shared object)", varName.c_str());
                             printStack();
@@ -7397,6 +7522,10 @@ class VM {
                 ZeusType::UniversalVariant left  = stack.back();
                 stack.pop_back();
 
+                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
+                if (tryDispatchTypeImplementationOperator(
+                        "[==]", operatorArguments, 2, instr)) break;
+
                 // 2.5 处理 nil 比较: nil == nil 为 true，nil == 非nil 为 false
                 bool leftIsNull = ZeusVMUtils::isNull(left);
                 bool rightIsNull = ZeusVMUtils::isNull(right);
@@ -7514,6 +7643,10 @@ class VM {
 
                 ZeusType::UniversalVariant left  = stack.back();
                 stack.pop_back();
+
+                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
+                if (tryDispatchTypeImplementationOperator(
+                        "[!=]", operatorArguments, 2, instr)) break;
 
                 // 2.5 处理 nil 比较: nil != nil 为 false，nil != 非nil 为 true
                 bool leftIsNull = ZeusVMUtils::isNull(left);
@@ -7633,6 +7766,10 @@ class VM {
                 ZeusType::UniversalVariant left  = stack.back();
                 stack.pop_back();
 
+                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
+                if (tryDispatchTypeImplementationOperator(
+                        "[>]", operatorArguments, 2, instr)) break;
+
                 // 3. 检查左操作数是否为对象（支持operator[>]重载）
                 if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
                     int objId = std::get<ZeusType::ObjectHandle>(left).id;
@@ -7702,6 +7839,10 @@ class VM {
                 // 3. 弹出左操作数
                 ZeusType::UniversalVariant left  = std::move(stack.back());
                 stack.pop_back();
+
+                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
+                if (tryDispatchTypeImplementationOperator(
+                        "[<]", operatorArguments, 2, instr)) break;
 
                 // P0 fast path: int < int（覆盖 for 循环条件）
                 // 跳过 BigDecimal(0) 构造 + extractNumber + BigDecimal 比较全套
@@ -7779,6 +7920,10 @@ class VM {
                 auto left  = stack.back();
                 stack.pop_back();
 
+                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
+                if (tryDispatchTypeImplementationOperator(
+                        "[>=]", operatorArguments, 2, instr)) break;
+
                 // 检查左操作数是否为对象（支持operator[>=]重载）
                 if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
                     int objId = std::get<ZeusType::ObjectHandle>(left).id;
@@ -7839,6 +7984,10 @@ class VM {
                 stack.pop_back();
                 auto left  = stack.back();
                 stack.pop_back();
+
+                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
+                if (tryDispatchTypeImplementationOperator(
+                        "[<=]", operatorArguments, 2, instr)) break;
 
                 // 检查左操作数是否为对象（支持operator[<=]重载）
                 if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
@@ -8013,15 +8162,46 @@ class VM {
                 ZEUS_DEBUG_PRINT("[DELETE_VAR] Deleting %s variable: %s (index=%d)", kind.c_str(), varName.c_str(), varIndex);
                 
                 // 调用 operator[~] 的辅助 lambda
-                auto callDestructor = [&](Cell* cell) {
-                    
-                    if (!cell) return;
-                    
-                    auto& cellVal = cell->value;
-                    
-                    if (!std::holds_alternative<ZeusType::ObjectHandle>(cellVal)) return;
-                    
-                    ZeusType::ObjectHandle objH = std::get<ZeusType::ObjectHandle>(cellVal);
+                auto objectHandleFromStoredObject = [&](const ZeusType::UniversalVariant& value) {
+                    ZeusType::ObjectHandle invalid{-1, 0};
+                    const auto* wrapped = std::get_if<ZeusType::Variant>(&value);
+                    if (!wrapped) return invalid;
+                    const auto* object = std::get_if<ZeusType::Object>(wrapped);
+                    if (!object || !object->impl) return invalid;
+
+                    const auto idIt = object->impl->data.find("__obj_id__");
+                    if (idIt == object->impl->data.end() ||
+                        !std::holds_alternative<LexerType::Value>(idIt->second)) {
+                        return invalid;
+                    }
+                    const int objectId = VMHelpers::getIntFromValue(
+                        std::get<LexerType::Value>(idIt->second));
+                    int generation = 0;
+                    const auto generationIt = object->impl->data.find("__obj_generation__");
+                    if (generationIt != object->impl->data.end() &&
+                        std::holds_alternative<LexerType::Value>(generationIt->second)) {
+                        generation = VMHelpers::getIntFromValue(
+                            std::get<LexerType::Value>(generationIt->second));
+                    }
+                    return ZeusType::ObjectHandle{objectId, generation};
+                };
+
+                auto resolveObjectHandle = [&](const ZeusType::UniversalVariant& value) {
+                    if (std::holds_alternative<ZeusType::ObjectHandle>(value)) {
+                        return std::get<ZeusType::ObjectHandle>(value);
+                    }
+                    if (std::holds_alternative<ZeusType::SharedObjectHandle>(value)) {
+                        const auto& shared = std::get<ZeusType::SharedObjectHandle>(value);
+                        auto source = ZeusShared::getGlobalHeap().find(shared.name, shared.generation);
+                        return source ? objectHandleFromStoredObject(source->read())
+                                      : ZeusType::ObjectHandle{-1, 0};
+                    }
+                    return objectHandleFromStoredObject(value);
+                };
+
+                auto callDestructor = [&](const ZeusType::UniversalVariant& cellVal) {
+                    ZeusType::ObjectHandle objH = resolveObjectHandle(cellVal);
+                    if (objH.id < 0) return;
                     
                     // 验证 generation，确保对象没有被复用
                     auto* objPtr = getValidObject(objH);
@@ -8110,14 +8290,22 @@ class VM {
                 };
                 
                 // 释放 Cell 中持有的对象或闭包的辅助 lambda
-                auto releaseRefInCell = [&](Cell* cell) {
-                    if (!cell) return;
-                    
-                    auto& cellVal = cell->value;
-                    
+                auto releaseRefInCell = [&](const ZeusType::UniversalVariant& cellVal) {
                     if (std::holds_alternative<ZeusType::ObjectHandle>(cellVal)) {
                         int objId = std::get<ZeusType::ObjectHandle>(cellVal).id;
                         releaseObject(objId);
+                    } else if (std::holds_alternative<ZeusType::SharedObjectHandle>(cellVal)) {
+                        const auto shared = std::get<ZeusType::SharedObjectHandle>(cellVal);
+                        auto target = ZeusShared::getGlobalHeap().find(shared.name, shared.generation);
+                        if (target) {
+                            const auto targetObject = objectHandleFromStoredObject(target->read());
+                            auto removedTarget = ZeusShared::getGlobalHeap().erase(
+                                shared.name, shared.generation);
+                            if (removedTarget) {
+                                removedTarget->write(ZeusType::Variant(ZeusType::Null{}));
+                                if (targetObject.id >= 0) releaseObject(targetObject.id);
+                            }
+                        }
                     } else if (std::holds_alternative<ZeusType::ClosureHandle>(cellVal)) {
                         int cloId = std::get<ZeusType::ClosureHandle>(cellVal).id;
                         releaseClosure(cloId);
@@ -8128,26 +8316,49 @@ class VM {
                 bool found = false;
                 
                 // 提取对象 ID 并打断闭包循环的辅助 lambda
-                auto breakCyclesIfObject = [&](Cell* cell) {
-                    if (!cell) return;
-
-                    auto& cellVal = cell->value;
-
-                    if (std::holds_alternative<ZeusType::ObjectHandle>(cellVal)) {
-                        int objId = std::get<ZeusType::ObjectHandle>(cellVal).id;
-                        forceBreakClosureCycles(objId);
-                    }
+                auto breakCyclesIfObject = [&](const ZeusType::UniversalVariant& cellVal) {
+                    const auto handle = resolveObjectHandle(cellVal);
+                    if (handle.id < 0 || !getValidObject(handle)) return;
+                    forceBreakClosureCycles(handle.id);
+                    destroyObjectSource(handle);
                 };
                 
-                if (kind == "local" && varIndex >= 0 && varIndex < (int)local.size()) {
+                if (kind == "shared") {
+                    auto source = ZeusShared::getGlobalHeap().find(varName);
+                    if (source) {
+                        source->lockWrite();
+                        struct SharedDeleteUnlock {
+                            std::shared_ptr<ZeusShared::SharedCell> cell;
+                            ~SharedDeleteUnlock() {
+                                if (cell) cell->unlockWrite();
+                            }
+                        } sharedDeleteUnlock{source};
+
+                        const auto value = source->read();
+                        callDestructor(value);
+                        if (vmstat != ZeusType::VMStatus::Running) break;
+                        breakCyclesIfObject(value);
+                        const auto objectHandle = objectHandleFromStoredObject(value);
+                        releaseRefInCell(value);
+
+                        auto removed = ZeusShared::getGlobalHeap().erase(
+                            varName, source->generation);
+                        if (removed) {
+                            removed->write(ZeusType::Variant(ZeusType::Null{}));
+                            if (objectHandle.id >= 0) releaseObject(objectHandle.id);
+                        }
+                        found = !ZeusShared::getGlobalHeap().find(
+                            varName, source->generation);
+                    }
+                } else if (kind == "local" && varIndex >= 0 && varIndex < (int)local.size()) {
                     // 删除局部变量
                     Cell* cell = local[varIndex];
                     
                     if (cell) {
-                        callDestructor(cell);
+                        callDestructor(cell->value);
                         if (vmstat != ZeusType::VMStatus::Running) break;
-                        breakCyclesIfObject(cell);
-                        releaseRefInCell(cell);
+                        breakCyclesIfObject(cell->value);
+                        releaseRefInCell(cell->value);
                         cell->release();
                         local[varIndex] = nullptr;
                         found = true;
@@ -8157,10 +8368,10 @@ class VM {
                     Cell* cell = upvalue[varIndex];
                     
                     if (cell) {
-                        callDestructor(cell);
+                        callDestructor(cell->value);
                         if (vmstat != ZeusType::VMStatus::Running) break;
-                        breakCyclesIfObject(cell);
-                        releaseRefInCell(cell);
+                        breakCyclesIfObject(cell->value);
+                        releaseRefInCell(cell->value);
                         cell->release();
                         upvalue[varIndex] = nullptr;
                         found = true;
@@ -8170,10 +8381,10 @@ class VM {
                     for (size_t i = 0; i < global.size(); ++i) {
                         if (i < globalNames.size() && globalNames[i] == varName) {
                             if (global[i]) {
-                                callDestructor(global[i]);
+                                callDestructor(global[i]->value);
                                 if (vmstat != ZeusType::VMStatus::Running) break;
-                                breakCyclesIfObject(global[i]);
-                                releaseRefInCell(global[i]);
+                                breakCyclesIfObject(global[i]->value);
+                                releaseRefInCell(global[i]->value);
                                 global[i]->release();
                                 global[i] = nullptr;
                                 found = true;

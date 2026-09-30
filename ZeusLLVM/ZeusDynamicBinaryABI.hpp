@@ -21,6 +21,8 @@ inline int opcodeFor(VMOperator op) {
         case VMOperator::GREATER_THAN: return 8;
         case VMOperator::GREATER_EQUAL: return 9;
         case VMOperator::LESS_EQUAL: return 10;
+        case VMOperator::LOGICAL_AND: return 11;
+        case VMOperator::LOGICAL_OR: return 12;
         default: return -1;
     }
 }

@@ -5,6 +5,7 @@
 #include "../ZeusRunner/ZeusBuiltins/array.hpp"
 #include "../ZeusRunner/ZeusBuiltins/dict.hpp"
 #include "../ZeusRunner/ZeusBuiltins/gc.hpp"
+#include "../ZeusRunner/ZeusBuiltins/ThreadNativeBuiltins.hpp"
 #include "../ZeusRunner/ZeusBuiltins/type.hpp"
 #include "../ZeusRunner/ZeusBuiltins/strings.hpp"
 #include "../ZeusRunner/ZeusBuiltins/time.hpp"
@@ -14,15 +15,16 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace {
 
 [[noreturn]] void nativeCallPanic(const char* name, const char* reason) {
-    std::fprintf(stderr, "[ZeusValue native ABI] %s: %s\n",
-                 name ? name : "<null builtin>", reason ? reason : "unknown error");
-    std::abort();
+    throw std::runtime_error(std::string("[ZeusValue native ABI] ") +
+        (name ? name : "<null builtin>") + ": " +
+        (reason ? reason : "unknown error"));
 }
 
 // Returns the text of a boxed native String instance, or nullptr when the value
@@ -46,6 +48,9 @@ void initializeStandaloneBuiltins() {
         ZeusBuiltins::registerArrayBuiltins();
         ZeusBuiltins::registerDictBuiltins();
         ZeusBuiltins::registerGcBuiltins();
+        // Lock/RLock in imported Zeus modules use these VM-independent native
+        // operations through the standalone ZeusValue call ABI.
+        ZeusBuiltins::registerStandaloneThreadBuiltins();
         // The time builtins need no VM state, so imported packages that use them
         // work in AOT binaries too.
         ZeusBuiltins::registerTimeBuiltins();

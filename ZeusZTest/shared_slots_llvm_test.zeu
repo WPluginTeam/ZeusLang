@@ -1,0 +1,42 @@
+var shared shared_count = 40;
+var shared shared_text = "zeus";
+var shared shared_flag = true;
+
+func main() {
+    shared_count = shared_count + 2;
+    if (shared_count == 42) {
+        print("PASS shared int read/write");
+    } else {
+        throw new Exception("shared int mismatch");
+    }
+
+    shared_text = shared_text + "lang";
+    if (shared_text == "zeuslang") {
+        print("PASS shared string read/write");
+    } else {
+        throw new Exception("shared string mismatch");
+    }
+
+    if (shared_flag) {
+        print("PASS shared bool read");
+    } else {
+        throw new Exception("shared bool mismatch");
+    }
+
+    delete shared_count;
+    try {
+        print(shared_count);
+        throw new Exception("deleted shared value remained readable");
+    } catch (&error) {
+        print("PASS shared delete invalidates slot");
+    }
+}
+
+main();
+delete shared_flag;
+try {
+    print(shared_flag);
+    throw new Exception("deleted top-level shared value remained readable");
+} catch (&error) {
+    print("PASS top-level shared delete invalidates slot");
+}

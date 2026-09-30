@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -39,10 +41,10 @@ using OwnedZeusBox = std::unique_ptr<ZeusBox, decltype(&zeus_box_release)>;
             break;
     }
 
-    std::fprintf(stderr, "[Zeus range runtime] %s", message);
-    if (sourceLine > 0) std::fprintf(stderr, " at line %d", sourceLine);
-    std::fprintf(stderr, "\nDetails: %s\nSuggestion: %s\n", details, suggestion);
-    std::abort();
+    std::string report = std::string("[Zeus range runtime] ") + message;
+    if (sourceLine > 0) report += " at line " + std::to_string(sourceLine);
+    report += std::string(". Details: ") + details + ". Suggestion: " + suggestion;
+    throw std::runtime_error(report);
 }
 
 bool isInvalidInteger(

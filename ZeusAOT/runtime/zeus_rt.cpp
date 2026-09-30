@@ -6,5 +6,10 @@
 #include "zeus_rt.h"
 
 int main() {
-    return zeus_entry();
+    try {
+        return zeus_entry();
+    } catch (...) {
+        zeus_exception_report_current();
+        return 1;
+    }
 }

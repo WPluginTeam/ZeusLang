@@ -8,6 +8,7 @@
 #include <shared_mutex>
 #include <unordered_map>
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <stdexcept>
@@ -25,6 +26,7 @@ namespace ZeusShared {
         mutable std::recursive_mutex mutex;  // 递归互斥锁
         std::atomic<int> refCount{1};
         std::atomic<int> lockCount{0};       // 锁定计数（用于调试）
+        uint64_t generation = 0;
 
         SharedCell() = default;
 
@@ -75,6 +77,7 @@ namespace ZeusShared {
 
         std::unordered_map<std::string, std::shared_ptr<SharedCell>> namedVars;
         std::recursive_mutex heapMutex;
+        uint64_t nextGeneration = 1;
 
     public:
 
@@ -98,6 +101,8 @@ namespace ZeusShared {
             }
 
             auto cell = std::make_shared<SharedCell>(initVal);
+            cell->generation = nextGeneration++;
+            if (nextGeneration == 0) nextGeneration = 1;
             namedVars[name] = cell;
             return cell;
         }
@@ -113,6 +118,35 @@ namespace ZeusShared {
             }
 
             return nullptr;
+        }
+
+        // Name-based shared-object handles include the cell generation so a
+        // deleted handle cannot bind to a later value stored under the same name.
+        std::shared_ptr<SharedCell> find(const std::string& name, uint64_t generation) {
+            std::lock_guard<std::recursive_mutex> lock(heapMutex);
+            const auto it = namedVars.find(name);
+            if (it == namedVars.end() || it->second->generation != generation) return nullptr;
+            return it->second;
+        }
+
+        // Remove the named source slot. Existing in-flight users may still
+        // hold the returned cell, but subsequent name-based lookups fail.
+        std::shared_ptr<SharedCell> erase(const std::string& name) {
+            std::lock_guard<std::recursive_mutex> lock(heapMutex);
+            const auto it = namedVars.find(name);
+            if (it == namedVars.end()) return nullptr;
+            auto cell = std::move(it->second);
+            namedVars.erase(it);
+            return cell;
+        }
+
+        std::shared_ptr<SharedCell> erase(const std::string& name, uint64_t generation) {
+            std::lock_guard<std::recursive_mutex> lock(heapMutex);
+            const auto it = namedVars.find(name);
+            if (it == namedVars.end() || it->second->generation != generation) return nullptr;
+            auto cell = std::move(it->second);
+            namedVars.erase(it);
+            return cell;
         }
 
         // 检查变量是否存在

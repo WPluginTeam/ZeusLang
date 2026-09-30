@@ -52,13 +52,13 @@ struct TypeImplementation {
 
 inline const std::vector<ImplementationModule>& implementationModules() {
     static const std::vector<ImplementationModule> modules = {
-        {"ZeusBuiltins.exception", true, false, false, ImportTrigger::Always, -1},
+        {"ZeusBuiltins.exception", true, true, false, ImportTrigger::Always, -1},
         {"ZeusBuiltins.namespace", true, false, false, ImportTrigger::Always, -1},
         {"ZeusBuiltins.list", true, true, true, ImportTrigger::Always, 1},
         {"ZeusBuiltins.string", true, true, true, ImportTrigger::Always, 0},
         {"ZeusBuiltins.dict", true, true, true, ImportTrigger::Always, 2},
         {"ZeusBuiltins.io", true, false, false, ImportTrigger::Always, -1},
-        {"ZeusBuiltins.byte", true, false, true, ImportTrigger::BytesLiteral, 2}
+        {"ZeusBuiltins.byte", true, true, true, ImportTrigger::BytesLiteral, 2}
     };
     return modules;
 }

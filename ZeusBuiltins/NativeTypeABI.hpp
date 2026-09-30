@@ -6,12 +6,13 @@
 namespace ZeusBuiltins {
 
 // A source type has one backend representation policy. Dynamic-only types stay
-// in ZeusValue; scalar and string-view types cross native calls without boxing.
+// in ZeusValue; scalar and immutable view types cross native calls without boxing.
 enum class NativeValueABI {
     ZeusValue,
     Int64,
     Bool1,
-    StringView
+    StringView,
+    BytesView
 };
 
 struct NativeTypeABI {
@@ -20,6 +21,36 @@ struct NativeTypeABI {
     std::string_view llvmType;
     NativeValueABI valueABI;
 };
+
+inline bool isNativeViewABI(const NativeTypeABI* abi) noexcept {
+    return abi != nullptr &&
+        (abi->valueABI == NativeValueABI::StringView ||
+         abi->valueABI == NativeValueABI::BytesView);
+}
+
+inline std::string_view nativeViewFromDynamicHelper(const NativeTypeABI* abi) noexcept {
+    return abi != nullptr && abi->valueABI == NativeValueABI::BytesView
+        ? "zeus_value_intern_bytes_view"
+        : "zeus_value_intern_string_view";
+}
+
+inline std::string_view nativeViewToDynamicHelper(const NativeTypeABI* abi) noexcept {
+    return abi != nullptr && abi->valueABI == NativeValueABI::BytesView
+        ? "zeus_value_from_bytes_view"
+        : "zeus_value_from_string_view";
+}
+
+inline std::string_view nativeViewInternHelper(const NativeTypeABI* abi) noexcept {
+    return abi != nullptr && abi->valueABI == NativeValueABI::BytesView
+        ? "zeus_bytes_view_intern"
+        : "zeus_string_view_intern";
+}
+
+inline std::string_view nativeViewFromDataHelper(const NativeTypeABI* abi) noexcept {
+    return abi != nullptr && abi->valueABI == NativeValueABI::BytesView
+        ? "zeus_bytes_view_from_data"
+        : "zeus_string_view_from_data";
+}
 
 inline const std::vector<NativeTypeABI>& nativeTypeABIs() {
     static const std::vector<NativeTypeABI> types = {
@@ -31,7 +62,7 @@ inline const std::vector<NativeTypeABI>& nativeTypeABIs() {
         {"nil", {}, "ptr", NativeValueABI::ZeusValue},
         {"list", {"array"}, "ptr", NativeValueABI::ZeusValue},
         {"dict", {"map"}, "ptr", NativeValueABI::ZeusValue},
-        {"bytes", {}, "ptr", NativeValueABI::ZeusValue},
+        {"bytes", {}, "ptr", NativeValueABI::BytesView},
         {"char", {}, "ptr", NativeValueABI::ZeusValue},
         {"object", {}, "ptr", NativeValueABI::ZeusValue},
         {"func", {"function"}, "ptr", NativeValueABI::ZeusValue}

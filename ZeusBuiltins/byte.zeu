@@ -1,36 +1,51 @@
 
 using original;
 
+@native("zeus_bytes_get")
+decl func __bytes_get(data: bytes, index: int) -> int;
+
+@native("zeus_bytes_len")
+decl func __bytes_len(data: bytes) -> int;
+
+@native("zeus_bytes_slice")
+decl func __bytes_slice(data: bytes, start: int, end: int) -> bytes;
+
+@native("zeus_bytes_decode")
+decl func __bytes_decode(data: bytes, encoding: string) -> string;
+
+@native("zeus_bytes_to_list")
+decl func __bytes_to_list(data: bytes) -> list;
+
 class Byte {
     using &this;
 
-    func init(data) {
+    func init(data: bytes) {
         this.data = data;
     }
 
-    let data = b"";
+    let data: bytes = b"";
 
-    func get(index) {
+    func get(index: int) -> int {
         return __bytes_get(this.data, index);
     }
 
-    func length() {
-        return len(this.data);
+    func length() -> int {
+        return __bytes_len(this.data);
     }
 
-    func slice(start, end) {
+    func slice(start: int, end: int) -> Byte {
         let sliced = __bytes_slice(this.data, start, end);
         return new Byte(sliced);
     }
 
-    func split(bt) {
+    func split(bt: int) -> list {
         let arr = [];
 
         let index = 0;
         let match = false;
 
-        for (0..len(this.data)) [i] {
-            if (this.data[i] == bt) {
+        for (0..this.length()) [i] {
+            if (__bytes_get(this.data, i) == bt) {
                 match = true;
             } else {
                 if (match) {
@@ -45,19 +60,19 @@ class Byte {
         return arr;
     }
 
-    func decode(encoding="utf-8") {
+    func decode(encoding: string = "utf-8") -> string {
         return __bytes_decode(this.data, encoding);
     }
 
-    func toList() {
+    func toList() -> list {
         return __bytes_to_list(this.data);
     }
 
-    func toString() {
+    func toString() -> string {
         return str(this.data);
     }
 
-    func operator[+](other) {
+    func operator[+](other: Byte) -> Byte {
         // 直接合并两个bytes值（底层实现支持bytes+bytes）
         let resultBytes = this.data + other.data;
         return new Byte(resultBytes);

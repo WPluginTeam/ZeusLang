@@ -1,0 +1,67 @@
+class DeleteBox {
+    using &this;
+    var value = 7;
+
+    func get() {
+        return this.value;
+    }
+
+    func operator[~]() {
+        print("DELETE_BOX_DESTROYED");
+    }
+}
+
+shared class SharedDeleteBox {
+    using &this;
+    var value = 13;
+
+    func get() {
+        return this.value;
+    }
+
+    func operator[~]() {
+        print("SHARED_DELETE_BOX_DESTROYED");
+    }
+}
+
+func main() {
+    var shared shared_count = 40;
+    shared_count = shared_count + 2;
+    if (shared_count == 42) {
+        print("PASS shared read/write");
+    } else {
+        throw new Exception("shared write mismatch");
+    }
+
+    delete shared_count;
+    try {
+        print(shared_count);
+        throw new Exception("deleted shared scalar remained readable");
+    } catch (&e) {
+        print("PASS shared delete invalidates slot");
+    }
+
+    let ordinary = new DeleteBox();
+    let ordinary_alias = ordinary;
+    delete ordinary;
+    try {
+        ordinary_alias.get();
+        throw new Exception("deleted ordinary object remained usable");
+    } catch (&e) {
+        print("PASS ordinary delete invalidates aliases");
+    }
+    delete ordinary_alias;
+
+    let shared_object = new SharedDeleteBox();
+    let shared_alias = shared_object;
+    delete shared_alias;
+    try {
+        shared_object.get();
+        throw new Exception("deleted shared object remained usable");
+    } catch (&e) {
+        print("PASS shared object delete invalidates aliases");
+    }
+    delete shared_object;
+}
+
+main();

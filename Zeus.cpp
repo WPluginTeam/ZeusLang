@@ -45,8 +45,7 @@ int main(int argc, char* argv[]) {
     if (argc == 1) {
         std::cout << "Zeus: no args -> running built-in test (Lexer+Parser+IR+VM)" << std::endl;
 
-    Test::testLexerParserIRGen(true);
-        return 0;
+        return Test::testLexerParserIRGen(true) ? 0 : 1;
     }
 
     bool strictDecl = false;
@@ -116,8 +115,7 @@ int main(int argc, char* argv[]) {
 
     if (argIndex >= argc) {
     std::cout << "Zeus: only global flags provided -> running built-in test (Lexer+Parser+IR+VM)" << std::endl;
-    Test::testLexerParserIRGen(enableHotspot);
-        return 0;
+        return Test::testLexerParserIRGen(enableHotspot) ? 0 : 1;
     }
 
     std::string arg1 = argv[argIndex++];

@@ -1,0 +1,45 @@
+class DeleteBox {
+    using &this;
+    let value = 0;
+
+    func init(v: int) {
+        this.value = v;
+    }
+
+    func get() -> int {
+        return this.value;
+    }
+
+    func operator[~]() {
+        print("DELETE_BOX_DESTROYED");
+    }
+}
+
+func main() {
+    let source = new DeleteBox(7);
+    let alias = source;
+    delete source;
+    try {
+        alias.get();
+        throw new Exception("deleted object remained usable");
+    } catch (&error) {
+        print("PASS LLVM delete invalidates alias");
+    }
+    delete alias;
+}
+
+main();
+
+let global_source = new DeleteBox(19);
+let global_alias = global_source;
+delete global_source;
+func verify_global_alias() {
+    try {
+        global_alias.get();
+        throw new Exception("deleted global object remained usable");
+    } catch (&error) {
+        print("PASS LLVM global delete invalidates alias");
+    }
+    delete global_alias;
+}
+verify_global_alias();

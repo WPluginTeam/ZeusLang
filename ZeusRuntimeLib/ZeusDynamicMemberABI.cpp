@@ -1,7 +1,9 @@
 #include "ZeusDynamicMemberABI.hpp"
 
 #include "ZeusABIInternal.hpp"
+#include "ZeusDynamicABI.hpp"
 #include "ZeusType.hpp"
+#include "ZeusVMUtils.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -9,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 
@@ -27,25 +30,30 @@ std::unordered_map<std::string, MethodMap>& dynamicMemberFunctions() {
 }
 
 [[noreturn]] void dynamicMemberPanic(const char* method, const char* reason) {
-    std::fprintf(stderr, "[Zeus dynamic member ABI] %s: %s\n",
-                 method ? method : "<null method>",
-                 reason ? reason : "unknown error");
-    std::abort();
+    throw std::runtime_error(std::string("[Zeus dynamic member ABI] ") +
+        (method ? method : "<null method>") + ": " +
+        (reason ? reason : "unknown error"));
 }
 
-bool getLLVMClassTypeName(const ZeusValue* value, std::string& typeName) {
+bool getDynamicTypeName(const ZeusValue* value, std::string& typeName) {
     if (!value) dynamicMemberPanic(nullptr, "null receiver");
 
     std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> box(
         zeus_value_to_box(value), &zeus_box_release);
     const auto* handle = std::get_if<ZeusType::LLVMClassHandle>(&box->v);
-    if (!handle) return false;
-    if (!handle->state) dynamicMemberPanic(nullptr, "invalid LLVM class handle");
+    if (handle) {
+        if (!handle->state) dynamicMemberPanic(nullptr, "invalid LLVM class handle");
 
-    if (handle->state->object.load(std::memory_order_acquire) == nullptr) {
-        dynamicMemberPanic(nullptr, "LLVM class object has already been deleted");
+        if (handle->state->object.load(std::memory_order_acquire) == nullptr) {
+            dynamicMemberPanic(nullptr, "LLVM class object has already been deleted");
+        }
+        typeName = handle->state->typeName;
+        return !typeName.empty();
     }
-    typeName = handle->state->typeName;
+
+    LexerType::Value nativeValue(0);
+    if (!ZeusVMUtils::convertToValue(box->v, nativeValue)) return false;
+    typeName = nativeValue.getStringType();
     return !typeName.empty();
 }
 
@@ -106,7 +114,7 @@ void zeus_value_has_dynamic_member(
 
     std::string typeName;
     try {
-        if (!getLLVMClassTypeName(receiver, typeName)) {
+        if (!getDynamicTypeName(receiver, typeName)) {
             zeus_value_init_bool(out, 0);
             return;
         }
@@ -136,7 +144,7 @@ int32_t zeus_value_try_dynamic_member_call(
 
     std::string typeName;
     try {
-        if (!getLLVMClassTypeName(receiver, typeName)) return 0;
+        if (!getDynamicTypeName(receiver, typeName)) return 0;
     } catch (...) {
         dynamicMemberPanic(method_name, "failed to inspect receiver type");
     }
@@ -151,14 +159,8 @@ int32_t zeus_value_try_dynamic_member_call(
         function = method->second;
     }
 
-    try {
-        function(out, receiver, argc, arguments);
-        return 1;
-    } catch (const std::exception&) {
-        dynamicMemberPanic(method_name, "generated method adapter threw an exception");
-    } catch (...) {
-        dynamicMemberPanic(method_name, "generated method adapter threw a non-standard exception");
-    }
+    function(out, receiver, argc, arguments);
+    return 1;
 }
 
 void zeus_value_dynamic_member_call(
@@ -174,15 +176,65 @@ void zeus_value_dynamic_member_call(
     }
 }
 
+void zeus_value_subscript_load(
+    ZeusValue* out,
+    const ZeusValue* container,
+    const ZeusValue* key
+) {
+    if (!out || !container || !key) {
+        dynamicMemberPanic("operator[[]]", "invalid subscript load arguments");
+    }
+
+    std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> box(
+        zeus_value_to_box(container), &zeus_box_release);
+    if (!box) dynamicMemberPanic("operator[[]]", "failed to inspect subscript receiver");
+
+    if (std::holds_alternative<ZeusType::LLVMClassHandle>(box->v)) {
+        const ZeusValue* arguments[] = { key };
+        zeus_value_dynamic_member_call(out, container, "operator[[]]", 1, arguments);
+        return;
+    }
+
+    zeus_value_dict_load(out, container, key);
+}
+
+void zeus_value_subscript_store(
+    ZeusValue* out,
+    const ZeusValue* container,
+    const ZeusValue* key,
+    const ZeusValue* value
+) {
+    if (!out || !container || !key || !value) {
+        dynamicMemberPanic("operator[[]=]", "invalid subscript store arguments");
+    }
+
+    std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> box(
+        zeus_value_to_box(container), &zeus_box_release);
+    if (!box) dynamicMemberPanic("operator[[]=]", "failed to inspect subscript receiver");
+
+    if (std::holds_alternative<ZeusType::LLVMClassHandle>(box->v)) {
+        const ZeusValue* arguments[] = { key, value };
+        ZeusValue ignored{};
+        zeus_value_init_nil(&ignored);
+        zeus_value_dynamic_member_call(
+            &ignored, container, "operator[[]=]", 2, arguments);
+        zeus_value_release(&ignored);
+        zeus_value_init_nil(out);
+        zeus_value_clone(out, value);
+        return;
+    }
+
+    zeus_value_dict_store(out, container, key, value);
+}
+
 [[noreturn]] void zeus_dynamic_member_arity_error(
     const char* method_name,
     int32_t expected,
     int32_t actual
 ) {
-    std::fprintf(stderr,
-                 "[Zeus dynamic member ABI] %s: expected %d arguments, got %d\n",
-                 method_name ? method_name : "<null method>", expected, actual);
-    std::abort();
+    throw std::runtime_error(std::string("[Zeus dynamic member ABI] ") +
+        (method_name ? method_name : "<null method>") + ": expected " +
+        std::to_string(expected) + " arguments, got " + std::to_string(actual));
 }
 
 } // extern "C"

@@ -49,6 +49,8 @@ inline void appendLLVMDeclarations(std::string& out) {
     out += "declare void @zeus_value_dict_keys(ptr, ptr)\n";
     out += "declare void @zeus_value_dict_load(ptr, ptr, ptr)\n";
     out += "declare void @zeus_value_dict_store(ptr, ptr, ptr, ptr)\n";
+    out += "declare void @zeus_value_subscript_load(ptr, ptr, ptr)\n";
+    out += "declare void @zeus_value_subscript_store(ptr, ptr, ptr, ptr)\n";
 }
 
 } // namespace ZeusLLVM::DynamicABI

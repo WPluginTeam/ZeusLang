@@ -6,6 +6,7 @@
 #include "ZeusVMUtils.hpp"
 
 #include <memory>
+#include <stdexcept>
 
 struct ZeusRuntimeContext {
     void* userData = nullptr;
@@ -22,10 +23,6 @@ ZeusBox* makeBox(const ZeusType::UniversalVariant& value) {
     ZeusBox* box = new ZeusBox();
     box->v = value;
     return box;
-}
-
-ZeusBox* makeNullBox() {
-    return makeBox(nullVariant());
 }
 
 bool isObjectHandle(const ZeusBox* box) {
@@ -102,7 +99,7 @@ ZeusBox* applyBuiltin(
     const ZeusBox* lhs,
     const ZeusBox* rhs
 ) {
-    if (!lhs || !rhs) return makeNullBox();
+    if (!lhs || !rhs) throw std::runtime_error("binary operation has a null operand pointer");
 
     if (opcode == ZEUS_BINARY_EQUAL || opcode == ZEUS_BINARY_NOT_EQUAL) {
         const bool equal = equalValues(lhs->v, rhs->v);
@@ -130,34 +127,31 @@ ZeusBox* applyBuiltin(
         !ZeusVMUtils::convertToValue(rhs->v, rightValue) ||
         !ZeusVMUtils::isNumericValue(leftValue) ||
         !ZeusVMUtils::isNumericValue(rightValue)) {
-        return makeNullBox();
+        throw std::runtime_error("binary operation requires numeric operands");
     }
 
-    try {
-        if (opcode == ZEUS_BINARY_SUBTRACT) {
+    if (opcode == ZEUS_BINARY_SUBTRACT) {
             return makeValueBox(leftValue - rightValue);
-        }
-        if (opcode == ZEUS_BINARY_MULTIPLY) {
+    }
+    if (opcode == ZEUS_BINARY_MULTIPLY) {
             return makeValueBox(leftValue * rightValue);
-        }
-        if (opcode == ZEUS_BINARY_DIVIDE) {
+    }
+    if (opcode == ZEUS_BINARY_DIVIDE) {
             return makeValueBox(leftValue / rightValue);
-        }
-        if (opcode == ZEUS_BINARY_MODULUS) {
+    }
+    if (opcode == ZEUS_BINARY_MODULUS) {
             if (leftValue.getStringType() != "int" ||
                 rightValue.getStringType() != "int") {
-                return makeNullBox();
+                throw std::runtime_error("modulus requires integer operands");
             }
             const auto& leftInt = std::get<ZeusType::BigInteger>(leftValue.data);
             const auto& rightInt = std::get<ZeusType::BigInteger>(rightValue.data);
-            if (rightInt == ZeusType::BigInteger(0)) return makeNullBox();
+            if (rightInt == ZeusType::BigInteger(0))
+                throw std::runtime_error("modulus by zero");
             return makeValueBox(LexerType::Value(leftInt % rightInt));
-        }
-    } catch (...) {
-        return makeNullBox();
     }
 
-    return makeNullBox();
+    throw std::runtime_error("unsupported binary operator");
 }
 
 } // namespace
@@ -182,6 +176,15 @@ ZeusBox* zeus_dynamic_binary(
     const ZeusBox* lhs,
     const ZeusBox* rhs
 ) {
+    if (opcode == ZEUS_BINARY_LOGICAL_AND || opcode == ZEUS_BINARY_LOGICAL_OR) {
+        if (!lhs || !rhs) {
+            throw std::runtime_error("logical operation has a null operand pointer");
+        }
+        const bool left = ZeusVMUtils::toBool(lhs->v);
+        const bool right = ZeusVMUtils::toBool(rhs->v);
+        return makeValueBox(LexerType::Value(
+            opcode == ZEUS_BINARY_LOGICAL_AND ? left && right : left || right));
+    }
     if (isObjectHandle(lhs)) {
         if (!context || !context->dispatch) {
             if (opcode == ZEUS_BINARY_EQUAL || opcode == ZEUS_BINARY_NOT_EQUAL) {
@@ -190,7 +193,7 @@ ZeusBox* zeus_dynamic_binary(
                     opcode == ZEUS_BINARY_EQUAL ? equal : !equal
                 ));
             }
-            return makeNullBox();
+            throw std::runtime_error("object operator has no runtime dispatcher");
         }
         return context->dispatch(context->userData, opcode, lhs, rhs);
     }

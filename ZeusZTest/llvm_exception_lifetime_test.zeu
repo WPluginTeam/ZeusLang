@@ -1,0 +1,79 @@
+class Probe {
+    using &this;
+    let id = 0;
+
+    func init(value: int) {
+        this.id = value;
+    }
+
+    func fail(value: Probe) {
+        throw "method failure";
+    }
+
+    func operator[~]() {
+        print("destroy", this.id);
+    }
+}
+
+func failDirect() {
+    throw "failure";
+}
+
+func failWithArgument(value: Probe) {
+    throw "failure";
+}
+
+func throwDirect() {
+    let local = new Probe(7);
+    throw "direct";
+}
+
+func throwThroughCall() {
+    let local = new Probe(8);
+    failDirect();
+}
+
+func throwWithTemporaryArgument() {
+    let local = new Probe(10);
+    failWithArgument(new Probe(11));
+}
+
+func throwFromMethod() {
+    let local = new Probe(12);
+    local.fail(new Probe(13));
+}
+
+func catchInsideFunction() {
+    let local = new Probe(9);
+    try {
+        failDirect();
+    } catch(&error) {
+        print("inner catch", local.id);
+    }
+}
+
+try {
+    throwDirect();
+} catch(&error) {
+    print("direct caught");
+}
+
+try {
+    throwThroughCall();
+} catch(&error) {
+    print("nested caught");
+}
+
+try {
+    throwWithTemporaryArgument();
+} catch(&error) {
+    print("argument caught");
+}
+
+try {
+    throwFromMethod();
+} catch(&error) {
+    print("method caught");
+}
+
+catchInsideFunction();
