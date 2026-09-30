@@ -51,6 +51,17 @@ bool getDynamicTypeName(const ZeusValue* value, std::string& typeName) {
         return !typeName.empty();
     }
 
+    if (std::holds_alternative<ZeusType::Bytes>(box->v)) {
+        typeName = "bytes";
+        return true;
+    }
+    if (const auto* variant = std::get_if<ZeusType::Variant>(&box->v)) {
+        if (std::holds_alternative<ZeusType::Bytes>(*variant)) {
+            typeName = "bytes";
+            return true;
+        }
+    }
+
     LexerType::Value nativeValue(0);
     if (!ZeusVMUtils::convertToValue(box->v, nativeValue)) return false;
     typeName = nativeValue.getStringType();
@@ -235,6 +246,18 @@ void zeus_value_subscript_store(
     throw std::runtime_error(std::string("[Zeus dynamic member ABI] ") +
         (method_name ? method_name : "<null method>") + ": expected " +
         std::to_string(expected) + " arguments, got " + std::to_string(actual));
+}
+
+[[noreturn]] void zeus_dynamic_member_arity_range_error(
+    const char* method_name,
+    int32_t minimum,
+    int32_t maximum,
+    int32_t actual
+) {
+    throw std::runtime_error(std::string("[Zeus dynamic member ABI] ") +
+        (method_name ? method_name : "<null method>") + ": expected between " +
+        std::to_string(minimum) + " and " + std::to_string(maximum) +
+        " arguments, got " + std::to_string(actual));
 }
 
 } // extern "C"

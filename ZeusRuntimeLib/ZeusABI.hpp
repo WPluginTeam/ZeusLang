@@ -202,6 +202,10 @@ void zeus_value_from_bytes_view(ZeusValue* out, const ZeusBytesView* view);
 void zeus_value_from_bytes(ZeusValue* out, const uint8_t* data, int64_t length);
 int64_t zeus_bytes_get(const ZeusBytesView* bytes, int64_t index);
 int64_t zeus_bytes_len(const ZeusBytesView* bytes);
+const ZeusBytesView* zeus_bytes_concat(
+    const ZeusBytesView* left,
+    const ZeusBytesView* right
+);
 const ZeusBytesView* zeus_bytes_slice(
     const ZeusBytesView* bytes,
     int64_t start,

@@ -1045,6 +1045,35 @@ int64_t zeus_bytes_len(const ZeusBytesView* bytes) {
     return static_cast<int64_t>(bytes->length);
 }
 
+const ZeusBytesView* zeus_bytes_concat(
+    const ZeusBytesView* left,
+    const ZeusBytesView* right
+) {
+    if (!left || !right ||
+        (left->length > 0 && !left->data) ||
+        (right->length > 0 && !right->data) ||
+        left->length > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        right->length > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        left->length > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+        right->length > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+        left->length > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) - right->length) {
+        dynamicValuePanic("invalid Bytes views for concatenation");
+    }
+
+    const size_t leftLength = static_cast<size_t>(left->length);
+    const size_t rightLength = static_cast<size_t>(right->length);
+    std::string contents;
+    contents.reserve(leftLength + rightLength);
+    if (leftLength > 0) {
+        contents.append(reinterpret_cast<const char*>(left->data), leftLength);
+    }
+    if (rightLength > 0) {
+        contents.append(reinterpret_cast<const char*>(right->data), rightLength);
+    }
+    return internNativeBytes(
+        reinterpret_cast<const uint8_t*>(contents.data()), contents.size());
+}
+
 const ZeusBytesView* zeus_bytes_slice(
     const ZeusBytesView* bytes,
     int64_t start,

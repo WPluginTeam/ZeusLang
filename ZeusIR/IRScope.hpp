@@ -70,7 +70,7 @@ namespace IRScope {
     struct OriginalTypeMode {
         bool useOriginal = false;
         bool useOriginalList = false;      // 是否使用原生list(不自动包装为Array对象)
-        bool useOriginalBytes = false;     // 是否使用原生bytes(不自动包装为Byte对象)
+        bool useOriginalBytes = false;     // Legacy mode flag; bytes literals are native by default.
         bool useOriginalString = false;    // 是否使用原生string(不自动包装为String对象)
     };
 

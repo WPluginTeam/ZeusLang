@@ -1,0 +1,68 @@
+func main() {
+    let data = b"zeus";
+    if (type(data) != "bytes") {
+        throw new Exception("bytes literal was wrapped as a class object");
+    }
+    if (data.length() != 4) {
+        throw new Exception("bytes impl length mismatch");
+    }
+    if (data.get(1) != 101) {
+        throw new Exception("bytes impl get mismatch");
+    }
+
+    let sliced = data.slice(1, 3);
+    if (sliced.decode() != "eu") {
+        throw new Exception("bytes impl slice/decode mismatch");
+    }
+
+    let joined = b"Zeus" + b"Lang";
+    if (joined.decode() != "ZeusLang") {
+        throw new Exception("bytes impl concatenation mismatch");
+    }
+
+    let parts = b"zeus,lang,,vm,".split(44);
+    if (len(parts) != 5) {
+        throw new Exception("bytes impl split count mismatch");
+    }
+    let firstPart = parts[0];
+    let secondPart = parts[1];
+    let emptyPart = parts[2];
+    let fourthPart = parts[3];
+    let trailingEmptyPart = parts[4];
+    if (firstPart.decode() != "zeus") {
+        throw new Exception("bytes impl split first segment mismatch");
+    }
+    if (secondPart.decode() != "lang") {
+        throw new Exception("bytes impl split second segment mismatch");
+    }
+    if (fourthPart.decode() != "vm") {
+        throw new Exception("bytes impl split fourth segment mismatch");
+    }
+    if (emptyPart.length() != 0) {
+        throw new Exception("bytes impl split inner empty segment mismatch");
+    }
+    if (trailingEmptyPart.length() != 0) {
+        throw new Exception("bytes impl split trailing empty segment mismatch");
+    }
+
+    let first = data[0];
+    if (first != 122) {
+        throw new Exception("bytes impl index mismatch");
+    }
+
+    if (len(data.toList()) != 4) {
+        throw new Exception("bytes impl toList mismatch");
+    }
+
+    let legacy = new Byte(b"ok");
+    if (legacy.length() != 2) {
+        throw new Exception("explicit Byte wrapper compatibility mismatch");
+    }
+    if (legacy.decode() != "ok") {
+        throw new Exception("explicit Byte wrapper default decode mismatch");
+    }
+
+    print("PASS bytes impl");
+}
+
+main();

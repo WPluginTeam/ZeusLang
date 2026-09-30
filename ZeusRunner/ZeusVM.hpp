@@ -2897,6 +2897,20 @@ class VM {
         return true;
     }
 
+    std::string typeImplementationName(
+        const ZeusType::UniversalVariant& value
+    ) const {
+        const ZeusType::UniversalVariant typeValue = ZeusBuiltins::builtin_type(
+            std::vector<ZeusType::UniversalVariant>{value});
+        const auto* typeName = std::get_if<std::string>(&typeValue);
+        if (!typeName) return {};
+
+        const auto* builtinType = ZeusBuiltins::findTypeImplementation(*typeName);
+        return builtinType
+            ? std::string(builtinType->canonicalName)
+            : *typeName;
+    }
+
     bool tryDispatchTypeImplementationOperator(
         const std::string& operatorName,
         const ZeusType::UniversalVariant* const* arguments,
@@ -2910,10 +2924,8 @@ class VM {
             return false;
         }
 
-        LexerType::Value receiverValue(0);
-        if (!ZeusVMUtils::convertToValue(*arguments[0], receiverValue)) return false;
-
-        const auto implementation = typeImplementations.find(receiverValue.getStringType());
+        const std::string receiverType = typeImplementationName(*arguments[0]);
+        const auto implementation = typeImplementations.find(receiverType);
         if (implementation == typeImplementations.end()) return false;
         const auto op = implementation->second.operatorMethods.find(operatorName);
         if (op == implementation->second.operatorMethods.end()) return false;
@@ -4780,9 +4792,10 @@ class VM {
                     break;
                 }
 
-                if (std::holds_alternative<LexerType::Value>(callee)) {
-                    const LexerType::Value receiver = std::get<LexerType::Value>(callee);
-                    auto implementation = typeImplementations.find(receiver.getStringType());
+                {
+                    const ZeusType::UniversalVariant receiver = callee;
+                    const std::string receiverType = typeImplementationName(receiver);
+                    auto implementation = typeImplementations.find(receiverType);
                     if (implementation != typeImplementations.end()) {
                         auto methodIt = implementation->second.instanceMethods.find(method);
                         if (methodIt != implementation->second.instanceMethods.end()) {

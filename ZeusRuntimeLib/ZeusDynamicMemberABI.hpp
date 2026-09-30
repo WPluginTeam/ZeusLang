@@ -70,5 +70,11 @@ void zeus_value_subscript_store(
     int32_t expected,
     int32_t actual
 );
+[[noreturn]] void zeus_dynamic_member_arity_range_error(
+    const char* method_name,
+    int32_t minimum,
+    int32_t maximum,
+    int32_t actual
+);
 
 }

@@ -2016,7 +2016,9 @@ public:
                 methodName,
                 signature.name,
                 signature.returnType,
-                signature.parameterTypes
+                signature.parameterTypes,
+                static_cast<size_t>(std::max(0, signature.minRequiredParams - 1)),
+                signature.hasDefaultParameters()
             });
         }
 
@@ -11378,6 +11380,7 @@ inline EmitResult emit(const ZeusCompile::Result& r) {
     out += "declare i32 @zeus_value_try_dynamic_member_call(ptr, ptr, ptr, i32, ptr)\n";
     out += "declare void @zeus_value_dynamic_member_call(ptr, ptr, ptr, i32, ptr)\n";
     out += "declare void @zeus_dynamic_member_arity_error(ptr, i32, i32)\n";
+    out += "declare void @zeus_dynamic_member_arity_range_error(ptr, i32, i32, i32)\n";
     out += "declare void @zeus_value_global_store(i32, ptr)\n";
     out += "declare void @zeus_value_global_load(ptr, i32)\n";
     out += "declare void @zeus_global_clear(i32)\n";

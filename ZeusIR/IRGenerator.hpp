@@ -1787,59 +1787,6 @@ namespace IRGen {
         if (tokens.size() == 1) {
             const auto& tk = tokens[0];
 
-            // Literal wrapping policy is registered centrally for each built-in type.
-            if (std::holds_alternative<LexerType::BytesLiteral>(tk) &&
-                ZeusBuiltins::shouldWrapLiteral(
-                    ZeusBuiltins::BuiltinLiteralKind::Bytes,
-                    IRScope::isUsingOriginal(
-                        ZeusBuiltins::BuiltinLiteralKind::Bytes))) {
-                const auto& bytesLit = std::get<LexerType::BytesLiteral>(tk);
-                ZeusType::Bytes bytes(bytesLit.data);
-                int tokenLine = _getTokenLine(tk);
-
-                // PUSH bytes数据
-                IRType::IRInstr pushBytes;
-                pushBytes.op = VMOperator::PUSH;
-                pushBytes.line = tokenLine;
-                pushBytes.args.push_back(bytes);
-                out.push_back(pushBytes);
-
-                // 查找Byte类
-                const auto* wrapper = ZeusBuiltins::findLiteralWrapper(
-                    ZeusBuiltins::BuiltinLiteralKind::Bytes);
-                IRScope::SymRef byteRef = wrapper
-                    ? IRScope::resolve(std::string(wrapper->qualifiedClassName))
-                    : IRScope::SymRef{};
-                if (byteRef.kind != IRScope::Kind::GLOBAL) {
-                    byteRef = wrapper
-                        ? IRScope::resolve(std::string(wrapper->shortClassName))
-                        : IRScope::SymRef{};
-                }
-
-                if (byteRef.kind == IRScope::Kind::GLOBAL) {
-                    // LOAD Byte类
-                    IRType::IRInstr loadByte;
-                    loadByte.op = VMOperator::LOAD_VALUE;
-                    loadByte.args.push_back(std::string("global"));
-                    loadByte.args.push_back(LexerType::Value(byteRef.index));
-                    out.push_back(loadByte);
-
-                    // SWAP: 使bytes在栈顶下方，Byte类在栈顶
-                    IRType::IRInstr swap;
-                    swap.op = VMOperator::SWAP;
-                    out.push_back(swap);
-
-                    // OBJ_BUILD 1 (构建Byte对象，传入1个参数：bytes数据)
-                    IRType::IRInstr objBuild;
-                    objBuild.op = VMOperator::OBJ_BUILD;
-                    objBuild.args.push_back(LexerType::Value(1));
-                    out.push_back(objBuild);
-                }
-                
-                // No matter if Byte class is found, we have pushed bytes data, return directly
-                return out;
-            }
-
             // Handle string literals through the registered built-in wrapper policy.
             if (std::holds_alternative<LexerType::Value>(tk)) {
                 const auto& val = std::get<LexerType::Value>(tk);

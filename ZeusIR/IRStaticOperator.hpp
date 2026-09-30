@@ -305,6 +305,12 @@ namespace IRStaticOperator {
                 }
 
                 if (ins.op == VMOperator::PUSH && !ins.args.empty() &&
+                    std::holds_alternative<ZeusType::Bytes>(ins.args[0])) {
+                    stack.push_back("bytes");
+                    continue;
+                }
+
+                if (ins.op == VMOperator::PUSH && !ins.args.empty() &&
                     std::holds_alternative<IRType::NullLiteral>(ins.args[0])) {
                     stack.push_back("nil");
                     continue;

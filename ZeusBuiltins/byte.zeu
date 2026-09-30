@@ -7,6 +7,9 @@ decl func __bytes_get(data: bytes, index: int) -> int;
 @native("zeus_bytes_len")
 decl func __bytes_len(data: bytes) -> int;
 
+@native("zeus_bytes_concat")
+decl func __bytes_concat(left: bytes, right: bytes) -> bytes;
+
 @native("zeus_bytes_slice")
 decl func __bytes_slice(data: bytes, start: int, end: int) -> bytes;
 
@@ -15,6 +18,56 @@ decl func __bytes_decode(data: bytes, encoding: string) -> string;
 
 @native("zeus_bytes_to_list")
 decl func __bytes_to_list(data: bytes) -> list;
+
+impl bytes {
+    using &this;
+
+    func get(index: int) -> int {
+        return __bytes_get(this, index);
+    }
+
+    func length() -> int {
+        return __bytes_len(this);
+    }
+
+    func slice(start: int, end: int) -> bytes {
+        return __bytes_slice(this, start, end);
+    }
+
+    func split(bt: int) -> list {
+        let arr = [];
+        let index = 0;
+
+        for (0..this.length()) [i] {
+            if (__bytes_get(this, i) == bt) {
+                __array_push(arr, __bytes_slice(this, index, i));
+                index = i + 1;
+            }
+        }
+        __array_push(arr, __bytes_slice(this, index, this.length()));
+        return arr;
+    }
+
+    func decode(encoding: string = "utf-8") -> string {
+        return __bytes_decode(this, encoding);
+    }
+
+    func toList() -> list {
+        return __bytes_to_list(this);
+    }
+
+    func toString() -> string {
+        return str(this);
+    }
+
+    func operator[+](other: bytes) -> bytes {
+        return __bytes_concat(this, other);
+    }
+
+    func operator[[]](index: int) -> int {
+        return __bytes_get(this, index);
+    }
+}
 
 class Byte {
     using &this;

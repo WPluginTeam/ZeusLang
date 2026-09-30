@@ -76,8 +76,7 @@ inline const std::vector<TypeImplementation>& typeImplementations() {
 
 inline const std::vector<LiteralWrapper>& literalWrappers() {
     static const std::vector<LiteralWrapper> wrappers = {
-        {BuiltinLiteralKind::Array, "list", "ZeusBuiltins.list.Array", "Array"},
-        {BuiltinLiteralKind::Bytes, "bytes", "ZeusBuiltins.byte.Byte", "Byte"}
+        {BuiltinLiteralKind::Array, "list", "ZeusBuiltins.list.Array", "Array"}
     };
     return wrappers;
 }

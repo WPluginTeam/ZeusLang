@@ -9,6 +9,18 @@
 namespace ZeusBuiltins {
 
     // ===== Bytes 操作函数 =====
+
+    inline const ZeusType::Bytes* getBytesValue(
+        const ZeusType::UniversalVariant& value
+    ) {
+        if (const auto* bytes = std::get_if<ZeusType::Bytes>(&value)) {
+            return bytes;
+        }
+        if (const auto* variant = std::get_if<ZeusType::Variant>(&value)) {
+            return std::get_if<ZeusType::Bytes>(variant);
+        }
+        return nullptr;
+    }
     
     // bytes(arg): 创建字节数组
     // - bytes(): 创建空字节数组
@@ -133,15 +145,7 @@ namespace ZeusBuiltins {
     inline ZeusType::UniversalVariant builtin_bytes_get(const std::vector<ZeusType::UniversalVariant>& args) {
         if (args.size() != 2) throw std::runtime_error("__bytes_get expects 2 arguments");
 
-        const auto& bytesArg = args[0];
-        const ZeusType::Bytes* bytes = nullptr;
-
-        // 尝试直接获取Bytes
-        if (const ZeusType::Bytes* bp = std::get_if<ZeusType::Bytes>(&bytesArg)) {
-            bytes = bp;
-        } else if (const ZeusType::Variant* vp = std::get_if<ZeusType::Variant>(&bytesArg)) {
-            bytes = std::get_if<ZeusType::Bytes>(vp);
-        }
+        const ZeusType::Bytes* bytes = getBytesValue(args[0]);
 
         if (!bytes) throw std::runtime_error("__bytes_get: first argument must be bytes");
 
@@ -165,7 +169,7 @@ namespace ZeusBuiltins {
     inline ZeusType::UniversalVariant builtin_bytes_set(const std::vector<ZeusType::UniversalVariant>& args) {
         if (args.size() != 3) throw std::runtime_error("__bytes_set expects 3 arguments");
 
-        // 注意：由于Bytes在Variant中，无法直接修改，需要返回新的bytes对象
+        // Bytes is immutable, so mutation is rejected for both direct and variant values.
         throw std::runtime_error("__bytes_set: bytes is immutable, use bytearray instead");
     }
 
@@ -173,28 +177,34 @@ namespace ZeusBuiltins {
     inline ZeusType::UniversalVariant builtin_bytes_len(const std::vector<ZeusType::UniversalVariant>& args) {
         if (args.size() != 1) throw std::runtime_error("__bytes_len expects 1 argument");
 
-        const auto& bytesArg = args[0];
-        const ZeusType::Bytes* bytes = nullptr;
-
-        if (const ZeusType::Variant* vp = std::get_if<ZeusType::Variant>(&bytesArg)) {
-            bytes = std::get_if<ZeusType::Bytes>(vp);
-        }
+        const ZeusType::Bytes* bytes = getBytesValue(args[0]);
 
         if (!bytes) throw std::runtime_error("__bytes_len: argument must be bytes");
 
         return ZeusType::UniversalVariant(ZeusType::BigInteger((int)bytes->data.size()));
     }
 
+    inline ZeusType::UniversalVariant builtin_bytes_concat(const std::vector<ZeusType::UniversalVariant>& args) {
+        if (args.size() != 2) {
+            throw std::runtime_error("__bytes_concat expects 2 arguments");
+        }
+
+        const ZeusType::Bytes* left = getBytesValue(args[0]);
+        const ZeusType::Bytes* right = getBytesValue(args[1]);
+        if (!left || !right) {
+            throw std::runtime_error("__bytes_concat expects bytes arguments");
+        }
+
+        ZeusType::Bytes result(left->data);
+        result.data.insert(result.data.end(), right->data.begin(), right->data.end());
+        return ZeusType::UniversalVariant(ZeusType::Variant(std::move(result)));
+    }
+
     // __bytes_slice(bytes, start, end): 字节数组切片
     inline ZeusType::UniversalVariant builtin_bytes_slice(const std::vector<ZeusType::UniversalVariant>& args) {
         if (args.size() != 3) throw std::runtime_error("__bytes_slice expects 3 arguments");
 
-        const auto& bytesArg = args[0];
-        const ZeusType::Bytes* bytes = nullptr;
-
-        if (const ZeusType::Variant* vp = std::get_if<ZeusType::Variant>(&bytesArg)) {
-            bytes = std::get_if<ZeusType::Bytes>(vp);
-        }
+        const ZeusType::Bytes* bytes = getBytesValue(args[0]);
 
         if (!bytes) throw std::runtime_error("__bytes_slice: first argument must be bytes");
 
@@ -233,15 +243,7 @@ namespace ZeusBuiltins {
     inline ZeusType::UniversalVariant builtin_bytes_decode(const std::vector<ZeusType::UniversalVariant>& args) {
         if (args.size() < 1) throw std::runtime_error("__bytes_decode expects at least 1 argument");
 
-        const auto& bytesArg = args[0];
-        const ZeusType::Bytes* bytes = nullptr;
-
-        // 尝试直接获取Bytes
-        if (const ZeusType::Bytes* bp = std::get_if<ZeusType::Bytes>(&bytesArg)) {
-            bytes = bp;
-        } else if (const ZeusType::Variant* vp = std::get_if<ZeusType::Variant>(&bytesArg)) {
-            bytes = std::get_if<ZeusType::Bytes>(vp);
-        }
+        const ZeusType::Bytes* bytes = getBytesValue(args[0]);
 
         if (!bytes) {
             throw std::runtime_error("__bytes_decode: first argument must be bytes");
@@ -259,15 +261,7 @@ namespace ZeusBuiltins {
     inline ZeusType::UniversalVariant builtin_bytes_to_list(const std::vector<ZeusType::UniversalVariant>& args) {
         if (args.size() != 1) throw std::runtime_error("__bytes_to_list expects 1 argument");
 
-        const auto& bytesArg = args[0];
-        const ZeusType::Bytes* bytes = nullptr;
-
-        // 尝试直接获取Bytes
-        if (const ZeusType::Bytes* bp = std::get_if<ZeusType::Bytes>(&bytesArg)) {
-            bytes = bp;
-        } else if (const ZeusType::Variant* vp = std::get_if<ZeusType::Variant>(&bytesArg)) {
-            bytes = std::get_if<ZeusType::Bytes>(vp);
-        }
+        const ZeusType::Bytes* bytes = getBytesValue(args[0]);
 
         if (!bytes) throw std::runtime_error("__bytes_to_list: argument must be bytes");
 
@@ -288,6 +282,7 @@ namespace ZeusBuiltins {
         registerBuiltin("__bytes_get", builtin_bytes_get, 2, 2);
         registerBuiltin("__bytes_set", builtin_bytes_set, 3, 3);
         registerBuiltin("__bytes_len", builtin_bytes_len, 1, 1);
+        registerBuiltin("__bytes_concat", builtin_bytes_concat, 2, 2);
         registerBuiltin("__bytes_slice", builtin_bytes_slice, 3, 3);
         registerBuiltin("__bytes_decode", builtin_bytes_decode, 1, 2);
         registerBuiltin("__bytes_to_list", builtin_bytes_to_list, 1, 1);

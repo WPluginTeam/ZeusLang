@@ -238,7 +238,7 @@ namespace ZeusPackage {
         IRScope::refSymbols.clear();
         IRScope::localCount = 0;
         IRScope::useOriginalList = false;    // Reset to default (wrap as Array)
-        IRScope::useOriginalBytes = false;   // Reset to default (wrap as Byte)
+        IRScope::useOriginalBytes = false;   // Keep legacy original-mode state in sync.
         IRScope::useOriginalString = false;  // Reset to default (wrap as String)
         
         // 同时重置 originalModeStack 回初始状态

@@ -3,6 +3,7 @@
 #include "../ZeusBuiltins/NativeTypeABI.hpp"
 
 #include <functional>
+#include <cstddef>
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -16,6 +17,8 @@ struct MethodBinding {
     std::string functionName;
     std::string returnType;
     std::vector<std::string> parameterTypes; // Includes the implicit receiver.
+    size_t minimumArgumentCount = 0;
+    bool hasDefaultParameters = false;
 };
 
 struct TypeRules {
@@ -80,6 +83,11 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
         }
 
         const size_t argumentCount = method.parameterTypes.size() - 1;
+        if (method.minimumArgumentCount > argumentCount) {
+            generated.error = "dynamic method '" + method.typeName + "::" +
+                method.methodName + "' has invalid required argument metadata";
+            return generated;
+        }
         const std::string thunkName = "@__zeus_dynamic_member_" +
             std::to_string(methodIndex);
         const std::string typeString = addString(methodIndex, "type", method.typeName);
@@ -89,12 +97,16 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
 
         generated.adapters += "define internal void " + thunkName +
             "(ptr %out, ptr %receiver, i32 %argc, ptr %arguments) {\nentry:\n";
-        generated.adapters += "  %arity.ok = icmp eq i32 %argc, " +
+        generated.adapters += "  %arity.at.least.minimum = icmp sge i32 %argc, " +
+            std::to_string(method.minimumArgumentCount) + "\n";
+        generated.adapters += "  %arity.at.most.maximum = icmp sle i32 %argc, " +
             std::to_string(argumentCount) + "\n";
+        generated.adapters += "  %arity.ok = and i1 %arity.at.least.minimum, %arity.at.most.maximum\n";
         generated.adapters += "  br i1 %arity.ok, label %arguments.valid, label %bad.arity\n";
         generated.adapters += "bad.arity:\n";
-        generated.adapters += "  call void @zeus_dynamic_member_arity_error(ptr " +
-            labelString + ", i32 " + std::to_string(argumentCount) +
+        generated.adapters += "  call void @zeus_dynamic_member_arity_range_error(ptr " +
+            labelString + ", i32 " + std::to_string(method.minimumArgumentCount) +
+            ", i32 " + std::to_string(argumentCount) +
             ", i32 %argc)\n  unreachable\n";
         generated.adapters += "arguments.valid:\n";
         generated.adapters += "  call void @zeus_value_init_nil(ptr %out)\n";
@@ -160,11 +172,26 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
                 return generated;
             }
 
+            const std::string providedLabel = "argument.provided." + suffix;
+            const std::string missingLabel = "argument.missing." + suffix;
+            const std::string doneLabel = "argument.done." + suffix;
+            const std::string isProvided = "%argument.is.provided." + suffix;
+            const std::string converted = "%argument.converted." + suffix;
+            const bool optional = argumentIndex >= method.minimumArgumentCount;
+            if (optional) {
+                generated.adapters += "  " + isProvided + " = icmp sgt i32 %argc, " +
+                    std::to_string(argumentIndex) + "\n";
+                generated.adapters += "  br i1 " + isProvided + ", label %" +
+                    providedLabel + ", label %" + missingLabel + "\n";
+                generated.adapters += providedLabel + ":\n";
+            }
+
             generated.adapters += "  " + slot +
                 " = getelementptr inbounds ptr, ptr %arguments, i64 " + suffix + "\n";
             generated.adapters += "  " + boxed + " = load ptr, ptr " + slot + ", align 8\n";
 
             std::string conversionType = parameterType;
+            bool passedBoxed = false;
             if (isReferenceType(parameterType)) {
                 conversionType = referencedType(parameterType);
                 const auto* abi = ZeusBuiltins::findNativeTypeABI(conversionType);
@@ -175,53 +202,73 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
                     return generated;
                 }
             } else if (rules.usesZeusValueABI(parameterType)) {
-                nativeArguments.emplace_back(nativeType, boxed);
-                continue;
+                passedBoxed = true;
             }
 
-            if (conversionType == "int" || conversionType == "int32" ||
-                conversionType == "int64") {
+            std::string convertedValue = boxed;
+            if (!passedBoxed && (conversionType == "int" || conversionType == "int32" ||
+                conversionType == "int64")) {
                 if (isReferenceType(parameterType)) {
-                    generated.adapters += "  " + native +
+                    generated.adapters += "  " + converted +
                         " = call ptr @zeus_value_require_i64_ptr(ptr " + boxed + ")\n";
                 } else {
-                    generated.adapters += "  " + native +
+                    generated.adapters += "  " + converted +
                         " = call i64 @zeus_value_require_i64(ptr " + boxed + ")\n";
                 }
-            } else if (conversionType == "bool") {
+                convertedValue = converted;
+            } else if (!passedBoxed && conversionType == "bool") {
                 if (isReferenceType(parameterType)) {
-                    generated.adapters += "  " + native +
+                    generated.adapters += "  " + converted +
                         " = call ptr @zeus_value_require_bool_ptr(ptr " + boxed + ")\n";
                 } else {
                     const std::string raw = "%argument.bool.raw." + suffix;
                     generated.adapters += "  " + raw +
                         " = call i32 @zeus_value_require_bool(ptr " + boxed + ")\n";
-                    generated.adapters += "  " + native + " = icmp ne i32 " + raw + ", 0\n";
+                    generated.adapters += "  " + converted + " = icmp ne i32 " + raw + ", 0\n";
                 }
-            } else if (const auto* abi = ZeusBuiltins::findNativeTypeABI(conversionType);
-                       ZeusBuiltins::isNativeViewABI(abi)) {
-                generated.adapters += "  " + native + " = call ptr @" +
-                    std::string(ZeusBuiltins::nativeViewFromDynamicHelper(abi)) +
-                    "(ptr " + boxed + ")\n";
-            } else if (rules.isClassType(conversionType)) {
-                const std::string classString =
-                    "@.zeus_dynamic_member_" + std::to_string(methodIndex) +
-                    "_parameter_type_" + suffix;
-                generated.constants += classString +
-                    " = private unnamed_addr constant [" +
-                    std::to_string(conversionType.size() + 1) +
-                    " x i8] c\"" + escapeBytes(conversionType) +
-                    "\\00\", align 1\n";
-                generated.adapters += "  " + native +
-                    " = call ptr @zeus_value_require_class_ptr(ptr " + boxed +
-                    ", ptr " + classString + ")\n";
-            } else {
-                generated.error = "dynamic method '" + method.typeName + "::" +
-                    method.methodName + "' cannot adapt parameter type '" +
-                    parameterType + "'";
-                return generated;
+                convertedValue = converted;
+            } else if (!passedBoxed) {
+                const auto* abi = ZeusBuiltins::findNativeTypeABI(conversionType);
+                if (ZeusBuiltins::isNativeViewABI(abi)) {
+                    generated.adapters += "  " + converted + " = call ptr @" +
+                        std::string(ZeusBuiltins::nativeViewFromDynamicHelper(abi)) +
+                        "(ptr " + boxed + ")\n";
+                    convertedValue = converted;
+                } else if (rules.isClassType(conversionType)) {
+                    const std::string classString =
+                        "@.zeus_dynamic_member_" + std::to_string(methodIndex) +
+                        "_parameter_type_" + suffix;
+                    generated.constants += classString +
+                        " = private unnamed_addr constant [" +
+                        std::to_string(conversionType.size() + 1) +
+                        " x i8] c\"" + escapeBytes(conversionType) +
+                        "\\00\", align 1\n";
+                    generated.adapters += "  " + converted +
+                        " = call ptr @zeus_value_require_class_ptr(ptr " + boxed +
+                        ", ptr " + classString + ")\n";
+                    convertedValue = converted;
+                } else {
+                    generated.error = "dynamic method '" + method.typeName + "::" +
+                        method.methodName + "' cannot adapt parameter type '" +
+                        parameterType + "'";
+                    return generated;
+                }
             }
-            nativeArguments.emplace_back(nativeType, native);
+
+            std::string nativeValue = convertedValue;
+            if (optional) {
+                generated.adapters += "  br label %" + doneLabel + "\n";
+                generated.adapters += missingLabel + ":\n  br label %" + doneLabel + "\n";
+                generated.adapters += doneLabel + ":\n";
+                const std::string placeholder = nativeType == "ptr"
+                    ? "null"
+                    : (nativeType == "i1" ? "false" : "0");
+                nativeValue = "%argument.optional.native." + suffix;
+                generated.adapters += "  " + nativeValue + " = phi " + nativeType +
+                    " [ " + convertedValue + ", %" + providedLabel + " ], [ " +
+                    placeholder + ", %" + missingLabel + " ]\n";
+            }
+            nativeArguments.emplace_back(nativeType, nativeValue);
         }
 
         const bool returnsDynamic = rules.usesZeusValueABI(method.returnType);
@@ -248,6 +295,21 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
             if (hasCallArgument) call += ", ";
             call += argument.first + " " + argument.second;
             hasCallArgument = true;
+        }
+        if (method.hasDefaultParameters) {
+            const std::string suppliedCount = "%provided.count";
+            const std::string suppliedCountWithReceiver = "%provided.count.with.receiver";
+            const std::string providedLimit = "%provided.mask.limit";
+            const std::string providedMask = "%provided.mask";
+            generated.adapters += "  " + suppliedCount + " = zext i32 %argc to i64\n";
+            generated.adapters += "  " + suppliedCountWithReceiver +
+                " = add i64 " + suppliedCount + ", 1\n";
+            generated.adapters += "  " + providedLimit + " = shl i64 1, " +
+                suppliedCountWithReceiver + "\n";
+            generated.adapters += "  " + providedMask + " = sub i64 " +
+                providedLimit + ", 1\n";
+            if (hasCallArgument) call += ", ";
+            call += "i64 " + providedMask;
         }
         call += ")\n";
         generated.adapters += call;
