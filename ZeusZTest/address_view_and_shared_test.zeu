@@ -1,0 +1,58 @@
+let localText = "hello";
+let localDataAddress = @reveal(localText);
+let localCopy = @faddr(localDataAddress) -> string;
+if (localCopy != "hello") {
+    throw new Exception("revealed local string read failed");
+}
+
+let firstByte = @faddr(localDataAddress, 1) -> int;
+if (localText != "hello") {
+    throw new Exception("raw string data read failed");
+}
+
+let localBytes = b"abc";
+let localBytesDataAddress = @reveal(localBytes);
+let localBytesCopy = @faddr(localBytesDataAddress) -> bytes;
+let localBytesLength = @faddr(localBytesDataAddress - 8, 8) -> int;
+if (localBytesLength != 3 or localBytesCopy.length() != 3 or firstByte != 104) {
+    throw new Exception("revealed local string/bytes layout failed");
+}
+
+var shared native_address_text = "shared";
+let sharedTextDataAddress = @reveal(native_address_text);
+let sharedCopy = @faddr(sharedTextDataAddress) -> string;
+if (sharedCopy != "shared") {
+    throw new Exception("revealed shared string read failed");
+}
+
+let sharedFirstByte = @faddr(sharedTextDataAddress, 1) -> int;
+if (native_address_text != "shared") {
+    throw new Exception("shared raw string data read failed");
+}
+
+var shared native_address_bytes = b"xyz";
+let sharedBytesDataAddress = @reveal(native_address_bytes);
+let sharedBytesCopy = @faddr(sharedBytesDataAddress) -> bytes;
+let sharedBytesLength = @faddr(sharedBytesDataAddress - 8, 8) -> int;
+if (sharedBytesLength != 3 or sharedBytesCopy.length() != 3 or sharedFirstByte != 115) {
+    throw new Exception("revealed shared bytes read failed");
+}
+
+var shared native_address_integer = 5;
+let sharedIntegerAddress = @addr(native_address_integer);
+@faddr(sharedIntegerAddress) -> int = 31;
+if (native_address_integer != 31) {
+    throw new Exception("shared raw int write failed");
+}
+
+func updateSharedAddressInFunction() -> int {
+    let address = @addr(native_address_integer);
+    @faddr(address) -> int = 47;
+    return native_address_integer;
+}
+
+if (updateSharedAddressInFunction() != 47) {
+    throw new Exception("shared function raw int write failed");
+}
+
+print("ADDRESS_VIEW_SHARED_PASS");

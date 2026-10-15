@@ -1,0 +1,44 @@
+func plusOne(value: int) -> int {
+    return value + 1;
+}
+
+func plusTwo(value: int) -> int {
+    return value + 2;
+}
+
+func selectCallback(flag: bool) {
+    let callback = nil;
+    if (flag) {
+        callback = plusOne;
+    } else {
+        callback = plusTwo;
+    }
+    return callback(40);
+}
+
+let globalCallback = nil;
+func setGlobalCallback(flag: bool) {
+    if (flag) {
+        globalCallback = plusOne;
+    } else {
+        globalCallback = plusTwo;
+    }
+}
+
+func main() {
+    if (selectCallback(true) != 41) {
+        throw new Exception("dynamic local function slot true call mismatch");
+    }
+    if (selectCallback(false) != 42) {
+        throw new Exception("dynamic local function slot call mismatch");
+    }
+
+    setGlobalCallback(false);
+    if (globalCallback(40) != 42) {
+        throw new Exception("dynamic global function slot call mismatch");
+    }
+
+    print("PASS dynamic function value slots");
+}
+
+main();

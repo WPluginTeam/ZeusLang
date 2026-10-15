@@ -22,6 +22,9 @@
 #pragma once
 
 #include <stdint.h>
+#ifndef __cplusplus
+#include <stdbool.h>
+#endif
 
 #define ZEUS_RUNTIME_VERSION_MAJOR 0
 #define ZEUS_RUNTIME_VERSION_MINOR 1
@@ -39,9 +42,11 @@ extern "C" {
 typedef struct ZeusBox ZeusBox;
 
 // Stable, C-compatible dynamic value exchanged at the LLVM/runtime boundary.
-// Scalars are inline, box-backed values own a ZeusBox, and scalar reference tags
-// carry a non-owning native address. Do not copy owned values bytewise.
-#define ZEUS_DYNAMIC_VALUE_ABI 2
+// Scalars are inline, strings/bytes own a [u64 length][data] allocation,
+// BigInteger/BigDecimal own typed native payloads, other managed values own a
+// ZeusBox, and scalar references carry a borrowed address. Do not copy owned
+// values bytewise.
+#define ZEUS_DYNAMIC_VALUE_ABI 4
 
 typedef enum ZeusValueTag {
     ZEUS_VALUE_TAG_NIL = 0,
@@ -53,33 +58,44 @@ typedef enum ZeusValueTag {
     ZEUS_VALUE_TAG_REF_INT64 = 6,
     ZEUS_VALUE_TAG_REF_BOOL = 7,
     ZEUS_VALUE_TAG_DELETED = 8,
+    ZEUS_VALUE_TAG_BYTES = 9,
+    ZEUS_VALUE_TAG_CHAR = 10,
     ZEUS_VALUE_TAG_BOXED = 255
 } ZeusValueTag;
 
-enum { ZEUS_VALUE_FLAG_OWNS_BOX = 1u };
+enum {
+    ZEUS_VALUE_FLAG_OWNS_BOX = 1u,
+    ZEUS_VALUE_FLAG_OWNS_BUFFER = 2u,
+    ZEUS_VALUE_FLAG_OWNS_NATIVE_PAYLOAD = 4u,
+    // Preserve whether a native BigInteger/BigDecimal came from the VM's
+    // LexerType::Value wrapper when crossing the dynamic ABI.
+    ZEUS_VALUE_FLAG_LEXER_VALUE = 8u
+};
 
 typedef struct ZeusValue {
     uint32_t tag;
     uint32_t flags;
-    uint64_t payload;
+    union {
+        uint64_t payload;
+        int64_t int64_payload;
+        bool bool_payload;
+        uint8_t char_payload;
+    };
 } ZeusValue;
 
-// Native string ABI: pointer to immutable UTF-8 bytes plus an explicit length.
-// The view and its data remain valid for the runtime process lifetime after
-// passing through zeus_string_view_intern / zeus_string_view_from_data /
-// zeus_value_intern_string_view.
-typedef struct ZeusStringView {
-    const char* data;
-    uint64_t length;
-} ZeusStringView;
+// Native strings point at UTF-8 data in [u64 byte length][UTF-8 bytes][NUL].
+// The pointer addresses the first character; the byte length is stored at data - 8.
+typedef const char* ZeusNativeString;
 
-// Native Bytes ABI: immutable byte span with an explicit length. Views
-// returned by zeus_bytes_view_* and zeus_value_intern_bytes_view remain valid
-// for the runtime process lifetime.
-typedef struct ZeusBytesView {
-    const uint8_t* data;
+// Native Bytes values point at the first byte in [u64 byte length][bytes].
+// The AOT runtime owns each allocation and releases it with zeus_bytes_release.
+typedef const uint8_t* ZeusNativeBytes;
+
+// C-compatible value representation for a non-owning raw byte range.
+typedef struct ZeusRawBytesRange {
+    uint64_t address;
     uint64_t length;
-} ZeusBytesView;
+} ZeusRawBytesRange;
 
 // Native closure ABI used by LLVM-generated functions. Captured values are
 // held in reference-counted cells; copy captures allocate a new cell at closure
@@ -103,7 +119,15 @@ ZeusValue* zeus_capture_cell_value_slot(void* cell);
 void zeus_value_slot_load(ZeusValue* out, const ZeusValue* slot);
 int64_t zeus_value_slot_load_i64(const ZeusValue* slot);
 int32_t zeus_value_slot_load_bool(const ZeusValue* slot);
+// Borrowed primitive addresses for synchronous @native reference calls. They
+// point into the existing slot (or its referent when the slot is itself a ref).
+int64_t* zeus_value_slot_i64_pointer(ZeusValue* slot);
+bool* zeus_value_slot_bool_pointer(ZeusValue* slot);
 void zeus_value_slot_store(ZeusValue* slot, const ZeusValue* value);
+// Generated LLVM class layouts mark embedded ZeusValue fields as graph edges.
+// These slots are internal edges, not independent collector roots.
+void zeus_value_slot_register_gc_edge(ZeusValue* slot);
+void zeus_value_slot_unregister_gc_edge(ZeusValue* slot);
 void zeus_value_slot_store_i64(ZeusValue* slot, int64_t value);
 void zeus_value_slot_store_bool(ZeusValue* slot, int32_t value);
 void zeus_capture_cell_delete(void* cell);
@@ -181,10 +205,14 @@ void zeus_value_from_i64_ptr(ZeusValue* out, void* value);
 void zeus_value_from_bool_ptr(ZeusValue* out, void* value);
 void zeus_value_clone(ZeusValue* out, const ZeusValue* value);
 void zeus_value_from_box(ZeusValue* out, const ZeusBox* box);
+void zeus_value_from_class_handle(ZeusValue* out, int32_t class_id);
+int32_t zeus_value_require_class_handle(
+    const ZeusValue* value, int32_t class_count);
 // Managed LLVM class handles share one lifetime lease. Explicit delete still
 // invalidates every copied handle; the lease only defers freeing its tombstone
 // allocation until the last boxed handle is released.
 void zeus_value_from_class_ptr(ZeusValue* out, void* object, const char* type_name);
+void zeus_class_gc_register(void* object, const char* type_name);
 void* zeus_value_require_class_ptr(const ZeusValue* value, const char* type_name);
 // Like zeus_value_require_class_ptr, but a nil value returns nullptr instead of
 // aborting. A non-nil value of the wrong class still aborts.
@@ -202,6 +230,14 @@ void zeus_exception_capture(
     ZeusRuntimeErrorFactory runtime_factory,
     ZeusRuntimeErrorFactory type_error_factory
 ) noexcept(false);
+/* Labels must be valid NUL-terminated strings or null; output is capped at 128 bytes. */
+#if defined(__cplusplus)
+[[noreturn]] void zeus_oom_abort(
+    const char* operation, const char* type_name
+) noexcept;
+#else
+void zeus_oom_abort(const char* operation, const char* type_name);
+#endif
 void zeus_exception_report_current() noexcept;
 void zeus_i64_check_division(int64_t left, int64_t right, int32_t line) noexcept(false);
 void zeus_value_validate_argument_type(
@@ -219,71 +255,140 @@ void zeus_value_slot_validate_argument_type(
 ) noexcept(false);
 int64_t zeus_value_require_i64(const ZeusValue* value);
 int32_t zeus_value_require_bool(const ZeusValue* value);
-const ZeusStringView* zeus_value_intern_string_view(const ZeusValue* value);
-const ZeusStringView* zeus_string_view_intern(const ZeusStringView* view);
-const ZeusStringView* zeus_string_view_from_data(const char* data, int64_t length);
-const ZeusBytesView* zeus_value_intern_bytes_view(const ZeusValue* value);
-const ZeusBytesView* zeus_bytes_view_intern(const ZeusBytesView* view);
-const ZeusBytesView* zeus_bytes_view_from_data(const uint8_t* data, int64_t length);
+int64_t zeus_value_require_argument_i64(
+    const ZeusValue* value,
+    const char* function_name,
+    int32_t argument_index,
+    const char* expected_type
+) noexcept(false);
+int32_t zeus_value_require_argument_bool(
+    const ZeusValue* value,
+    const char* function_name,
+    int32_t argument_index,
+    const char* expected_type
+) noexcept(false);
+int32_t zeus_value_require_char(const ZeusValue* value);
+void zeus_value_from_char(ZeusValue* out, int32_t value);
+int64_t zeus_value_array_length_i64(const ZeusValue* array);
+int64_t zeus_value_dict_length_i64(const ZeusValue* dict);
+int64_t zeus_value_dict_contains_key_i64(
+    const ZeusValue* dict,
+    const ZeusValue* normalized_key
+);
+void zeus_value_dict_get_normalized(
+    ZeusValue* out,
+    const ZeusValue* dict,
+    const ZeusValue* normalized_key
+);
+void zeus_value_dict_store_normalized(
+    ZeusValue* out,
+    const ZeusValue* dict,
+    const ZeusValue* normalized_key,
+    const ZeusValue* value
+);
+void zeus_value_dict_delete_normalized(
+    ZeusValue* out,
+    const ZeusValue* dict,
+    const ZeusValue* normalized_key
+);
+ZeusNativeString zeus_value_intern_string(const ZeusValue* value);
+void* zeus_value_native_address(const ZeusValue* value, int32_t reveal);
+ZeusNativeString zeus_string_intern(ZeusNativeString view);
+ZeusNativeString zeus_string_from_data(const char* data, int64_t length);
+ZeusNativeString zeus_string_from_address(int64_t data_address, int64_t length);
+ZeusNativeString zeus_string_copy_from_data(const char* data, int64_t length);
+void zeus_native_string_validate(ZeusNativeString value);
+ZeusNativeBytes zeus_value_copy_bytes(const ZeusValue* value);
+ZeusNativeBytes zeus_bytes_from_data(const uint8_t* data, int64_t length);
+ZeusNativeBytes zeus_bytes_copy_from_address(int64_t data_address, int64_t length);
+ZeusNativeBytes zeus_bytes_clone(ZeusNativeBytes bytes);
+void zeus_bytes_release(ZeusNativeBytes bytes);
+void zeus_bytes_store_slot(ZeusNativeBytes* slot, ZeusNativeBytes value, int32_t value_owned);
+void zeus_bytes_copy_to_address(ZeusNativeBytes bytes, int64_t destination_address, int64_t length);
+void zeus_bytes_store_raw_range(ZeusNativeBytes bytes, int64_t destination_address, int64_t length);
+void zeus_raw_bytes_range_copy(int64_t destination_address, int64_t source_address, int64_t length);
+void zeus_raw_bytes_range_validate(int64_t address, int64_t length);
+void zeus_raw_bytes_range_store(
+    int64_t destination_address, int64_t destination_length,
+    int64_t source_address, int64_t source_length
+);
+int64_t zeus_raw_bytes_range_get(int64_t address, int64_t length, int64_t index);
+void zeus_raw_bytes_range_set(int64_t address, int64_t length, int64_t index, int64_t value);
+int64_t zeus_bytes_data_address(ZeusNativeBytes bytes) noexcept(false);
 void* zeus_value_require_i64_ptr(const ZeusValue* value);
 void* zeus_value_require_bool_ptr(const ZeusValue* value);
 ZeusBox* zeus_value_to_box(const ZeusValue* value);
 void zeus_value_release(ZeusValue* value);
 void zeus_value_from_cstr(ZeusValue* out, const char* text);
 void zeus_value_from_string_data(ZeusValue* out, const char* data, int64_t length);
-void zeus_value_from_string_view(ZeusValue* out, const ZeusStringView* view);
-void zeus_value_from_bytes_view(ZeusValue* out, const ZeusBytesView* view);
+void zeus_value_from_native_string(ZeusValue* out, ZeusNativeString view);
+void zeus_value_from_native_bytes(ZeusValue* out, ZeusNativeBytes bytes);
+void zeus_value_from_raw_bytes_range(
+    ZeusValue* out, int64_t address, int64_t length
+);
+void zeus_value_require_raw_bytes_range(
+    ZeusRawBytesRange* out, const ZeusValue* value
+);
 void zeus_value_from_bytes(ZeusValue* out, const uint8_t* data, int64_t length);
-int64_t zeus_bytes_get(const ZeusBytesView* bytes, int64_t index);
-int64_t zeus_bytes_len(const ZeusBytesView* bytes);
-const ZeusBytesView* zeus_bytes_concat(
-    const ZeusBytesView* left,
-    const ZeusBytesView* right
+int64_t zeus_bytes_get(ZeusNativeBytes bytes, int64_t index);
+int64_t zeus_bytes_len(ZeusNativeBytes bytes);
+ZeusNativeBytes zeus_bytes_concat(
+    ZeusNativeBytes left,
+    ZeusNativeBytes right
 );
-const ZeusBytesView* zeus_bytes_slice(
-    const ZeusBytesView* bytes,
+ZeusNativeBytes zeus_bytes_slice(
+    ZeusNativeBytes bytes,
     int64_t start,
     int64_t end
 );
-const ZeusStringView* zeus_bytes_decode(
-    const ZeusBytesView* bytes,
-    const ZeusStringView* encoding
+ZeusNativeString zeus_bytes_decode(
+    ZeusNativeBytes bytes,
+    ZeusNativeString encoding
 );
-void zeus_bytes_to_list(ZeusValue* out, const ZeusBytesView* bytes);
-int64_t zeus_string_length_view(const ZeusStringView* value);
-const ZeusStringView* zeus_string_get_view(const ZeusStringView* value, int64_t index);
-const ZeusStringView* zeus_string_slice_view(
-    const ZeusStringView* value,
+void zeus_bytes_to_list(ZeusValue* out, ZeusNativeBytes bytes);
+int64_t zeus_string_length(ZeusNativeString value);
+ZeusNativeString zeus_native_string_concat(
+    ZeusNativeString left,
+    ZeusNativeString right
+);
+bool zeus_native_string_equal(
+    ZeusNativeString left,
+    ZeusNativeString right
+);
+ZeusNativeString zeus_native_string_get(ZeusNativeString value, int64_t index);
+ZeusNativeString zeus_native_string_slice(
+    ZeusNativeString value,
     int64_t start,
     int64_t end
 );
-int64_t zeus_string_index_view(
-    const ZeusStringView* value,
-    const ZeusStringView* substring
+int64_t zeus_native_string_index(
+    ZeusNativeString value,
+    ZeusNativeString substring
 );
-int64_t zeus_string_rindex_view(
-    const ZeusStringView* value,
-    const ZeusStringView* substring
+int64_t zeus_native_string_rindex(
+    ZeusNativeString value,
+    ZeusNativeString substring
 );
-const ZeusStringView* zeus_string_replace_view(
-    const ZeusStringView* value,
-    const ZeusStringView* old_value,
-    const ZeusStringView* replacement
+ZeusNativeString zeus_native_string_replace(
+    ZeusNativeString value,
+    ZeusNativeString old_value,
+    ZeusNativeString replacement
 );
-bool zeus_string_startswith_view(
-    const ZeusStringView* value,
-    const ZeusStringView* prefix
+bool zeus_native_string_startswith(
+    ZeusNativeString value,
+    ZeusNativeString prefix
 );
-bool zeus_string_endswith_view(
-    const ZeusStringView* value,
-    const ZeusStringView* suffix
+bool zeus_native_string_endswith(
+    ZeusNativeString value,
+    ZeusNativeString suffix
 );
-const ZeusStringView* zeus_string_lower_view(const ZeusStringView* value);
-const ZeusStringView* zeus_string_upper_view(const ZeusStringView* value);
-int64_t zeus_string_count_view(
-    const ZeusStringView* value,
-    const ZeusStringView* substring
+ZeusNativeString zeus_native_string_lower(ZeusNativeString value);
+ZeusNativeString zeus_native_string_upper(ZeusNativeString value);
+int64_t zeus_native_string_count(
+    ZeusNativeString value,
+    ZeusNativeString substring
 );
+int64_t zeus_string_data_address(ZeusNativeString value) noexcept(false);
 void zeus_value_from_bigint_decimal(ZeusValue* out, const char* decimalText);
 void zeus_value_from_bigdecimal_decimal(ZeusValue* out, const char* decimalText);
 void zeus_value_push(ZeusValue* value);
@@ -315,6 +420,13 @@ void zeus_value_delete_object(ZeusValue* value);
 void zeus_shared_value_store(const char* name, const ZeusValue* value);
 void zeus_shared_value_assign(const char* name, const ZeusValue* value);
 void zeus_shared_value_load(ZeusValue* out, const char* name);
+void zeus_shared_value_store_i64(const char* name, int64_t value);
+void zeus_shared_value_assign_i64(const char* name, int64_t value);
+int64_t zeus_shared_value_load_i64(const char* name);
+void zeus_shared_value_store_bool(const char* name, int32_t value);
+void zeus_shared_value_assign_bool(const char* name, int32_t value);
+int32_t zeus_shared_value_load_bool(const char* name);
+void* zeus_shared_value_native_address(const char* name, int32_t reveal);
 int32_t zeus_shared_value_delete(const char* name);
 // Scalar fast path for the same global slots. A top-level loop that bumps a
 // scalar global uses these instead of boxing a ZeusValue per access; a type
@@ -323,6 +435,14 @@ void zeus_global_store_i64(int idx, int64_t value);
 int64_t zeus_global_load_i64(int idx);
 void zeus_global_store_bool(int idx, int32_t value);
 int32_t zeus_global_load_bool(int idx);
+void zeus_global_store_string(int idx, ZeusNativeString value);
+ZeusNativeString zeus_global_load_string(int idx);
+ZeusNativeString* zeus_global_string_slot(int idx);
+void zeus_global_sync_native_string_slot(void* slot);
+void zeus_global_store_bytes(int idx, ZeusNativeBytes value);
+ZeusNativeBytes zeus_global_load_bytes(int idx);
+ZeusNativeBytes* zeus_global_bytes_slot(int idx);
+void zeus_global_sync_native_bytes_slot(void* slot);
 void zeus_value_int_add(ZeusValue* out, const ZeusValue* lhs, const ZeusValue* rhs);
 void zeus_value_less_than(ZeusValue* out, const ZeusValue* lhs, const ZeusValue* rhs);
 int32_t zeus_value_truthy(const ZeusValue* value);
@@ -340,6 +460,7 @@ ZeusBox* zeus_box_cstr(const char* s);
 ZeusBox* zeus_null_box(void);
 void zeus_box_release(ZeusBox* box);
 void zeus_gc_collect(void);
+void zeus_gc_safepoint(void);
 uint64_t zeus_gc_live_node_count(void);
 
 int64_t zeus_unbox_int(const ZeusBox* box);

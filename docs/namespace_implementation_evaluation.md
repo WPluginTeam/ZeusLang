@@ -3,7 +3,7 @@
 ## 问题总结
 
 ### 当前问题
-在 `ZeusBuiltins/cppfunctions.zeu` 中，包内代码调用内置函数 `input()` 失败：
+在 `ZeusBuiltins/zeus/cppfunctions.zeu` 中，包内代码调用内置函数 `input()` 失败：
 
 ```zeu
 class io {
@@ -387,7 +387,7 @@ case VMOperator::PACKAGE_LOAD_ATTR: {
 
 #### 1. 包到C++类的映射
 
-**ZeusBuiltins/cppfunctions.zeu**：
+**ZeusBuiltins/zeus/cppfunctions.zeu**：
 ```zeu
 class io {
     func static input() { return input(); }
@@ -396,7 +396,7 @@ class io {
 
 **自动生成C++代码**（新工具：ZeusPkgCompiler）：
 ```cpp
-// Generated from ZeusBuiltins/cppfunctions.zeu
+// Generated from ZeusBuiltins/zeus/cppfunctions.zeu
 
 namespace ZeusNative {
     class cppfunctions {
@@ -795,9 +795,9 @@ git log -p --all -S "ZeusBuiltins::findId" -- ZeusIR/IRGenerator.hpp
 查看是否有顺序调整的提交记录。
 
 ### 可能性2：io.input() 从未真正被调用过
-查看 `ZeusBuiltins/cppfunctions.zeu` 的提交历史：
+查看 `ZeusBuiltins/zeus/cppfunctions.zeu` 的提交历史：
 ```bash
-git log -p -- ZeusBuiltins/cppfunctions.zeu
+git log -p -- ZeusBuiltins/zeus/cppfunctions.zeu
 ```
 可能 `io.input()` 方法是最近才添加的，之前都直接使用全局 `input()`。
 

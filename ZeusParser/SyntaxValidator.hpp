@@ -23,7 +23,7 @@ inline bool isSyntaxIdentifier(const LexerType::Token& token) {
     if (!std::holds_alternative<LexerType::Keyword>(token)) return false;
     const std::string& name = std::get<LexerType::Keyword>(token).name;
     static const std::vector<std::string> reserved = {
-        "var", "let", "const", "shared", "if", "else", "for", "func", "class", "impl",
+        "var", "let", "const", "shared", "if", "else", "for", "func", "class", "interface", "impl",
         "return", "break", "continue", "delete", "throw", "try", "catch", "with",
         "import", "using", "original", "decl", "static", "new", "true", "false", "nil"
     };
@@ -31,6 +31,12 @@ inline bool isSyntaxIdentifier(const LexerType::Token& token) {
         if (name == keyword) return false;
     }
     return true;
+}
+
+inline bool isSyntaxPackageIdentifier(const LexerType::Token& token) {
+    if (!std::holds_alternative<LexerType::Keyword>(token)) return false;
+    const std::string& name = std::get<LexerType::Keyword>(token).name;
+    return !name.empty() && name != "true" && name != "false" && name != "nil";
 }
 
 inline bool isSyntaxTypePath(const std::string& name) {
@@ -139,6 +145,32 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
         for (size_t j = i; j <= end; ++j) inOperatorName[j] = true;
     }
 
+    std::vector<bool> inInterfaceScope(tokens.size(), false);
+    std::vector<bool> interfaceScopes;
+    size_t declarationStart = 0;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        inInterfaceScope[i] = !interfaceScopes.empty() && interfaceScopes.back();
+        if (isSyntaxOperator(tokens[i], "{")) {
+            bool opensInterface = false;
+            for (size_t j = declarationStart; j < i; ++j) {
+                if (!inOperatorName[j] &&
+                    std::holds_alternative<LexerType::Keyword>(tokens[j]) &&
+                    std::get<LexerType::Keyword>(tokens[j]).name == "interface" &&
+                    !isSyntaxMemberKeyword(tokens, j)) {
+                    opensInterface = true;
+                    break;
+                }
+            }
+            interfaceScopes.push_back(opensInterface);
+            declarationStart = i + 1;
+        } else if (isSyntaxOperator(tokens[i], "}")) {
+            if (!interfaceScopes.empty()) interfaceScopes.pop_back();
+            declarationStart = i + 1;
+        } else if (isSyntaxOperator(tokens[i], ";")) {
+            declarationStart = i + 1;
+        }
+    }
+
     // Report mismatched and unclosed delimiters before the permissive tree
     // parser can discard or misclassify the remaining tokens.
     struct Delimiter {
@@ -168,6 +200,100 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
                       tokens[delimiter.index]);
     }
 
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (inOperatorName[i] || !std::holds_alternative<LexerType::Keyword>(tokens[i]) ||
+            isSyntaxMemberKeyword(tokens, i)) {
+            continue;
+        }
+        const std::string& declaration = std::get<LexerType::Keyword>(tokens[i]).name;
+        if (declaration == "interface") {
+            const size_t name = i + 1;
+            if (name >= tokens.size() || !isSyntaxIdentifier(tokens[name])) {
+                addDiagnostic("P0040", "expected an interface name", tokens[i]);
+            } else if (name + 1 >= tokens.size() || !isSyntaxOperator(tokens[name + 1], "{")) {
+                addDiagnostic("P0040", "expected '{' after interface name", tokens[name]);
+            }
+            continue;
+        }
+        if (declaration != "class") continue;
+
+        size_t name = i + 1;
+        if (name < tokens.size() && std::holds_alternative<LexerType::Keyword>(tokens[name]) &&
+            std::get<LexerType::Keyword>(tokens[name]).name == "shared") {
+            ++name;
+        }
+        if (name >= tokens.size() || !isSyntaxIdentifier(tokens[name])) continue;
+
+        size_t position = name + 1;
+        if (position >= tokens.size() || !isSyntaxOperator(tokens[position], "[")) continue;
+        ++position;
+        bool expectPath = true;
+        bool sawPath = false;
+        while (position < tokens.size() && !isSyntaxOperator(tokens[position], "]")) {
+            if (expectPath) {
+                if (!isSyntaxIdentifier(tokens[position])) {
+                    addDiagnostic("P0041", "expected an interface name in class interface list",
+                                  tokens[position]);
+                    break;
+                }
+                sawPath = true;
+                ++position;
+                expectPath = false;
+                continue;
+            }
+            if (isSyntaxOperator(tokens[position], ".")) {
+                ++position;
+                if (position >= tokens.size() || !isSyntaxIdentifier(tokens[position])) {
+                    addDiagnostic("P0041", "expected a name after '.' in class interface list",
+                                  tokens[position - 1]);
+                    break;
+                }
+                ++position;
+                continue;
+            }
+            if (isSyntaxOperator(tokens[position], ",")) {
+                ++position;
+                expectPath = true;
+                continue;
+            }
+            addDiagnostic("P0041", "expected ',' or ']' in class interface list",
+                          tokens[position]);
+            break;
+        }
+        if (!sawPath || expectPath) {
+            addDiagnostic("P0041", "class interface list cannot be empty or end with ','",
+                          tokens[i]);
+        }
+        if (position >= tokens.size() || !isSyntaxOperator(tokens[position], "]")) {
+            addDiagnostic("P0041", "expected ']' after class interface list", tokens[i]);
+        } else if (position + 1 >= tokens.size() || !isSyntaxOperator(tokens[position + 1], "{")) {
+            addDiagnostic("P0041", "expected '{' after class interface list", tokens[position]);
+        }
+    }
+
+    // Angle brackets in a declared generic type are type delimiters, not
+    // comparison operators. Record them once so expression validation below
+    // can keep its ordinary comparison checks.
+    std::vector<bool> inGenericType(tokens.size(), false);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (!isSyntaxOperator(tokens[i], ":")) continue;
+        size_t typeEnd = i + 1;
+        std::string typeName;
+        if (!parseGenericType(tokens, typeEnd, typeName)) continue;
+        std::string genericBase;
+        std::vector<std::string> genericArguments;
+        if (!ZeusTypeInfer::decodeGenericSpecializationName(
+                typeName, genericBase, genericArguments)) {
+            continue;
+        }
+        for (size_t typeToken = i + 1; typeToken < typeEnd; ++typeToken) {
+            if (isSyntaxOperator(tokens[typeToken], "<") ||
+                isSyntaxOperator(tokens[typeToken], ">")) {
+                inGenericType[typeToken] = true;
+            }
+        }
+    }
+
     auto isExpressionBoundary = [&](size_t index) {
         if (index >= tokens.size()) return true;
         if (!std::holds_alternative<LexerType::Operator>(tokens[index])) return false;
@@ -191,7 +317,8 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
         "and", "or", "."
     };
     for (size_t i = 0; i < tokens.size(); ++i) {
-        if (inOperatorName[i] || !std::holds_alternative<LexerType::Operator>(tokens[i])) continue;
+        if (inOperatorName[i] || inGenericType[i] ||
+            !std::holds_alternative<LexerType::Operator>(tokens[i])) continue;
         const std::string& symbol = std::get<LexerType::Operator>(tokens[i]).symbol;
         bool needsRightOperand = false;
         for (const auto& op : operatorsRequiringRightOperand) {
@@ -278,9 +405,12 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
         int parenDepth = 0;
         int bracketDepth = 0;
         int braceDepth = 0;
+        int genericTypeDepth = 0;
+        bool readingType = false;
         for (size_t j = paramsOpen + 1; j < paramsClose; ++j) {
             const bool atTopLevelComma = isSyntaxOperator(tokens[j], ",") &&
-                parenDepth == 0 && bracketDepth == 0 && braceDepth == 0;
+                parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 &&
+                genericTypeDepth == 0;
             if (atTopLevelComma) {
                 if (segmentStart == j) {
                     if (!emptyParameterReported) {
@@ -294,12 +424,22 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
                 }
                 segmentStart = j + 1;
                 previousWasComma = true;
+                readingType = false;
+                genericTypeDepth = 0;
                 continue;
             }
 
             previousWasComma = false;
             if (!std::holds_alternative<LexerType::Operator>(tokens[j])) continue;
             const std::string& symbol = std::get<LexerType::Operator>(tokens[j]).symbol;
+            if (parenDepth == 0 && bracketDepth == 0 && braceDepth == 0) {
+                if (symbol == ":") readingType = true;
+                else if (symbol == "=") readingType = false;
+                else if (readingType && symbol == "<") ++genericTypeDepth;
+                else if (readingType && symbol == ">" && genericTypeDepth > 0) {
+                    --genericTypeDepth;
+                }
+            }
             if (symbol == "(") ++parenDepth;
             else if (symbol == ")" && parenDepth > 0) --parenDepth;
             else if (symbol == "[") ++bracketDepth;
@@ -315,9 +455,11 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
             parameterSegments.push_back({ segmentStart, paramsClose });
         }
 
-        const bool forwardDeclaration = i > 0 &&
+        const bool hasDeclPrefix = i > 0 &&
             std::holds_alternative<LexerType::Keyword>(tokens[i - 1]) &&
             std::get<LexerType::Keyword>(tokens[i - 1]).name == "decl";
+        const bool interfaceMethodDeclaration = inInterfaceScope[i] && hasDeclPrefix;
+        const bool forwardDeclaration = hasDeclPrefix;
         bool nativeForwardDeclaration = false;
         if (forwardDeclaration) {
             for (size_t prefixEnd = i; prefixEnd > 0; --prefixEnd) {
@@ -325,7 +467,7 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
                 if (!isSyntaxOperator(tokens[prefixStart], "@")) continue;
                 const std::vector<LexerType::Token> prefixTokens(
                     tokens.begin() + prefixStart, tokens.begin() + i);
-                const auto prefix = parseFunctionDecoratorPrefix(prefixTokens);
+                const auto prefix = parseFunctionPrefix(prefixTokens);
                 const size_t declarationIndex = prefixStart + prefix.nextToken;
                 const bool namesThisDeclaration = prefix.valid &&
                     declarationIndex + 1 == i &&
@@ -350,7 +492,8 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
             const bool byReference = position < end &&
                 isSyntaxOperator(tokens[position], "&");
             if (byReference) ++position;
-            if (byReference && forwardDeclaration && !nativeForwardDeclaration) {
+            if (byReference && forwardDeclaration && !interfaceMethodDeclaration &&
+                !nativeForwardDeclaration) {
                 addDiagnostic("P0019",
                               "non-native 'decl func' cannot declare reference parameters",
                               tokens[segment.first]);
@@ -619,7 +762,7 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
                     validBinding = isBinding(bodyIndex + 1, bindingClose);
                 } else if (!multipleColons) {
                     size_t valueBegin = colon + 1;
-                    // ZeusBuiltins.io uses `...` as an explicit separator in
+                    // zeus.io uses `...` as an explicit separator in
                     // its kwargs key/value binding; TreeParser treats it as a
                     // separator and preserves the two bindings.
                     if (valueBegin + 2 < bindingClose &&
@@ -646,15 +789,90 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
         }
     }
 
-    // Decorator parsing is deliberately narrow today: @static decorates a
-    // function definition and @native("symbol") decorates a `decl func`.
+    // @static and @no_safepoint decorate function definitions;
+    // @native("symbol", "raw|slot") decorates a `decl func`.
     // Validate the whole prefix so malformed/unknown annotations cannot be
     // silently dropped by TreeParser::leadingDecorators().
     for (size_t i = 0; i < tokens.size(); ++i) {
         if (!isSyntaxOperator(tokens[i], "@") || inOperatorName[i]) continue;
 
+        if (i + 2 < tokens.size() &&
+            std::holds_alternative<LexerType::Keyword>(tokens[i + 1]) &&
+            std::get<LexerType::Keyword>(tokens[i + 1]).name == "this") {
+            if (!isSyntaxOperator(tokens[i + 2], "=")) {
+                addDiagnostic("P0039", "@this is only valid as an assignment target",
+                              tokens[i]);
+            }
+            ++i;
+            continue;
+        }
+
+        if (i + 2 < tokens.size() &&
+            std::holds_alternative<LexerType::Keyword>(tokens[i + 1]) &&
+            (std::get<LexerType::Keyword>(tokens[i + 1]).name == "addr" ||
+             std::get<LexerType::Keyword>(tokens[i + 1]).name == "reveal" ||
+             std::get<LexerType::Keyword>(tokens[i + 1]).name == "faddr") &&
+            isSyntaxOperator(tokens[i + 2], "(")) {
+            const std::string intrinsicName =
+                std::get<LexerType::Keyword>(tokens[i + 1]).name;
+            const bool isFetchAddress = intrinsicName == "faddr";
+            const size_t close = matchingSyntaxDelimiter(tokens, i + 2);
+            if (close >= tokens.size()) {
+                addDiagnostic("P0039", "expected ')' after @" + intrinsicName +
+                              " argument", tokens[i]);
+                continue;
+            }
+            int depth = 0;
+            size_t argumentCount = 0;
+            bool hasArgument = false;
+            for (size_t j = i + 3; j < close; ++j) {
+                if (isSyntaxOperator(tokens[j], "(") || isSyntaxOperator(tokens[j], "[") ||
+                    isSyntaxOperator(tokens[j], "{")) {
+                    ++depth;
+                } else if (isSyntaxOperator(tokens[j], ")") || isSyntaxOperator(tokens[j], "]") ||
+                           isSyntaxOperator(tokens[j], "}")) {
+                    --depth;
+                } else if (depth == 0 && isSyntaxOperator(tokens[j], ",")) {
+                    ++argumentCount;
+                } else {
+                    hasArgument = true;
+                }
+            }
+            if (!hasArgument ||
+                (isFetchAddress ? argumentCount > 1 : argumentCount != 0)) {
+                addDiagnostic("P0039", isFetchAddress
+                    ? "@faddr requires an address and at most one size argument"
+                    : "@" + intrinsicName + " requires exactly one value argument",
+                    tokens[i]);
+            }
+            if (isFetchAddress) {
+                const size_t arrow = close + 1;
+                if (arrow >= tokens.size() || !isSyntaxOperator(tokens[arrow], "->")) {
+                    addDiagnostic("P0039",
+                                  "@faddr requires '-> <type>' after its address argument",
+                                  tokens[i]);
+                } else {
+                    const bool hasNamedType = arrow + 1 < tokens.size() &&
+                        std::holds_alternative<LexerType::Keyword>(tokens[arrow + 1]);
+                    const bool hasRawBytesRangeType = arrow + 2 < tokens.size() &&
+                        isSyntaxOperator(tokens[arrow + 1], "&") &&
+                        std::holds_alternative<LexerType::Keyword>(tokens[arrow + 2]) &&
+                        std::get<LexerType::Keyword>(tokens[arrow + 2]).name == "bytes";
+                    if (!hasNamedType && !hasRawBytesRangeType) {
+                        addDiagnostic("P0039", "@faddr requires a Zeus type after '->'",
+                                      tokens[i]);
+                    } else {
+                        i = arrow + (hasRawBytesRangeType ? 2 : 1);
+                        continue;
+                    }
+                }
+            }
+            i = close;
+            continue;
+        }
+
         const std::vector<LexerType::Token> suffix(tokens.begin() + i, tokens.end());
-        const auto prefix = parseFunctionDecoratorPrefix(suffix);
+        const auto prefix = parseFunctionPrefix(suffix);
         if (!prefix.valid || prefix.decorators.empty()) {
             addDiagnostic("P0038", "malformed function decorator prefix", tokens[i]);
             continue;
@@ -668,9 +886,43 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
             isForwardDeclaration = true;
             ++declarationIndex;
         }
-        if (declarationIndex >= tokens.size() ||
-            !std::holds_alternative<LexerType::Keyword>(tokens[declarationIndex]) ||
-            std::get<LexerType::Keyword>(tokens[declarationIndex]).name != "func") {
+        size_t classKeywordIndex = declarationIndex;
+        if (classKeywordIndex < tokens.size() &&
+            std::holds_alternative<LexerType::Keyword>(tokens[classKeywordIndex]) &&
+            std::get<LexerType::Keyword>(tokens[classKeywordIndex]).name == "shared") {
+            ++classKeywordIndex;
+        }
+        const bool isClassDeclaration = classKeywordIndex < tokens.size() &&
+            std::holds_alternative<LexerType::Keyword>(tokens[classKeywordIndex]) &&
+            std::get<LexerType::Keyword>(tokens[classKeywordIndex]).name == "class";
+        const bool isFunctionDeclaration = declarationIndex < tokens.size() &&
+            std::holds_alternative<LexerType::Keyword>(tokens[declarationIndex]) &&
+            std::get<LexerType::Keyword>(tokens[declarationIndex]).name == "func";
+        if (isClassDeclaration) {
+            for (const auto& decorator : prefix.decorators) {
+                if (decorator.name != "type") {
+                    addDiagnostic("P0038", "only @type may decorate a class definition",
+                                  tokens[i]);
+                    continue;
+                }
+                const std::vector<std::string>& parameters = decorator.typeArguments;
+                if (parameters.empty()) {
+                    addDiagnostic("P0038", "@type on a class requires one or more type-parameter names",
+                                  tokens[i]);
+                    continue;
+                }
+                std::unordered_set<std::string> uniqueParameters;
+                for (const auto& parameter : parameters) {
+                    if (parameter.empty() || !uniqueParameters.insert(parameter).second) {
+                        addDiagnostic("P0038", "@type class parameters must be distinct identifiers",
+                                      tokens[i]);
+                    }
+                }
+            }
+            i = classKeywordIndex;
+            continue;
+        }
+        if (!isFunctionDeclaration) {
             addDiagnostic("P0038", "function decorators must immediately precede 'func' or 'decl func'",
                           tokens[i]);
             continue;
@@ -678,10 +930,16 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
 
         bool sawNative = false;
         bool sawStatic = false;
+        bool sawNoSafepoint = false;
+        bool sawTypeParameter = false;
         for (const auto& decorator : prefix.decorators) {
             if (decorator.name == "native") {
-                if (sawNative || !decorator.hasArgument || decorator.argument.empty()) {
-                    addDiagnostic("P0038", "@native requires one non-empty string symbol",
+                if (sawNative || !decorator.hasArgument || decorator.argument.empty() ||
+                    (decorator.hasSecondaryArgument &&
+                     decorator.secondaryArgument != "raw" &&
+                     decorator.secondaryArgument != "slot")) {
+                    addDiagnostic("P0038",
+                                  "@native requires a symbol and optional reference ABI 'raw' or 'slot'",
                                   tokens[i]);
                 }
                 if (!isForwardDeclaration) {
@@ -699,12 +957,87 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
                                   tokens[i]);
                 }
                 sawStatic = true;
+            } else if (decorator.name == "no_safepoint") {
+                if (sawNoSafepoint || decorator.hasArgument) {
+                    addDiagnostic("P0038", "@no_safepoint takes no arguments and may appear only once",
+                                  tokens[i]);
+                }
+                if (isForwardDeclaration) {
+                    addDiagnostic("P0038", "@no_safepoint is only supported on function definitions",
+                                  tokens[i]);
+                }
+                sawNoSafepoint = true;
+            } else if (decorator.name == "type") {
+                if (sawTypeParameter || !decorator.hasArgument ||
+                    !decorator.argumentIsIdentifier || decorator.typeArguments.empty()) {
+                    addDiagnostic("P0038",
+                                  "@type requires one or more type-parameter names, such as @type(T, T2)",
+                                  tokens[i]);
+                } else {
+                    std::unordered_set<std::string> uniqueParameters;
+                    for (const auto& parameter : decorator.typeArguments) {
+                        if (parameter.empty() ||
+                            !uniqueParameters.insert(parameter).second) {
+                            addDiagnostic("P0038",
+                                          "@type parameters must be distinct identifiers",
+                                          tokens[i]);
+                        }
+                    }
+                }
+                if (isForwardDeclaration) {
+                    addDiagnostic("P0038", "@type is only supported on function definitions",
+                                  tokens[i]);
+                }
+                sawTypeParameter = true;
             } else {
                 addDiagnostic("P0038", "unsupported function decorator '@" + decorator.name + "'",
                               tokens[i]);
             }
         }
         i = declarationIndex;
+    }
+
+    // `inline` is a function-definition modifier, not an @decorator. It only
+    // changes LLVM code generation; external `decl func` bodies cannot inline.
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (inOperatorName[i] ||
+            !std::holds_alternative<LexerType::Keyword>(tokens[i]) ||
+            std::get<LexerType::Keyword>(tokens[i]).name != "inline" ||
+            (i > 0 && isSyntaxOperator(tokens[i - 1], "@"))) {
+            continue;
+        }
+
+        const std::vector<LexerType::Token> suffix(tokens.begin() + i, tokens.end());
+        const auto prefix = parseFunctionPrefix(suffix);
+        if (!prefix.valid) {
+            const bool followsInlinePrefix = i + 1 < tokens.size() &&
+                ((std::holds_alternative<LexerType::Keyword>(tokens[i + 1]) &&
+                  (std::get<LexerType::Keyword>(tokens[i + 1]).name == "inline" ||
+                   std::get<LexerType::Keyword>(tokens[i + 1]).name == "func")) ||
+                 isSyntaxOperator(tokens[i + 1], "@"));
+            if (followsInlinePrefix) {
+                addDiagnostic("P0038", "malformed inline function modifier", tokens[i]);
+            }
+            continue;
+        }
+        if (!prefix.isInline) continue;
+
+        size_t declarationIndex = i + prefix.nextToken;
+        bool isForwardDeclaration = false;
+        if (declarationIndex < tokens.size() &&
+            std::holds_alternative<LexerType::Keyword>(tokens[declarationIndex]) &&
+            std::get<LexerType::Keyword>(tokens[declarationIndex]).name == "decl") {
+            isForwardDeclaration = true;
+            ++declarationIndex;
+        }
+        const bool namesFunction = declarationIndex < tokens.size() &&
+            std::holds_alternative<LexerType::Keyword>(tokens[declarationIndex]) &&
+            std::get<LexerType::Keyword>(tokens[declarationIndex]).name == "func";
+        if (isForwardDeclaration || (namesFunction && i > 0 &&
+            std::holds_alternative<LexerType::Keyword>(tokens[i - 1]) &&
+            std::get<LexerType::Keyword>(tokens[i - 1]).name == "decl")) {
+            addDiagnostic("P0038", "inline only applies to function definitions with a body", tokens[i]);
+        }
     }
 
     // `while` is not a Zeus control-flow keyword. Keep it usable as a dynamic
@@ -732,7 +1065,7 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
         }
     }
 
-    // Validate the only two forms supported by `using` statements/blocks and
+    // Validate the supported forms of `using` statements/blocks and
     // class receiver aliases. It is otherwise a reserved statement keyword.
     for (size_t i = 0; i < tokens.size(); ++i) {
         if (inOperatorName[i] || !std::holds_alternative<LexerType::Keyword>(tokens[i]) ||
@@ -747,6 +1080,14 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
                 (!isSyntaxOperator(tokens[after], ";") && !isSyntaxOperator(tokens[after], "{"))) {
                 addDiagnostic("P0030", "expected ';' or '{' after 'using original'", tokens[i + 1]);
             }
+        } else if (i + 2 < tokens.size() &&
+                   std::holds_alternative<LexerType::Keyword>(tokens[i + 1]) &&
+                   (std::get<LexerType::Keyword>(tokens[i + 1]).name == "LLVM" ||
+                    std::get<LexerType::Keyword>(tokens[i + 1]).name == "llvm" ||
+                    std::get<LexerType::Keyword>(tokens[i + 1]).name == "VM" ||
+                    std::get<LexerType::Keyword>(tokens[i + 1]).name == "vm") &&
+                   isSyntaxOperator(tokens[i + 2], "{")) {
+            // `using LLVM/VM { ... }` selects a compile-target implementation block.
         } else if (i + 2 >= tokens.size() || !isSyntaxOperator(tokens[i + 1], "&") ||
                    !isSyntaxIdentifier(tokens[i + 2])) {
             addDiagnostic("P0030", "expected 'original' or '&name' after 'using'", tokens[i]);
@@ -803,12 +1144,36 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
         }
         return std::vector<LexerType::Token>(tokens.begin() + assignment + 1, tokens.end());
     };
+    const auto isFaddrLValue = [](const std::vector<LexerType::Token>& tokens) {
+        if (tokens.size() < 7 || !isSyntaxOperator(tokens[0], "@") ||
+            !std::holds_alternative<LexerType::Keyword>(tokens[1]) ||
+            std::get<LexerType::Keyword>(tokens[1]).name != "faddr" ||
+            !isSyntaxOperator(tokens[2], "(")) {
+            return false;
+        }
+        const size_t close = matchingSyntaxDelimiter(tokens, 2);
+        const bool simpleType = close + 3 == tokens.size() &&
+            close + 1 < tokens.size() && isSyntaxOperator(tokens[close + 1], "->") &&
+            std::holds_alternative<LexerType::Keyword>(tokens[close + 2]);
+        const bool rawBytesRangeType = close + 4 == tokens.size() &&
+            close + 3 < tokens.size() && isSyntaxOperator(tokens[close + 1], "->") &&
+            isSyntaxOperator(tokens[close + 2], "&") &&
+            isSyntaxIdentifier(tokens[close + 3]) &&
+            std::get<LexerType::Keyword>(tokens[close + 3]).name == "bytes";
+        return simpleType || rawBytesRangeType;
+    };
+    const auto isThisLValue = [](const std::vector<LexerType::Token>& tokens) {
+        return tokens.size() == 2 && isSyntaxOperator(tokens[0], "@") &&
+            std::holds_alternative<LexerType::Keyword>(tokens[1]) &&
+            std::get<LexerType::Keyword>(tokens[1]).name == "this";
+    };
 
     const auto visit = [&](const auto& self,
                            const std::vector<TreeParser::NodeAndBlock>& elements,
                            bool parentIsTry,
                            bool parentIsClass,
                            const std::string& parentReceiverAlias,
+                           bool parentIsInterface,
                            bool parentIsTopLevel) -> void {
         for (const auto& element : elements) {
             if (std::holds_alternative<TreeParser::Node>(element)) {
@@ -840,8 +1205,12 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                         }
                     } else if (assignment != node.tokens.size()) {
                         const std::vector<LexerType::Token> left(node.tokens.begin(), node.tokens.begin() + assignment);
-                        bool validLValue = left.size() == 1 && isSyntaxIdentifier(left[0]);
-                        if (left.size() >= 2 && isSyntaxOperator(left.back(), "]")) {
+                        bool validLValue = (left.size() == 1 && isSyntaxIdentifier(left[0])) ||
+                            isThisLValue(left);
+                        if (!validLValue && isFaddrLValue(left)) {
+                            validateExpression(left);
+                            validLValue = true;
+                        } else if (left.size() >= 2 && isSyntaxOperator(left.back(), "]")) {
                             int depth = 0;
                             size_t bracketOpen = left.size();
                             for (size_t i = left.size(); i-- > 0;) {
@@ -862,7 +1231,7 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                             validLValue = true;
                         }
                         if (!validLValue) {
-                            addDiagnostic("P0025", "left side of assignment must be a variable, member, or index",
+                            addDiagnostic("P0025", "left side of assignment must be a variable, member, index, or @this",
                                           node.sourceLine, node.sourceColumn);
                         }
                     }
@@ -879,7 +1248,7 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                             addDiagnostic("P0026", "class receiver alias must be written as 'using &name'",
                                           node.sourceLine, node.sourceColumn);
                         } else if (!parentIsClass) {
-                            addDiagnostic("P0026", "'using &name' is only valid inside a class",
+                            addDiagnostic("P0026", "'using &name' is only valid inside a class or interface",
                                           node.sourceLine, node.sourceColumn);
                         }
                     } else if (!node.tokens.empty()) {
@@ -918,14 +1287,16 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                     }
                 } else if (node.type == NodeType::IMPORT_STMT) {
                     size_t position = 1;
-                    if (position >= node.tokens.size() || !isSyntaxIdentifier(node.tokens[position])) {
+                    if (position >= node.tokens.size() ||
+                        !isSyntaxPackageIdentifier(node.tokens[position])) {
                         addDiagnostic("P0029", "expected a package name after 'import'",
                                       node.sourceLine, node.sourceColumn);
                     } else {
                         ++position;
                         while (position < node.tokens.size() && isSyntaxOperator(node.tokens[position], ".")) {
                             ++position;
-                            if (position >= node.tokens.size() || !isSyntaxIdentifier(node.tokens[position])) {
+                            if (position >= node.tokens.size() ||
+                                !isSyntaxPackageIdentifier(node.tokens[position])) {
                                 addDiagnostic("P0029", "expected a package name after '.'",
                                               syntaxTokenLine(node.tokens[position - 1]),
                                               syntaxTokenColumn(node.tokens[position - 1]));
@@ -984,16 +1355,33 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                     if (!hasDeclFunc) {
                         addDiagnostic("P0023", "expected 'decl func name(...)'", node.sourceLine, node.sourceColumn);
                     }
+                } else if (node.type == NodeType::INTERFACE_METHOD_DECL_STMT) {
+                    const auto signature = parseForwardFunctionSignature(node.tokens);
+                    const bool hasDeclFunc = node.tokens.size() >= 2 &&
+                        std::holds_alternative<LexerType::Keyword>(node.tokens[0]) &&
+                        std::get<LexerType::Keyword>(node.tokens[0]).name == "decl" &&
+                        std::holds_alternative<LexerType::Keyword>(node.tokens[1]) &&
+                        std::get<LexerType::Keyword>(node.tokens[1]).name == "func";
+                    if (!parentIsInterface) {
+                        addDiagnostic("P0040", "interface method signatures must appear inside an interface",
+                                      node.sourceLine, node.sourceColumn);
+                    } else if (!hasDeclFunc || !signature.valid || signature.name.empty()) {
+                        addDiagnostic("P0040", "interface methods must use 'decl func name(...)'",
+                                      node.sourceLine, node.sourceColumn);
+                    }
                 } else if (node.type == NodeType::FOR_DECL_STMT) {
                     addDiagnostic("P0013", "unsupported or malformed 'for' header",
                                   node.sourceLine, node.sourceColumn);
                 } else if (node.type == NodeType::IF_DECL_STMT ||
                            node.type == NodeType::FUNC_DECL_STMT ||
                            node.type == NodeType::CLASS_DECL_STMT ||
+                           node.type == NodeType::INTERFACE_DECL_STMT ||
                            node.type == NodeType::IMPL_DECL_STMT ||
                            node.type == NodeType::TRY_DECL_STMT ||
                            node.type == NodeType::WITH_DECL_STMT ||
-                           node.type == NodeType::USING_BLOCK_STMT) {
+                           node.type == NodeType::USING_BLOCK_STMT ||
+                           node.type == NodeType::USING_LLVM_BLOCK_STMT ||
+                           node.type == NodeType::USING_VM_BLOCK_STMT) {
                     addDiagnostic("P0032", "expected a block for this declaration",
                                   node.sourceLine, node.sourceColumn);
                 }
@@ -1005,6 +1393,10 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
             const auto& block = *blockPtr;
             if (block.type == CodeBlockType::IMPL && !parentIsTopLevel) {
                 addDiagnostic("P0038", "impl declarations must appear at module scope",
+                              block.sourceLine, block.sourceColumn);
+            }
+            if (block.type == CodeBlockType::INTERFACE && !parentIsTopLevel) {
+                addDiagnostic("P0040", "interface declarations must appear at module scope",
                               block.sourceLine, block.sourceColumn);
             }
             if (block.type == CodeBlockType::CATCH && !parentIsTry) {
@@ -1039,6 +1431,9 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
             } else if (block.type == CodeBlockType::CLASS && block.className.empty()) {
                 addDiagnostic("P0014", "class declarations require a name",
                               block.sourceLine, block.sourceColumn);
+            } else if (block.type == CodeBlockType::INTERFACE && block.interfaceName.empty()) {
+                addDiagnostic("P0040", "interface declarations require a name",
+                              block.sourceLine, block.sourceColumn);
             } else if (block.type == CodeBlockType::IMPL && block.implTypeName.empty()) {
                 addDiagnostic("P0014", "impl declarations require a target type",
                               block.sourceLine, block.sourceColumn);
@@ -1067,6 +1462,30 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                     const auto& method = std::get<std::unique_ptr<TreeParser::CodeBlock>>(member);
                     if (method && method->type != CodeBlockType::FUNC) {
                         addDiagnostic("P0032", "impl blocks may only contain function declarations",
+                                      method->sourceLine, method->sourceColumn);
+                    }
+                }
+            }
+            if (block.type == CodeBlockType::INTERFACE) {
+                for (const auto& member : block.nodes) {
+                    if (std::holds_alternative<TreeParser::Node>(member)) {
+                        const auto& node = std::get<TreeParser::Node>(member);
+                        const bool receiverAlias = node.type == NodeType::EXP_STMT &&
+                            node.tokens.size() == 3 &&
+                            std::holds_alternative<LexerType::Keyword>(node.tokens[0]) &&
+                            std::get<LexerType::Keyword>(node.tokens[0]).name == "using" &&
+                            isSyntaxOperator(node.tokens[1], "&") &&
+                            isSyntaxIdentifier(node.tokens[2]);
+                        if (!receiverAlias &&
+                            node.type != NodeType::INTERFACE_METHOD_DECL_STMT) {
+                            addDiagnostic("P0040", "interfaces may only contain method signatures and a receiver alias",
+                                          node.sourceLine, node.sourceColumn);
+                        }
+                        continue;
+                    }
+                    const auto& method = std::get<std::unique_ptr<TreeParser::CodeBlock>>(member);
+                    if (method) {
+                        addDiagnostic("P0040", "interfaces contain signatures without method bodies",
                                       method->sourceLine, method->sourceColumn);
                     }
                 }
@@ -1128,9 +1547,14 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
             }
             self(self, block.nodes,
                  block.type == CodeBlockType::TRY,
-                 block.type == CodeBlockType::CLASS || block.type == CodeBlockType::IMPL,
-                 (block.type == CodeBlockType::CLASS || block.type == CodeBlockType::IMPL)
+                 block.type == CodeBlockType::CLASS ||
+                    block.type == CodeBlockType::INTERFACE ||
+                    block.type == CodeBlockType::IMPL,
+                 (block.type == CodeBlockType::CLASS ||
+                    block.type == CodeBlockType::INTERFACE ||
+                    block.type == CodeBlockType::IMPL)
                      ? block.classDefaultAlias : std::string(),
+                 block.type == CodeBlockType::INTERFACE,
                  false);
         }
     };
@@ -1140,12 +1564,12 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
         std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(ast.front())) {
         const auto& root = std::get<std::unique_ptr<TreeParser::CodeBlock>>(ast.front());
         if (root && root->type == CodeBlockType::BLOCK) {
-            visit(visit, root->nodes, false, false, {}, true);
+            visit(visit, root->nodes, false, false, {}, false, true);
         } else {
-            visit(visit, ast, false, false, {}, true);
+            visit(visit, ast, false, false, {}, false, true);
         }
     } else {
-        visit(visit, ast, false, false, {}, true);
+        visit(visit, ast, false, false, {}, false, true);
     }
     return diagnostics;
 }

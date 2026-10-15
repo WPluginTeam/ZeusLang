@@ -1,0 +1,66 @@
+interface Map {
+    using &self;
+    decl func get(key: string) -> string;
+    decl func static version() -> int;
+}
+
+interface Sized {
+    using &self;
+    decl func size() -> int;
+}
+
+interface RefInput {
+    decl func inspect(&value: int) -> int;
+}
+
+class HashMap [Map, Sized] {
+    using &self;
+    func get(key: string) -> string {
+        return key;
+    }
+    func static version() -> int {
+        return 1;
+    }
+    func size() -> int {
+        return 1;
+    }
+}
+
+class RefInputImpl [RefInput] {
+    func inspect(&value: int) -> int {
+        return value;
+    }
+}
+
+interface RefTypeInput {
+    decl func inspect(value: &int) -> int;
+}
+
+class RefTypeInputImpl [RefTypeInput] {
+    func inspect(&value: int) -> int {
+        return value;
+    }
+}
+
+interface RefPrefixInput {
+    decl func inspect(&value: int) -> int;
+}
+
+class RefPrefixInputImpl [RefPrefixInput] {
+    func inspect(value: &int) -> int {
+        return value;
+    }
+}
+
+interface VariadicInput {
+    decl func collect(*args, **kwargs) -> int;
+}
+
+class VariadicInputImpl [VariadicInput] {
+    func collect(*args, **kwargs) -> int {
+        return 1;
+    }
+}
+
+let map = new HashMap();
+print("PASS interface conformance");

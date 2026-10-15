@@ -1,0 +1,18 @@
+using original;
+
+func main() {
+    let values = [11, 22, 33];
+    let total = 0;
+
+    for (values) [const &value] {
+        total = total + value;
+    }
+    for (0..3) [const &index] {
+        total = total + index;
+    }
+
+    if (total != 69) throw "const reference loop binding returned a wrong result";
+    print("LOOP_CONST_REFERENCE_TEST_PASS", total);
+}
+
+main();

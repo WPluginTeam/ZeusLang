@@ -1,0 +1,28 @@
+@type(T, T2, T3)
+func preserve(a: T, b: T2, c: T3) -> T2 {
+    return b;
+}
+
+@type(T, T2)
+class Pair {
+    using &this;
+    var left: T;
+    var right: T2;
+
+    func init(a: T, b: T2) {
+        this.left = a;
+        this.right = b;
+    }
+
+    func first() -> T { return this.left; }
+    func second() -> T2 { return this.right; }
+}
+
+let pair = new Pair<int, string>(17, "pair-ok");
+let reversePair = new Pair<string, int>("reverse-ok", 29);
+print(pair.first());
+print(pair.second());
+print(reversePair.first());
+print(reversePair.second());
+print(preserve(1, "multi-ok", true));
+print(preserve<int, string, bool>(2, "explicit-ok", false));

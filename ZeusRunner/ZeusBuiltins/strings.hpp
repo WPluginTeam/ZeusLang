@@ -5,6 +5,7 @@
 
 #include "core.hpp"
 #include "array.hpp"
+#include "../../ZeusRuntimeLib/ZeusGC.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -237,6 +238,7 @@ namespace ZeusBuiltins {
 
     // __str_split(string, separator): 分割字符串，返回数组
     inline ZeusType::UniversalVariant builtin_str_split(const std::vector<ZeusType::UniversalVariant>& args) {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         if (args.size() < 2) throw std::runtime_error("__str_split expects at least 2 arguments");
 
         const std::string* str = nullptr;
@@ -260,7 +262,7 @@ namespace ZeusBuiltins {
         if (!sep) throw std::runtime_error("__str_split: second argument must be string");
 
         ZeusType::Array result;
-        result.impl = std::make_shared<ZeusType::ArrayData>();
+        result.impl = ZeusGC::makeArrayData();
 
         if (sep->empty()) {
             for (char c : *str) {

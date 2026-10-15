@@ -1,0 +1,87 @@
+@native("zeus_runtime_debug_dump")
+decl func runtime_debug_dump() -> int;
+
+var failures = 0;
+
+class SidecarOwner {
+    using &this;
+    var value = 0;
+
+    func reset() {
+        @this = new SidecarOwner();
+    }
+
+    func replaceFrom(other) {
+        @this = other;
+    }
+}
+
+func setExtra(target, value) {
+    target.extra = value;
+}
+
+func getExtra(target) {
+    return target.extra;
+}
+
+func fail(message: string) {
+    failures = failures + 1;
+    print("[FAIL]", message);
+}
+
+func makeSidecarSelfCycle() {
+    let owner = new SidecarOwner();
+    let edge = {};
+    edge["owner"] = owner;
+    setExtra(owner, edge);
+}
+
+func makeSidecarReplacementCycle() {
+    let owner = new SidecarOwner();
+    let edge = {"owner": owner, "label": "copied"};
+    setExtra(owner, edge);
+    owner.reset();
+}
+
+func makeSidecarCopyCycle() {
+    let source = new SidecarOwner();
+    let edge = {"owner": source, "label": "copied"};
+    setExtra(source, edge);
+    let target = new SidecarOwner();
+    target.replaceFrom(source);
+    if (getExtra(target)["label"] != "copied") {
+        fail("@this did not copy dynamic sidecar values");
+    }
+}
+
+func main() {
+    __gc_collect();
+    let baseline = __gc_native_nodes();
+
+    makeSidecarSelfCycle();
+    __gc_collect();
+    let afterSelfCycle = __gc_native_nodes();
+    print("SIDECAR_SELF_CYCLE", baseline, afterSelfCycle);
+    if (afterSelfCycle > baseline) fail("unrooted dynamic sidecar cycle remained");
+
+    makeSidecarReplacementCycle();
+    __gc_collect();
+    let afterReplacement = __gc_native_nodes();
+    print("SIDECAR_REPLACEMENT_CYCLE", baseline, afterReplacement);
+    if (afterReplacement > baseline) fail("@this replacement retained the old sidecar cycle");
+
+    makeSidecarCopyCycle();
+    __gc_collect();
+    let afterCopy = __gc_native_nodes();
+    print("SIDECAR_COPY_CYCLE", baseline, afterCopy);
+    if (afterCopy > baseline) fail("copied dynamic sidecar cycle remained");
+
+    using LLVM {
+        runtime_debug_dump();
+    }
+
+    if (failures == 0) print("GC_DYNAMIC_SIDECAR_CYCLE_PASS", baseline, afterCopy);
+    else print("GC_DYNAMIC_SIDECAR_CYCLE_FAIL", failures);
+}
+
+main();

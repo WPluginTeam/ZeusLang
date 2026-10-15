@@ -119,17 +119,24 @@ namespace ZeusBuiltins {
         return ZeusType::UniversalVariant(LexerType::Value(threadId));
     }
 
-    // __thread_start(threadId, protoIdOrClosure, args...): 启动线程执行函数
-    // 第二个参数可以是整数 protoId，或者是闭包句柄
+    // __thread_start(threadId, target, args): args is nil or an argument array.
+    // The VM receives the same copied argument sequence as the LLVM runtime.
     inline ZeusType::UniversalVariant builtin_thread_start(const std::vector<ZeusType::UniversalVariant>& args) {
-        if (args.size() < 2) {
-            throw std::runtime_error("__thread_start requires at least 2 arguments (threadId, protoId/closure)");
+        if (args.size() != 3) {
+            throw std::runtime_error("__thread_start requires threadId, target, and an argument array");
         }
 
         int threadId = -1;
         int protoId = -1;
         int closureIdToRetain = -1;  // 需要 retain 的闭包 ID
         std::optional<ZeusType::ObjectHandle> boundThis;
+        std::vector<ZeusType::UniversalVariant> threadArgs;
+
+        if (!ZeusVMUtils::isNull(args[2])) {
+            const ZeusType::Array* argumentArray = ZeusVMUtils::getArrayConst(args[2]);
+            if (!argumentArray) return ZeusType::UniversalVariant(false);
+            if (argumentArray->impl) threadArgs = argumentArray->impl->data;
+        }
 
         // 获取线程 ID
         if (std::holds_alternative<LexerType::Value>(args[0])) {
@@ -217,14 +224,67 @@ namespace ZeusBuiltins {
             sharedObjects = sharedObjectResolver();
         }
 
-        // 收集额外参数
-        std::vector<ZeusType::UniversalVariant> threadArgs;
-        for (size_t i = 2; i < args.size(); ++i) {
-            threadArgs.push_back(args[i]);
+        auto retainThreadArguments = [&threadArgs]() {
+            for (const auto& argument : threadArgs) {
+                if (std::holds_alternative<ZeusType::ObjectHandle>(argument)) {
+                    if (g_vmRetainObject) {
+                        g_vmRetainObject(std::get<ZeusType::ObjectHandle>(argument));
+                    }
+                } else if (std::holds_alternative<ZeusType::ClosureHandle>(argument)) {
+                    if (g_vmRetainClosure) {
+                        g_vmRetainClosure(std::get<ZeusType::ClosureHandle>(argument).id);
+                    }
+                }
+            }
+        };
+        auto releaseThreadArguments = [&threadArgs]() {
+            for (const auto& argument : threadArgs) {
+                if (std::holds_alternative<ZeusType::ObjectHandle>(argument)) {
+                    if (g_vmReleaseObject) {
+                        g_vmReleaseObject(std::get<ZeusType::ObjectHandle>(argument));
+                    }
+                } else if (std::holds_alternative<ZeusType::ClosureHandle>(argument)) {
+                    if (g_vmReleaseClosure) {
+                        g_vmReleaseClosure(std::get<ZeusType::ClosureHandle>(argument).id);
+                    }
+                }
+            }
+        };
+
+        bool retainedBoundThis = false;
+        if (boundThis.has_value()) {
+            if (!g_vmRetainObject || !g_vmReleaseObject) {
+                if (g_vmReleaseClosure && closureIdToRetain >= 0) {
+                    g_vmReleaseClosure(closureIdToRetain);
+                }
+                throw std::runtime_error(
+                    "__thread_start: bound method requires VM object retain/release callbacks");
+            }
+            g_vmRetainObject(*boundThis);
+            retainedBoundThis = true;
         }
 
-        bool started = ZeusThread::getThreadManager().startThread(
-            threadId, protoId, threadArgs, entryFunc, boundThis, sharedObjects);
+        retainThreadArguments();
+        bool started = false;
+        try {
+            started = ZeusThread::getThreadManager().startThread(
+                threadId, protoId, threadArgs, entryFunc, boundThis, sharedObjects);
+        } catch (...) {
+            releaseThreadArguments();
+            if (retainedBoundThis && g_vmReleaseObject) {
+                g_vmReleaseObject(*boundThis);
+            }
+            if (g_vmReleaseClosure && closureIdToRetain >= 0) {
+                g_vmReleaseClosure(closureIdToRetain);
+            }
+            throw;
+        }
+        if (!started) {
+            releaseThreadArguments();
+            if (retainedBoundThis && g_vmReleaseObject) {
+                g_vmReleaseObject(*boundThis);
+            }
+        }
 
         // 线程启动后，release 闭包
         // 闭包只是用来传递 protoId，线程使用的是 protoId（函数原型），不是闭包本身
@@ -389,12 +449,9 @@ namespace ZeusBuiltins {
         registerBuiltin("__heap_unlock", builtin_heap_unlock, 1, 1);
         registerBuiltin("__heap_exists", builtin_heap_exists, 1, 1);
 
-        // Keep the VM builtin registration order stable.
-        registerStandaloneMutexBuiltins();
-
         // 线程操作（用于多线程支持）
         registerBuiltin("__thread_create", builtin_thread_create, 0, 0);
-        registerBuiltin("__thread_start", builtin_thread_start, 2, -1);  // 可变参数
+        registerBuiltin("__thread_start", builtin_thread_start, 3, 3);
         registerBuiltin("__thread_join", builtin_thread_join, 1, 1);
         registerBuiltin("__thread_is_alive", builtin_thread_is_alive, 1, 1);
         registerBuiltin("__thread_count", builtin_thread_count, 0, 0);
@@ -402,6 +459,7 @@ namespace ZeusBuiltins {
         registerBuiltin("__thread_join_all", builtin_thread_join_all, 0, 0);
         registerStandaloneThreadSleepBuiltin();
         registerStandaloneThreadIdBuiltin();
+        registerStandaloneThreadStopBuiltin();
         registerBuiltin("__thread_eliminate", builtin_thread_eliminate, 1, 1);
         registerBuiltin("__thread_set_name", builtin_thread_set_name, 2, 2);
         registerBuiltin("__thread_get_name", builtin_thread_get_name, 1, 1);

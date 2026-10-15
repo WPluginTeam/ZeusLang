@@ -1,0 +1,64 @@
+import zeus.websocket;
+import zeus.crypto;
+import zeus.exception;
+
+func assertWebSocket(condition, message) {
+    if (!condition) throw new Exception("WebSocket test failed: " + message);
+}
+
+func headTestHandler(request) {
+    return "representation";
+}
+
+func main() {
+    let digest = Crypto.sha1(bytes("abc"));
+    assertWebSocket(digest.length() == 20, "SHA-1 returns 20 bytes");
+    assertWebSocket(
+        Crypto.base64Encode(digest) == "qZk+NkcGgWq6PiVxeFDCbJzQ2J0=",
+        "SHA-1 matches the standard abc vector");
+
+    let decoded = Crypto.base64Decode("AQIDBA==");
+    assertWebSocket(decoded.length() == 4 and decoded.get(0) == 1 and
+        decoded.get(3) == 4, "Base64 decoder preserves binary bytes");
+    assertWebSocket(Crypto.base64Encode(decoded) == "AQIDBA==", "Base64 round trip");
+    assertWebSocket(Crypto.randomBytes(16).length() == 16, "secure random byte length");
+
+    let noContent = __http_response_bytes(new HTTPResponse("ignored", 204), true).decode();
+    assertWebSocket(noContent.index("Content-Length:") < 0,
+        "204 response omits Content-Length");
+    assertWebSocket(noContent.endswith("\r\n\r\n"), "204 response has no body");
+
+    let splitHead = bytes("GET /scan HTTP/1.1\r\nHost:");
+    let incomplete = __http_parse_request(splitHead, 16384, 1024);
+    let completed = __http_parse_request(
+        splitHead + bytes(" localhost\r\n\r\n"),
+        16384, 1024, incomplete.nextHeaderSearchStart);
+    assertWebSocket(completed.status == 0 and !completed.incomplete,
+        "incremental header scan covers a delimiter split across reads");
+    assertWebSocket(!completed.request.hasTextBody, "request body text decoding is lazy");
+
+    let headRequest = __http_parse_request(
+        bytes("HEAD /page HTTP/1.1\r\nHost: localhost\r\n\r\n"), 16384, 1024);
+    let router = new HTTPRouter();
+    router.get("/page", headTestHandler);
+    let headResponse = router.dispatch(headRequest.request);
+    let headWire = __http_response_bytes(headResponse, true, true).decode();
+    assertWebSocket(headResponse.status == 200 and headResponse.body.length() == 14,
+        "HEAD uses the corresponding GET route metadata");
+    assertWebSocket(headWire.index("Content-Length: 14") >= 0 and
+        headWire.endswith("\r\n\r\n"), "HEAD keeps GET length and omits body");
+
+    let injected = new HTTPResponse("ok", 200);
+    injected.headerLines = "X-Test: safe\r\n\r\nInjected: yes\r\n";
+    let rejectedInjection = false;
+    try {
+        __http_response_bytes(injected, false);
+    } catch (&error) {
+        rejectedInjection = true;
+    }
+    assertWebSocket(rejectedInjection, "raw response header mutation cannot inject fields");
+
+    print("PASS WebSocket protocol primitives");
+}
+
+main();

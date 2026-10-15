@@ -1,0 +1,86 @@
+import zeus.string;
+
+@native("zeus_string_copy_from_data")
+decl func copyNativeStringData(data: string, length: int) -> string;
+
+class TextHolder {
+    using &this;
+    var value: string = "default";
+    func init(value: string) { this.value = value; }
+    func get() -> string { return this.value; }
+}
+
+func passText(value: string) -> string { return value; }
+func produceText() -> string { return "return"; }
+func dynamicIdentity(value) { return value; }
+func typedFromDynamic(value: string) -> string { return dynamicIdentity(value); }
+func dataFromFunctionLocal() -> int {
+    let local: string = "lifetime";
+    return local.dataAddress();
+}
+
+let explicitGlobal: string = "typed-global";
+let inferredGlobal = "inferred-global";
+var reassignedGlobal: string = "before";
+reassignedGlobal = "after";
+
+let explicitLocal: string = "123";
+let inferredLocal = "hello";
+let emptyLocal: string = "";
+let embeddedZero: string = "a\0b";
+let returned = produceText();
+let passed = passText(explicitLocal);
+let dynamicBoundary = typedFromDynamic("boundary");
+let joined = inferredLocal + " world";
+let holder = new TextHolder("field");
+let fieldCopy: string = holder.get();
+
+if (explicitGlobal != "typed-global" or inferredGlobal != "inferred-global" or
+    reassignedGlobal != "after") throw "string globals lost native values";
+if (explicitLocal.length() != 3 or inferredLocal.index("ell") != 1 or
+    !inferredLocal.startswith("he")) throw "native string methods failed";
+if (returned != "return" or passed != "123" or
+    dynamicBoundary != "boundary") throw "string parameter/return bridge failed";
+if (joined != "hello world" or fieldCopy != "field") throw "string concat/field path failed";
+if (!emptyLocal.isEmpty() or emptyLocal.length() != 0) throw "empty string layout failed";
+if (embeddedZero.length() != 3 or embeddedZero.index("\0") != 1 or
+    embeddedZero != "a\0b") throw "embedded NUL string layout failed";
+var edited = "abc";
+edited[1] = "Z";
+if (edited != "aZc" or "banana".replace("na", "!") != "ba!!") {
+    throw "string setter or replace failed";
+}
+
+using LLVM {
+    let explicitData = explicitLocal.dataAddress();
+    let emptyData = emptyLocal.dataAddress();
+    if (@faddr(explicitData - 8, 8) -> int != 3 or
+        @faddr(explicitData + 3, 1) -> int != 0) {
+        throw "string data-8 length or NUL layout failed";
+    }
+    if (@faddr(emptyData - 8, 8) -> int != 0 or
+        @faddr(emptyData, 1) -> int != 0) {
+        throw "empty string header or terminator failed";
+    }
+    if (copyNativeStringData(explicitLocal, explicitLocal.length()) != explicitLocal or
+        copyNativeStringData(explicitLocal, explicitLocal.length()).dataAddress() ==
+            explicitLocal.dataAddress()) {
+        throw "string equality failed for independent equal buffers";
+    }
+}
+
+var pointerSource: string = "lifetime";
+let data = pointerSource.dataAddress();
+if (@faddr(data, 1) -> int != 108) throw "string data pointer expired after return";
+using LLVM {
+    let returnedData = dataFromFunctionLocal();
+    if (@faddr(returnedData, 1) -> int != 108) throw "string pool range expired with its source slot";
+    var readonlyRejected = false;
+    try {
+        @faddr(data, 1) -> int = 65;
+    } catch (&error) {
+        readonlyRejected = true;
+    }
+    if (!readonlyRejected) throw "interned string data accepted a raw write";
+}
+print("NATIVE_STRING_LAYOUT_PASS");

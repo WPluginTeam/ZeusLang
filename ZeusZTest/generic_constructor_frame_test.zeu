@@ -1,0 +1,30 @@
+class GenericConstructorLeaf {
+    using &this;
+    var value: int = 0;
+    func init(value: int) {
+        this.value = value;
+        return "ignored-init-result";
+    }
+}
+class GenericConstructorBranch {
+    using &this;
+    var child = nil;
+    func init() { this.child = new GenericConstructorLeaf(9); }
+}
+class GenericConstructorRoot {
+    using &this;
+    var child = nil;
+    func init() { this.child = new GenericConstructorBranch(); }
+}
+let root = new GenericConstructorRoot();
+print(root.child.child.value);
+class GenericConstructorFailure {
+    using &this;
+    func init() { throw new Exception("construction-failed"); }
+}
+try {
+    let failed = new GenericConstructorFailure();
+} catch (&error) {
+    print(error.getMessage());
+}
+print("constructor-frame-pass");

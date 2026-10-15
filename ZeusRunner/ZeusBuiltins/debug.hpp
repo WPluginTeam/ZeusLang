@@ -7,10 +7,14 @@
 #include "gc.hpp"
 #include "../ZeusThread.hpp"
 #include "../../ZeusRuntimeLib/ZeusCell.hpp"
+#include "../../ZeusRuntimeLib/ZeusSocketABI.hpp"
 
 #ifdef _WIN32
     #ifndef NOMINMAX
     #define NOMINMAX
+    #endif
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
     #endif
     #include <windows.h>
     #include <psapi.h>
@@ -57,14 +61,9 @@ namespace ZeusBuiltins {
         size_t freeObjects = g_vmFreeObjectSlotsSize ? *g_vmFreeObjectSlotsSize : 0;
         size_t closures = g_vmClosuresSize ? *g_vmClosuresSize : 0;
         size_t freeClosures = g_vmGetFreeClosureSlotsSize ? g_vmGetFreeClosureSlotsSize() : 0;
-        size_t sockets = g_vmSockets ? g_vmSockets->size() : 0;
-        size_t freeSocketSlots = g_vmFreeSocketSlotsSize ? *g_vmFreeSocketSlotsSize : 0;
-        size_t connectedSockets = 0;
-        if (g_vmSockets) {
-            for (const auto& s : *g_vmSockets) {
-                if (s.isConnected) connectedSockets++;
-            }
-        }
+        const size_t sockets = static_cast<size_t>(zeus_socket_open_count());
+        const size_t connectedSockets =
+            static_cast<size_t>(zeus_socket_connected_count());
         size_t prototypesCount = g_vmPrototypesSize ? *g_vmPrototypesSize : 0;
         size_t globalNames = g_vmGlobalNames ? g_vmGlobalNames->size() : 0;
 
@@ -72,8 +71,7 @@ namespace ZeusBuiltins {
         oss << "VM STATS: Memory=" << memoryMB << "MB, Objects=" << objects << ", FreeObjSlots=" << freeObjects
             << ", ClosuresCreated=" << closures << ", FreeClosSlots=" << freeClosures
             << ", Sockets(total=" << sockets << ", connected=" << connectedSockets << ")"
-            << ", Prototypes=" << prototypesCount << ", GlobalNames=" << globalNames
-            << ", FreeSocketSlots=" << freeSocketSlots;
+            << ", Prototypes=" << prototypesCount << ", GlobalNames=" << globalNames;
 
         std::string info = oss.str();
         std::cout << info << std::endl;
@@ -292,8 +290,10 @@ namespace ZeusBuiltins {
 
         for (size_t fromIdx = 0; fromIdx < g_vmObjects->size(); ++fromIdx) {
             const auto& fromObj = (*g_vmObjects)[fromIdx];
-            if (fromObj.classId < 0 || fromObj.markedForDeletion) continue;
-            for (const auto& kv : fromObj.values) {
+            if (fromObj.classId < 0 || fromObj.classId >= static_cast<int>(g_vmClasses->size()) ||
+                fromObj.markedForDeletion) continue;
+            const auto& classInfo = (*g_vmClasses)[fromObj.classId];
+            for (const auto& kv : ZeusType::snapshotObjectFields(fromObj, classInfo)) {
                 const auto& v = kv.second;
                 // Direct field edges (ObjectHandle only)
                 if (std::holds_alternative<ZeusType::ObjectHandle>(v)) {
@@ -324,7 +324,8 @@ namespace ZeusBuiltins {
             auto live = HeapStats::getLiveCells();
             for (Cell* c : live) {
                 if (!c) continue;
-                scanForObjectHandles(c->value, scanForObjectHandles, [&](int toId) {
+                const auto value = c->readValue();
+                scanForObjectHandles(value, scanForObjectHandles, [&](int toId) {
                     if (toId < 0 || toId >= (int)g_vmObjects->size()) return;
                     const auto& toObj = (*g_vmObjects)[toId];
                     if (toObj.classId < 0 || toObj.markedForDeletion) return;
@@ -347,21 +348,25 @@ namespace ZeusBuiltins {
                 // extra per-class health checks (field state)
                 if (obj.classId == threadClassId) {
                     threadHealth.alive++;
-                    auto itT = obj.values.find("target");
-                    if (itT != obj.values.end() && !isNil(itT->second)) {
-                        threadHealth.targetNonNil++;
-                        if (std::holds_alternative<ZeusType::ClosureHandle>(itT->second)) threadHealth.targetIsClosure++;
+                    const auto& classInfo = (*g_vmClasses)[obj.classId];
+                    if (ZeusType::objectHasField(obj, classInfo, "target")) {
+                        const auto target = ZeusType::readObjectField(obj, classInfo, "target");
+                        if (!isNil(target)) {
+                            threadHealth.targetNonNil++;
+                            if (std::holds_alternative<ZeusType::ClosureHandle>(target)) threadHealth.targetIsClosure++;
+                        }
                     }
-                    auto itA = obj.values.find("args");
-                    if (itA != obj.values.end() && !isNil(itA->second)) threadHealth.argsNonNil++;
-                    auto itN = obj.values.find("name");
-                    if (itN != obj.values.end() && !isNil(itN->second)) threadHealth.nameNonNil++;
+                    if (ZeusType::objectHasField(obj, classInfo, "args") &&
+                        !isNil(ZeusType::readObjectField(obj, classInfo, "args"))) threadHealth.argsNonNil++;
+                    if (ZeusType::objectHasField(obj, classInfo, "name") &&
+                        !isNil(ZeusType::readObjectField(obj, classInfo, "name"))) threadHealth.nameNonNil++;
                 } else if (obj.classId == socketClassId) {
                     socketHealth.alive++;
-                    auto itH = obj.values.find("handle");
-                    if (itH != obj.values.end() && !isNil(itH->second)) socketHealth.handleNonNil++;
-                    auto itC = obj.values.find("isConnected");
-                    if (itC != obj.values.end() && !isNil(itC->second)) socketHealth.connectedNonNil++;
+                    const auto& classInfo = (*g_vmClasses)[obj.classId];
+                    if (ZeusType::objectHasField(obj, classInfo, "handle") &&
+                        !isNil(ZeusType::readObjectField(obj, classInfo, "handle"))) socketHealth.handleNonNil++;
+                    if (ZeusType::objectHasField(obj, classInfo, "isConnected") &&
+                        !isNil(ZeusType::readObjectField(obj, classInfo, "isConnected"))) socketHealth.connectedNonNil++;
                 }
             }
         }
@@ -371,9 +376,11 @@ namespace ZeusBuiltins {
         int objCells = 0;
         int staleCells = 0;
         for (Cell* c : cells) {
-            if (!c || !std::holds_alternative<ZeusType::ObjectHandle>(c->value)) continue;
+            if (!c) continue;
+            const auto value = c->readValue();
+            if (!std::holds_alternative<ZeusType::ObjectHandle>(value)) continue;
             objCells++;
-            auto oh = std::get<ZeusType::ObjectHandle>(c->value);
+            const auto oh = std::get<ZeusType::ObjectHandle>(value);
             if (oh.id < 0 || oh.id >= (int)g_vmObjects->size()) { staleCells++; continue; }
             const auto& obj = (*g_vmObjects)[oh.id];
             if (obj.generation != oh.generation || obj.classId < 0 || obj.markedForDeletion) {

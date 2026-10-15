@@ -3,7 +3,7 @@
 ## 当前状态
 
 ### ✅ 已有组件
-1. **Array类**: `ZeusBuiltins/list.zeu` 中已定义
+1. **Array类**: `ZeusBuiltins/zeus/list.zeu` 中已定义
    - 构造函数: `init(arr)` - 接受一个数组参数
    - 内部存储: `this.data = []` - 使用底层列表
    - 方法: append, pop, length, get 等
@@ -69,13 +69,13 @@ print(x);
 
 **当前用法**:
 ```zeus
-import ZeusBuiltins.list;
+import zeus.list;
 let arr = new Array([1, 2, 3]);  // [1, 2, 3]是底层列表
 ```
 
 **目标用法**:
 ```zeus
-import ZeusBuiltins.list;
+import zeus.list;
 let arr = new Array([1, 2, 3]);  // 同上,但更自然
 // 或者直接:
 let arr2 = [1, 2, 3];  // 返回底层列表,不是Array对象!

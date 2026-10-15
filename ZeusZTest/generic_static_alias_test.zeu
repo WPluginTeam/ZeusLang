@@ -1,0 +1,4 @@
+@type(T)
+func identity(value: T) -> T { return value; }
+let alias = identity;
+print(alias(1));

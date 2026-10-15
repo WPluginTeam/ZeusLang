@@ -1,0 +1,417 @@
+
+using original;
+import zeus.mem;
+
+@native("zeus_bytes_get")
+decl func __bytes_get(data: bytes, index: int) -> int;
+
+@native("zeus_bytes_len")
+decl func __bytes_len(data: bytes) -> int;
+
+@native("zeus_bytes_concat")
+decl func __bytes_concat(left: bytes, right: bytes) -> bytes;
+
+@native("zeus_bytes_slice")
+decl func __bytes_slice(data: bytes, start: int, end: int) -> bytes;
+
+@native("zeus_bytes_copy_from_address")
+decl func __bytes_copy_from_address(dataAddress: int, length: int) -> bytes;
+
+@native("zeus_bytes_decode")
+decl func __bytes_decode(data: bytes, encoding: string) -> string;
+
+@native("zeus_bytes_to_list")
+decl func __bytes_to_list(data: bytes) -> list;
+
+impl bytes {
+    using &this;
+
+    inline func get(index: int) -> int {
+        let dataAddress = @reveal(this);
+        let byteLength = @faddr(dataAddress - 8, 8) -> int;
+        if (index < 0) throw new Exception("Bytes index out of range");
+        if (index >= byteLength) throw new Exception("Bytes index out of range");
+        return @faddr(dataAddress + index, 1) -> int;
+    }
+
+    @no_safepoint inline func length() -> int {
+        let dataAddress = @reveal(this);
+        return @faddr(dataAddress - 8, 8) -> int;
+    }
+
+    @no_safepoint inline func dataAddress() -> int {
+        return @reveal(this);
+    }
+
+    func slice(start: int, end: int) -> bytes {
+        return __bytes_slice(this, start, end);
+    }
+
+    func split(bt: int) -> list {
+        let arr = [];
+        let index = 0;
+
+        for (0..this.length()) [const &i] {
+            if (this.get(i) == bt) {
+                __array_push(arr, this.slice(index, i));
+                index = i + 1;
+            }
+        }
+        __array_push(arr, this.slice(index, this.length()));
+        return arr;
+    }
+
+    func decode(encoding: string = "utf-8") -> string {
+        return __bytes_decode(this, encoding);
+    }
+
+    func toList() -> list {
+        return __bytes_to_list(this);
+    }
+
+    func toString() -> string {
+        return str(this);
+    }
+
+    func operator[+](other: bytes) -> bytes {
+        return __bytes_concat(this, other);
+    }
+
+    inline func operator[[]](index: int) -> int {
+        return this.get(index);
+    }
+
+    func operator[[]=](index: int, value: int) -> bytes {
+        let byteLength = this.length();
+
+        if (index < 0) {
+            throw new Exception("Bytes index out of range");
+        }
+        if (index >= byteLength) {
+            throw new Exception("Bytes index out of range");
+        }
+        if (value < 0) {
+            throw new Exception("Bytes index assignment requires a value from 0 to 255");
+        }
+        if (value > 255) {
+            throw new Exception("Bytes index assignment requires a value from 0 to 255");
+        }
+
+        using LLVM {
+            if (byteLength > 9223372036854775807) {
+                throw new Exception("Bytes index assignment result is too large");
+            }
+            let sourceAddress = this.dataAddress();
+            let result = __bytes_copy_from_address(sourceAddress, byteLength);
+            let outputAddress = result.dataAddress();
+            @faddr(outputAddress + index, 1) -> int = value;
+            return result;
+        }
+        using VM {
+            let result: bytes = bytes(byteLength);
+            let outputAddress = result.dataAddress();
+            @faddr(outputAddress, byteLength) -> bytes = this;
+            @faddr(outputAddress + index, 1) -> int = value;
+            return result;
+        }
+    }
+}
+
+func __bytebuffer_write_bytes(destinationAddress: int, source: bytes) {
+    using LLVM {
+        @faddr(destinationAddress, source.length()) -> bytes = source;
+    }
+    using VM {
+        @faddr(destinationAddress, source.length()) -> bytes = source;
+    }
+}
+
+func __bytebuffer_zeroed_bytes(length: int) -> bytes {
+    if (length <= 0) return b"";
+
+    var result: bytes = b"\0";
+    var capacity: int = 1;
+    for (true) {
+        if (capacity >= length) break;
+        if (capacity > 4611686018427387903) {
+            throw new Exception("ByteBuffer prefix table is too large");
+        }
+        result = __bytes_concat(result, result);
+        capacity = capacity * 2;
+    }
+    return result;
+}
+
+func __bytebuffer_read_int(address: int) -> int {
+    using LLVM {
+        return @faddr(address, 8) -> int;
+    }
+    using VM {
+        return @faddr(address, 8) -> int;
+    }
+}
+
+func __bytebuffer_write_int(address: int, value: int) {
+    using LLVM {
+        @faddr(address, 8) -> int = value;
+    }
+    using VM {
+        @faddr(address, 8) -> int = value;
+    }
+}
+
+// Growable contiguous bytes with direct writes; slices leave the backing store private.
+class ByteBuffer {
+    using &this;
+
+    let _storage: bytes = b"";
+    let _headOffset: int = 0;
+    let _length: int = 0;
+
+    func init() {
+        this._storage = b"";
+        this._headOffset = 0;
+        this._length = 0;
+    }
+
+    func append(data: bytes) {
+        let dataLength = data.length();
+        if (dataLength == 0) return this;
+        if (dataLength > 9223372036854775807 - this._length) {
+            throw new Exception("ByteBuffer capacity overflow");
+        }
+
+        let requiredLength = this._length + dataLength;
+        let capacity = this._storage.length();
+        if (requiredLength <= capacity - this._headOffset) {
+            let storage = this._storage;
+            let destinationAddress = storage.dataAddress() +
+                this._headOffset + this._length;
+            __bytebuffer_write_bytes(destinationAddress, data);
+            this._storage = storage;
+            this._length = requiredLength;
+            return this;
+        }
+
+        if (requiredLength <= capacity) {
+            let storage = this._storage;
+            let activeBytes = storage.slice(
+                this._headOffset, this._headOffset + this._length);
+            let storageAddress = storage.dataAddress();
+            __bytebuffer_write_bytes(storageAddress, activeBytes);
+            __bytebuffer_write_bytes(storageAddress + this._length, data);
+            this._storage = storage;
+            this._headOffset = 0;
+            this._length = requiredLength;
+            return this;
+        }
+
+        var nextCapacity: int = capacity;
+        if (nextCapacity < 64) nextCapacity = 64;
+        for (true) {
+            if (nextCapacity >= requiredLength) break;
+            if (nextCapacity > 4611686018427387903) {
+                nextCapacity = requiredLength;
+                break;
+            }
+            nextCapacity = nextCapacity * 2;
+        }
+
+        let activeBytes = this._storage.slice(
+            this._headOffset, this._headOffset + this._length);
+        using LLVM {
+            this._storage = bytes(nextCapacity);
+            let expandedAddress = this._storage.dataAddress();
+            if (this._length > 0) {
+                __bytebuffer_write_bytes(expandedAddress, activeBytes);
+            }
+            __bytebuffer_write_bytes(expandedAddress + this._length, data);
+        }
+        using VM {
+            let expanded = bytes(nextCapacity);
+            let expandedAddress = expanded.dataAddress();
+            if (this._length > 0) {
+                __bytebuffer_write_bytes(expandedAddress, activeBytes);
+            }
+            __bytebuffer_write_bytes(expandedAddress + this._length, data);
+            this._storage = expanded;
+        }
+        this._headOffset = 0;
+        this._length = requiredLength;
+        return this;
+    }
+
+    func length() -> int {
+        return this._length;
+    }
+
+    func get(index: int) -> int {
+        if (index < 0 or index >= this._length) {
+            throw new Exception("ByteBuffer index out of range");
+        }
+
+        return this._storage.get(this._headOffset + index);
+    }
+
+    func indexOf(pattern: bytes, startAt: int=0) -> int {
+        var searchStart: int = startAt;
+        if (searchStart < 0) searchStart = 0;
+
+        let patternLength = pattern.length();
+        if (patternLength == 0) {
+            if (searchStart <= this._length) return searchStart;
+            return -1;
+        }
+        if (searchStart >= this._length or
+            patternLength > this._length - searchStart) return -1;
+
+        // KMP keeps delimiter scanning linear in the input and pattern lengths.
+        let prefix: bytes = __bytebuffer_zeroed_bytes(patternLength * 8);
+        var prefixAddress: int = 0;
+        using LLVM {
+            prefixAddress = prefix.dataAddress();
+        }
+        using VM {
+            prefixAddress = prefix.dataAddress();
+        }
+        __bytebuffer_write_int(prefixAddress, 0);
+        var matched: int = 0;
+        var patternIndex: int = 1;
+        for (true) {
+            if (patternIndex >= patternLength) break;
+            let value = pattern.get(patternIndex);
+            for (true) {
+                if (matched == 0 or value == pattern.get(matched)) break;
+                matched = __bytebuffer_read_int(
+                    prefixAddress + (matched - 1) * 8);
+            }
+            if (value == pattern.get(matched)) matched = matched + 1;
+            __bytebuffer_write_int(prefixAddress + patternIndex * 8, matched);
+            patternIndex = patternIndex + 1;
+        }
+
+        var absoluteIndex: int = 0;
+        matched = 0;
+        for (true) {
+            if (absoluteIndex >= this._length) break;
+            let value = this._storage.get(this._headOffset + absoluteIndex);
+            if (absoluteIndex >= searchStart) {
+                for (true) {
+                    if (matched == 0 or value == pattern.get(matched)) break;
+                    matched = __bytebuffer_read_int(
+                        prefixAddress + (matched - 1) * 8);
+                }
+                if (value == pattern.get(matched)) matched = matched + 1;
+                if (matched == patternLength) {
+                    return absoluteIndex - patternLength + 1;
+                }
+            }
+            absoluteIndex = absoluteIndex + 1;
+        }
+        return -1;
+    }
+
+    func slice(start: int, end: int) -> bytes {
+        var sliceStart: int = start;
+        var sliceEnd: int = end;
+        if (sliceStart < 0) sliceStart = 0;
+        if (sliceEnd < 0) sliceEnd = 0;
+        if (sliceStart > this._length) sliceStart = this._length;
+        if (sliceEnd > this._length) sliceEnd = this._length;
+        if (sliceStart > sliceEnd) sliceStart = sliceEnd;
+        if (sliceStart == sliceEnd) return b"";
+
+        return this._storage.slice(
+            this._headOffset + sliceStart,
+            this._headOffset + sliceEnd);
+    }
+
+    func toBytes() -> bytes {
+        return this._storage.slice(this._headOffset, this._headOffset + this._length);
+    }
+
+    func consume(count: int) {
+        if (count < 0 or count > this._length) {
+            throw new Exception("ByteBuffer consume count out of range");
+        }
+        if (count == 0) return this;
+        this._headOffset = this._headOffset + count;
+        this._length = this._length - count;
+        if (this._length == 0) this._headOffset = 0;
+        return this;
+    }
+
+    func clear() {
+        this._storage = b"";
+        this._headOffset = 0;
+        this._length = 0;
+        return this;
+    }
+}
+
+class Byte {
+    using &this;
+
+    func init(data: bytes) {
+        this.data = data;
+    }
+
+    let data: bytes = b"";
+
+    func get(index: int) -> int {
+        return __bytes_get(this.data, index);
+    }
+
+    func length() -> int {
+        return __bytes_len(this.data);
+    }
+
+    func slice(start: int, end: int) -> Byte {
+        let sliced = __bytes_slice(this.data, start, end);
+        return new Byte(sliced);
+    }
+
+    func split(bt: int) -> list {
+        let arr = [];
+
+        let index = 0;
+        let match = false;
+
+        for (0..this.length()) [const &i] {
+            if (__bytes_get(this.data, i) == bt) {
+                match = true;
+            } else {
+                if (match) {
+                    let part = __bytes_slice(this.data, index, i);
+                    arr.append(new Byte(part));
+                    index = i;
+                    match = false;
+                }
+            }
+
+        }
+        return arr;
+    }
+
+    func decode(encoding: string = "utf-8") -> string {
+        return __bytes_decode(this.data, encoding);
+    }
+
+    func toList() -> list {
+        return __bytes_to_list(this.data);
+    }
+
+    func toString() -> string {
+        return str(this.data);
+    }
+
+    func operator[+](other: Byte) -> Byte {
+        // 直接合并两个bytes值（底层实现支持bytes+bytes）
+        let resultBytes = this.data + other.data;
+        return new Byte(resultBytes);
+    }
+
+    func operator[[]] (index) {
+        return this.slice(index, index + 1);
+    }
+}

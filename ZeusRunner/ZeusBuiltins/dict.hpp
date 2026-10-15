@@ -1,18 +1,9 @@
 #pragma once
 
 #include "core.hpp"
-
-#include <algorithm>
+#include "../../ZeusRuntimeLib/ZeusContainerOps.hpp"
 
 namespace ZeusBuiltins {
-
-inline ZeusType::Object* getMutableDictData(
-    const ZeusType::UniversalVariant& value
-) {
-    const auto* variant = std::get_if<ZeusType::Variant>(&value);
-    if (!variant) return nullptr;
-    return const_cast<ZeusType::Object*>(std::get_if<ZeusType::Object>(variant));
-}
 
 inline std::string getDictKeyString(
     const ZeusType::UniversalVariant& value
@@ -33,18 +24,7 @@ inline ZeusType::UniversalVariant builtin_dict_clone(
         throw std::runtime_error("__dict_clone expects 1 argument");
     }
 
-    const ZeusType::Object* source = getMutableDictData(args[0]);
-    if (!source) {
-        throw std::runtime_error("__dict_clone: argument must be a dictionary");
-    }
-
-    ZeusType::Object result;
-    result.impl = std::make_shared<ZeusType::ObjectData>();
-    if (source->impl) {
-        result.impl->data = source->impl->data;
-        result.impl->order = source->impl->order;
-    }
-    return ZeusType::UniversalVariant(ZeusType::Variant(std::move(result)));
+    return ZeusContainerOps::dictClone(args[0]);
 }
 
 inline bool dictValueHasToString(
@@ -82,39 +62,13 @@ inline ZeusType::UniversalVariant builtin_dict_has_to_string(
         dictValueHasToString(args[0], getDictKeyString(args[1])));
 }
 
-inline bool takeDictValue(
-    const ZeusType::UniversalVariant& value,
-    const std::string& key,
-    ZeusType::UniversalVariant& removed
-) {
-    ZeusType::Object* dict = getMutableDictData(value);
-    if (!dict || !dict->impl) return false;
-
-    auto found = dict->impl->data.find(key);
-    if (found == dict->impl->data.end()) return false;
-
-    removed = std::move(found->second);
-    dict->impl->data.erase(found);
-    auto& order = dict->impl->order;
-    order.erase(std::remove(order.begin(), order.end(), key), order.end());
-    return true;
-}
-
 inline ZeusType::UniversalVariant builtin_dict_delete(
     const std::vector<ZeusType::UniversalVariant>& args
 ) {
     if (args.size() != 2) {
         throw std::runtime_error("__dict_delete expects 2 arguments");
     }
-    if (!getMutableDictData(args[0])) {
-        throw std::runtime_error("__dict_delete: first argument must be a dictionary");
-    }
-
-    ZeusType::UniversalVariant removed;
-    if (!takeDictValue(args[0], getDictKeyString(args[1]), removed)) {
-        return ZeusType::UniversalVariant(ZeusType::Variant(ZeusType::Null()));
-    }
-    return removed;
+    return ZeusContainerOps::dictDelete(args[0], args[1]);
 }
 
 inline void registerDictBuiltins() {

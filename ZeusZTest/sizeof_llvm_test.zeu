@@ -1,0 +1,11 @@
+using LLVM {
+    if (sizeof(int) != 8 or sizeof(bool) != 1 or
+        sizeof(string) != 8 or sizeof(bytes) != 8) {
+        throw "LLVM sizeof value-slot layout mismatch";
+    }
+}
+
+using VM {
+}
+
+print("LLVM_SIZEOF_PASS");

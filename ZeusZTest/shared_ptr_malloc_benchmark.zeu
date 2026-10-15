@@ -1,0 +1,165 @@
+import zeus.mem;
+import zeus.shared_ptr;
+
+@native("zeus_runtime_debug_dump")
+decl func runtimeDebugDump() -> int;
+
+func runRawOne(value: int) -> int {
+    let address = malloc(8);
+    @faddr(address) -> int = value;
+    let result = @faddr(address) -> int;
+    free(address);
+    return result;
+}
+
+func runSharedOne(value: int) -> int {
+    let owner = new SharedPtr(8);
+    owner.save(value);
+    return owner.read(0);
+}
+
+func runSharedAliasProbe() -> int {
+    let owner = new SharedPtr(8);
+    let ownerCopy = owner;
+    ownerCopy.save(765);
+    return owner.read(0);
+}
+
+func runSharedAllocOne(value: int) -> int {
+    let owner = new SharedPtr(8);
+    return value;
+}
+
+func runBoolProbe() -> bool {
+    let owner = new SharedPtr(1);
+    owner.save(true);
+    return owner.read(false);
+}
+
+func runRaw(iterations: int) -> int {
+    let sum = 0;
+    let index = 0;
+    for (true) {
+        if (index >= iterations) break;
+        sum = sum + runRawOne(index);
+        index = index + 1;
+    }
+    return sum;
+}
+
+func runRawReuse(iterations: int) -> int {
+    let address = malloc(8);
+    let sum = 0;
+    let index = 0;
+    for (true) {
+        if (index >= iterations) break;
+        @faddr(address) -> int = index;
+        sum = sum + @faddr(address) -> int;
+        index = index + 1;
+    }
+    free(address);
+    return sum;
+}
+
+func runShared(iterations: int) -> int {
+    let sum = 0;
+    let index = 0;
+    for (true) {
+        if (index >= iterations) break;
+        sum = sum + runSharedOne(index);
+        index = index + 1;
+    }
+    return sum;
+}
+
+func runSharedReuse(iterations: int) -> int {
+    let owner = new SharedPtr(8);
+    let sum = 0;
+    let index = 0;
+    for (true) {
+        if (index >= iterations) break;
+        owner.save(index);
+        sum = sum + owner.read(0);
+        index = index + 1;
+    }
+    return sum;
+}
+
+func runSharedAddressReuse(iterations: int) -> int {
+    let owner = new SharedPtr(8);
+    let address = owner.address();
+    let sum = 0;
+    let index = 0;
+    for (true) {
+        if (index >= iterations) break;
+        @faddr(address) -> int = index;
+        sum = sum + @faddr(address) -> int;
+        index = index + 1;
+    }
+    return sum;
+}
+
+func runSharedAlloc(iterations: int) -> int {
+    let sum = 0;
+    let index = 0;
+    for (true) {
+        if (index >= iterations) break;
+        sum = sum + runSharedAllocOne(index);
+        index = index + 1;
+    }
+    return sum;
+}
+
+let iterations = 100000;
+if (!runBoolProbe()) {
+    throw "SharedPtr bool round-trip failed";
+}
+if (runSharedAliasProbe() != 765) {
+    throw "SharedPtr aliases did not share the allocation";
+}
+
+runRaw(1000);
+runRawReuse(1000);
+runSharedAlloc(1000);
+runShared(1000);
+runSharedReuse(1000);
+runSharedAddressReuse(1000);
+runtimeDebugDump();
+
+let rawStart = __time_perf_counter_ns();
+let rawSum = runRaw(iterations);
+let rawElapsed = __time_perf_counter_ns() - rawStart;
+
+let rawReuseStart = __time_perf_counter_ns();
+let rawReuseSum = runRawReuse(iterations);
+let rawReuseElapsed = __time_perf_counter_ns() - rawReuseStart;
+
+let allocationStart = __time_perf_counter_ns();
+let allocationSum = runSharedAlloc(iterations);
+let allocationElapsed = __time_perf_counter_ns() - allocationStart;
+
+let sharedStart = __time_perf_counter_ns();
+let sharedSum = runShared(iterations);
+let sharedElapsed = __time_perf_counter_ns() - sharedStart;
+
+let sharedReuseStart = __time_perf_counter_ns();
+let sharedReuseSum = runSharedReuse(iterations);
+let sharedReuseElapsed = __time_perf_counter_ns() - sharedReuseStart;
+
+let sharedAddressStart = __time_perf_counter_ns();
+let sharedAddressSum = runSharedAddressReuse(iterations);
+let sharedAddressElapsed = __time_perf_counter_ns() - sharedAddressStart;
+
+if (rawSum != rawReuseSum or rawSum != allocationSum or
+    rawSum != sharedSum or rawSum != sharedReuseSum or
+    rawSum != sharedAddressSum) {
+    throw "SharedPtr round-trip checksum mismatch";
+}
+
+print("MALLOC_RAW_100K_NS", rawElapsed, rawSum);
+print("MALLOC_RAW_REUSE_100K_NS", rawReuseElapsed, rawReuseSum);
+print("SHARED_PTR_ALLOC_FREE_100K_NS", allocationElapsed, allocationSum);
+print("SHARED_PTR_100K_NS", sharedElapsed, sharedSum);
+print("SHARED_PTR_REUSE_100K_NS", sharedReuseElapsed, sharedReuseSum);
+print("SHARED_PTR_ADDRESS_REUSE_100K_NS", sharedAddressElapsed, sharedAddressSum);
+runtimeDebugDump();

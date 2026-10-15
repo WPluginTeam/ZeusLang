@@ -24,9 +24,13 @@
 
 // 对象和全局变量
 #include "object.hpp"
+#include "allocation.hpp"
 
 // Socket 网络操作
 #include "socket.hpp"
+#include "crypto.hpp"
+#include "websocket.hpp"
+#include "NativeInjectionRegistry.hpp"
 
 // 线程和同步
 #include "thread.hpp"
@@ -61,7 +65,7 @@ namespace ZeusBuiltins {
         
         // Socket
         registerSocketBuiltins();
-        
+
         // 线程和同步
         registerThreadBuiltins();
         
@@ -73,6 +77,7 @@ namespace ZeusBuiltins {
 
         // Keep legacy native function IDs stable; append new dictionary ABI last.
         registerDictBuiltins();
+        registerAllocationBuiltins();
     }
 
 } // namespace ZeusBuiltins

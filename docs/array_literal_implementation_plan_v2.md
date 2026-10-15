@@ -8,7 +8,7 @@
 
 ## 实现步骤
 
-### 步骤1: 默认加载 ZeusBuiltins/list.zeu
+### 步骤1: 默认加载 ZeusBuiltins/zeus/list.zeu
 
 **文件**: `Zeus.cpp` 或启动代码
 
@@ -17,7 +17,7 @@
 // 在main()开始时,或者在IR生成前
 // 自动加载核心库
 std::vector<std::string> corePackages = {
-    "ZeusBuiltins.list"
+    "zeus.list"
 };
 
 for (const auto& pkg : corePackages) {
@@ -51,7 +51,7 @@ case TreeType::NodeType::List: {
     //    假设Array已经在全局环境中注册
     int arrayGlobalId = env.resolveGlobal("Array");
     if (arrayGlobalId < 0) {
-        throw std::runtime_error("Array class not found. Did you import ZeusBuiltins.list?");
+        throw std::runtime_error("Array class not found. Did you import zeus.list?");
     }
     
     IRType::Instruction loadArray;
@@ -86,7 +86,7 @@ case TreeType::NodeType::List: {
 
 ### 步骤4: 修改Array类构造函数
 
-**文件**: `ZeusBuiltins/list.zeu`
+**文件**: `ZeusBuiltins/zeus/list.zeu`
 
 当前的Array类可能是:
 ```zeus
@@ -181,7 +181,7 @@ let arr = new Array(1, 2, 3);
 ## 下一步
 
 1. 检查 `TreeParser.hpp` 是否支持List解析
-2. 检查 `ZeusBuiltins/list.zeu` 中Array的构造函数
+2. 检查 `ZeusBuiltins/zeus/list.zeu` 中Array的构造函数
 3. 确定Array的加载机制(global? class?)
 4. 实现IRGenerator中的List处理
 5. 测试基本用例

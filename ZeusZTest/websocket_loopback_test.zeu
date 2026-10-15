@@ -1,0 +1,52 @@
+import zeus.websocket;
+import zeus.thread [&];
+import zeus.exception;
+
+func websocketEchoHandler(connection, request) {
+    var keepReceiving = true;
+    for (keepReceiving) {
+        let message = connection.receive();
+        if (message == nil) keepReceiving = false;
+        if (message != nil) {
+            if (message.isText()) connection.sendText(message.text);
+        }
+    }
+}
+
+func assertWebSocketLoopback(condition, message) {
+    if (!condition) throw new Exception("WebSocket loopback failed: " + message);
+}
+
+func main() {
+    let server = new HTTPServer("127.0.0.1", 29904);
+    WebSocketServer.attach(server, "/echo", websocketEchoHandler);
+    let serverThread = server.startAsync(2);
+    let client = WebSocketClient.connect("ws://127.0.0.1:29904/echo");
+
+    client.sendText("simple text");
+    let simpleResponse = client.receive();
+    assertWebSocketLoopback(simpleResponse != nil and simpleResponse.isText() and
+        simpleResponse.text == "simple text", "complete text frame round trip");
+
+    // Exercise a ping between text fragments to verify control-frame handling.
+    client._sendFrame(1, bytes("Zeus "), false);
+    client.ping(bytes("probe"));
+    client._sendFrame(0, bytes("WebSocket"), true);
+    let response = client.receive();
+    assertWebSocketLoopback(response != nil and response.isText(), "fragmented text frame is returned");
+    assertWebSocketLoopback(response.text == "Zeus WebSocket", "fragmented text round trip");
+
+    client.close(1000, "done");
+    let closeResponse = client.receive();
+    assertWebSocketLoopback(closeResponse == nil, "close handshake ends the connection");
+    server.close();
+    let joined = serverThread.join();
+    assertWebSocketLoopback(joined, "HTTP accept thread exits");
+
+    delete client;
+    delete serverThread;
+    delete server;
+    print("PASS WebSocket client and server loopback");
+}
+
+main();

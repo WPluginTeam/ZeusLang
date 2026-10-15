@@ -1,0 +1,107 @@
+import zeus.static;
+
+let values = new StaticArray<int>(4);
+values.append(7);
+values.append(11);
+values.append(-3);
+values[1] = 13;
+if (values.length() != 3 or values.capacity() != 4 or
+    values[0] != 7 or values[1] != 13 or values[2] != -3) {
+    throw "StaticArray read/write check failed";
+}
+values.clear();
+if (values.length() != 0) {
+    throw "StaticArray clear check failed";
+}
+values.append(29);
+if (values[0] != 29) {
+    throw "StaticArray reuse check failed";
+}
+values.append(31);
+values.append(33);
+values.append(35);
+var arrayCapacityCaught = false;
+try {
+    values.append(37);
+} catch (&error) {
+    arrayCapacityCaught = true;
+}
+var arrayBoundsCaught = false;
+try {
+    let ignored = values[-1];
+} catch (&error) {
+    arrayBoundsCaught = true;
+}
+if (!arrayCapacityCaught or !arrayBoundsCaught) {
+    throw "StaticArray bounds check failed";
+}
+
+let boolValues = new StaticArray<bool>(2);
+boolValues.append(true);
+boolValues.append(false);
+if (!boolValues[0] or boolValues[1]) {
+    throw "StaticArray<bool> read/write check failed";
+}
+
+let stringValues = new StaticArray<string>(2);
+stringValues.append("native-view");
+stringValues[0] = "updated-view";
+if (stringValues[0] != "updated-view") {
+    throw "StaticArray<string> view slot check failed";
+}
+
+let byteValues = new StaticArray<bytes>(2);
+byteValues.append(b"AB");
+byteValues[0] = b"XYZ";
+if (byteValues[0].length() != 3 or byteValues[0][0] != 88) {
+    throw "StaticArray<bytes> view slot check failed";
+}
+
+let table = new StaticDict(8);
+table.set(0, 100);
+table.set(4, 200);
+table.set(-1, 300);
+table.set(8, 400);
+table.set(4, 222);
+if (table.length() != 4 or table.capacity() != 8 or
+    !table.hasKey(0) or !table.hasKey(-1) or !table.hasKey(8) or
+    table[0] != 100 or table[4] != 222 or table[-1] != 300 or
+    table[8] != 400 or table.hasKey(99)) {
+    throw "StaticDict collision/read/write check failed";
+}
+table.clear();
+if (table.length() != 0 or table.hasKey(0)) {
+    throw "StaticDict clear check failed";
+}
+table.set(99, 900);
+if (table[99] != 900) {
+    throw "StaticDict reuse check failed";
+}
+var missingKeyCaught = false;
+try {
+    let ignored = table.get(-99);
+} catch (&error) {
+    missingKeyCaught = true;
+}
+if (!missingKeyCaught) {
+    throw "StaticDict missing-key check failed";
+}
+table.set(1, 10);
+table.set(2, 20);
+table.set(3, 30);
+table.set(4, 40);
+table.set(5, 50);
+table.set(6, 60);
+table.set(7, 70);
+var dictCapacityCaught = false;
+try {
+    table.set(8, 80);
+} catch (&error) {
+    dictCapacityCaught = true;
+}
+if (!dictCapacityCaught or table.length() != 8) {
+    throw "StaticDict capacity check failed";
+}
+
+print("STATIC_CONTAINER_PASS");
+delete values, boolValues, stringValues, byteValues, table;

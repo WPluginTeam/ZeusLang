@@ -1,0 +1,52 @@
+var dynamic_new_sequence = 0;
+
+func next_dynamic_new_sequence() {
+    dynamic_new_sequence = dynamic_new_sequence + 1;
+    return dynamic_new_sequence;
+}
+
+class DynamicNewFirst {
+    using &this;
+    var first = next_dynamic_new_sequence();
+    var second = this.first + 1;
+    var result = 0;
+
+    func init() {
+        this.result = this.second + 100;
+    }
+}
+
+class DynamicNewSecond {
+    using &this;
+    var first = next_dynamic_new_sequence() * 10;
+    var second = this.first + 2;
+    var result = 0;
+
+    func init() {
+        this.result = this.second + 200;
+    }
+}
+
+func choose_dynamic_new_type(use_first) {
+    if (use_first) {
+        return DynamicNewFirst;
+    }
+    return DynamicNewSecond;
+}
+
+func construct_dynamic_new_value(use_first) {
+    let target_type = choose_dynamic_new_type(use_first);
+    return new target_type();
+}
+
+let second_type = choose_dynamic_new_type(false);
+let first_value = construct_dynamic_new_value(true);
+let second_value = new second_type();
+
+if (dynamic_new_sequence == 2 and
+    first_value.first == 1 and first_value.second == 2 and first_value.result == 102 and
+    second_value.first == 20 and second_value.second == 22 and second_value.result == 222) {
+    print("DYNAMIC_CLASS_NEW_PASS");
+} else {
+    print("DYNAMIC_CLASS_NEW_FAIL");
+}

@@ -47,10 +47,8 @@ namespace IRFor {
     inline std::vector<IRType::IRInstr> buildListForIR(const ForBuildInput& in) {
         std::vector<IRType::IRInstr> out;
 
-        // 基本语义：
-        //   listExpr 只求值一次 -> 存隐藏 list 槽 + 长度槽 + index 槽 + 绑定变量槽
-        //   模式：for [ &? name ] : expr { body }
-        //   当前仅实现 copy 绑定（&/const& 后续扩展）。
+        // Bindings support copy, mutable-reference, and const-reference modes.
+        // References alias the source slot/index; copies create iteration locals.
 
         if (in.block.forKind != TreeParser::CodeBlock::ForKind::LIST || !in.emitExpr) {
             return out;

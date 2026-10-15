@@ -1,0 +1,19 @@
+func runDeletePressure() {
+    let dict = new Dict();
+    var index = 0;
+    for (true) {
+        if (index >= 20000) break;
+        dict.set(__builtin_str(index), index);
+        index = index + 1;
+    }
+    index = 0;
+    let started = __time_perf_counter_ns();
+    for (true) {
+        if (index >= 20000) break;
+        dict.deleteKey(__builtin_str(index));
+        index = index + 1;
+    }
+    print("DICT_DELETE_20K_NS", __time_perf_counter_ns() - started, dict.length());
+}
+
+runDeletePressure();

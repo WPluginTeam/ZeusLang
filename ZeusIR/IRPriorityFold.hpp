@@ -137,10 +137,38 @@ inline std::vector<LexerType::Token> postfixToInfix(
 inline std::vector<LexerType::Token> priorityFoldExpression(
     IRType::IRCompilerStatus& irstat,
     const std::vector<LexerType::Token>& tokens) {
-    // This folder's infix/postfix reconstruction is binary-only. Preserve a
-    // prefix logical-not expression intact so the real expression parser can
-    // lower it as a unary operation instead of silently dropping the token.
-    if (std::any_of(tokens.begin(), tokens.end(), [](const LexerType::Token& token) {
+    // This folder's infix/postfix reconstruction is binary-only. Preserve
+    // unary operators intact for the real expression parser; otherwise an
+    // expression such as `value == -1` can be rewritten as `value - 1`.
+    bool hasUnarySign = false;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (!std::holds_alternative<LexerType::Operator>(tokens[i])) continue;
+        const std::string& symbol = std::get<LexerType::Operator>(tokens[i]).symbol;
+        if (symbol != "+" && symbol != "-") continue;
+        if (i == 0) {
+            hasUnarySign = true;
+            break;
+        }
+
+        const auto& previous = tokens[i - 1];
+        bool previousCanEndOperand =
+            std::holds_alternative<LexerType::Value>(previous) ||
+            std::holds_alternative<LexerType::Keyword>(previous);
+        if (std::holds_alternative<LexerType::Operator>(previous)) {
+            const std::string& previousSymbol =
+                std::get<LexerType::Operator>(previous).symbol;
+            previousCanEndOperand = previousSymbol == ")" ||
+                                    previousSymbol == "]" ||
+                                    previousSymbol == "}";
+        }
+        if (!previousCanEndOperand) {
+            hasUnarySign = true;
+            break;
+        }
+    }
+
+    if (hasUnarySign ||
+        std::any_of(tokens.begin(), tokens.end(), [](const LexerType::Token& token) {
             return std::holds_alternative<LexerType::Operator>(token) &&
                    std::get<LexerType::Operator>(token).symbol == "!";
         })) {

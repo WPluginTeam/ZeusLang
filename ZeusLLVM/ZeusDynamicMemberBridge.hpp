@@ -135,10 +135,10 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
             generated.adapters += "  " + receiverNative + " = icmp ne i32 " +
                 rawBool + ", 0\n";
         } else if (const auto* abi = ZeusBuiltins::findNativeTypeABI(receiverType);
-                   ZeusBuiltins::isNativeViewABI(abi)) {
+                   ZeusBuiltins::isNativePointerABI(abi)) {
             receiverNative = "%receiver.native";
             generated.adapters += "  " + receiverNative + " = call ptr @" +
-                std::string(ZeusBuiltins::nativeViewFromDynamicHelper(abi)) +
+                std::string(ZeusBuiltins::nativePointerFromDynamicHelper(abi)) +
                 "(ptr %receiver)\n";
         } else if (rules.isClassType(receiverType)) {
             receiverNative = "%receiver.native";
@@ -229,9 +229,9 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
                 convertedValue = converted;
             } else if (!passedBoxed) {
                 const auto* abi = ZeusBuiltins::findNativeTypeABI(conversionType);
-                if (ZeusBuiltins::isNativeViewABI(abi)) {
+                if (ZeusBuiltins::isNativePointerABI(abi)) {
                     generated.adapters += "  " + converted + " = call ptr @" +
-                        std::string(ZeusBuiltins::nativeViewFromDynamicHelper(abi)) +
+                        std::string(ZeusBuiltins::nativePointerFromDynamicHelper(abi)) +
                         "(ptr " + boxed + ")\n";
                     convertedValue = converted;
                 } else if (rules.isClassType(conversionType)) {
@@ -258,11 +258,22 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
             std::string nativeValue = convertedValue;
             if (optional) {
                 generated.adapters += "  br label %" + doneLabel + "\n";
-                generated.adapters += missingLabel + ":\n  br label %" + doneLabel + "\n";
+                generated.adapters += missingLabel + ":\n";
+                std::string placeholder;
+                if (nativeType == "ptr" && rules.usesZeusValueABI(parameterType)) {
+                    placeholder = "%argument.optional.nil." + suffix;
+                    generated.adapters += "  " + placeholder +
+                        " = alloca %ZeusValue, align 8\n";
+                    generated.adapters += "  call void @zeus_value_init_nil(ptr " +
+                        placeholder + ")\n";
+                    generated.adapters += "  br label %" + doneLabel + "\n";
+                } else {
+                    generated.adapters += "  br label %" + doneLabel + "\n";
+                    placeholder = nativeType == "ptr"
+                        ? "null"
+                        : (nativeType == "i1" ? "false" : "0");
+                }
                 generated.adapters += doneLabel + ":\n";
-                const std::string placeholder = nativeType == "ptr"
-                    ? "null"
-                    : (nativeType == "i1" ? "false" : "0");
                 nativeValue = "%argument.optional.native." + suffix;
                 generated.adapters += "  " + nativeValue + " = phi " + nativeType +
                     " [ " + convertedValue + ", %" + providedLabel + " ], [ " +
@@ -338,9 +349,9 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
                         rawBool + ")\n";
                 }
             } else if (const auto* abi = ZeusBuiltins::findNativeTypeABI(resultType);
-                       ZeusBuiltins::isNativeViewABI(abi)) {
+                       ZeusBuiltins::isNativePointerABI(abi)) {
                 generated.adapters += "  call void @" +
-                    std::string(ZeusBuiltins::nativeViewToDynamicHelper(abi)) +
+                    std::string(ZeusBuiltins::nativePointerToDynamicHelper(abi)) +
                     "(ptr %out, ptr " + rawResult + ")\n";
             } else if (rules.isClassType(resultType)) {
                 const std::string resultClassString =

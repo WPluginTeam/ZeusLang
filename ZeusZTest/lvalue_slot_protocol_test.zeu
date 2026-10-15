@@ -1,0 +1,91 @@
+import zeus.mem;
+
+class SlotItem {
+    using &this;
+    var value: int = 0;
+    func init(value: int) { this.value = value; }
+}
+func replaceString(address: int) {
+    @faddr(address) -> string = "longer replacement";
+}
+func staleAddress() -> int {
+    let temporaryText: string = "temporary";
+    return @addr(temporaryText);
+}
+func makeDynamicBytes() {
+    return b"temporary bytes";
+}
+func staleDynamicBytesReveal() -> int {
+    using LLVM {
+        let temporaryBytes = makeDynamicBytes();
+        return @reveal(temporaryBytes);
+    }
+    using VM {
+        return 0;
+    }
+}
+var text: string = "hello";
+let address = @addr(text);
+let before = @faddr(address) -> string;
+if (before != "hello" or before.length() != 5) throw "string slot read failed";
+replaceString(address);
+if (text != "longer replacement" or text.length() != 18) throw "string slot write lost length";
+if (@faddr(text.dataAddress(), 1) -> int != 108) {
+    throw "string dataAddress did not point at its first character";
+}
+var data: bytes = b"AB";
+let bytesAddress = @addr(data);
+@faddr(bytesAddress) -> bytes = b"WXYZ";
+if (data.length() != 4 or data[0] != 87) throw "bytes slot write failed";
+if (@faddr(data.dataAddress(), 1) -> int != 87) {
+    throw "bytes dataAddress did not point at its first byte";
+}
+let readBytes = @faddr(bytesAddress) -> bytes;
+if (readBytes.length() != 4) throw "bytes slot read lost length";
+var count: int = 3;
+let countAddress = @addr(count);
+@faddr(countAddress) -> int = 9;
+if (count != 9 or @faddr(countAddress) -> int != 9) throw "int slot failed";
+let repeatedCountAddress = @addr(count);
+if (repeatedCountAddress != countAddress) throw "active slot identity changed";
+if (@faddr(countAddress, 8) -> int != 9) throw "full-width int slot read failed";
+@faddr(countAddress, 8) -> int = 10;
+if (count != 10) throw "full-width int slot write failed";
+var item = new SlotItem(7);
+let itemAddress = @addr(item);
+let sourceItem = new SlotItem(22);
+@faddr(itemAddress) -> SlotItem = sourceItem;
+item.value = 30;
+if (sourceItem.value != 22 or item.value != 30) throw "class slot assignment aliases source";
+let itemCopy = @faddr(itemAddress) -> SlotItem;
+itemCopy.value = 44;
+if (item.value != 30) throw "class slot read not copied at binding";
+let reveal = @reveal(text);
+using LLVM {
+    if (@faddr(reveal - 8, 8) -> int != 18) throw "reveal stored length failed";
+}
+using VM {
+    if (@faddr(reveal - 8, 8) -> int != 18) throw "reveal stored length failed";
+}
+var mismatch = false;
+try { let wrong = @faddr(address) -> int; } catch (&error) { mismatch = true; }
+if (!mismatch) throw "typed slot mismatch was accepted";
+var invalid = false;
+try { let wrong = @faddr(1) -> int; } catch (&error) { invalid = true; }
+if (!invalid) throw "unknown address was accepted";
+let stale = staleAddress();
+var staleCaught = false;
+try { let wrong = @faddr(stale) -> string; } catch (&error) { staleCaught = true; }
+if (!staleCaught) throw "expired stack slot accepted";
+using LLVM {
+    let staleBytesData = staleDynamicBytesReveal();
+    var staleBytesCaught = false;
+    try { let staleBytesLength = @faddr(staleBytesData - 8, 8) -> int; }
+    catch (&error) { staleBytesCaught = true; }
+    if (!staleBytesCaught) throw "expired revealed Bytes storage accepted";
+}
+let allocation = malloc(16);
+@faddr(allocation, 8) -> int = 42;
+if (@faddr(allocation, 8) -> int != 42) throw "tracked raw allocation failed";
+free(allocation);
+print("LVALUE_SLOT_PROTOCOL_PASS");

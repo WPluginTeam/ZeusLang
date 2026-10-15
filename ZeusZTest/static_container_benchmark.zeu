@@ -1,0 +1,177 @@
+import zeus.static;
+import zeus.dict;
+
+func makeBuiltinArray(size: int) -> Array {
+    let values = [];
+    var index = 0;
+    for (true) {
+        if (index >= size) break;
+        values.append(index + 1);
+        index = index + 1;
+    }
+    return values;
+}
+
+func makeStaticArray(size: int) -> StaticArray<int> {
+    let values = new StaticArray<int>(size);
+    var index = 0;
+    for (true) {
+        if (index >= size) break;
+        values.append(index + 1);
+        index = index + 1;
+    }
+    return values;
+}
+
+@no_safepoint
+func readBuiltinArray(values: Array, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + values[index];
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+@no_safepoint
+func readStaticArray(values: StaticArray<int>, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + values[index];
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func makeBuiltinDict(count: int) -> Dict {
+    let values = new Dict();
+    var key = 1;
+    for (true) {
+        if (key > count) break;
+        values.set(key * 4, key * 2);
+        key = key + 1;
+    }
+    return values;
+}
+
+func makeStaticDict(count: int, capacity: int) -> StaticDict {
+    let values = new StaticDict(capacity);
+    var key = 1;
+    for (true) {
+        if (key > count) break;
+        values.set(key * 4, key * 2);
+        key = key + 1;
+    }
+    return values;
+}
+
+func updateBuiltinDict(values, count: int, iterations: int) -> int {
+    var cursor = 0;
+    var logicalKey = 1;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        let key = logicalKey * 4;
+        let current = values.get(key);
+        values.set(key, current + 1);
+        checksum = checksum + current;
+        logicalKey = logicalKey + 1;
+        if (logicalKey > count) logicalKey = 1;
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+@no_safepoint
+func updateStaticDict(values: StaticDict, count: int, iterations: int) -> int {
+    var cursor = 0;
+    var logicalKey = 1;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        let key = logicalKey * 4;
+        let current = values.get(key);
+        values.set(key, current + 1);
+        checksum = checksum + current;
+        logicalKey = logicalKey + 1;
+        if (logicalKey > count) logicalKey = 1;
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+let arraySize = 256;
+let selectedIndex = 127;
+let dictCount = 256;
+let dictCapacity = 512;
+var arrayIterations = 0;
+var dictIterations = 0;
+var rounds = 0;
+using LLVM {
+    arrayIterations = 500000;
+    dictIterations = 200000;
+    rounds = 5;
+}
+using VM {
+    arrayIterations = 5000;
+    dictIterations = 2000;
+    rounds = 1;
+}
+
+let builtinArray = makeBuiltinArray(arraySize);
+let staticArray = makeStaticArray(arraySize);
+let builtinDict = makeBuiltinDict(dictCount);
+let staticDict = makeStaticDict(dictCount, dictCapacity);
+
+if (readBuiltinArray(builtinArray, selectedIndex, 1000) !=
+    readStaticArray(staticArray, selectedIndex, 1000)) {
+    throw "StaticArray benchmark warmup checksum mismatch";
+}
+if (updateBuiltinDict(builtinDict, dictCount, 1000) !=
+    updateStaticDict(staticDict, dictCount, 1000)) {
+    throw "StaticDict benchmark warmup checksum mismatch";
+}
+
+var round = 0;
+for (true) {
+    if (round == rounds) break;
+
+    let builtinArrayStart = __time_perf_counter_ns();
+    let builtinArrayChecksum = readBuiltinArray(
+        builtinArray, selectedIndex, arrayIterations);
+    let builtinArrayElapsed = __time_perf_counter_ns() - builtinArrayStart;
+
+    let staticArrayStart = __time_perf_counter_ns();
+    let staticArrayChecksum = readStaticArray(
+        staticArray, selectedIndex, arrayIterations);
+    let staticArrayElapsed = __time_perf_counter_ns() - staticArrayStart;
+
+    if (builtinArrayChecksum != staticArrayChecksum) {
+        throw "StaticArray benchmark checksum mismatch";
+    }
+    print("ARRAY_BUILTIN_NS", round, builtinArrayElapsed, builtinArrayChecksum);
+    print("ARRAY_STATIC_NS", round, staticArrayElapsed, staticArrayChecksum);
+
+    let builtinDictStart = __time_perf_counter_ns();
+    let builtinDictChecksum = updateBuiltinDict(
+        builtinDict, dictCount, dictIterations);
+    let builtinDictElapsed = __time_perf_counter_ns() - builtinDictStart;
+
+    let staticDictStart = __time_perf_counter_ns();
+    let staticDictChecksum = updateStaticDict(
+        staticDict, dictCount, dictIterations);
+    let staticDictElapsed = __time_perf_counter_ns() - staticDictStart;
+
+    if (builtinDictChecksum != staticDictChecksum) {
+        throw "StaticDict benchmark checksum mismatch";
+    }
+    print("DICT_BUILTIN_NS", round, builtinDictElapsed, builtinDictChecksum);
+    print("DICT_STATIC_NS", round, staticDictElapsed, staticDictChecksum);
+    round = round + 1;
+}
+
+delete staticArray, staticDict;

@@ -17,6 +17,15 @@ typedef void (*ZeusDynamicFieldGetter)(
     int32_t line
 );
 
+typedef void (*ZeusDynamicFieldSetter)(
+    void* object,
+    const ZeusValue* value,
+    int32_t line
+);
+
+typedef void (*ZeusDynamicValueTraceCallback)(void* context, const ZeusValue* value);
+typedef void (*ZeusDynamicFieldPreparer)(void* object);
+
 extern "C" {
 
 void zeus_dynamic_member_register(
@@ -31,6 +40,25 @@ void zeus_dynamic_field_register(
     ZeusDynamicFieldGetter getter
 );
 
+// Registers a field reader for GC graph tracing without exposing that field to
+// dynamic attribute lookup.
+void zeus_dynamic_field_trace_register(
+    const char* type_name,
+    const char* field_name,
+    ZeusDynamicFieldGetter getter,
+    ZeusDynamicFieldPreparer preparer
+);
+
+// Registers dynamic-write policy for a known field. Explicitly typed fields may
+// provide a native setter; other writes use the dynamic sidecar.
+void zeus_dynamic_field_setter_register(
+    const char* type_name,
+    const char* field_name,
+    int32_t writable,
+    const char* expected_type,
+    ZeusDynamicFieldSetter setter
+);
+
 // Loads a field from a dynamically typed native class receiver. The generated
 // class adapter writes an owned dynamic value to `out` or throws on invalid
 // receivers, deleted objects, uninitialized fields, and missing fields.
@@ -40,6 +68,39 @@ void zeus_value_dynamic_field_load(
     const char* field_name,
     int32_t line
 );
+
+// Loads a dynamic attribute using VM member precedence: an existing field wins,
+// otherwise a registered instance method is returned as a bound closure.
+void zeus_value_dynamic_attribute_load(
+    ZeusValue* out,
+    const ZeusValue* receiver,
+    const char* member_name,
+    int32_t line,
+    ZeusClosureInvoke method_invoke
+);
+
+void zeus_value_dynamic_field_store(
+    const ZeusValue* receiver,
+    const char* field_name,
+    const ZeusValue* value,
+    int32_t line
+);
+
+// Drops dynamic fields when the owning native object is destroyed.
+void zeus_value_dynamic_field_object_destroy(void* object);
+// Replaces the destination object's dynamic field sidecar with a cloned copy
+// of the source object's sidecar. Both objects must already have matching types.
+void zeus_value_dynamic_field_replace_state(void* destination, void* source);
+// Traces dynamic sidecar values as edges owned by their LLVM class instance.
+void zeus_value_dynamic_field_trace(
+    void* object,
+    const char* type_name,
+    ZeusDynamicValueTraceCallback callback,
+    void* context
+);
+// Converts inline ZeusValue fields into graph edges when a class first enters
+// the managed value graph. Unboxed native class instances keep ordinary roots.
+void zeus_value_dynamic_field_prepare(void* object, const char* type_name);
 
 // Reports whether a method adapter is registered for a runtime class.
 int32_t zeus_dynamic_member_has_method(
@@ -100,3 +161,15 @@ void zeus_value_subscript_store(
 );
 
 }
+
+extern "C" {
+void zeus_value_copy_class_graph(ZeusValue* out, const ZeusValue* source, void* context) noexcept(false);
+void zeus_value_dynamic_field_copy_state(void* destination, void* source, void* context) noexcept(false);
+}
+
+extern "C" {
+void zeus_value_copy_class_graph_default(ZeusValue* out, const ZeusValue* source, void* context) noexcept(false);
+void zeus_value_copy_class_graph_internal(ZeusValue* out, const ZeusValue* source, void* context) noexcept(false);
+}
+
+extern "C" void zeus_value_copy_class_owned(ZeusValue* out, const ZeusValue* source, int32_t skip_hook) noexcept(false);

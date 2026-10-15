@@ -1,0 +1,62 @@
+var destroyedCount = 0;
+
+class NullableClassValue {
+    using &this;
+
+    func value() -> int {
+        return 1;
+    }
+
+    func operator[~]() {
+        destroyedCount = destroyedCount + 1;
+    }
+}
+
+let globalValue = new NullableClassValue();
+globalValue = nil;
+if (type(globalValue) != "nil") {
+    throw "global inferred class assignment to nil failed";
+}
+if (destroyedCount != 1) {
+    throw "global nil assignment did not release its class value";
+}
+let nilValue = nil;
+
+func clearLocalValue() {
+    let localValue = new NullableClassValue();
+    localValue = nil;
+    if (type(localValue) != "nil") {
+        throw "local inferred class assignment to nil failed";
+    }
+    if (destroyedCount != 3) {
+        throw "local nil assignment did not release its class value";
+    }
+}
+
+func clearLocalSlotValue() {
+    let localValue = new NullableClassValue();
+    if (true) {
+        localValue = nilValue;
+    }
+    if (type(localValue) != "nil") {
+        throw "control-flow local class assignment to nil failed";
+    }
+    if (destroyedCount != 4) {
+        throw "control-flow local nil assignment did not release its class value";
+    }
+}
+
+let globalSlotValue = new NullableClassValue();
+if (true) {
+    globalSlotValue = nilValue;
+}
+if (type(globalSlotValue) != "nil") {
+    throw "control-flow global class assignment to nil failed";
+}
+if (destroyedCount != 2) {
+    throw "control-flow global nil assignment did not release its class value";
+}
+
+clearLocalValue();
+clearLocalSlotValue();
+print("INFERRED_CLASS_NIL_ASSIGNMENT_PASS");

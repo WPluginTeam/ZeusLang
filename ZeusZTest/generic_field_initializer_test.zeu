@@ -1,0 +1,15 @@
+@type(T)
+class GenericFieldInitializerProbe {
+    using &this;
+
+    var payload: T;
+    var base = 5;
+    var derived = this.base + 3;
+}
+
+let generic_probe = new GenericFieldInitializerProbe<int>();
+if (generic_probe.derived != 8) {
+    throw new Exception("generic field initializer thunk was not specialized");
+}
+
+print("GENERIC_FIELD_INITIALIZER_TEST_PASS");

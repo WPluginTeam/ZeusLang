@@ -1,0 +1,53 @@
+@type(T)
+func readAt(array: T, index: int) {
+    return array[index];
+}
+
+func readDynamicAt(array: Array, index) {
+    return array[index];
+}
+
+@type(T)
+func writeAt(array: T, index: int, value: int) -> int {
+    array[index] = value;
+    return array.length();
+}
+
+@type(T)
+func sumAtLoop(array: T, index: int, count: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= count) break;
+        checksum = checksum + array[index];
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+let values = [10, 20, 30];
+print(readAt<Array>(values, 1));
+print(writeAt<Array>(values, 1, 99));
+print(values[1]);
+if (sumAtLoop<Array>(values, 1, 3) != 297) {
+    throw new Exception("looped array indexed reads returned the wrong sum");
+}
+let caughtOutOfBounds = false;
+try {
+    let ignored = readAt<Array>(values, 8);
+} catch (&error) {
+    caughtOutOfBounds = true;
+}
+if (!caughtOutOfBounds) {
+    throw new Exception("array indexed read must reject an out-of-bounds index");
+}
+let caughtDynamicOutOfBounds = false;
+try {
+    let ignored = readDynamicAt(values, 8);
+} catch (&error) {
+    caughtDynamicOutOfBounds = true;
+}
+if (!caughtDynamicOutOfBounds) {
+    throw new Exception("dynamic array indexed read must reject an out-of-bounds index");
+}
+print("ARRAY_I64_INDEX_PASS");

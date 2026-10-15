@@ -1,0 +1,26 @@
+import zeus.http [&];
+func debugEcho(request) { return request.text(); }
+
+let request = new HTTPRequest();
+print("string eq", "host" == "content-length", "host" == "host");
+print("int eq", 0 == -2, 0 == -1, 0 == 0, 3 == -2);
+let dict = {};
+dict["host"] = "localhost";
+print("direct dict", dict);
+print("initial", request.persistent);
+request.persistent = true;
+print("assigned", request.persistent);
+request.headers["direct"] = "assigned";
+print("direct request headers", request.headers);
+let wire = bytes("POST /echo?source=test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nabcGET /next HTTP/1.1\r\nHost: localhost\r\n\r\n");
+let parsed = __http_parse_request(wire, 16384, 1024);
+print("parsed", parsed.status, parsed.incomplete, type(parsed.request), parsed.request, parsed.request.persistent);
+print("parsed headers", parsed.request.headers);
+print("parsed host", parsed.request.headers["host"]);
+print("parsed body", parsed.request.body, parsed.request.text(), parsed.consumed);
+let callback = debugEcho;
+print("callback result", callback(parsed.request));
+let tail = wire.slice(parsed.consumed, wire.length());
+print("tail length", tail.length());
+let parsedNext = __http_parse_request(tail, 16384, 1024);
+print("tail result", parsedNext.status, parsedNext.incomplete);

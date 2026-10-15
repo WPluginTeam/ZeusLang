@@ -1,0 +1,216 @@
+using original;
+import zeus.mem;
+
+func readAndDropRawBytesRange(address: int) -> int {
+    let view = @faddr(address, 1) -> &bytes;
+    return view[0];
+}
+
+func makeRawBytesRange(address: int, length: int) -> &bytes {
+    return @faddr(address, length) -> &bytes;
+}
+
+func readFirstRawByte(view: &bytes) -> int {
+    return view[0];
+}
+
+let source = malloc(8);
+let destinationAllocation = malloc(16);
+let destination = destinationAllocation + 8;
+if (source == 0 || destinationAllocation == 0) {
+    throw new Exception("raw bytes test allocation failed");
+}
+
+@faddr(destination - 8, 1) -> int = 51;
+@faddr(destination - 7, 1) -> int = 52;
+@faddr(destination - 6, 1) -> int = 53;
+@faddr(destination - 5, 1) -> int = 54;
+@faddr(destination - 4, 1) -> int = 55;
+@faddr(destination - 3, 1) -> int = 56;
+@faddr(destination - 2, 1) -> int = 57;
+@faddr(destination - 1, 1) -> int = 58;
+
+@faddr(source, 1) -> int = 10;
+@faddr(source + 1, 1) -> int = 20;
+@faddr(source + 2, 1) -> int = 30;
+@faddr(source + 3, 1) -> int = 40;
+
+let length = 4;
+let sourceRange = makeRawBytesRange(source, length);
+let rangeAlias = sourceRange;
+if (rangeAlias[0] != 10 || rangeAlias[3] != 40 ||
+    readFirstRawByte(rangeAlias) != 10) {
+    throw new Exception("raw bytes range read failed");
+}
+
+rangeAlias[1] = 71;
+if (@faddr(source + 1, 1) -> int != 71) {
+    throw new Exception("raw bytes range write did not update source memory");
+}
+@faddr(source + 2, 1) -> int = 31;
+if (rangeAlias[2] != 31) {
+    throw new Exception("raw bytes range did not observe a source memory change");
+}
+
+let untrackedStorage = 0;
+let untrackedRange = @faddr(@reveal(untrackedStorage), 1) -> &bytes;
+untrackedRange[0] = 110;
+if (untrackedRange[0] != 110) {
+    throw new Exception("raw bytes range rejected valid untracked native storage");
+}
+
+let snapshot = @faddr(source, length) -> bytes;
+@faddr(source, 1) -> int = 99;
+if (snapshot[0] != 10) {
+    throw new Exception("owned bytes snapshot changed with source memory");
+}
+
+let payload = b"xyz";
+let payloadLength = 3;
+@faddr(destination, payloadLength) -> bytes = payload;
+if (@faddr(destination, 1) -> int != 120 ||
+    @faddr(destination + 1, 1) -> int != 121 ||
+    @faddr(destination + 2, 1) -> int != 122) {
+    throw new Exception("owned bytes @faddr assignment failed");
+}
+
+@faddr(destination, payloadLength) -> &bytes = payload;
+if (@faddr(destination, 1) -> int != 120 ||
+    @faddr(destination + 1, 1) -> int != 121 ||
+    @faddr(destination + 2, 1) -> int != 122) {
+    throw new Exception("raw bytes range assignment from owned bytes failed");
+}
+if (@faddr(destination - 8, 1) -> int != 51 ||
+    @faddr(destination - 7, 1) -> int != 52 ||
+    @faddr(destination - 6, 1) -> int != 53 ||
+    @faddr(destination - 5, 1) -> int != 54 ||
+    @faddr(destination - 4, 1) -> int != 55 ||
+    @faddr(destination - 3, 1) -> int != 56 ||
+    @faddr(destination - 2, 1) -> int != 57 ||
+    @faddr(destination - 1, 1) -> int != 58) {
+    throw new Exception("raw bytes range assignment overwrote memory before its destination");
+}
+
+memcpy(source, length, destination);
+if (@faddr(destination, 1) -> int != 99 ||
+    @faddr(destination + 1, 1) -> int != 71 ||
+    @faddr(destination + 2, 1) -> int != 31 ||
+    @faddr(destination + 3, 1) -> int != 40) {
+    throw new Exception("memcpy did not copy the requested bytes");
+}
+if (@faddr(destination - 8, 1) -> int != 51 ||
+    @faddr(destination - 7, 1) -> int != 52 ||
+    @faddr(destination - 6, 1) -> int != 53 ||
+    @faddr(destination - 5, 1) -> int != 54 ||
+    @faddr(destination - 4, 1) -> int != 55 ||
+    @faddr(destination - 3, 1) -> int != 56 ||
+    @faddr(destination - 2, 1) -> int != 57 ||
+    @faddr(destination - 1, 1) -> int != 58) {
+    throw new Exception("memcpy overwrote memory before its destination");
+}
+
+let sawIndexBounds = false;
+try {
+    let invalidByte = sourceRange[length];
+} catch (&error) {
+    sawIndexBounds = true;
+}
+if (!sawIndexBounds) {
+    throw new Exception("raw bytes range accepted an out-of-range index");
+}
+
+let sawNegativeIndex = false;
+try {
+    let invalidByte = sourceRange[-1];
+} catch (&error) {
+    sawNegativeIndex = true;
+}
+if (!sawNegativeIndex) {
+    throw new Exception("raw bytes range accepted a negative index");
+}
+
+let sawWriteBounds = false;
+try {
+    sourceRange[length] = 1;
+} catch (&error) {
+    sawWriteBounds = true;
+}
+if (!sawWriteBounds) {
+    throw new Exception("raw bytes range wrote past its end");
+}
+
+let emptyRange = @faddr(source, 0) -> &bytes;
+let sawEmptyRangeBounds = false;
+try {
+    let invalidByte = emptyRange[0];
+} catch (&error) {
+    sawEmptyRangeBounds = true;
+}
+if (!sawEmptyRangeBounds) {
+    throw new Exception("zero-length raw bytes range exposed an element");
+}
+
+let sawNegativeLength = false;
+try {
+    let invalidRange = @faddr(0, -1) -> &bytes;
+} catch (&error) {
+    sawNegativeLength = true;
+}
+if (!sawNegativeLength) {
+    throw new Exception("raw bytes range accepted a negative length");
+}
+
+let sawAddressOverflow = false;
+try {
+    let invalidRange = @faddr(-1, 2) -> &bytes;
+} catch (&error) {
+    sawAddressOverflow = true;
+}
+if (!sawAddressOverflow) {
+    throw new Exception("raw bytes range accepted an overflowing address");
+}
+
+let sawRawRangeByteLengthMismatch = false;
+try {
+    @faddr(destination, 2) -> &bytes = payload;
+} catch (&error) {
+    sawRawRangeByteLengthMismatch = true;
+}
+if (!sawRawRangeByteLengthMismatch) {
+    throw new Exception("raw bytes range assignment accepted unequal lengths");
+}
+
+let sawRawRangeRangeLengthMismatch = false;
+try {
+    let shortRange = @faddr(source, 3) -> &bytes;
+    @faddr(destination, length) -> &bytes = shortRange;
+} catch (&error) {
+    sawRawRangeRangeLengthMismatch = true;
+}
+if (!sawRawRangeRangeLengthMismatch) {
+    throw new Exception("raw bytes range copy accepted unequal lengths");
+}
+
+let sawOwnedLengthMismatch = false;
+try {
+    @faddr(destination, length) -> bytes = payload;
+} catch (&error) {
+    sawOwnedLengthMismatch = true;
+}
+if (!sawOwnedLengthMismatch) {
+    throw new Exception("owned bytes assignment accepted a length mismatch");
+}
+
+let dropSource = malloc(1);
+@faddr(dropSource, 1) -> int = 123;
+if (readAndDropRawBytesRange(dropSource) != 123) {
+    throw new Exception("raw bytes range descriptor read failed");
+}
+if (@faddr(dropSource, 1) -> int != 123) {
+    throw new Exception("dropping a raw bytes range freed or modified its live source");
+}
+free(dropSource);
+
+free(source);
+free(destinationAllocation);
+print("RAW_BYTES_RANGE_PASS");

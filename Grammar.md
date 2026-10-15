@@ -20,7 +20,7 @@ identifier ::= [A-Za-z_][A-Za-z0-9_]* ;
 
 实现中词法阶段将标识符与关键字都记为 `Keyword`，语义在语法/IR 阶段区分。常用语法关键字包括：
 
-`var let const shared if else for func class impl return break delete throw try catch with import using original decl static new true false nil and or`
+`var let const shared if else for func class interface impl return break delete throw try catch with import using original decl static new true false nil and or`
 
 ### 1.3 字面量
 
@@ -67,6 +67,7 @@ stmt_or_block ::=
   | for_block
   | func_block
   | class_block
+  | interface_block
   | try_block
   | with_block
   | using_block ;
@@ -198,17 +199,24 @@ func_fwd_decl ::= "decl" "func" identifier "(" [identifier { "," identifier } ["
 
 ```ebnf
 static_function ::= "@static" func_block ;
+no_safepoint_function ::= "@no_safepoint" func_block ;
+inline_function ::= "inline" func_block ;
 native_function ::= "@native" "(" string_lit ")" func_fwd_decl ;
 ```
 
-当前只接受 `@static` 函数定义和 `@native("symbol") decl func ...;` 原生函数声明。修饰符必须紧邻对应函数声明；未知修饰符、错误参数和不匹配的声明形式会产生语法诊断。
+当前支持 `@static`、`@no_safepoint` 函数定义，`inline func` 内联请求，以及 `@native("symbol") decl func ...;` 原生函数声明。修饰符必须紧邻对应函数声明；未知修饰符、错误参数和不匹配的声明形式会产生语法诊断。
 
 ## 5. 类与对象
 
 ### 5.1 类声明
 
 ```ebnf
-class_block ::= ("class" | "shared class" | "class shared") identifier block ;
+class_block ::= ("class" | "shared class" | "class shared") identifier
+                [ "[" type_path { "," type_path } "]" ] block ;
+interface_block ::= "interface" identifier "{" { interface_method_decl | receiver_alias } "}" ;
+interface_method_decl ::= "decl" "func" ["static"] identifier ["static"]
+                          "(" [param_list] ")"
+                          [ "->" type_name ] ";" ;
 ```
 
 类体常见成员：
@@ -216,6 +224,22 @@ class_block ::= ("class" | "shared class" | "class shared") identifier block ;
 - 字段：`var/let ... = ...;`
 - 方法：`func ... { ... }`
 - 类内实例别名声明：`using &alias;`
+
+接口只参与编译期检查，不生成运行时对象。`class HashMap [Map] {}` 声明实现关系；接口用 `decl func` 列出签名，编译器会检查实现类的方法名、接收者形式、参数类型/引用形式和返回类型。
+
+```zeus
+interface Map {
+    using &this;
+    decl func get(key: string) -> string;
+    decl func static version() -> int;
+}
+
+class HashMap [Map] {
+    using &this;
+    func get(key: string) -> string { return key; }
+    func static version() -> int { return 1; }
+}
+```
 
 ### 5.1.1 接收者（receiver）的两种写法
 
@@ -269,6 +293,30 @@ type_path ::= identifier { "." identifier } ;
 
 `operator[new]` 是静态工厂运算符，不接收隐式 `this`。`new T(args...)` 会调用 `T` 上登记的 `operator[new]` 并把它的返回值作为表达式结果；未定义工厂时，普通类仍按字段分配和 `init(...)` 构造。`impl T` 可以为原生类型登记工厂，例如 `impl string`。
 
+### 5.1.3 原位替换实例状态
+
+```ebnf
+this_assignment ::= "@this" "=" expr ;
+```
+
+`@this = value` 只允许在实例方法中使用，且 `value` 必须与当前接收者属于同一个类。它会把 `value` 的字段状态复制到当前实例，同时保留当前实例的身份和地址；已经指向当前实例的其他变量也会看到更新。VM 对动态类型在运行时检查，LLVM 对静态类型在编译时检查。
+
+```zeus
+class Test {
+    using &this;
+    var value = 0;
+
+    func reset() {
+        @this = new Test();
+    }
+}
+
+let a: Test = new Test();
+let b: Test = a;
+a.reset();
+print(b); // 仍是同一个 Test 实例，但字段已重置
+```
+
 ### 5.2 对象创建
 
 ```ebnf
@@ -312,10 +360,32 @@ package_path ::= identifier { "." identifier } ;
 
 ```ebnf
 using_stmt  ::= "using" "original" ;
-using_block ::= "using" "original" block ;
+using_block ::= "using" "original" block
+             | "using" "LLVM" block
+             | "using" "VM" block ;
+llvm_intrinsic ::= "@addr" "(" expr ")"
+                 | "@reveal" "(" expr ")"
+                 | "@faddr" "(" expr ")" "->" llvm_value_type
+                 | "@faddr" "(" expr "," expr ")" "->" llvm_value_type ;
+llvm_faddr_assignment ::= "@faddr" "(" expr ")" "->" llvm_value_type "=" expr
+                          | "@faddr" "(" expr "," expr ")" "->" llvm_value_type "=" expr ;
+this_assignment ::= "@this" "=" expr ;
+llvm_value_type ::= identifier ;
 ```
 
 另：类内 `using &alias;` 属于类语义，不是 `using original` 语义。
+
+using LLVM 和 using VM 是按作用域顺序配对的目标块。AOT 只编译 LLVM 块，VM 只编译 VM 块，缺少配对时跳过并警告。
+
+`@addr(value)` 只接受命名左值并返回 int 地址。AOT 下它指向变量存储槽；VM 下它返回关联到变量 Cell 的地址句柄。两者都用于读写变量槽，string/bytes 的原始数据地址由 `@reveal` 返回。对 shared 变量取址时地址关联到 SharedCell 的值槽，不持有互斥锁，调用方负责并发；共享值被替换或从共享堆删除后，旧地址可能失效。
+
+AOT 原生 `string` 和动态 ZeusValue 中的 string 都使用 `[u64 字节长度][UTF-8 字节][NUL]` 缓冲区，地址指向第一个字符，长度位于 `data - 8`，长度按字节计且不含 NUL。动态 ZeusValue 槽保存数据指针并拥有这段分配；复制 ZeusValue 时深拷贝缓冲区。原生字符串池按内容去重，并在进程生命周期内保持地址稳定。
+
+`@reveal(value)` 返回 string/bytes 的原始数据地址。VM 与 AOT 共用 `[u64 字节长度][data]` 布局，地址指向 data 首字节，长度可从 `@reveal(value) - 8` 读取；string 的 data 末尾另有 NUL，bytes 没有。`@faddr(address) -> T` 按目标内存布局读写；完整 string/bytes 按该布局读取。`@faddr(address, width) -> int` 读取或写入 1、2、4、8 字节，宽度必须是整数字面量，窄读取按无符号字节序扩展为 int，写入保留低位。`@faddr(address, length) -> string` 从原始数据地址复制指定字节数；length 可为运行时 int，不依赖 NUL 结尾，结果进入原生字符串池以保持地址稳定。
+
+`@addr(string/bytes)` 指向变量槽位，`@reveal(value)` 才返回数据首地址；`@faddr(@addr(value)) -> string/bytes` 读写的是完整变量值，带长度的 `@faddr` 则用于显式原始字节范围。bytes 的长度头与数据一起分配，替换槽位会更新该槽持有的完整值。bigint、float、容器和对象的布局尚未定义为跨后端稳定 ABI。原始地址访问只在动态位于 `try` 区域内时（包括 try 中代码调用到的函数）检查已登记的槽位或存活内存范围：越界、类型不符或对只读存储的写入会抛出可捕获异常；`try` 区域之外跳过这些检查，按地址直接读写，错误地址即野指针行为。指针仍不携带类型，不能用它推断未登记内存的布局。
+
+`inline func` 为函数请求 LLVM 内联；用 `zeusc --opt-level 2` 等选项启用 LLVM 优化，默认等级为 `0`。`@no_safepoint` 让 LLVM 后端不在该函数体的循环回边和返回点插入 GC 检查；函数调用到的运行时或其他函数仍可能执行自己的检查。长时间运行且产生垃圾的循环应自行安排回收时机，避免延迟回收。
 
 ## 8. 异常与 with
 

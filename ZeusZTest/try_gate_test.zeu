@@ -1,0 +1,286 @@
+import zeus.mem;
+
+// Dynamic try-gating for raw address checks (@faddr/@addr):
+//  - outside any dynamically active try region the raw checks are skipped;
+//  - inside a try (including code of callees) the strong checks stay active;
+//  - every control-flow edge that leaves a try region (return / break /
+//    continue / exception) must keep the dynamic depth balanced afterward.
+
+func check(condition: bool, label: string) -> int {
+    if (!condition) {
+        print("FAILED: " + label);
+        return 1;
+    }
+    return 0;
+}
+
+var failures = 0;
+
+// --- inside try: invalid accesses are still caught ---
+
+func unknownAddressCaught() -> bool {
+    try {
+        let wrong = @faddr(1) -> int;
+        return false;
+    } catch (&error) {
+        return true;
+    }
+}
+
+var typedSlot: int = 7;
+func typedSlotReinterpretCaught() -> bool {
+    let typedAddress = @addr(typedSlot);
+    try {
+        let wrong = @faddr(typedAddress, 1) -> int;
+        return false;
+    } catch (&error) {
+        return true;
+    }
+}
+
+func calleeBadAccessInside() -> int {
+    let wrong = @faddr(1) -> int;
+    return wrong;
+}
+
+func calleeIsProtected() -> bool {
+    try {
+        let value = calleeBadAccessInside();
+        return false;
+    } catch (&error) {
+        return true;
+    }
+}
+
+func mixedReturnForConversion(flag: bool) {
+    if (flag) {
+        return 1;
+    }
+    return "not an integer";
+}
+
+func intReturnConversionCaughtInsideCallee() -> int {
+    try {
+        let value = mixedReturnForConversion(false);
+        return value;
+    } catch (&error) {
+        return -1;
+    }
+}
+
+func callerTrySurvivesReturnConversionFailure() -> bool {
+    var target: int = 7;
+    let targetAddress = @addr(target);
+    try {
+        let value = intReturnConversionCaughtInsideCallee();
+        let wrong = @faddr(targetAddress, 1) -> int;
+        return false;
+    } catch (&error) {
+        return true;
+    }
+}
+
+func innerTryCompletesThenBadAccess() -> int {
+    try {
+        let fine = 1 + 1;
+        if (fine != 2) {
+            return -1;
+        }
+    } catch (&error) {
+        return -1;
+    }
+    let wrong = @faddr(1) -> int;
+    return wrong;
+}
+
+func outerProtectsAfterInnerTry() -> bool {
+    try {
+        let value = innerTryCompletesThenBadAccess();
+        return false;
+    } catch (&error) {
+        return true;
+    }
+}
+
+// --- try edges: return / break / continue must restore the depth ---
+
+func earlyReturnFromTry(value: int) -> int {
+    try {
+        if (value > 0) {
+            return value + 10;
+        }
+        return value - 10;
+    } catch (&error) {
+        return -1;
+    }
+}
+
+func returnFromCatch() -> int {
+    try {
+        throw "boom";
+    } catch (&error) {
+        return 42;
+    }
+}
+
+func breakOutOfTry() -> int {
+    var total = 0;
+    for (0 .. 5) [index] {
+        try {
+            if (index == 2) {
+                break;
+            }
+            total = total + 1;
+        } catch (&error) {
+            total = total + 100;
+        }
+    }
+    return total;
+}
+
+func conditionalBreakOutOfTry(limit: int) -> int {
+    var total = 0;
+    for (0 .. 10) [index] {
+        try {
+            if (index == limit) {
+                break;
+            }
+            total = total + 1;
+        } catch (&error) {
+            total = total + 100;
+        }
+    }
+    return total;
+}
+
+func breakInsideLoopInsideTry() -> int {
+    try {
+        var total = 0;
+        for (0 .. 10) [index] {
+            if (index == 3) {
+                break;
+            }
+            total = total + 1;
+        }
+        return total;
+    } catch (&error) {
+        return -1;
+    }
+}
+
+func nestedRethrow() -> bool {
+    var outerCaught = false;
+    try {
+        try {
+            throw "inner failure";
+        } catch (&error) {
+            throw "wrapped failure";
+        }
+    } catch (&error) {
+        outerCaught = true;
+    }
+    return outerCaught;
+}
+
+func throwInsideLoopInsideTry() -> int {
+    var total = 0;
+    try {
+        for (0 .. 3) [index] {
+            total = total + 1;
+            if (index == 1) {
+                throw "loop failure";
+            }
+        }
+    } catch (&error) {
+        total = total + 100;
+    }
+    return total;
+}
+
+// --- outside try: valid raw access still works, registration still active ---
+
+func outsideTryRawDataAccess() -> int {
+    var text: string = "AB";
+    let dataAddress = @reveal(text);
+    return @faddr(dataAddress, 1) -> int;
+}
+
+func insideTryValidRawAccess() -> int {
+    var text: string = "XY";
+    let dataAddress = @reveal(text);
+    try {
+        return @faddr(dataAddress, 1) -> int;
+    } catch (&error) {
+        return -1;
+    }
+}
+
+func outsideTryTypedSlot() -> int {
+    var counter: int = 3;
+    let counterAddress = @addr(counter);
+    @faddr(counterAddress) -> int = 9;
+    return counter + (@faddr(counterAddress) -> int);
+}
+
+// --- run all checks ---
+
+failures = failures + check(unknownAddressCaught(), "unknown address inside try");
+failures = failures + check(typedSlotReinterpretCaught(), "typed slot reinterpret inside try");
+failures = failures + check(calleeIsProtected(), "callee of a try is protected");
+failures = failures + check(
+    callerTrySurvivesReturnConversionFailure(),
+    "caller try survives callee return conversion failure");
+failures = failures + check(outerProtectsAfterInnerTry(), "inner try end keeps outer protection");
+failures = failures + check(earlyReturnFromTry(5) == 15, "early return from try (positive)");
+failures = failures + check(earlyReturnFromTry(-5) == -15, "early return from try (negative)");
+failures = failures + check(returnFromCatch() == 42, "return from catch");
+failures = failures + check(breakOutOfTry() == 2, "break out of try");
+failures = failures + check(conditionalBreakOutOfTry(7) == 7, "conditional break out of try");
+failures = failures + check(breakInsideLoopInsideTry() == 3, "break inside loop inside try");
+failures = failures + check(nestedRethrow(), "nested rethrow");
+failures = failures + check(throwInsideLoopInsideTry() == 102, "throw inside loop inside try");
+failures = failures + check(outsideTryRawDataAccess() == 65, "valid raw data access outside try");
+failures = failures + check(insideTryValidRawAccess() == 88, "valid raw data access inside try");
+failures = failures + check(outsideTryTypedSlot() == 18, "typed slot outside try");
+
+// --- outside try: valid typed operations on a global slot (known storage ABI) ---
+
+var globalCount: int = 3;
+let globalCountAddress = @addr(globalCount);
+@faddr(globalCountAddress) -> int = 9;
+let globalReadback = @faddr(globalCountAddress, 8) -> int;
+failures = failures + check(globalCount == 9, "global typed slot store");
+failures = failures + check(globalReadback == 9, "global full-width typed read");
+
+// Top-level try region and top-level break-out-of-try edge.
+
+var topLevelCaught = false;
+try {
+    let wrong = @faddr(1) -> int;
+} catch (&error) {
+    topLevelCaught = true;
+}
+failures = failures + check(topLevelCaught, "top-level try catches");
+
+var topLevelTotal = 0;
+for (0 .. 5) [index] {
+    try {
+        if (index == 2) {
+            break;
+        }
+        topLevelTotal = topLevelTotal + 1;
+    } catch (&error) {
+        topLevelTotal = topLevelTotal + 100;
+    }
+}
+failures = failures + check(topLevelTotal == 2, "top-level break out of try");
+
+// After all edges above, a fresh try must still catch (depth not leaked down).
+
+failures = failures + check(unknownAddressCaught(), "fresh try after edge stress");
+
+if (failures == 0) {
+    print("TRY_GATE_PASS");
+} else {
+    throw "try gate failures";
+}

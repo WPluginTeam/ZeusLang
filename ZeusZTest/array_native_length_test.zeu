@@ -1,0 +1,26 @@
+let values = [];
+if (values.length() != 0) {
+    throw new Exception("empty Array length failed");
+}
+
+values.append(11);
+values.append(22);
+values.append(33);
+if (values.length() != 3) {
+    throw new Exception("Array length after append failed");
+}
+
+values.pop();
+if (values.length() != 2) {
+    throw new Exception("Array length after pop failed");
+}
+
+let total = 0;
+for (values) [const &item] {
+    total = total + item;
+}
+if (total != 33) {
+    throw new Exception("Array iteration length failed");
+}
+
+print("ARRAY_NATIVE_LENGTH_PASS");

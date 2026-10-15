@@ -1,0 +1,9 @@
+func build_capturing_class() {
+    let outer_value = 42;
+
+    class CapturingFieldDefault {
+        var value = outer_value;
+    }
+}
+
+build_capturing_class();

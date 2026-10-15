@@ -12,6 +12,7 @@
 #include "./ZeusRunner/ZeusBuiltins.hpp"
 #include "./ZeusCompile.hpp"
 #include "./ZeusDebug/Utils.hpp"
+#include "./ZeusDebug/BreakpointConfig.hpp"
 #include "./ZeusRunner/ZeusHotspot.hpp"
 #include "./ZeusPackage/ZeusPackageLoader.hpp"
 #include "./ZeusIR/IRImport.hpp"
@@ -23,6 +24,9 @@
 
 #include <algorithm>
 #include <iostream>
+#include <cstdio>
+#include <new>
+#include <unordered_map>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -33,6 +37,7 @@ int main(int argc, char* argv[]) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
+    try {
     ZeusBuiltins::initCoreBuiltins();
     IRHotspotList::registerHotspots();
     
@@ -52,6 +57,7 @@ int main(int argc, char* argv[]) {
     bool timingFlag = false;
     bool enableHotspot = true;
     bool strictCapture = true;
+    ZeusDebug::BreakpointConfig breakpointConfig;
 
     // 第一遍：扫描全局 flag
     std::string debugChannelsPending;
@@ -64,6 +70,18 @@ int main(int argc, char* argv[]) {
         }
         if (a == "--strict-capture") {
             strictCapture = true;
+            continue;
+        }
+        if (a == "--breakpoints") {
+            if (i + 1 >= argc) {
+                std::cerr << "--breakpoints requires a comma-separated line list" << std::endl;
+                return 2;
+            }
+            std::string error;
+            if (!ZeusDebug::parseBreakpointList(argv[++i], breakpointConfig, error)) {
+                std::cerr << "Invalid --breakpoints value: " << error << std::endl;
+                return 2;
+            }
             continue;
         }
         if (a == "--debug") {
@@ -82,6 +100,15 @@ int main(int argc, char* argv[]) {
         if (a.rfind(prefix, 0) == 0) {
             debugChannelsPending = a.substr(prefix.size());
             ZeusDebug::setEnabled(true);
+            continue;
+        }
+        const std::string breakpointPrefix = "--breakpoints=";
+        if (a.rfind(breakpointPrefix, 0) == 0) {
+            std::string error;
+            if (!ZeusDebug::parseBreakpointList(a.substr(breakpointPrefix.size()), breakpointConfig, error)) {
+                std::cerr << "Invalid --breakpoints value: " << error << std::endl;
+                return 2;
+            }
             continue;
         }
     }
@@ -110,10 +137,22 @@ int main(int argc, char* argv[]) {
             argIndex++;
             continue;
         }
+        if (a == "--breakpoints") {
+            argIndex += 2;
+            continue;
+        }
+        if (a.rfind("--breakpoints=", 0) == 0) {
+            argIndex++;
+            continue;
+        }
         break;
     }
 
     if (argIndex >= argc) {
+        if (breakpointConfig.enabled()) {
+            std::cerr << "--breakpoints requires a VM source file or .zir input" << std::endl;
+            return 2;
+        }
     std::cout << "Zeus: only global flags provided -> running built-in test (Lexer+Parser+IR+VM)" << std::endl;
         return Test::testLexerParserIRGen(enableHotspot) ? 0 : 1;
     }
@@ -165,6 +204,11 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
+        if (breakpointConfig.enabled()) {
+            breakpointConfig.sourcePath = zirPath;
+            breakpointConfig.snapshotDirectory = ZeusDebug::defaultSnapshotDirectory(zirPath);
+        }
+
         if (ZeusDebug::enabled() && ZeusDebug::channelEnabled(ZeusDebug::CH_IR)) {
             std::cout << "-------------------- IR Gen --------------------" << std::endl;
             std::cout << "(Read) chunk count: " << cr.program.size() << std::endl;
@@ -178,12 +222,19 @@ int main(int argc, char* argv[]) {
         } else {
             // non-debug mode: keep silent unless IR channel enabled
         }
-        ZeusCompile::run(cr);
-        
-        return 0;
+        return ZeusCompile::run(cr, breakpointConfig) ? 0 : 1;
     } else {
         srcPath = arg1;
     }
+
+        if (breakpointConfig.enabled() && (compileSingle || emitLLVM)) {
+            std::cerr << "--breakpoints is available for VM execution, not compile-only or LLVM output" << std::endl;
+            return 2;
+        }
+        if (breakpointConfig.enabled()) {
+            breakpointConfig.sourcePath = srcPath;
+            breakpointConfig.snapshotDirectory = ZeusDebug::defaultSnapshotDirectory(srcPath);
+        }
 
         std::ifstream ifs(srcPath);
         if (!ifs) {
@@ -227,6 +278,14 @@ int main(int argc, char* argv[]) {
             builtinTarget, usesBytesLiteral);
 
         ZeusLLVM::ModuleGraphResult llvmModuleGraph;
+        struct ModuleTypeInference {
+            std::unordered_map<TreeParser::NodeId, std::string>
+                functionReturnTypes;
+            std::unordered_map<TreeParser::NodeId, std::string>
+                bindingTypesByNode;
+        };
+        std::unordered_map<std::string, ModuleTypeInference>
+            moduleTypeInferences;
         if (emitLLVM) {
             llvmModuleGraph = ZeusLLVM::buildModuleGraph(
                 srcPath, code, builtinCompilationPlan.implementationModules);
@@ -275,7 +334,35 @@ int main(int argc, char* argv[]) {
                             );
                         }
                     }
+                    for (const auto& classInterface : module->classes) {
+                        checker.registerExternalClass(
+                            imported.packageName + "." + classInterface.name,
+                            classInterface.fields
+                        );
+                        checker.registerExternalClass(
+                            imported.namespaceMode
+                                ? alias + "." + classInterface.name
+                                : classInterface.name,
+                            classInterface.fields
+                        );
+                    }
                 }
+            };
+
+            auto importedInterfaceContracts = [&](const std::vector<ZeusLLVM::ModuleImport>& imports) {
+                ZeusParser::InterfaceContractRegistry contracts;
+                for (const auto& imported : imports) {
+                    const ZeusLLVM::ModuleNode* module = findModule(imported.packageName);
+                    if (module == nullptr) continue;
+                    ZeusParser::bindImportedInterfaceContracts(
+                        contracts,
+                        imported.packageName,
+                        imported.alias,
+                        imported.namespaceMode,
+                        module->interfaceContracts
+                    );
+                }
+                return contracts;
             };
 
             for (const auto& module : llvmModuleGraph.dependencyOrder) {
@@ -294,12 +381,25 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
                 auto moduleAst = TreeParser::parse(moduleTokens, &moduleDiagnostics);
+                ZeusParser::selectBackendBlocks(
+                    moduleAst, ZeusParser::BackendTarget::LLVM);
                 ZeusDiagnostics::append(
                     moduleDiagnostics,
                     ZeusParser::validateParsedSyntax(moduleAst)
                 );
                 if (!moduleDiagnostics.empty()) {
                     for (const auto& diagnostic : moduleDiagnostics) {
+                        std::cout << ZeusDiagnostics::render(
+                            diagnostic, module.path, module.source
+                        ) << std::endl;
+                    }
+                    return 1;
+                }
+                const auto interfaceDiagnostics =
+                    ZeusParser::validateInterfaceConformance(
+                        moduleAst, importedInterfaceContracts(module.imports));
+                if (!interfaceDiagnostics.empty()) {
+                    for (const auto& diagnostic : interfaceDiagnostics) {
                         std::cout << ZeusDiagnostics::render(
                             diagnostic, module.path, module.source
                         ) << std::endl;
@@ -320,6 +420,11 @@ int main(int argc, char* argv[]) {
                     }
                     return 1;
                 }
+                auto& typeInference = moduleTypeInferences[module.packageName];
+                typeInference.functionReturnTypes =
+                    moduleChecker.getInferredFunctionReturnTypes();
+                typeInference.bindingTypesByNode =
+                    moduleChecker.getInferredBindingTypesByNode();
             }
 
             std::vector<ZeusDiagnostics::Diagnostic> parseDiagnostics;
@@ -335,6 +440,8 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             auto typingAst = TreeParser::parse(typingTokens, &parseDiagnostics);
+            ZeusParser::selectBackendBlocks(
+                typingAst, ZeusParser::BackendTarget::LLVM);
             ZeusDiagnostics::append(
                 parseDiagnostics,
                 ZeusParser::validateParsedSyntax(typingAst)
@@ -404,6 +511,7 @@ int main(int argc, char* argv[]) {
                     }
                     
                     if (!packageName.empty()) {
+                        packageName = IRImport::canonicalPackageName(packageName);
                         importedPackages.push_back(packageName);
                         ZEUS_DEBUG_PRINT("[Main] Pre-scanned import: %s", packageName.c_str());
                     }
@@ -585,7 +693,18 @@ int main(int argc, char* argv[]) {
                     }
                     try {
                         ZeusDiagnostics::setSourceContext(module->path, module->source);
-                        auto compiled = ZeusPackage::compilePackage(packageName, module->path, strictDecl);
+                        const auto inference =
+                            moduleTypeInferences.find(packageName);
+                        if (inference == moduleTypeInferences.end()) {
+                            throw std::runtime_error(
+                                "LLVM module type inference result is missing for '" +
+                                packageName + "'");
+                        }
+                        auto compiled = ZeusPackage::compilePackage(
+                            packageName, module->path, strictDecl,
+                            ZeusParser::BackendTarget::LLVM,
+                            &inference->second.functionReturnTypes,
+                            &inference->second.bindingTypesByNode);
                         ZeusPackage::loadedPackages[packageName] = std::move(compiled);
                         pkg = &ZeusPackage::loadedPackages[packageName];
                     } catch (const std::exception& ex) {
@@ -607,6 +726,10 @@ int main(int argc, char* argv[]) {
                 }
                 
                 if (pkg) {
+                    for (const auto& warning : pkg->warnings) {
+                        std::cout << ZeusDiagnostics::render(
+                            warning, pkg->filePath, pkg->sourceCode, "warning") << std::endl;
+                    }
                     packages.push_back(pkg);
 
                     if (emitLLVM) {
@@ -737,12 +860,14 @@ int main(int argc, char* argv[]) {
                         }
                     }
 
+                    pkgName = IRImport::canonicalPackageName(pkgName);
+
                     if (isNamespaceMode) {
                         if (aliasName.empty()) {
                             aliasName = pkgName;
                             
                             // 如果包名包含点号,只使用最后一段作为别名
-                            // 例如: "ZeusBuiltins.math" -> "math"
+                            // 例如: "zeus.math" -> "math"
                             size_t lastDot = aliasName.find_last_of('.');
                             if (lastDot != std::string::npos && lastDot + 1 < aliasName.size()) {
                                 aliasName = aliasName.substr(lastDot + 1);
@@ -912,8 +1037,26 @@ int main(int argc, char* argv[]) {
 
         ZEUS_DEBUG_PRINT("[Main] Compiling main program (package globals: %d)...", packageGlobalCount);
 
+        ZeusParser::InterfaceContractRegistry rootImportedInterfaceContracts;
+        for (const auto& imported : ZeusPackage::extractImportDeclarations(code)) {
+            ZeusPackage::CompiledPackage* package =
+                ZeusPackage::findPackage(packages, imported.packageName);
+            if (package == nullptr) continue;
+            ZeusParser::bindImportedInterfaceContracts(
+                rootImportedInterfaceContracts,
+                imported.packageName,
+                imported.alias,
+                imported.importMode == 1,
+                package->interfaceContracts
+            );
+        }
+
         ZeusCompile::Result cr = ZeusCompile::compile(
-            code, strictDecl, emitLLVM ? false : enableHotspot, srcPath
+            code, strictDecl, emitLLVM ? false : enableHotspot, srcPath,
+            emitLLVM ? ZeusParser::BackendTarget::LLVM
+                     : ZeusParser::BackendTarget::VirtualMachine,
+            !packages.empty(),
+            rootImportedInterfaceContracts
         );
         
         // 设置源文件信息用于错误报告
@@ -922,6 +1065,9 @@ int main(int argc, char* argv[]) {
 
         for (const auto& diagnostic : cr.diagnostics) {
             std::cout << ZeusDiagnostics::render(diagnostic, srcPath, code) << std::endl;
+        }
+        for (const auto& warning : cr.warnings) {
+            std::cout << ZeusDiagnostics::render(warning, srcPath, code, "warning") << std::endl;
         }
         
         ZEUS_DEBUG_PRINT("[Main] Compile done. cr.globalNames.size()=%zu", cr.globalNames.size());
@@ -984,9 +1130,54 @@ int main(int argc, char* argv[]) {
             cr.globalNames = mainAndAliasGlobals;
         }
 
+        // Package implementations add the concrete impl signatures needed by
+        // value-returning setters. Resolve them after package merge for both
+        // backends so the VM also writes the returned value back to its slot.
+        IRStaticCall::annotate(cr.program);
+        IRStaticOperator::annotate(cr.program);
+        std::string genericClassError;
+        int genericClassErrorLine = 0;
+        if (!IRGenericClass::specialize(
+                cr.program, genericClassError, genericClassErrorLine)) {
+            std::cout << ZeusDiagnostics::render(
+                { emitLLVM ? "llvm" : "type", genericClassError,
+                  genericClassErrorLine, 0 },
+                srcPath,
+                code
+            ) << std::endl;
+            return 1;
+        }
+        std::string genericStaticError;
+        int genericStaticErrorLine = 0;
+        if (!IRGenericStatic::specialize(
+                cr.program,
+                emitLLVM,
+                genericStaticError,
+                genericStaticErrorLine)) {
+            std::cout << ZeusDiagnostics::render(
+                { emitLLVM ? "llvm" : "type", genericStaticError,
+                  genericStaticErrorLine, 0 },
+                srcPath,
+                code
+            ) << std::endl;
+            return 1;
+        }
+        genericClassError.clear();
+        genericClassErrorLine = 0;
+        if (!IRGenericClass::specialize(
+                cr.program, genericClassError, genericClassErrorLine)) {
+            std::cout << ZeusDiagnostics::render(
+                { emitLLVM ? "llvm" : "type", genericClassError,
+                  genericClassErrorLine, 0 },
+                srcPath,
+                code
+            ) << std::endl;
+            return 1;
+        }
+        IRStaticCall::annotate(cr.program);
+        IRStaticOperator::annotate(cr.program);
+
         if (emitLLVM) {
-            IRStaticCall::annotate(cr.program);
-            IRStaticOperator::annotate(cr.program);
             ZeusLLVM::EmitResult emitted = ZeusLLVM::emit(cr);
             for (const auto& warning : emitted.warnings) {
                 std::cout << "[emit-llvm] warning: " << warning << std::endl;
@@ -1033,7 +1224,11 @@ int main(int argc, char* argv[]) {
             }
             return 0;
         }
-        ZeusCompile::run(cr);
-        
-        return 0;
+        return ZeusCompile::run(cr, breakpointConfig) ? 0 : 1;
+    } catch (const std::bad_alloc&) {
+        static constexpr char message[] = "Zeus: out of memory\n";
+        std::fwrite(message, 1, sizeof(message) - 1, stderr);
+        std::fflush(stderr);
+        return 1;
     }
+}

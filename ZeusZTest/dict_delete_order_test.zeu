@@ -1,0 +1,15 @@
+let dict = new Dict();
+dict.set("", 0);
+dict.set("middle", 1);
+dict.set("last", 2);
+dict.deleteKey("middle");
+dict.set("middle", 3);
+print(dict.keys());
+print(dict.length());
+let copy = dict.copy();
+print(copy.keys());
+print(copy.toString());
+copy.deleteKey("");
+copy.set("", 4);
+print(copy.keys());
+print(dict.keys());

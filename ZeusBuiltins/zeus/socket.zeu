@@ -1,0 +1,162 @@
+// socket.zeu - Zeus Socket Module
+// 提供基于句柄的Socket操作，使用内置bytes类型进行数据传输
+
+// 注意：不在文件级使用 using original，避免影响对象返回
+// 在需要原始bytes的函数内单独处理类型转换
+
+// ===== Socket 类 =====
+
+class Socket {
+    using &this;
+
+    let handle;       // SocketHandle
+    let isConnected;  // bool
+    let isOpen;       // bool
+
+    func init(ip=nil, port=nil) {
+        this.handle = __socket_create();
+        this.isOpen = true;
+        this.isConnected = false;
+
+        if (ip != nil and port != nil) {
+            this.connect(ip, port);
+        }
+    }
+
+    func connect(host, port) {
+        let hostStr = host;
+
+        __socket_connect(this.handle, hostStr, port);
+        this.isConnected = true;
+    }
+
+    func bind(host, port) {
+        let hostStr = host;
+
+        __socket_bind(this.handle, hostStr, port);
+    }
+
+    func listen(backlog=5) {
+        __socket_listen(this.handle, backlog);
+    }
+
+    func accept() {
+        let clientHandle = __socket_accept(this.handle);
+        let result = new Socket();
+
+        // 关闭 init 中创建的多余 socket，使用 accept 返回的 handle
+        result.close();
+        result.handle = clientHandle;
+        result.isOpen = true;
+        result.isConnected = true;
+        return result;
+    }
+
+    // Transfer native socket ownership without carrying this wrapper across a worker VM.
+    func detachHandle() {
+        if (!this.isOpen) throw new Exception("socket is closed");
+        let handle = this.handle;
+        this.handle = nil;
+        this.isOpen = false;
+        this.isConnected = false;
+        return handle;
+    }
+
+    func adoptHandle(handle) -> &Socket {
+        if (this.isOpen) this.close();
+        this.handle = handle;
+        this.isOpen = true;
+        this.isConnected = true;
+        return this;
+    }
+
+    func send(data) -> int {
+        if (data == nil) {
+            return __socket_send(this.handle, bytes(""));
+        }
+        
+        let dataType = type(data);
+        
+        // 使用早返回模式避免 else if 问题
+        if (dataType == "Byte") {
+            return __socket_send(this.handle, data.data);
+        }
+        
+        if (dataType == "bytes") {
+            return __socket_send(this.handle, data);
+        }
+        
+        return __socket_send(this.handle, bytes(data));
+    }
+
+    func sendAll(data: bytes) -> int {
+        return __socket_send_all(this.handle, data);
+    }
+
+    func recv(size=1024) {
+        return __socket_recv(this.handle, size);
+    }
+
+    func recvExact(size: int) -> bytes {
+        if (size < 0) throw new Exception("socket receive size must be non-negative");
+        if (size == 0) return b"";
+        return __socket_recv_exact(this.handle, size);
+    }
+
+    func close() {
+        if (this.isOpen) {
+            __socket_close(this.handle);
+            this.handle = nil;
+            this.isOpen = false;
+            this.isConnected = false;
+        }
+    }
+
+    // Close the native socket to interrupt a blocking accept/recv without
+    // changing this wrapper. The owner calls close() after the operation exits.
+    func requestClose() {
+        if (this.isOpen) {
+            __socket_close(this.handle);
+        }
+    }
+
+    func getConnected() {
+        if (!this.isOpen) {
+            return false;
+        }
+        return __socket_is_connected(this.handle);
+    }
+
+    func operator[~] () {
+        // 析构函数：确保 socket 资源被正确释放
+        this.close();
+    }
+
+    func toString() {
+        let connected = this.getConnected();
+        let status = "disconnected";
+
+        if (connected) {
+            status = "connected";
+        }
+
+        return "<Socket " + status + ">";
+    }
+
+    func operator[with] () {
+        return this;
+    }
+
+    func operator[~with] () {
+        this.close();
+    }
+}
+
+// ===== 导出的工厂类 =====
+
+class SocketFactory {
+
+    func static createSocket() {
+        return new Socket();
+    }
+}

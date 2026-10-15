@@ -1,0 +1,32 @@
+import zeus.thread [&];
+
+class Worker {
+    using &this;
+    let value = 37;
+
+    func run() {
+        print("worker", this.value);
+    }
+
+    func waitForStop() {
+        for (true) {
+            if (__thread_should_stop()) {
+                return;
+            }
+        }
+    }
+}
+
+let worker = new Worker();
+let workerThread = new thread.Thread(worker.run);
+workerThread.setName("abi-worker");
+workerThread.start();
+let workerName = workerThread.getName();
+workerThread.join();
+print("thread-name", workerName);
+workerThread.target = worker.waitForStop;
+workerThread.start();
+workerThread.eliminate();
+print("thread-count", thread.thread_count());
+delete workerThread;
+delete worker;

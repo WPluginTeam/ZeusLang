@@ -1,0 +1,47 @@
+func nativeViewLength(value: string) -> int {
+    using LLVM {
+        return value.length();
+    }
+}
+
+func nativeBuiltinLength(value: string) -> int {
+    using LLVM {
+        return len(value);
+    }
+}
+
+func nativeIntAddress(value: int) -> bool {
+    using LLVM {
+        return @addr(value) > 0;
+    }
+}
+
+func nativeBoolAddress(value: bool) -> bool {
+    using LLVM {
+        return @addr(value) > 0;
+    }
+}
+
+func nativeStringAddress(value: string) -> bool {
+    using LLVM {
+        return @addr(value) > 0;
+    }
+}
+
+if (nativeViewLength("zeus") != 4) {
+    throw new Exception("typed string length failed");
+}
+if (nativeBuiltinLength("llvm") != 4) {
+    throw new Exception("global len(string) failed");
+}
+if (nativeIntAddress(7) != true) {
+    throw new Exception("int @addr failed");
+}
+if (nativeBoolAddress(true) != true) {
+    throw new Exception("bool @addr failed");
+}
+if (nativeStringAddress("zeus") != true) {
+    throw new Exception("string @addr failed");
+}
+
+print("USING_LLVM_ADDR_LEN_PASS");

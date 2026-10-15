@@ -1,0 +1,381 @@
+// Fixed-capacity containers. StaticArray<T> keeps the LLVM element stride for T;
+// class payload identity is managed separately so a cleared slot can be reused
+// without reviving an alias to its previous payload. VM branches use regular
+// Zeus containers.
+import zeus.mem;
+
+@native("__zeus_object_clone")
+decl func __zeus_object_clone(value);
+
+@type(T) class StaticArray {
+    using &this;
+
+    var dataAddress: int = 0;
+    var countValue: int = 0;
+    var capacityValue: int = 0;
+    var vmValues = nil;
+
+    func init(capacity: int) {
+        if (capacity <= 0) {
+            throw "StaticArray capacity must be positive";
+        }
+
+        this.capacityValue = capacity;
+        this.countValue = 0;
+        using LLVM {
+            let elementSize = sizeof(T);
+            if (elementSize <= 0) {
+                throw "StaticArray element type has no native LLVM storage size";
+            }
+            let allocationSize = capacity * elementSize;
+            if (allocationSize <= 0 or allocationSize / elementSize != capacity) {
+                throw "StaticArray capacity is too large";
+            }
+            let allocation = malloc(allocationSize);
+            if (allocation == 0) {
+                throw "StaticArray allocation failed";
+            }
+            this.dataAddress = allocation;
+        }
+        using VM {
+            this.vmValues = [];
+        }
+    }
+
+    @no_safepoint
+    inline func length() -> int {
+        return this.countValue;
+    }
+
+    @no_safepoint
+    inline func capacity() -> int {
+        return this.capacityValue;
+    }
+
+    @no_safepoint
+    inline func append(value: T) -> StaticArray {
+        if (this.countValue >= this.capacityValue) {
+            throw "StaticArray capacity exceeded";
+        }
+
+        using LLVM {
+            @faddr(this.dataAddress + this.countValue * sizeof(T), slot) -> T = value;
+        }
+        using VM {
+            this.vmValues.append(__zeus_object_clone(value));
+        }
+        this.countValue = this.countValue + 1;
+        return this;
+    }
+
+    @no_safepoint
+    inline func get(index: int) -> T {
+        if (index < 0 or index >= this.countValue) {
+            throw "StaticArray index out of range";
+        }
+
+        using LLVM {
+            return @faddr(this.dataAddress + index * sizeof(T), slot) -> T;
+        }
+        using VM {
+            return this.vmValues[index];
+        }
+    }
+
+    @no_safepoint
+    inline func set(index: int, value: T) -> StaticArray {
+        this.writeElement(index, value);
+        return this;
+    }
+
+    @no_safepoint
+    inline func writeElement(index: int, value: T) {
+        if (index < 0 or index >= this.countValue) {
+            throw "StaticArray index out of range";
+        }
+
+        using LLVM {
+            @faddr(this.dataAddress + index * sizeof(T), slot) -> T = value;
+        }
+        using VM {
+            this.vmValues[index] = __zeus_object_clone(value);
+        }
+    }
+
+    @no_safepoint
+    inline func operator[[]](index: int) -> T {
+        return this.get(index);
+    }
+
+    @no_safepoint
+    inline func operator[[]=](index: int, value: T) {
+        this.writeElement(index, value);
+    }
+
+    func clear() -> StaticArray {
+        using LLVM {
+            var index = 0;
+            for (true) {
+                if (index >= this.countValue) break;
+                @faddr(this.dataAddress + index * sizeof(T), slot_clear) -> T;
+                index = index + 1;
+            }
+            this.countValue = 0;
+        }
+        using VM {
+            this.vmValues.clear();
+        }
+        this.countValue = 0;
+        return this;
+    }
+
+    // The copy protocol runs on the source; its owned result is adopted once.
+    func operator[@=]() -> StaticArray {
+        let result = new StaticArray<T>(this.capacityValue);
+        try {
+            var index = 0;
+            for (true) {
+                if (index >= this.countValue) break;
+                using LLVM {
+                    let value = this.get(index);
+                    @faddr(result.dataAddress + index * sizeof(T), slot) -> T = value;
+                    result.countValue = result.countValue + 1;
+                }
+                using VM {
+                    result.vmValues.append(__zeus_object_clone(this.vmValues[index]));
+                    result.countValue = result.countValue + 1;
+                }
+                index = index + 1;
+            }
+        } catch (&error) {
+            delete result;
+            throw error;
+        }
+        return result;
+    }
+
+    func operator[~]() {
+        using LLVM {
+            if (this.dataAddress != 0) {
+                free(this.dataAddress);
+                this.dataAddress = 0;
+            }
+        }
+        using VM {
+            this.vmValues = [];
+            this.countValue = 0;
+        }
+    }
+}
+
+class StaticDict {
+    using &this;
+
+    var dataAddress: int = 0;
+    var countValue: int = 0;
+    var capacityValue: int = 0;
+    var vmData = nil;
+
+    func init(capacity: int) {
+        if (capacity <= 0) {
+            throw "StaticDict capacity must be positive";
+        }
+
+        let allocationSize = capacity * 24;
+        if (allocationSize <= 0 or allocationSize / 24 != capacity) {
+            throw "StaticDict capacity is too large";
+        }
+
+        this.capacityValue = capacity;
+        this.countValue = 0;
+        using LLVM {
+            let allocation = malloc(allocationSize);
+            if (allocation == 0) {
+                throw "StaticDict allocation failed";
+            }
+            this.dataAddress = allocation;
+
+            var slot = 0;
+            for (true) {
+                if (slot >= capacity) break;
+                @faddr(allocation + slot * 24, 8) -> int = 0;
+                slot = slot + 1;
+            }
+        }
+        using VM {
+            this.vmData = {};
+        }
+    }
+
+    @no_safepoint
+    inline func length() -> int {
+        return this.countValue;
+    }
+
+    @no_safepoint
+    inline func capacity() -> int {
+        return this.capacityValue;
+    }
+
+    @no_safepoint
+    inline func findSlot(key: int) -> int {
+        using LLVM {
+            var slot = key % this.capacityValue;
+            if (slot < 0) slot = slot + this.capacityValue;
+            var probes = 0;
+            for (true) {
+                let entryAddress = this.dataAddress + slot * 24;
+                let occupied = @faddr(entryAddress, 8) -> int;
+                if (occupied == 0 or @faddr(entryAddress + 8, 8) -> int == key) {
+                    return slot;
+                }
+                slot = slot + 1;
+                if (slot >= this.capacityValue) slot = 0;
+                probes = probes + 1;
+                if (probes >= this.capacityValue) return -1;
+            }
+            return -1;
+        }
+        using VM {
+            return -1;
+        }
+        return -1;
+    }
+
+    @no_safepoint
+    inline func set(key: int, value: int) -> StaticDict {
+        using LLVM {
+            let slot = this.findSlot(key);
+            if (slot < 0) {
+                throw "StaticDict capacity exceeded";
+            }
+            let entryAddress = this.dataAddress + slot * 24;
+            if (@faddr(entryAddress, 8) -> int == 0) {
+                this.countValue = this.countValue + 1;
+            }
+            @faddr(entryAddress, 8) -> int = 1;
+            @faddr(entryAddress + 8, 8) -> int = key;
+            @faddr(entryAddress + 16, 8) -> int = value;
+        }
+        using VM {
+            let normalizedKey = str(key);
+            if (!hasKey(this.vmData, normalizedKey)) {
+                if (this.countValue >= this.capacityValue) {
+                    throw "StaticDict capacity exceeded";
+                }
+                this.countValue = this.countValue + 1;
+            }
+            this.vmData[normalizedKey] = value;
+        }
+        return this;
+    }
+
+    @no_safepoint
+    inline func hasKey(key: int) -> bool {
+        using LLVM {
+            let slot = this.findSlot(key);
+            if (slot < 0) return false;
+            let entryAddress = this.dataAddress + slot * 24;
+            return @faddr(entryAddress, 8) -> int != 0;
+        }
+        using VM {
+            return hasKey(this.vmData, str(key));
+        }
+        return false;
+    }
+
+    @no_safepoint
+    inline func get(key: int) -> int {
+        using LLVM {
+            let slot = this.findSlot(key);
+            if (slot < 0) {
+                throw "StaticDict key not found";
+            }
+            let entryAddress = this.dataAddress + slot * 24;
+            if (@faddr(entryAddress, 8) -> int == 0) {
+                throw "StaticDict key not found";
+            }
+            return @faddr(entryAddress + 16, 8) -> int;
+        }
+        using VM {
+            let normalizedKey = str(key);
+            if (!hasKey(this.vmData, normalizedKey)) {
+                throw "StaticDict key not found";
+            }
+            return this.vmData[normalizedKey];
+        }
+        return 0;
+    }
+
+    @no_safepoint
+    inline func operator[[]=](key: int, value: int) {
+        this.set(key, value);
+    }
+
+    @no_safepoint
+    inline func operator[[]](key: int) -> int {
+        return this.get(key);
+    }
+
+    func clear() -> StaticDict {
+        using LLVM {
+            var slot = 0;
+            for (true) {
+                if (slot >= this.capacityValue) break;
+                @faddr(this.dataAddress + slot * 24, 8) -> int = 0;
+                slot = slot + 1;
+            }
+        }
+        using VM {
+            this.vmData = {};
+        }
+        this.countValue = 0;
+        return this;
+    }
+
+    func operator[@=]() -> StaticDict {
+        let result = new StaticDict(this.capacityValue);
+        try {
+            using LLVM {
+                var slot = 0;
+                for (true) {
+                    if (slot >= this.capacityValue) break;
+                    let entryAddress = this.dataAddress + slot * 24;
+                    if (@faddr(entryAddress, 8) -> int != 0) {
+                        let key = @faddr(entryAddress + 8, 8) -> int;
+                        let value = @faddr(entryAddress + 16, 8) -> int;
+                        let targetSlot = result.findSlot(key);
+                        let targetAddress = result.dataAddress + targetSlot * 24;
+                        @faddr(targetAddress, 8) -> int = 1;
+                        @faddr(targetAddress + 8, 8) -> int = key;
+                        @faddr(targetAddress + 16, 8) -> int = value;
+                        result.countValue = result.countValue + 1;
+                    }
+                    slot = slot + 1;
+                }
+            }
+            using VM {
+                for (this.vmData) [key: value] {
+                    let normalizedKey = str(key);
+                    result.vmData[normalizedKey] = value;
+                    result.countValue = result.countValue + 1;
+                }
+            }
+        } catch (&error) {
+            delete result;
+            throw error;
+        }
+        return result;
+    }
+
+    func operator[~]() {
+        using LLVM {
+            if (this.dataAddress != 0) {
+                free(this.dataAddress);
+                this.dataAddress = 0;
+            }
+        }
+        using VM {
+        }
+    }
+}

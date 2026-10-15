@@ -1,8 +1,10 @@
 #include "ZeusABI.hpp"
+#include "ZeusLValueABI.hpp"
 
 #include "ZeusABIInternal.hpp"
 #include "ZeusDynamicABI.hpp"
 #include "ZeusGC.hpp"
+#include "ZeusRuntimeDebug.hpp"
 
 #include <algorithm>
 #include <memory>
@@ -35,8 +37,11 @@ struct CaptureCell {
         zeus_value_slot_register_gc_edge(&value);
     }
     ~CaptureCell() {
+        zeus_lvalue_unregister(&value);
         zeus_value_slot_unregister_gc_edge(&value);
         zeus_value_release_internal(&value);
+        ZeusRuntimeDebug::trackDestroyed(
+            ZeusRuntimeDebug::ResourceKind::CaptureCell, this);
     }
 };
 
@@ -45,6 +50,11 @@ struct CaptureCellHandle {
 };
 
 struct ClosureRecord {
+    ~ClosureRecord() {
+        ZeusRuntimeDebug::trackDestroyed(
+            ZeusRuntimeDebug::ResourceKind::ManagedClosure, this);
+    }
+
     ZeusClosureInvoke invoke = nullptr;
     int32_t minArity = 0;
     int32_t maxArity = 0;
@@ -80,6 +90,14 @@ void breakClosureRecordCycles(void* payload) {
 
 std::shared_ptr<CaptureCell> makeCaptureCell(const ZeusValue* initial) {
     auto cell = std::make_shared<CaptureCell>(initial);
+    ZeusRuntimeDebug::trackCreated(
+        ZeusRuntimeDebug::ResourceKind::CaptureCell,
+        cell.get(),
+        "closure-capture-cell",
+        __FILE__,
+        __LINE__,
+        sizeof(CaptureCell)
+    );
     ZeusGC::registerSharedNode(
         std::static_pointer_cast<void>(cell),
         traceCaptureCell,
@@ -100,6 +118,14 @@ std::shared_ptr<ClosureRecord> makeClosureRecord(
     void* const* cells
 ) {
     auto record = std::make_shared<ClosureRecord>();
+    ZeusRuntimeDebug::trackCreated(
+        ZeusRuntimeDebug::ResourceKind::ManagedClosure,
+        record.get(),
+        "closure-record",
+        __FILE__,
+        __LINE__,
+        sizeof(ClosureRecord)
+    );
     record->invoke = invoke;
     record->minArity = minArity;
     record->maxArity = maxArity;
@@ -334,7 +360,7 @@ void zeus_closure_create(
         // The local box is a root, so the record stays reachable if the scope
         // exit triggers a collection.
         ZeusBox box;
-        box.v = makeClosureHandle(invoke, arity, arity, capture_count, cells);
+        box.assignVariant(makeClosureHandle(invoke, arity, arity, capture_count, cells));
         zeus_value_from_box(out, &box);
     } catch (...) {
         closurePanic("failed to create closure value");
@@ -354,8 +380,8 @@ void zeus_closure_create_range(
     ZeusGC::AllocationScope allocation;
     try {
         ZeusBox box;
-        box.v = makeClosureHandle(
-            invoke, min_arity, max_arity, capture_count, cells);
+        box.assignVariant(makeClosureHandle(
+            invoke, min_arity, max_arity, capture_count, cells));
         zeus_value_from_box(out, &box);
     } catch (...) {
         closurePanic("failed to create closure value");

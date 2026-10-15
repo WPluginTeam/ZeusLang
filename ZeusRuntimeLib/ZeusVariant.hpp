@@ -2,9 +2,14 @@
 
 #include <variant>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <unordered_map>
 #include <memory>
+#include <atomic>
+#include <cstddef>
+#include <stdexcept>
+#include <utility>
 
 #include "ZeusType.hpp"
 #include "ZeusReference.hpp"
@@ -15,7 +20,7 @@ namespace ZeusType {
     // 命名参数包装器：在函数调用时,包装参数值和参数名
     struct NamedArg;  // 前向声明
 
-    using UniversalVariant = std::variant<Variant, BigInteger, BigDecimal, bool, char, std::string, LexerType::Value, ClosureHandle, NativeFuncHandle, NativeClosureHandle, ClassHandle, ObjectHandle, NamespaceHandle, ArgInfo, std::shared_ptr<NamedArg>, ModuleProxy, SocketHandle, Bytes, SharedHandle, SharedClassHandle, SharedObjectHandle, LLVMClassHandle, ReferenceHandle>;
+    using UniversalVariant = std::variant<Variant, BigInteger, BigDecimal, bool, char, std::string, LexerType::Value, ClosureHandle, NativeFuncHandle, NativeClosureHandle, ClassHandle, ObjectHandle, NamespaceHandle, ArgInfo, std::shared_ptr<NamedArg>, ModuleProxy, SocketHandle, Bytes, SharedHandle, SharedClassHandle, SharedObjectHandle, LLVMClassHandle, ReferenceHandle, RawBytesRange>;
 
     // 命名参数包装器定义(需要在 UniversalVariant 之后)
     struct NamedArg {
@@ -27,6 +32,7 @@ namespace ZeusType {
     struct FieldDef {
         UniversalVariant defaultValue;
         bool isConst = false;
+        int initializerProtoId = -1;
     };
 
     // 类信息表（运行期注册）
@@ -37,6 +43,15 @@ namespace ZeusType {
         std::string usingThisAlias;
 
         std::unordered_map<std::string, FieldDef> fields;
+        // Source declaration order; runtime construction uses this instead of
+        // iterating the unordered field map.
+        std::vector<std::string> fieldOrder;
+        // Declared fields occupy indexed ZeusValue slots in each VM object.
+        // The map is rebuilt from fieldOrder when class metadata is registered.
+        std::unordered_map<std::string, std::size_t> fieldIndices;
+        std::unordered_map<std::string, std::string> fieldInitializerNames;
+        // Source-annotated field types are runtime contracts for dynamic writes.
+        std::unordered_map<std::string, std::string> explicitFieldTypes;
         std::unordered_map<std::string, int>      staticMethods;
         std::unordered_map<std::string, int>      instanceMethods;
 
@@ -45,15 +60,22 @@ namespace ZeusType {
         std::unordered_map<std::string, int>      operatorMethods;
     };
 
+    class DeclaredFieldBuffer;
+
     // 对象实例（运行期）
     struct ObjectInstance {
         int classId = -1;
         int generation = 0;              // generation 用于检测 slot 复用后的悬空引用
-        std::unordered_map<std::string, UniversalVariant> values;
+        // Declared fields live in a malloc-backed contiguous ZeusValue payload.
+        // Undeclared fields remain in this dynamic extension map.
+        std::shared_ptr<DeclaredFieldBuffer> declaredFields;
+        std::unordered_map<std::string, UniversalVariant> extensionValues;
         std::unordered_map<std::string, uint8_t>          flags; // 0x1 const
 
         int refCount = 1;                // 引用计数（初始为1）
         bool markedForDeletion = false;  // 标记为待删除（用于垃圾回收）
+        bool destructorCalled = false;   // operator[~] 最多调用一次
+        bool finalizing = false;         // 防止析构期间递归进入最终释放
 
         // 增加引用计数
         void retain() { ++refCount; }
@@ -63,11 +85,14 @@ namespace ZeusType {
 
         // 清空对象数据（释放内存）
         void clear() {
-            values.clear();
+            declaredFields.reset();
+            extensionValues.clear();
             flags.clear();
             classId = -1;
             refCount = 0;
             markedForDeletion = true;
+            destructorCalled = false;
+            finalizing = false;
             // 注意: 不重置 generation，在 slot 复用时由分配函数递增
         }
     };
@@ -88,12 +113,99 @@ namespace ZeusType {
     // 延后定义容器数据，使用 UniversalVariant
     struct ObjectData {
         std::unordered_map<std::string, ZeusType::UniversalVariant> data;
-        // 维护插入顺序（只在首次出现 key 时追加；覆盖不改变顺序）
+        // Keeps insertion order while allowing O(1) expected deletion. Deleted
+        // slots remain tombstones until compaction; a reinserted key gets a new slot.
         std::vector<std::string> order;
+        // Views point at the immutable keys owned by `data`; erase the index
+        // before erasing a data key. This avoids a third copy of every key.
+        std::unordered_map<std::string_view, std::size_t> orderPositions;
+        std::size_t deletedOrderCount = 0;
+
+        bool hasOrderKey(const std::string& key) const {
+            return orderPositions.find(std::string_view(key)) != orderPositions.end();
+        }
+
+        bool isLiveOrderEntry(std::size_t position) const {
+            if (position >= order.size()) return false;
+            const auto found = orderPositions.find(std::string_view(order[position]));
+            return found != orderPositions.end() && found->second == position;
+        }
+
+        void appendOrderKey(const std::string& key) {
+            if (hasOrderKey(key)) return;
+            const auto stored = data.find(key);
+            if (stored == data.end()) {
+                throw std::logic_error("ObjectData order key is missing from data");
+            }
+            const std::size_t position = order.size();
+            order.push_back(key);
+            try {
+                const auto inserted = orderPositions.emplace(
+                    std::string_view(stored->first), position);
+                if (!inserted.second) order.pop_back();
+            } catch (...) {
+                order.pop_back();
+                throw;
+            }
+        }
+
+        void setValue(const std::string& key, const UniversalVariant& value) {
+            auto found = data.find(key);
+            if (found != data.end()) {
+                found->second = value;
+                return;
+            }
+
+            auto inserted = data.emplace(key, value);
+            if (!inserted.second) {
+                inserted.first->second = value;
+                return;
+            }
+            try {
+                appendOrderKey(key);
+            } catch (...) {
+                data.erase(inserted.first);
+                throw;
+            }
+        }
+
+        void eraseOrderKey(const std::string& key) {
+            const auto found = orderPositions.find(std::string_view(key));
+            if (found == orderPositions.end()) return;
+            orderPositions.erase(found);
+            ++deletedOrderCount;
+
+            // Compact geometrically: total moved live keys stays linear over a
+            // deletion run, while small dictionaries avoid compaction churn.
+            constexpr std::size_t minimumSlots = 64;
+            if (order.size() < minimumSlots ||
+                deletedOrderCount < orderPositions.size()) {
+                return;
+            }
+
+            std::size_t write = 0;
+            for (std::size_t read = 0; read < order.size(); ++read) {
+                auto current = orderPositions.find(std::string_view(order[read]));
+                if (current == orderPositions.end() || current->second != read) {
+                    continue;
+                }
+                if (write != read) {
+                    order[write] = std::move(order[read]);
+                    current->second = write;
+                }
+                ++write;
+            }
+            order.resize(write);
+            deletedOrderCount = 0;
+        }
+        // Number of VM-owned Object values sharing this mutable storage.
+        std::atomic<std::size_t> valueRefCount{1};
     };
 
     struct ArrayData {
         std::vector<ZeusType::UniversalVariant> data;
+        // Number of VM-owned Array values sharing this mutable storage.
+        std::atomic<std::size_t> valueRefCount{1};
     };
 
     // 包命名空间数据：存储包的导出项映射到全局变量索引

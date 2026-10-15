@@ -164,7 +164,7 @@ namespace IRBinary {
             return prog;
         }
 
-        if (ver != 2 && ver != VERSION) { if (errorMsg) *errorMsg = "Unsupported version"; return prog; }
+        if (ver < 2 || ver > VERSION) { if (errorMsg) *errorMsg = "Unsupported version"; return prog; }
 
         IRMeta meta;
         if (!readString(ifs, meta.compilerName)) { if (errorMsg) *errorMsg = "File too short (compilerName)"; return prog; }
@@ -179,6 +179,8 @@ namespace IRBinary {
         std::vector<SectionEntry> sections;
         std::vector<std::string> symbols;
         std::vector<std::string> globals;
+        SectionEntry metadataSection;
+        bool hasMetadataSection = false;
 
         if (readFooter(ifs, footerCount, tableOffset)) {
             if (readSectionTable(ifs, sections, tableOffset, footerCount)) {
@@ -193,9 +195,17 @@ namespace IRBinary {
                             if (errorMsg) *errorMsg = "Failed to read global names";
                             return {};
                         }
+                    } else if (ent.type == SECTION_INSTRUCTION_METADATA) {
+                        metadataSection = ent;
+                        hasMetadataSection = true;
                     }
                 }
             }
+        }
+
+        if (ver >= 4 && !hasMetadataSection) {
+            if (errorMsg) *errorMsg = "Version 4 IR is missing its instruction metadata section";
+            return {};
         }
 
         if (outGlobalNames) *outGlobalNames = globals;
@@ -236,6 +246,12 @@ namespace IRBinary {
                 chunk.push_back(std::move(instr));
             }
             prog.push_back(std::move(chunk));
+        }
+
+        if (hasMetadataSection && !IRMetadataCodec::readSection(
+                ifs, metadataSection.offset, metadataSection.size, ver, prog)) {
+            if (errorMsg) *errorMsg = "Failed to read IR instruction metadata";
+            return {};
         }
 
         return prog;

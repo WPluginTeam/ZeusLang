@@ -10,7 +10,9 @@
 #include <unordered_set>
 #include "./ZeusParser/LexerParser.hpp"
 #include "./ZeusParser/TreeParser.hpp"
+#include "./ZeusParser/BackendBlockSelector.hpp"
 #include "./ZeusParser/SyntaxValidator.hpp"
+#include "./ZeusParser/InterfaceConformance.hpp"
 #include "./ZeusTyping/TypeChecker.hpp"
 #ifdef ZEUS_DEBUG_FILE_CHANNEL
 #undef ZEUS_DEBUG_FILE_CHANNEL
@@ -18,11 +20,15 @@
 #define ZEUS_DEBUG_FILE_CHANNEL ::ZeusDebug::CH_COMPILE
 #include "./ZeusDebug/Utils.hpp"
 #include "./ZeusIR/IRGenerator.hpp"
+#include "./ZeusIR/IRNilStore.hpp"
 #include "./ZeusIR/IRStaticOperator.hpp"
 #include "./ZeusIR/IRStaticCall.hpp"
+#include "./ZeusIR/IRGenericStatic.hpp"
+#include "./ZeusIR/IRGenericClass.hpp"
 #include "./ZeusIR/IRReferenceValidation.hpp"
 #include "./ZeusIRReader/IRWrite.hpp"
 #include "./ZeusIRReader/IRRead.hpp"
+#include "./ZeusDebug/BreakpointConfig.hpp"
 #include "./ZeusRunner/ZeusVM.hpp"
 #include "./ZeusIR/IRHotspot.hpp"
 
@@ -35,6 +41,7 @@ namespace ZeusCompile {
         std::vector<std::vector<IRType::IRInstr>> program;
         std::vector<std::string> globalNames;
         std::vector<ZeusDiagnostics::Diagnostic> diagnostics;
+        std::vector<ZeusDiagnostics::Diagnostic> warnings;
         bool hasReportedErrors = false;
         bool strictDecl = false; // 记录是否严格模式（影响 VM 行为：禁用 late resolve）
         std::string sourceFilePath; // 源文件路径（用于错误信息）
@@ -84,6 +91,7 @@ namespace ZeusCompile {
         for (auto& chunk : r.program) {
             for (auto& ins : chunk) {
                 if (ins.op != VMOperator::LOAD_VALUE) continue;
+                if (ins.metadata.symbol.kind == IRType::SymbolRefKind::Class) continue;
                 if (ins.args.size() != 1 || !std::holds_alternative<std::string>(ins.args[0])) continue;
 
                 const std::string& name = std::get<std::string>(ins.args[0]);
@@ -127,7 +135,10 @@ namespace ZeusCompile {
         const std::string& src,
         bool strictDecl=false,
         bool enableHotspot=true,
-        const std::string& sourceFilePath={}
+        const std::string& sourceFilePath={},
+        ZeusParser::BackendTarget target = ZeusParser::BackendTarget::VirtualMachine,
+        bool deferUnresolvedGenericClasses = false,
+        const ZeusParser::InterfaceContractRegistry& importedInterfaceContracts = {}
     ) {
         // 注意：源文件信息的清除应在整个编译流程开始前进行（在 Zeus.cpp 中）
         // 这样包编译期间注册的源文件信息不会被清除
@@ -148,18 +159,30 @@ namespace ZeusCompile {
         }
         std::vector<TreeParser::NodeAndBlock> ast = TreeParser::parse(tokens, &r.diagnostics);
         auto t2 = std::chrono::steady_clock::now();
+        ZeusParser::selectBackendBlocks(ast, target, &r.warnings);
         ZeusDiagnostics::append(r.diagnostics, ZeusParser::validateParsedSyntax(ast));
+        if (r.diagnostics.empty()) {
+            ZeusDiagnostics::append(
+                r.diagnostics,
+                ZeusParser::validateInterfaceConformance(
+                    ast, importedInterfaceContracts));
+        }
         if (!r.diagnostics.empty()) {
             r.lexTimeMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
             r.parseTimeMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
             return r;
         }
         ZeusTypeInfer::TypeChecker returnTypeChecker(ast);
-        returnTypeChecker.check(ZeusTypeInfer::TypeCheckOptions::llvm());
+        returnTypeChecker.check(target == ZeusParser::BackendTarget::LLVM
+            ? ZeusTypeInfer::TypeCheckOptions::llvm()
+            : ZeusTypeInfer::TypeCheckOptions::dynamic());
         bool hasCallArgumentTypeErrors = false;
         for (const auto& diagnostic : returnTypeChecker.getDiagnostics()) {
-            if (diagnostic.code !=
-                ZeusTypeInfer::TypeCheckDiagnosticCode::CallArgumentTypeMismatch) {
+            if (diagnostic.code != ZeusTypeInfer::TypeCheckDiagnosticCode::CallArgumentTypeMismatch &&
+                diagnostic.code != ZeusTypeInfer::TypeCheckDiagnosticCode::GenericTypeArgumentMismatch &&
+                diagnostic.code != ZeusTypeInfer::TypeCheckDiagnosticCode::GenericTypeArgumentUnknown &&
+                diagnostic.code != ZeusTypeInfer::TypeCheckDiagnosticCode::GenericTypeParameterNameInvalid &&
+                diagnostic.code != ZeusTypeInfer::TypeCheckDiagnosticCode::GenericTypeParameterUnsupportedContext) {
                 continue;
             }
             hasCallArgumentTypeErrors = true;
@@ -180,6 +203,8 @@ namespace ZeusCompile {
         irGen.strictDecl = strictDecl;
         irGen.inferredFunctionReturnTypes =
             returnTypeChecker.getInferredFunctionReturnTypes();
+        irGen.inferredBindingTypesByNode =
+            returnTypeChecker.getInferredBindingTypesByNode();
         const size_t reportCountBeforeIR = ZeusDiagnostics::reportedCount;
         irGen.parse(ast);
         r.hasReportedErrors = ZeusDiagnostics::reportedCount > reportCountBeforeIR;
@@ -216,8 +241,58 @@ namespace ZeusCompile {
         }
 
         if (!r.program.empty()) {
+            IRNilStore::eliminateOverwrittenInitializers(r.program);
             // 类型已明确的类运算符复用函数签名/DirectCall 元信息；VM 忽略该标注。
             // 普通静态函数调用补齐目标签名；VM 继续执行原 CALL_CLOSURE，LLVM 使用 typed call。
+            IRStaticCall::annotate(r.program);
+            IRStaticOperator::annotate(r.program);
+            std::string genericClassError;
+            int genericClassErrorLine = 0;
+            if (!IRGenericClass::specialize(
+                    r.program, genericClassError, genericClassErrorLine,
+                    deferUnresolvedGenericClasses)) {
+                r.diagnostics.push_back({
+                    target == ZeusParser::BackendTarget::LLVM ? "llvm" : "type",
+                    genericClassError,
+                    genericClassErrorLine,
+                    0
+                });
+                r.hasReportedErrors = true;
+                r.program.clear();
+                return r;
+            }
+            std::string genericStaticError;
+            int genericStaticErrorLine = 0;
+            if (!IRGenericStatic::specialize(
+                    r.program,
+                    target == ZeusParser::BackendTarget::LLVM,
+                    genericStaticError,
+                    genericStaticErrorLine)) {
+                r.diagnostics.push_back({
+                    target == ZeusParser::BackendTarget::LLVM ? "llvm" : "type",
+                    genericStaticError,
+                    genericStaticErrorLine,
+                    0
+                });
+                r.hasReportedErrors = true;
+                r.program.clear();
+                return r;
+            }
+            genericClassError.clear();
+            genericClassErrorLine = 0;
+            if (!IRGenericClass::specialize(
+                    r.program, genericClassError, genericClassErrorLine,
+                    deferUnresolvedGenericClasses)) {
+                r.diagnostics.push_back({
+                    target == ZeusParser::BackendTarget::LLVM ? "llvm" : "type",
+                    genericClassError,
+                    genericClassErrorLine,
+                    0
+                });
+                r.hasReportedErrors = true;
+                r.program.clear();
+                return r;
+            }
             IRStaticCall::annotate(r.program);
             IRStaticOperator::annotate(r.program);
             indexifyLateResolves(r);
@@ -265,8 +340,18 @@ namespace ZeusCompile {
         return r;
     }
 
-    inline void run(const Result& r) {
+    inline bool run(
+        const Result& r,
+        const ZeusDebug::BreakpointConfig& breakpointConfig = {}
+    ) {
         VM vm;
+        vm.configureBreakpoints(breakpointConfig, r.sourceFilePath);
+
+        std::string registrationError;
+        if (!vm.registerPrototypes(r.program, &registrationError)) {
+            std::cerr << "[VM] " << registrationError << std::endl;
+            return false;
+        }
         
         // 注意：不在这里清除源文件信息，因为编译期间已经注册了所有包的源文件
         // 清除操作已移至 compile() 开始处
@@ -279,24 +364,17 @@ namespace ZeusCompile {
             VMException::setSourceCode(r.sourceCode);
         }
         
-        // 设置全局指针以便builtin函数访问classes、objects和sockets
         ZeusBuiltins::g_vmClasses = &vm.classes;
         ZeusBuiltins::g_vmObjects = &vm.objects;
-        ZeusBuiltins::g_vmSockets = &vm.sockets;
         ZeusBuiltins::g_vmClosuresSize = &vm.closuresCount;
         ZeusBuiltins::g_vmGetFreeClosureSlotsSize = [&vm]() -> size_t { return vm.freeClosureSlots.size(); };
         ZeusBuiltins::g_vmFreeObjectSlots = &vm.freeObjectSlots;
         ZeusBuiltins::g_vmFreeObjectSlotsSize = &vm.freeObjectSlotsCount;
         ZeusBuiltins::g_vmGlobalNames = &vm.globalNames;
         ZeusBuiltins::g_vmPrototypesSize = &vm.prototypesCount;
-        ZeusBuiltins::g_vmFreeSocketSlots = &vm.freeSocketSlots;
-        ZeusBuiltins::g_vmFreeSocketSlotsSize = &vm.freeSocketSlotsCount;
-        ZeusBuiltins::g_vmSocketsMutex = &vm.socketsMutex;
         ZeusBuiltins::g_vmDumpClosureDetails = [&vm]() -> std::string { return vm.dumpClosureDetails(); };
         g_vmClassesPtr = &vm.classes;
         g_vmObjectsPtr = &vm.objects;
-
-        vm.registerPrototypes(r.program);
 
         // 设置主程序到线程管理器（用于多线程支持）
         ZeusThread::getThreadManager().setMainProgram(r.program, r.globalNames);
@@ -336,7 +414,8 @@ namespace ZeusCompile {
             ZeusThread::SharedObjectSystem shared;
             
             // 原有共享
-            shared.classes = &vm.classes;
+             shared.classes = &vm.classes;
+             shared.typeImplementations = &vm.typeImplementations;
             shared.objects = &vm.objects;
             shared.mutex = &vm.objectsMutex;
             shared.freeObjectSlots = &vm.freeObjectSlots;  // GC: 共享空闲槽位
@@ -356,11 +435,11 @@ namespace ZeusCompile {
         
         // 设置 retain/release 函数解析器（用于线程参数的引用计数管理）
         ZeusThread::setGlobalRetainReleaseResolver([&vm]() -> std::tuple<
-            std::function<void(int)>, std::function<void(int)>, 
+            std::function<void(ZeusType::ObjectHandle)>, std::function<void(ZeusType::ObjectHandle)>,
             std::function<void(int)>, std::function<void(int)>> {
             return std::make_tuple(
-                [&vm](int objId) { vm.retainObject(objId); },      // retainObject
-                [&vm](int objId) { vm.releaseObject(objId); },     // releaseObject
+                [&vm](ZeusType::ObjectHandle handle) { vm.retainObject(handle); },      // retainObject
+                [&vm](ZeusType::ObjectHandle handle) { vm.releaseObject(handle); },     // releaseObject
                 [&vm](int cloId) { vm.retainClosure(cloId); },     // retainClosure
                 [&vm](int cloId) { vm.releaseClosure(cloId); }     // releaseClosure
             );
@@ -408,6 +487,7 @@ namespace ZeusCompile {
             double execMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
             std::cout << "[time] execute total = " << execMs << " ms" << std::endl;
         }
+        return vm.vmstat == ZeusType::VMStatus::Running;
     }
 
     inline void printAll() {
@@ -493,25 +573,24 @@ __builtin_print("use --debug-channels=IR/PARSE to see IR details");
         ZEUS_DEBUG_PRINT("------------------ Run ------------------");
 
         VM vm;
+
+        std::string registrationError;
+        if (!vm.registerPrototypes(optimizedChunks, &registrationError)) {
+            std::cerr << "[VM] " << registrationError << std::endl;
+            return false;
+        }
         
-        // 设置全局指针以便builtin函数访问classes、objects和sockets
         ZeusBuiltins::g_vmClasses = &vm.classes;
         ZeusBuiltins::g_vmObjects = &vm.objects;
-        ZeusBuiltins::g_vmSockets = &vm.sockets;
         ZeusBuiltins::g_vmClosuresSize = &vm.closuresCount;
         ZeusBuiltins::g_vmGetFreeClosureSlotsSize = [&vm]() -> size_t { return vm.freeClosureSlots.size(); };
         ZeusBuiltins::g_vmFreeObjectSlots = &vm.freeObjectSlots;
         ZeusBuiltins::g_vmFreeObjectSlotsSize = &vm.freeObjectSlotsCount;
         ZeusBuiltins::g_vmGlobalNames = &vm.globalNames;
         ZeusBuiltins::g_vmPrototypesSize = &vm.prototypesCount;
-        ZeusBuiltins::g_vmFreeSocketSlots = &vm.freeSocketSlots;
-        ZeusBuiltins::g_vmFreeSocketSlotsSize = &vm.freeSocketSlotsCount;
-        ZeusBuiltins::g_vmSocketsMutex = &vm.socketsMutex;
         g_vmClassesPtr = &vm.classes;
         g_vmObjectsPtr = &vm.objects;
         
-        vm.registerPrototypes(optimizedChunks);
-
         if (!irGen.globalNamesByIndex.empty())
             vm.setGlobalNames(irGen.globalNamesByIndex);
 

@@ -6,42 +6,13 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "../ZeusBuiltins/BuiltinRegistry.hpp"
 
 namespace IRScope {
 
     // 单个作用域：记录本作用域内标识符到局部槽位的映射
-    struct Scope {
-        std::unordered_map<std::string, int> nameToLocal;
-    };
-
-    // 使用 C++17 inline 变量，避免头文件多重定义问题
-    inline std::vector<Scope> scopeStack;          // 作用域栈
-    inline int localCount = 0;                     // 非函数上下文的简易局部计数（可选）
-    inline std::unordered_map<std::string, int> globals; // 全局：名字 -> 全局槽位
-    inline std::unordered_set<std::string> sharedVars;   // 共享变量名集合（进程级共享堆）
-    inline std::unordered_set<std::string> functionNames; // 当前编译单元可直接识别的函数名
-
-    inline std::unordered_map<std::string, int> importedGlobalSlots;
-    inline std::unordered_map<std::string, std::string> importedFunctionTargets;
-    inline std::unordered_set<std::string> importedFunctionNames;
-
-    inline void clearImportedSymbols() {
-        importedGlobalSlots.clear();
-        importedFunctionTargets.clear();
-        importedFunctionNames.clear();
-    }
-
-    inline bool isFunctionName(const std::string& name) {
-        return functionNames.find(name) != functionNames.end();
-    }
-
-    inline bool isStaticFunctionName(const std::string& name) {
-        return isFunctionName(name) || importedFunctionNames.find(name) != importedFunctionNames.end();
-    }
-
-    // ---- 闭包/函数环境 ----
     enum Kind {
         UNDEFINED,
         LOCAL,
@@ -61,7 +32,44 @@ namespace IRScope {
         bool isConst;
     };
 
-    inline std::unordered_map<std::string, RefSymbolMeta> refSymbols; // 名字 -> 引用元信息（仅当前函数/作用域生命周期内有效）
+    struct Scope {
+        std::unordered_map<std::string, int> nameToLocal;
+        std::unordered_map<std::string, bool> nameToRawBytesRange;
+        std::unordered_map<std::string, RefSymbolMeta> refSymbols;
+        int functionDepth = 0;
+    };
+
+    // 使用 C++17 inline 变量，避免头文件多重定义问题
+    inline std::vector<Scope> scopeStack;          // 作用域栈
+    inline int localCount = 0;                     // 非函数上下文的简易局部计数（可选）
+    inline std::unordered_map<std::string, int> globals; // 全局：名字 -> 全局槽位
+    inline std::unordered_map<std::string, bool> globalRawBytesRange;
+    inline std::unordered_set<std::string> sharedVars;   // 共享变量名集合（进程级共享堆）
+    inline std::unordered_map<std::string, bool> sharedRawBytesRange;
+    inline std::unordered_set<std::string> functionNames; // 当前编译单元可直接识别的函数名
+
+    inline std::unordered_map<std::string, int> importedGlobalSlots;
+    inline std::unordered_map<std::string, std::string> importedFunctionTargets;
+    inline std::unordered_set<std::string> importedFunctionNames;
+    inline std::unordered_map<std::string, int> nativeFunctionHandles;
+
+    inline void clearImportedSymbols() {
+        importedGlobalSlots.clear();
+        importedFunctionTargets.clear();
+        importedFunctionNames.clear();
+    }
+
+    inline bool isFunctionName(const std::string& name) {
+        return functionNames.find(name) != functionNames.end();
+    }
+
+    inline bool isStaticFunctionName(const std::string& name) {
+        return isFunctionName(name) || importedFunctionNames.find(name) != importedFunctionNames.end();
+    }
+
+    // ---- 闭包/函数环境 ----
+
+
 
     // 控制是否允许隐式捕获（默认允许）。在严格模式下应禁止自动在内层函数引用外层局部时生成捕获链。
     inline bool allowImplicitCapture = true;
@@ -81,6 +89,29 @@ namespace IRScope {
     
     // 全局using original模式栈，用于支持嵌套和范围限制
     inline std::vector<OriginalTypeMode> originalModeStack = {OriginalTypeMode()}; // 初始化为默认状态
+
+    // `using LLVM` enables the LLVM-only expression intrinsics while IR is
+    // generated for the enclosed source block.
+    inline std::vector<bool> llvmModeStack = { false };
+
+    inline bool isUsingLLVM() {
+        return !llvmModeStack.empty() && llvmModeStack.back();
+    }
+
+    inline void pushLLVMMode() {
+        llvmModeStack.push_back(true);
+    }
+
+    inline void popLLVMMode() {
+        if (llvmModeStack.size() > 1) llvmModeStack.pop_back();
+    }
+
+    struct LLVMModeGuard {
+        LLVMModeGuard() { pushLLVMMode(); }
+        LLVMModeGuard(const LLVMModeGuard&) = delete;
+        LLVMModeGuard& operator=(const LLVMModeGuard&) = delete;
+        ~LLVMModeGuard() { popLLVMMode(); }
+    };
     
     // 便捷方法：获取当前的using original模式
     inline OriginalTypeMode getCurrentOriginalMode() {
@@ -144,7 +175,7 @@ namespace IRScope {
     
     // 包编译上下文：用于解决包内调用内置函数的命名冲突
     inline bool isCompilingPackage = false;  // 是否正在编译包
-    inline std::string currentPackageName = "";  // 当前包名（如 "ZeusBuiltins.cppfunctions"）
+    inline std::string currentPackageName = "";  // 当前包名（如 "zeus.cppfunctions"）
 
     inline std::string functionTargetName(const std::string& name) {
         if (isFunctionName(name) && isCompilingPackage && !currentPackageName.empty()) {
@@ -173,6 +204,36 @@ namespace IRScope {
 
     inline std::vector<FuncEnv> funcStack;            // 函数环境栈（外层在前、内层在后）
 
+    struct ReceiverContext {
+        std::string ownerType;
+        std::string alias;
+    };
+    inline std::vector<ReceiverContext> receiverContextStack;
+
+    inline void pushReceiverContext(std::string ownerType, std::string alias) {
+        receiverContextStack.push_back(
+            ReceiverContext{std::move(ownerType), std::move(alias)});
+    }
+
+    inline void popReceiverContext() {
+        if (!receiverContextStack.empty()) receiverContextStack.pop_back();
+    }
+
+    inline const ReceiverContext* currentReceiverContext() {
+        return receiverContextStack.empty() ? nullptr : &receiverContextStack.back();
+    }
+
+    class ScopedReceiverContext {
+    public:
+        ScopedReceiverContext(std::string ownerType, std::string alias) {
+            pushReceiverContext(std::move(ownerType), std::move(alias));
+        }
+        ~ScopedReceiverContext() { popReceiverContext(); }
+
+        ScopedReceiverContext(const ScopedReceiverContext&) = delete;
+        ScopedReceiverContext& operator=(const ScopedReceiverContext&) = delete;
+    };
+
     // Capture-all state (used to force-capture unresolved outer refs for [&] / [] )
     inline int captureAllDepth = 0;
     inline void pushCaptureAll(bool enabled) { if (enabled) ++captureAllDepth; }
@@ -180,8 +241,9 @@ namespace IRScope {
     inline bool isCaptureAllActive() { return captureAllDepth > 0; }
 
     // 进入/离开作用域
-    inline void pushScope () {
-        scopeStack.push_back(Scope());
+    inline void pushScope() {
+        scopeStack.emplace_back();
+        scopeStack.back().functionDepth = static_cast<int>(funcStack.size());
     }
 
     inline void popScope () {
@@ -191,10 +253,14 @@ namespace IRScope {
     // 进入/离开函数环境
     inline void beginFunction() {
         funcStack.push_back(FuncEnv{});
+        // Reference bindings such as `for (...) [const &index]` belong to the
+        // active function and must be resolvable at its function depth.
+        pushScope();
     }
 
     inline FuncEnv endFunction() {
         FuncEnv env = funcStack.back();
+        popScope();
         funcStack.pop_back();
         return env;
     }
@@ -276,6 +342,19 @@ namespace IRScope {
 
     // 从最近作用域开始解析标识符；未命中则查全局；都没有则返回 UNDEFINED
     inline SymRef resolve(const std::string& name) {
+        auto findActiveRef = [&]() -> const RefSymbolMeta* {
+            const int activeDepth = static_cast<int>(funcStack.size());
+            for (int si = static_cast<int>(scopeStack.size()) - 1; si >= 0; --si) {
+                const Scope& scope = scopeStack[si];
+                if (scope.functionDepth != activeDepth) continue;
+                auto it = scope.refSymbols.find(name);
+                if (it != scope.refSymbols.end()) return &it->second;
+            }
+            return nullptr;
+        };
+        auto makeRef = [](const RefSymbolMeta& meta) {
+            SymRef r; r.kind = meta.kind; r.index = meta.baseSlot; r.isConst = meta.isConst; r.aux = meta.indexSlot; return r;
+        };
         // 若在函数内：先解析词法局部和捕获，再查全局符号。
         if (!funcStack.empty()) {
             // 1) 当前函数的局部
@@ -288,6 +367,8 @@ namespace IRScope {
             // 2) 当前函数已有 upvalue
             auto itU = cur.upvalues.find(name);
             if (itU != cur.upvalues.end()) return SymRef{ Kind::UPVALUE, itU->second };
+
+            if (const auto* ref = findActiveRef()) return makeRef(*ref);
 
             // 如果禁止隐式捕获，则不要向外层查找并建立捕获链，直接跳到全局/外层作用域查找
             if (!allowImplicitCapture) {
@@ -372,6 +453,8 @@ namespace IRScope {
                     return SymRef{ Kind::LOCAL, it->second };
                 }
             }
+
+            if (const auto* ref = findActiveRef()) return makeRef(*ref);
         }
         
         _resolve_globals:
@@ -381,20 +464,54 @@ namespace IRScope {
         }
 
         // 4) 全局
-        auto g = globals.find(name);
-        if (g != globals.end()) return SymRef{ Kind::GLOBAL, g->second };
-
         auto imported = importedGlobalSlots.find(name);
         if (imported != importedGlobalSlots.end()) return SymRef{ Kind::GLOBAL, imported->second };
 
-        // 引用绑定使用独立符号表；先让显式局部、共享变量和全局变量完成解析。
-        auto rit = refSymbols.find(name);
-        if (rit != refSymbols.end()) {
-            const auto &meta = rit->second;
-            SymRef r; r.kind = meta.kind; r.index = meta.baseSlot; r.isConst = meta.isConst; r.aux = meta.indexSlot; return r;
-        }
+        auto g = globals.find(name);
+        if (g != globals.end()) return SymRef{ Kind::GLOBAL, g->second };
 
+        // 引用绑定使用独立符号表；先让显式局部、共享变量和全局变量完成解析。
         return SymRef{ Kind::UNDEFINED, -1 };
+    }
+
+    inline void setRawBytesRangeBinding(const std::string& name, bool isRawBytesRange) {
+        const SymRef symbol = resolve(name);
+        if (symbol.kind == Kind::LOCAL) {
+            for (auto scope = scopeStack.rbegin(); scope != scopeStack.rend(); ++scope) {
+                const auto local = scope->nameToLocal.find(name);
+                if (local != scope->nameToLocal.end() && local->second == symbol.index) {
+                    scope->nameToRawBytesRange[name] = isRawBytesRange;
+                    return;
+                }
+            }
+            return;
+        }
+        if (symbol.kind == Kind::GLOBAL) {
+            globalRawBytesRange[name] = isRawBytesRange;
+        } else if (symbol.kind == Kind::SHARED) {
+            sharedRawBytesRange[name] = isRawBytesRange;
+        }
+    }
+
+    inline bool isRawBytesRangeBinding(const std::string& name) {
+        const SymRef symbol = resolve(name);
+        if (symbol.kind == Kind::GLOBAL) {
+            const auto found = globalRawBytesRange.find(name);
+            return found != globalRawBytesRange.end() && found->second;
+        }
+        if (symbol.kind == Kind::SHARED) {
+            const auto found = sharedRawBytesRange.find(name);
+            return found != sharedRawBytesRange.end() && found->second;
+        }
+        if (symbol.kind == Kind::LOCAL || symbol.kind == Kind::UPVALUE) {
+            for (auto scope = scopeStack.rbegin(); scope != scopeStack.rend(); ++scope) {
+                const auto local = scope->nameToLocal.find(name);
+                if (local == scope->nameToLocal.end()) continue;
+                const auto rawRange = scope->nameToRawBytesRange.find(name);
+                return rawRange != scope->nameToRawBytesRange.end() && rawRange->second;
+            }
+        }
+        return false;
     }
 
     // 标记/取消标记当前函数的某个本地变量为 const
@@ -451,22 +568,26 @@ namespace IRScope {
 
     inline void registerListElemRef(const std::string& name, int listSlot, int indexSlot, bool isConst) {
         RefSymbolMeta m{ Kind::LIST_ELEM_REF, listSlot, indexSlot, isConst };
-        refSymbols[name] = m;
+        if (scopeStack.empty()) pushScope();
+        scopeStack.back().refSymbols[name] = m;
     }
 
     inline void registerCountIndexRef(const std::string& name, int indexSlot, bool isConst) {
         RefSymbolMeta m{ Kind::COUNT_INDEX_REF, indexSlot, -1, isConst };
-        refSymbols[name] = m;
+        if (scopeStack.empty()) pushScope();
+        scopeStack.back().refSymbols[name] = m;
     }
 
     inline void registerDictKeyRef(const std::string& name, int keySlot) {
         RefSymbolMeta m{ Kind::DICT_KEY_REF, keySlot, -1, true }; // key 永远视为 const
-        refSymbols[name] = m;
+        if (scopeStack.empty()) pushScope();
+        scopeStack.back().refSymbols[name] = m;
     }
 
     inline void registerDictValueRef(const std::string& name, int dictSlot, int keyTempSlot, bool isConst) {
         RefSymbolMeta m{ Kind::DICT_VAL_REF, dictSlot, keyTempSlot, isConst };
-        refSymbols[name] = m;
+        if (scopeStack.empty()) pushScope();
+        scopeStack.back().refSymbols[name] = m;
     }
 
     

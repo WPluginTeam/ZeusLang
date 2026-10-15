@@ -432,10 +432,6 @@ cppfunctions.array.array_pop();
 ...
 ```
 
-## Zeus 对象
-在 Zeus 中有很多内置对象如 Array, Dict, String, Socket, Thread 等等。
-这些对象都定义在 ZeusBuiltins 包中，无需通过 import 导入，直接使用即可。
-
 ## Zeus 调试方法
 
 ```
@@ -448,6 +444,78 @@ Zeus
 ```
 
 cl /O2 /MD /DNDEBUG /utf-8 /std:c++17 Zeus.cpp /Fe:Zeus.exe
+
+## 类型检查
+
+Zeus 会为每个值进行类型推断，当无法推断时会使用内部类型 ZeusValue 表示泛化类型，在 Zeus 语言中体现为动态类型。
+
+可以使用```@static```修饰符强制函数静态编译检查，检查函数参数和返回值类型是否正确。
+
+```
+@static
+func add(a: int, b: int) -> int {
+    return a+b;
+}
+```
+
+## 静态泛化
+
+Zeus 提供静态泛化能力，允许用户在编译期进行类型推导和函数重载。
+
+```
+import ZeusBuiltins.mem [&];
+
+class testptr {
+    using &this;
+    let ptr: int = 0;
+
+    func init () {
+        this.ptr = mem.malloc(8);
+    }
+
+    @type(T) func save(obj: T) {
+        @faddr(this.ptr) = obj;
+    }
+}
+
+let a = new testptr();
+a.save(123);
+```
+
+可以使用```@type(T, ...)```来定义泛型函数，T为类型参数，在编译期会根据调用时传入的参数类型进行类型推导。
+
+
+## 地址操作
+Zeus 为 VM 和 LLVM 都提供了直接的地址操作来保障实现的灵活性和性能。
+
+```
+let a = "123";
+let addr: int = @addr(a);
+```
+可以使用```@addr```获取变量的地址，返回值为int类型。
+
+```
+print(@faddr(addr)->string);
+```
+上述例子是错误的未定义操作。
+
+使用```@faddr```可以通过地址获取变量的值，返回值为变量的类型。注意，```@addr```返回的是原始地址，而可以通过```@reveal```获取桥接地址，reveal获取的是 LLVM 编译中的特有结构地址，例如 string 的存储结构为:
+```
+8Byte 原始指针 + 8Byte 长度
+```
+所以可以通过
+```
+let a = "123";
+let addr: int = @reveal(a);
+
+print(@faddr(addr)->string); // 123
+print(@faddr(addr+8)->int); // 3
+```
+reveal 暴露 Zeus 内置结构来获取一些信息，具体参照 docs Zeus 内置结构。
+
+> 注：@reveal、@addr、@faddr 等操作除去与 malloc 互动的操作以外，其他都是不安全的操作，可能会破坏字符串缓存池等 Zeus 程序运行时，使用时请谨慎。
+
+
 
 [FOR LLM]实现过程中注意：
 

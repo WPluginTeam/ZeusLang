@@ -1,0 +1,5 @@
+import interface_collision_a;
+import interface_collision_b;
+
+class AmbiguousImplementation [SharedContract] {
+}

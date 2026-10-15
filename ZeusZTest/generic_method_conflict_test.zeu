@@ -1,0 +1,7 @@
+class GenericPair {
+    using &this;
+    @type(T)
+    func same(left: T, right: T) -> T { return left; }
+}
+let pair: GenericPair = new GenericPair();
+print(pair.same(1, "different"));

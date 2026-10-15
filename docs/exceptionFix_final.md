@@ -24,7 +24,7 @@
 throw "string"   → caught: string ✓
 throw 123        → caught: 123 ✓
 throw true       → caught: true ✓
-throw null       → caught: <RuntimeError> ✓
+throw nil       → caught: <RuntimeError> ✓
 ```
 
 ### 问题 2: catch 块无参数时异常未被捕获 ✓

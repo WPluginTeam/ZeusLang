@@ -25,7 +25,7 @@ if errorlevel 1 (
 )
 
 set "ZEUS_RT=%ZEUS_ROOT%\ZeusRuntimeLib"
-set "ZEUS_SOURCES=%ZEUS_ROOT%\ZeusZTest\gc_collector_test.cpp %ZEUS_RT%\ZeusABI.cpp %ZEUS_RT%\ZeusClosureABI.cpp %ZEUS_RT%\ZeusGCABI.cpp %ZEUS_RT%\ZeusNativeABI.cpp %ZEUS_RT%\ZeusStringNativeABI.cpp %ZEUS_RT%\ZeusDynamicABI.cpp %ZEUS_RT%\ZeusDynamicBinaryABI.cpp %ZEUS_RT%\ZeusDynamicMemberABI.cpp %ZEUS_RT%\ZeusRangeCheckABI.cpp"
+set "ZEUS_SOURCES=%ZEUS_ROOT%\ZeusZTest\gc_collector_test.cpp %ZEUS_RT%\ZeusABI.cpp %ZEUS_RT%\ZeusClosureABI.cpp %ZEUS_RT%\ZeusGCABI.cpp %ZEUS_RT%\ZeusNativeABI.cpp %ZEUS_RT%\ZeusStringNativeABI.cpp %ZEUS_RT%\ZeusDynamicABI.cpp %ZEUS_RT%\ZeusDynamicBinaryABI.cpp %ZEUS_RT%\ZeusDynamicMemberABI.cpp %ZEUS_RT%\ZeusRangeCheckABI.cpp %ZEUS_RT%\ZeusLValueABI.cpp %ZEUS_RT%\ZeusMemoryABI.cpp %ZEUS_RT%\ZeusObjectLifetime.cpp %ZEUS_RT%\ZeusSocketABI.cpp %ZEUS_RT%\ZeusThreadABI.cpp %ZEUS_RT%\ZeusRuntimeDebug.cpp"
 
 cl.exe /nologo /MT /O2 /EHsc /utf-8 /std:c++17 /I "%ZEUS_RT%" %ZEUS_SOURCES% /Fe:"%ZEUS_WORK%\gc_collector_test.exe" /Fo:"%ZEUS_WORK%\\" /link /NOLOGO
 if errorlevel 1 (

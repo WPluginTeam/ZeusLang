@@ -1,0 +1,180 @@
+using original;
+
+@native("zeus_value_dict_delete")
+decl func __dict_delete(value, key);
+
+@native("zeus_value_dict_contains_key_i64")
+decl func __dict_has_key(data, key) -> int;
+
+@native("zeus_value_dict_get_normalized")
+decl func __dict_get_normalized(data, key);
+
+@native("zeus_value_dict_store_normalized")
+decl func __dict_store_normalized(data, key, value);
+
+@native("zeus_value_dict_delete_normalized")
+decl func __dict_delete_normalized(data, key);
+
+@native("zeus_value_dict_clone")
+decl func __dict_clone(value);
+
+@native("zeus_value_dict_length_i64")
+decl func __dict_length_i64(value: dict) -> int;
+
+@native("zeus_value_has_dynamic_member")
+decl func __dict_has_to_string(value, method);
+
+func __dict_normalize_string(key: string) -> string {
+    return key;
+}
+
+func __dict_normalize_key(key) {
+    if (type(key) == "string") return key;
+    return __builtin_str(key);
+}
+
+func __dict_text(value) -> string {
+    if (type(value) == "string") return value;
+    if (__dict_has_to_string(value, "toString")) {
+        let text = value.toString();
+        if (type(text) == "string") return text;
+        return __builtin_str(text);
+    }
+    return __builtin_str(value);
+}
+
+func __dict_format(data, keys, index: int, count: int) -> string {
+    if (index >= count) return "";
+    let key = keys[index];
+    let value = data[key];
+    if (index + 1 >= count) {
+        return __dict_text(key) + ": " + __dict_text(value);
+    }
+    return __dict_text(key) + ": " + __dict_text(value) + ", " +
+        __dict_format(data, keys, index + 1, count);
+}
+
+class Dict {
+    using &this;
+
+    let data = {};
+
+    func init() {
+        this.data = {};
+    }
+
+    inline func set(key, value) {
+        let normalizedKey = __dict_normalize_key(key);
+        using LLVM {
+            __dict_store_normalized(this.data, normalizedKey, value);
+        }
+        using VM {
+            this.data[normalizedKey] = value;
+        }
+        return this;
+    }
+
+    inline func get(key) {
+        let normalizedKey = __dict_normalize_key(key);
+        using LLVM {
+            return __dict_get_normalized(this.data, normalizedKey);
+        }
+        using VM {
+            return this.data[normalizedKey];
+        }
+    }
+
+    inline func hasKey(key) {
+        let targetKey = __dict_normalize_key(key);
+        using LLVM {
+            return __dict_has_key(this.data, targetKey) != 0;
+        }
+        using VM {
+            for (this.data) [&entryKey: &entryValue] {
+                if (__dict_normalize_key(entryKey) == targetKey) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    func keys() {
+        let result = [];
+        for (this.data) [&entryKey: &entryValue] {
+            __array_push(result, entryKey);
+        }
+        return result;
+    }
+
+    func values() {
+        let result = [];
+        for (this.data) [&entryKey: &entryValue] {
+            __array_push(result, entryValue);
+        }
+        return result;
+    }
+
+    func items() {
+        let result = [];
+        for (this.data) [&entryKey: &entryValue] {
+            __array_push(result, [entryKey, entryValue]);
+        }
+        return result;
+    }
+
+    @no_safepoint inline func length() -> int {
+        using LLVM {
+            return __dict_length_i64(this.data);
+        }
+        using VM {
+            return len(this.keys());
+        }
+    }
+
+    inline func deleteKey(key) {
+        let targetKey = __dict_normalize_key(key);
+        using LLVM {
+            __dict_delete_normalized(this.data, targetKey);
+        }
+        using VM {
+            __dict_delete(this.data, targetKey);
+        }
+        return this;
+    }
+
+    func clear() {
+        this.data = {};
+        return this;
+    }
+
+    func copy() {
+        let result = new Dict();
+        result.data = __dict_clone(this.data);
+        return result;
+    }
+
+    func toString() -> string {
+        return "{" + __dict_format(this.data, this.keys(), 0, this.length()) + "}";
+    }
+
+    inline func operator[[]=](key, value) {
+        let normalizedKey = __dict_normalize_key(key);
+        using LLVM {
+            __dict_store_normalized(this.data, normalizedKey, value);
+        }
+        using VM {
+            this.data[normalizedKey] = value;
+        }
+    }
+
+    inline func operator[[]](key) {
+        let normalizedKey = __dict_normalize_key(key);
+        using LLVM {
+            return __dict_get_normalized(this.data, normalizedKey);
+        }
+        using VM {
+            return this.data[normalizedKey];
+        }
+    }
+}

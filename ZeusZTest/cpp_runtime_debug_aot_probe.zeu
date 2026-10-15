@@ -1,0 +1,42 @@
+@native("zeus_runtime_debug_dump")
+decl func runtime_debug_dump() -> int;
+
+var destroyed = 0;
+
+class DebugProbe {
+    using &this;
+    let value = 0;
+
+    func init(input: int) {
+        this.value = input;
+    }
+
+    func operator[~]() {
+        destroyed = destroyed + 1;
+    }
+}
+
+func conditional(count: int) {
+    if (count > 0) {
+        let branchItem = new DebugProbe(count);
+    }
+}
+
+func churn(count: int) {
+    let i = 0;
+    for (true) {
+        if (i >= count) {
+            break;
+        }
+        let values = [i, i + 1, i + 2];
+        let mapping = {"value": values};
+        let item = new DebugProbe(i);
+        delete item;
+        i = i + 1;
+    }
+}
+
+conditional(1);
+churn(20);
+print("destroyed =", destroyed);
+runtime_debug_dump();

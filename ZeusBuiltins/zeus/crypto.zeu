@@ -1,0 +1,56 @@
+// Small cryptographic primitives used by protocol modules.
+
+import zeus.exception;
+
+@native("zeus_crypto_random_bytes")
+decl func __crypto_random_bytes(length: int) -> bytes;
+
+@native("zeus_crypto_sha1")
+decl func __crypto_sha1(data: bytes) -> bytes;
+
+@native("zeus_crypto_base64_encode")
+decl func __crypto_base64_encode(data: bytes) -> string;
+
+@native("zeus_crypto_base64_decode")
+decl func __crypto_base64_decode(data: string) -> bytes;
+
+@native("zeus_protocol_last_error")
+decl func __protocol_last_error() -> string;
+
+func __crypto_check_native_error() {
+    let message = __protocol_last_error();
+    if (message.length() > 0) throw new Exception(message);
+}
+
+class Crypto {
+    func static randomBytes(length: int) -> bytes {
+        if (length < 0 or length > 65536) {
+            throw new Exception("random byte request must be between 0 and 65536");
+        }
+        let result = __crypto_random_bytes(length);
+        __crypto_check_native_error();
+        return result;
+    }
+
+    func static sha1(data: bytes) -> bytes {
+        let result = __crypto_sha1(data);
+        __crypto_check_native_error();
+        return result;
+    }
+
+    func static base64Encode(data: bytes) -> string {
+        let result = __crypto_base64_encode(data);
+        __crypto_check_native_error();
+        return result;
+    }
+
+    func static base64Decode(data: string) -> bytes {
+        let result = __crypto_base64_decode(data);
+        __crypto_check_native_error();
+        return result;
+    }
+
+    func static checkNativeError() {
+        return __crypto_check_native_error();
+    }
+}

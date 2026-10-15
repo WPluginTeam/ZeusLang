@@ -1,4 +1,4 @@
-import ZeusBuiltins.thread [&];
+import zeus.thread [&];
 let lock = new thread.Lock();
 print("Lock first acquisition:");
 print(lock.tryAcquire());

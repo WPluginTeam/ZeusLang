@@ -1,0 +1,52 @@
+// Temporary stage-1 measurement: raw @faddr access cost with the dynamic
+// checks skipped (outside any try) versus active (inside a try).
+// Not a correctness test; safe to delete.
+
+@native("zeus_bytes_get")
+decl func benchAbiGet(data: bytes, index: int) -> int;
+
+func rawGet(data: bytes, index: int) -> int {
+    let dataAddress = @reveal(data);
+    let length = @faddr(dataAddress - 8, 8) -> int;
+    if (index < 0) index = length;
+    return @faddr(dataAddress + index, 1) -> int;
+}
+
+func runRawGet(data: bytes, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + rawGet(data, index);
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func measureOutside(data: bytes, index: int, iterations: int) -> int {
+    let start = __time_perf_counter_ns();
+    let checksum = runRawGet(data, index, iterations);
+    if (checksum == 12345) print("unreachable");
+    return __time_perf_counter_ns() - start;
+}
+
+func measureInside(data: bytes, index: int, iterations: int) -> int {
+    try {
+        let start = __time_perf_counter_ns();
+        let checksum = runRawGet(data, index, iterations);
+        if (checksum == 12345) print("unreachable");
+        return __time_perf_counter_ns() - start;
+    } catch (&error) {
+        return -1;
+    }
+}
+
+let data = bytes(4096);
+let index = 173;
+let iterations = 100000;
+runRawGet(data, index, 1000);
+for (0 .. 5) [sample] {
+    let outside = measureOutside(data, index, iterations);
+    let inside = measureInside(data, index, iterations);
+    print("GATE_COST_NS", sample, outside, inside);
+}

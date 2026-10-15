@@ -1,0 +1,9 @@
+interface Map {
+    decl func get(key: string) -> string;
+}
+
+class HashMap [Map] {
+    func get(key: int) -> int {
+        return key;
+    }
+}

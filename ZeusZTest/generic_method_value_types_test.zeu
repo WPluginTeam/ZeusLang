@@ -1,0 +1,18 @@
+class GenericValues {
+    using &this;
+    @type(T)
+    func echo(value: T) -> T { return value; }
+}
+class GenericItem {
+    var value: int = 4;
+}
+let owner: GenericValues = new GenericValues();
+let data = owner.echo(b"AB");
+print(data[0]);
+let items = owner.echo([1, 2]);
+print(items[1]);
+let mapping = owner.echo({"x": 3});
+print(mapping["x"]);
+let item: GenericItem = owner.echo(new GenericItem());
+print(item.value);
+print(owner.echo(true));

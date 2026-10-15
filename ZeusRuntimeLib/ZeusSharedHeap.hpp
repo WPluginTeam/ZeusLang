@@ -12,8 +12,10 @@
 #include <memory>
 #include <string>
 #include <stdexcept>
+#include <utility>
 
 #include "ZeusVariant.hpp"
+#include "ZeusValueSlot.hpp"
 
 namespace ZeusShared {
 
@@ -22,7 +24,7 @@ namespace ZeusShared {
     // 例如：__heap_lock("x"); x = x + 1; __heap_unlock("x");
     struct SharedCell {
 
-        ZeusType::UniversalVariant value;
+        ZeusValueSlot value;
         mutable std::recursive_mutex mutex;  // 递归互斥锁
         std::atomic<int> refCount{1};
         std::atomic<int> lockCount{0};       // 锁定计数（用于调试）
@@ -39,13 +41,25 @@ namespace ZeusShared {
         // 读取（加锁，返回拷贝）
         ZeusType::UniversalVariant read() const {
             std::lock_guard<std::recursive_mutex> lock(mutex);
-            return value;
+            return value.read();
         }
 
         // 写入（加锁）
         void write(const ZeusType::UniversalVariant& v) {
             std::lock_guard<std::recursive_mutex> lock(mutex);
-            value = v;
+            value.write(v);
+        }
+
+        template <typename Function>
+        void withValue(Function&& function) {
+            std::lock_guard<std::recursive_mutex> lock(mutex);
+            value.withVariant(std::forward<Function>(function));
+        }
+
+        template <typename Function>
+        void withValue(Function&& function) const {
+            std::lock_guard<std::recursive_mutex> lock(mutex);
+            value.withVariant(std::forward<Function>(function));
         }
 
         // 获取锁（用于复合操作）
@@ -92,18 +106,28 @@ namespace ZeusShared {
             const std::string& name,
             const ZeusType::UniversalVariant& initVal
         ) {
-            std::lock_guard<std::recursive_mutex> lock(heapMutex);
-
-            auto it = namedVars.find(name);
-
-            if (it != namedVars.end()) {
-                return it->second;
+            {
+                std::lock_guard<std::recursive_mutex> lock(heapMutex);
+                const auto it = namedVars.find(name);
+                if (it != namedVars.end()) {
+                    return it->second;
+                }
             }
 
+            // ZeusValueSlot construction enters the GC graph lock. Build the
+            // candidate without holding heapMutex so the heap lock never nests
+            // outside the graph lock.
             auto cell = std::make_shared<SharedCell>(initVal);
-            cell->generation = nextGeneration++;
-            if (nextGeneration == 0) nextGeneration = 1;
-            namedVars[name] = cell;
+            {
+                std::lock_guard<std::recursive_mutex> lock(heapMutex);
+                const auto it = namedVars.find(name);
+                if (it != namedVars.end()) {
+                    return it->second;
+                }
+                cell->generation = nextGeneration++;
+                if (nextGeneration == 0) nextGeneration = 1;
+                namedVars.emplace(name, cell);
+            }
             return cell;
         }
 
@@ -127,6 +151,24 @@ namespace ZeusShared {
             const auto it = namedVars.find(name);
             if (it == namedVars.end() || it->second->generation != generation) return nullptr;
             return it->second;
+        }
+
+        std::shared_ptr<SharedCell> findByAddress(
+            const SharedCell* address,
+            uint64_t generation = 0,
+            std::string* name = nullptr
+        ) {
+            if (!address) return nullptr;
+            std::lock_guard<std::recursive_mutex> lock(heapMutex);
+            for (const auto& entry : namedVars) {
+                if (entry.second.get() != address ||
+                    (generation != 0 && entry.second->generation != generation)) {
+                    continue;
+                }
+                if (name) *name = entry.first;
+                return entry.second;
+            }
+            return nullptr;
         }
 
         // Remove the named source slot. Existing in-flight users may still
@@ -184,6 +226,9 @@ namespace ZeusShared {
 
     // 全局单例访问
     inline GlobalHeap& getGlobalHeap() {
+        // Initialize the collector first so this heap (and its rooted slots)
+        // is destroyed before the collector at process shutdown.
+        (void)ZeusGC::graphMutex();
         static GlobalHeap heap;
         return heap;
     }

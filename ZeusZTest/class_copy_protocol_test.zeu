@@ -1,0 +1,62 @@
+import zeus.static;
+
+class Item {
+    using &this;
+    var value: int = 0;
+    func init(value: int) { this.value = value; }
+}
+class Custom {
+    using &this;
+    var value: int = 0;
+    func init(value: int) { this.value = value; }
+    func operator[@=]() -> Custom {
+        let result = new Custom(this.value + 1);
+        return result;
+    }
+}
+class Shared {
+    using &this;
+    var value: int = 0;
+    func init(value: int) { this.value = value; }
+    func operator[@=]() -> &Shared { return this; }
+}
+class Returned {
+    using &this;
+    var value: int = 0;
+    func init(value: int) { this.value = value; }
+    func operator[@=]() -> Returned { return this; }
+}
+let a = new Item(10);
+let b = a;
+b.value = 20;
+if (a.value != 10 or b.value != 20) throw "default copy aliases source";
+b = a;
+b.value = 30;
+if (a.value != 10 or b.value != 30) throw "copy assignment aliases source";
+b = b;
+if (b.value != 30) throw "self assignment failed";
+let custom = new Custom(4);
+let copied = custom;
+if (custom.value != 4 or copied.value != 5) throw "copy hook not adopted exactly once";
+let sharedValue = new Shared(8);
+let alias = sharedValue;
+alias.value = 9;
+if (sharedValue.value != 9) throw "reference hook lost alias";
+let returned = new Returned(7);
+let returnedCopy = returned;
+returnedCopy.value = 12;
+if (returned.value != 7) throw "return this copy recursed or aliased";
+let array = new StaticArray<int>(4);
+array.append(10);
+array.append(11);
+let arrayCopy = array;
+arrayCopy[0] = 99;
+arrayCopy.append(12);
+if (array[0] != 10 or array.length() != 2 or arrayCopy[0] != 99 or arrayCopy.length() != 3) throw "array copy shares storage";
+let dict = new StaticDict(8);
+dict.set(1,10);
+dict.set(9,20);
+let dictCopy = dict;
+dictCopy.set(1,30);
+if (dict[1] != 10 or dictCopy[1] != 30 or dictCopy[9] != 20) throw "dict copy shares storage";
+print("CLASS_COPY_PROTOCOL_PASS");

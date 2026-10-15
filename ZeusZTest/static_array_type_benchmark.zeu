@@ -1,0 +1,217 @@
+import zeus.static;
+
+@no_safepoint
+func readBuiltinInt(values: Array, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + values[index];
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+@no_safepoint
+func readStaticInt(values: StaticArray<int>, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + values[index];
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+@no_safepoint
+func readBuiltinBool(values: Array, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        if (values[index]) checksum = checksum + 1;
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+@no_safepoint
+func readStaticBool(values: StaticArray<bool>, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        if (values[index]) checksum = checksum + 1;
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+@no_safepoint
+func readBuiltinStringLength(values: Array, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + values[index].length();
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+@no_safepoint
+func readStaticStringLength(values: StaticArray<string>, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + values[index].length();
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+@no_safepoint
+func readBuiltinBytesLength(values: Array, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + values[index].length();
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+@no_safepoint
+func readStaticBytesLength(values: StaticArray<bytes>, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + values[index].length();
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func makeStaticInts() -> StaticArray<int> {
+    let values = new StaticArray<int>(4);
+    values.append(3);
+    values.append(5);
+    values.append(7);
+    values.append(11);
+    return values;
+}
+
+func makeStaticBools() -> StaticArray<bool> {
+    let values = new StaticArray<bool>(4);
+    values.append(true);
+    values.append(false);
+    values.append(true);
+    values.append(true);
+    return values;
+}
+
+func makeStaticStrings() -> StaticArray<string> {
+    let values = new StaticArray<string>(4);
+    values.append("alpha");
+    values.append("bravo");
+    values.append("charlie");
+    values.append("delta");
+    return values;
+}
+
+func makeStaticBytes() -> StaticArray<bytes> {
+    let values = new StaticArray<bytes>(4);
+    values.append(b"A");
+    values.append(b"BC");
+    values.append(b"DEF");
+    values.append(b"GHIJ");
+    return values;
+}
+
+let builtinInts = [3, 5, 7, 11];
+let staticInts = makeStaticInts();
+
+let builtinBools = [true, false, true, true];
+let staticBools = makeStaticBools();
+
+let builtinStrings = ["alpha", "bravo", "charlie", "delta"];
+let staticStrings = makeStaticStrings();
+
+let builtinBytes = [b"A", b"BC", b"DEF", b"GHIJ"];
+let staticBytes = makeStaticBytes();
+
+let selectedIndex = 2;
+var iterations = 0;
+var rounds = 0;
+using LLVM {
+    iterations = 250000;
+    rounds = 5;
+}
+using VM {
+    iterations = 5000;
+    rounds = 1;
+}
+
+if (readBuiltinInt(builtinInts, selectedIndex, 100) !=
+    readStaticInt(staticInts, selectedIndex, 100) or
+    readBuiltinBool(builtinBools, selectedIndex, 100) !=
+    readStaticBool(staticBools, selectedIndex, 100) or
+    readBuiltinStringLength(builtinStrings, selectedIndex, 100) !=
+    readStaticStringLength(staticStrings, selectedIndex, 100) or
+    readBuiltinBytesLength(builtinBytes, selectedIndex, 100) !=
+    readStaticBytesLength(staticBytes, selectedIndex, 100)) {
+    throw "StaticArray type benchmark checksum setup failed";
+}
+
+var round = 0;
+for (true) {
+    if (round == rounds) break;
+
+    let builtinIntStart = __time_perf_counter_ns();
+    let builtinIntChecksum = readBuiltinInt(builtinInts, selectedIndex, iterations);
+    let builtinIntElapsed = __time_perf_counter_ns() - builtinIntStart;
+    let staticIntStart = __time_perf_counter_ns();
+    let staticIntChecksum = readStaticInt(staticInts, selectedIndex, iterations);
+    let staticIntElapsed = __time_perf_counter_ns() - staticIntStart;
+    if (builtinIntChecksum != staticIntChecksum) throw "int checksum mismatch";
+    print("INT_BUILTIN_NS", round, builtinIntElapsed, builtinIntChecksum);
+    print("INT_STATIC_NS", round, staticIntElapsed, staticIntChecksum);
+
+    let builtinBoolStart = __time_perf_counter_ns();
+    let builtinBoolChecksum = readBuiltinBool(builtinBools, selectedIndex, iterations);
+    let builtinBoolElapsed = __time_perf_counter_ns() - builtinBoolStart;
+    let staticBoolStart = __time_perf_counter_ns();
+    let staticBoolChecksum = readStaticBool(staticBools, selectedIndex, iterations);
+    let staticBoolElapsed = __time_perf_counter_ns() - staticBoolStart;
+    if (builtinBoolChecksum != staticBoolChecksum) throw "bool checksum mismatch";
+    print("BOOL_BUILTIN_NS", round, builtinBoolElapsed, builtinBoolChecksum);
+    print("BOOL_STATIC_NS", round, staticBoolElapsed, staticBoolChecksum);
+
+    let builtinStringStart = __time_perf_counter_ns();
+    let builtinStringChecksum = readBuiltinStringLength(builtinStrings, selectedIndex, iterations);
+    let builtinStringElapsed = __time_perf_counter_ns() - builtinStringStart;
+    let staticStringStart = __time_perf_counter_ns();
+    let staticStringChecksum = readStaticStringLength(staticStrings, selectedIndex, iterations);
+    let staticStringElapsed = __time_perf_counter_ns() - staticStringStart;
+    if (builtinStringChecksum != staticStringChecksum) throw "string checksum mismatch";
+    print("STRING_LENGTH_BUILTIN_NS", round, builtinStringElapsed, builtinStringChecksum);
+    print("STRING_LENGTH_STATIC_NS", round, staticStringElapsed, staticStringChecksum);
+
+    let builtinBytesStart = __time_perf_counter_ns();
+    let builtinBytesChecksum = readBuiltinBytesLength(builtinBytes, selectedIndex, iterations);
+    let builtinBytesElapsed = __time_perf_counter_ns() - builtinBytesStart;
+    let staticBytesStart = __time_perf_counter_ns();
+    let staticBytesChecksum = readStaticBytesLength(staticBytes, selectedIndex, iterations);
+    let staticBytesElapsed = __time_perf_counter_ns() - staticBytesStart;
+    if (builtinBytesChecksum != staticBytesChecksum) throw "bytes checksum mismatch";
+    print("BYTES_LENGTH_BUILTIN_NS", round, builtinBytesElapsed, builtinBytesChecksum);
+    print("BYTES_LENGTH_STATIC_NS", round, staticBytesElapsed, staticBytesChecksum);
+
+    round = round + 1;
+}
+
+delete staticInts, staticBools, staticStrings, staticBytes;

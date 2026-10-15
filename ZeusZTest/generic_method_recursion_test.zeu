@@ -1,0 +1,11 @@
+impl int {
+    using &this;
+    @type(T)
+    func descend(value: T, depth: int) -> T {
+        if (depth == 0) return value;
+        return this.descend(value, depth - 1);
+    }
+}
+let receiver = 1;
+print(receiver.descend(123, 2000));
+print(receiver.descend("recursive", 2000));

@@ -1,0 +1,23 @@
+import zeus.thread;
+import zeus.byte;
+
+func threadReadBytes() {
+    let value = bytes("abc");
+    print("thread-byte-length", value.length());
+}
+
+func main() {
+    let worker = new Thread(threadReadBytes);
+    worker.start();
+    worker.join();
+    delete worker;
+
+    let pool = new ThreadPool(1);
+    pool.submit(threadReadBytes);
+    pool.start();
+    pool.shutdown(true);
+    delete pool;
+    print("THREAD_IMPL_DISPATCH_TEST_PASS");
+}
+
+main();

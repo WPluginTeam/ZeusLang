@@ -5,6 +5,7 @@
 
 #include "core.hpp"
 #include "array.hpp"  // for getArrayPtr
+#include "../../ZeusRuntimeLib/ZeusGC.hpp"
 
 namespace ZeusBuiltins {
 
@@ -99,27 +100,47 @@ namespace ZeusBuiltins {
         // 从数组对象创建字节数组 (通过ObjectHandle - Zeus Array类)
         if (const ZeusType::ObjectHandle* ohp = std::get_if<ZeusType::ObjectHandle>(&arg)) {
             if (g_vmObjects && ohp->id >= 0 && ohp->id < (int)g_vmObjects->size()) {
+                const auto hasObjectField = [](const ZeusType::ObjectInstance& object,
+                                               const std::string& name) {
+                    if (g_vmClasses && object.classId >= 0 &&
+                        object.classId < static_cast<int>(g_vmClasses->size())) {
+                        return ZeusType::objectHasField(
+                            object, (*g_vmClasses)[object.classId], name);
+                    }
+                    return object.extensionValues.find(name) != object.extensionValues.end();
+                };
+                const auto readObjectField = [](const ZeusType::ObjectInstance& object,
+                                                const std::string& name) {
+                    if (g_vmClasses && object.classId >= 0 &&
+                        object.classId < static_cast<int>(g_vmClasses->size())) {
+                        return ZeusType::readObjectField(
+                            object, (*g_vmClasses)[object.classId], name);
+                    }
+                    const auto field = object.extensionValues.find(name);
+                    if (field == object.extensionValues.end()) {
+                        throw std::out_of_range("object field not found: " + name);
+                    }
+                    return field->second;
+                };
                 const auto& obj = (*g_vmObjects)[ohp->id];
-                
+
                 // 检查是否有data属性(Array类的内部数组)
-                auto it = obj.values.find("data");
-                if (it != obj.values.end()) {
-                    const auto& dataVar = it->second;
-                    
+                if (hasObjectField(obj, "data")) {
+                    const auto dataVar = readObjectField(obj, "data");
+
                     // data是一个原生dict，使用ObjectHandle访问
                     if (const ZeusType::ObjectHandle* dataOhp = std::get_if<ZeusType::ObjectHandle>(&dataVar)) {
                         if (dataOhp->id >= 0 && dataOhp->id < (int)g_vmObjects->size()) {
                             const auto& dataObj = (*g_vmObjects)[dataOhp->id];
-                            
                             ZeusType::Bytes bytes;
                             // 遍历所有属性，按数字索引顺序读取
                             for (int i = 0; ; ++i) {
-                                auto itemIt = dataObj.values.find(std::to_string(i));
-                                if (itemIt == dataObj.values.end()) break;
-                                
-                                const auto& itemVar = itemIt->second;
+                                const std::string indexName = std::to_string(i);
+                                if (!hasObjectField(dataObj, indexName)) break;
+
+                                const auto itemVar = readObjectField(dataObj, indexName);
                                 int value = 0;
-                                
+
                                 if (const ZeusType::BigInteger* ip = std::get_if<ZeusType::BigInteger>(&itemVar)) {
                                     value = ZeusVMUtils::bigIntegerToInt(*ip);
                                 } else if (const LexerType::Value* vp = std::get_if<LexerType::Value>(&itemVar)) {
@@ -127,7 +148,7 @@ namespace ZeusBuiltins {
                                         value = ZeusVMUtils::bigIntegerToInt(std::get<ZeusType::BigInteger>(vp->data));
                                     }
                                 }
-                                
+
                                 if (value < 0 || value > 255) throw std::runtime_error("byte value must be 0-255");
                                 bytes.data.push_back(static_cast<uint8_t>(value));
                             }
@@ -259,6 +280,7 @@ namespace ZeusBuiltins {
 
     // __bytes_to_list(bytes): 将字节数组转换为整数列表
     inline ZeusType::UniversalVariant builtin_bytes_to_list(const std::vector<ZeusType::UniversalVariant>& args) {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         if (args.size() != 1) throw std::runtime_error("__bytes_to_list expects 1 argument");
 
         const ZeusType::Bytes* bytes = getBytesValue(args[0]);
@@ -266,7 +288,7 @@ namespace ZeusBuiltins {
         if (!bytes) throw std::runtime_error("__bytes_to_list: argument must be bytes");
 
         ZeusType::Array result;
-        result.impl = std::make_shared<ZeusType::ArrayData>();
+        result.impl = ZeusGC::makeArrayData();
 
         for (uint8_t byte : bytes->data) {
             result.impl->data.push_back(ZeusType::UniversalVariant(ZeusType::BigInteger(byte)));

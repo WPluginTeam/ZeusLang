@@ -1,0 +1,22 @@
+func runDeletePressure() {
+    let dict = new Dict();
+    let keys = [];
+    var index = 0;
+    for (true) {
+        if (index >= 20000) break;
+        let key = __builtin_str(index);
+        dict.set(key, index);
+        __array_push(keys, key);
+        index = index + 1;
+    }
+    index = 0;
+    let started = __time_perf_counter_ns();
+    for (true) {
+        if (index >= 20000) break;
+        dict.deleteKey(keys[index]);
+        index = index + 1;
+    }
+    print("DICT_DELETE_PRECOMPUTED_20K_NS", __time_perf_counter_ns() - started, dict.length());
+}
+
+runDeletePressure();

@@ -1,0 +1,72 @@
+func dynamicValueLoop(seed) {
+    let value = seed;
+    for (0..4) [const &i] {
+        value = value * 10 + i;
+    }
+    return value;
+}
+
+func dynamicParameterLoop(value) {
+    for (0..4) [const &i] {
+        value = value * 10 + i;
+    }
+    return value;
+}
+
+func nilToIntLoop() {
+    let value = nil;
+    value = 0;
+    for (0..4) [const &i] {
+        value = value * 10 + i;
+    }
+    return value;
+}
+
+func breakOnlyDynamicWrite(stopEarly) {
+    let exitValue = nil;
+    for (0..4) [const &i] {
+        if (stopEarly) {
+            if (i == 1) {
+                exitValue = "broke";
+                break;
+            }
+        }
+    }
+    return exitValue;
+}
+
+func staticLoopSum() -> int {
+    let total = 0;
+    for (0..4) [const &i] {
+        total = total + i;
+    }
+    return total;
+}
+
+func main() {
+    if (dynamicValueLoop(0) != 123) {
+        throw new Exception("dynamic loop value was not preserved");
+    }
+    if (dynamicParameterLoop(0) != 123) {
+        throw new Exception("dynamic parameter loop value was not preserved");
+    }
+    if (nilToIntLoop() != 123) {
+        throw new Exception("nil-to-int loop value was not preserved");
+    }
+    if (breakOnlyDynamicWrite(true) != "broke") {
+        throw new Exception("break-only dynamic write was not preserved");
+    }
+    if (breakOnlyDynamicWrite(false) != nil) {
+        throw new Exception("zero-break dynamic write changed the initial value");
+    }
+    if (staticLoopSum() != 6) {
+        throw new Exception("static integer loop result mismatch");
+    }
+    print("PASS dynamic loop slot stability");
+    print("PASS dynamic parameter loop slot stability");
+    print("PASS nil-to-int loop slot stability");
+    print("PASS CFG loop membership for break-only write");
+    print("PASS static integer loop");
+}
+
+main();

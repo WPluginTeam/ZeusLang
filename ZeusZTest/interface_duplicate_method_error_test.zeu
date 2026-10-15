@@ -1,0 +1,19 @@
+interface IntConverter {
+    decl func convert(value: int) -> int;
+}
+
+class DuplicateConverter [IntConverter] {
+    func convert(value: int) -> int {
+        return value;
+    }
+
+    func convert(value: string) -> string {
+        return value;
+    }
+}
+
+impl DuplicateConverter {
+    func convert(value: int) -> int {
+        return value;
+    }
+}

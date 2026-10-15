@@ -1,0 +1,28 @@
+impl int {
+    using &this;
+    @type(T)
+    func update(value: T, &target: int) { target = 99; }
+}
+class GenericReferences {
+    using &this;
+    @type(T)
+    func update(value: T, &target: int) { target = 88; }
+    @type(T)
+    func static updateStatic(value: T, &target: int) { target = 77; }
+}
+let receiver=1;
+let target=0;
+receiver.update(12,target);
+print(target);
+let owner: GenericReferences = new GenericReferences();
+owner.update("class",target);
+print(target);
+GenericReferences.updateStatic(true,target);
+print(target);
+func localReference() -> int {
+    let receiver=1;
+    let target=0;
+    receiver.update("local",target);
+    return target;
+}
+print(localReference());

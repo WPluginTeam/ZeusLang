@@ -37,10 +37,14 @@ namespace TreeParser {
         std::string ownerClassName; // 如果是类方法,这里记录所属类名
         std::vector<std::string> paramNames; // 函数形参名
         std::vector<std::string> paramTypeNames; // 函数形参类型名,空表示未声明
+        std::vector<std::string> typeParameters; // 编译期类型参数（@type(T)）
+        std::vector<std::string> classTypeParameters; // enclosing generic class parameters
         std::string returnTypeName; // 函数返回类型名,空表示未声明
         std::vector<std::string> decorators; // 函数名前的 @decorator 修饰符
         std::string nativeSymbol; // @native("symbol") 声明的链接符号
         bool isCompileTimeStatic = false; // @static 要求 LLVM 静态检查通过
+        bool isInline = false; // inline asks LLVM to inline calls to this definition
+        bool isNoSafepoint = false; // @no_safepoint disables compiler-inserted polls in LLVM lowering
         
         // 默认参数和变长参数支持
         std::vector<std::vector<Token>> paramDefaults; // 参数默认值表达式(与paramNames对应,空表示无默认值)
@@ -49,6 +53,8 @@ namespace TreeParser {
         
         bool isStaticMethod = false; // whether the function declaration included 'static' modifier
         std::string className;
+        std::vector<std::string> implementedInterfaces;
+        std::string interfaceName;
         std::string implTypeName; // 如果是类块,这里记录类名
         bool isSharedClass = false; // 是否是 shared class（存储到共享堆）
         std::vector<std::string> captureVars;
@@ -192,10 +198,14 @@ namespace TreeParser {
             return node;
         };
 
+        auto leadingFunctionPrefix = [&]() {
+            if (stack.empty()) return ZeusParser::FunctionPrefixSyntax{};
+            return ZeusParser::parseFunctionPrefix(stack);
+        };
+
         auto leadingDecorators = [&]() {
             std::vector<std::string> decorators;
-            if (stack.empty()) return decorators;
-            const auto prefix = ZeusParser::parseFunctionDecoratorPrefix(stack);
+            const auto prefix = leadingFunctionPrefix();
             if (!prefix.valid) return decorators;
             for (const auto& decorator : prefix.decorators) {
                 decorators.push_back(decorator.name);
@@ -203,8 +213,24 @@ namespace TreeParser {
             return decorators;
         };
 
+        auto leadingTypeParameters = [&]() {
+            std::vector<std::string> parameters;
+            const auto prefix = leadingFunctionPrefix();
+            if (!prefix.valid) return parameters;
+            for (const auto& decorator : prefix.decorators) {
+                if (decorator.name != "type") continue;
+                if (!decorator.typeArguments.empty()) {
+                    parameters.insert(parameters.end(),
+                        decorator.typeArguments.begin(), decorator.typeArguments.end());
+                } else if (decorator.hasArgument && decorator.argumentIsIdentifier) {
+                    parameters.push_back(decorator.argument);
+                }
+            }
+            return parameters;
+        };
+
         auto leadingNativeSymbol = [&]() {
-            const auto prefix = ZeusParser::parseFunctionDecoratorPrefix(stack);
+            const auto prefix = ZeusParser::parseFunctionPrefix(stack);
             if (!prefix.valid) return std::string();
             for (const auto& decorator : prefix.decorators) {
                 if (decorator.name == "native" && decorator.hasArgument) {
@@ -311,15 +337,32 @@ namespace TreeParser {
                     }
                 }
 
-                if (kwStr == "func" && !leadingDecorators().empty()) {
-                    const auto prefix = ZeusParser::parseFunctionDecoratorPrefix(stack);
-                    size_t afterDecorators = prefix.nextToken;
-                    if (afterDecorators < stack.size() &&
-                        std::holds_alternative<LexerType::Keyword>(stack[afterDecorators]) &&
-                        std::get<LexerType::Keyword>(stack[afterDecorators]).name == "decl") {
-                        ndtype = NodeType::FUNC_FWD_DECL_STMT;
-                    } else {
-                        ndtype = NodeType::FUNC_DECL_STMT;
+                if (kwStr == "func") {
+                    const auto prefix = leadingFunctionPrefix();
+                    if (prefix.valid && (!prefix.decorators.empty() || prefix.isInline)) {
+                        const size_t afterPrefix = prefix.nextToken;
+                        if (afterPrefix < stack.size() &&
+                            std::holds_alternative<LexerType::Keyword>(stack[afterPrefix]) &&
+                            std::get<LexerType::Keyword>(stack[afterPrefix]).name == "decl") {
+                            ndtype = NodeType::FUNC_FWD_DECL_STMT;
+                        } else {
+                            ndtype = NodeType::FUNC_DECL_STMT;
+                        }
+                    }
+                }
+
+                if (kwStr == "class") {
+                    const auto prefix = leadingFunctionPrefix();
+                    if (prefix.valid && !prefix.decorators.empty()) {
+                        size_t declarationIndex = prefix.nextToken;
+                        if (declarationIndex < stack.size() &&
+                            std::holds_alternative<LexerType::Keyword>(stack[declarationIndex]) &&
+                            std::get<LexerType::Keyword>(stack[declarationIndex]).name == "shared") {
+                            ++declarationIndex;
+                        }
+                        if (declarationIndex == stack.size()) {
+                            ndtype = NodeType::CLASS_DECL_STMT;
+                        }
                     }
                 }
 
@@ -330,6 +373,7 @@ namespace TreeParser {
                     if (kwStr == "for")  ndtype = NodeType::FOR_DECL_STMT;
                     if (kwStr == "func") ndtype = NodeType::FUNC_DECL_STMT;
                     if (kwStr == "class") ndtype = NodeType::CLASS_DECL_STMT;
+                    if (kwStr == "interface") ndtype = NodeType::INTERFACE_DECL_STMT;
                     if (kwStr == "impl") ndtype = NodeType::IMPL_DECL_STMT;
                     if (kwStr == "try")  ndtype = NodeType::TRY_DECL_STMT;
                     if (kwStr == "throw") ndtype = NodeType::THROW_STMT;
@@ -356,6 +400,8 @@ namespace TreeParser {
                         // Need to check pattern: 'using original {' (block scope) vs 'using original;' (global scope)
                         bool nextIsAmpersand = false;
                         bool nextIsOpenBrace = false;
+                        bool nextIsLLVM = false;
+                        bool nextIsVM = false;
                         if (__i + 1 < tokens.size()) {
                             auto& nextTok = tokens[__i + 1];
                             if (std::holds_alternative<LexerType::Operator>(nextTok)) {
@@ -367,6 +413,18 @@ namespace TreeParser {
                             } else if (std::holds_alternative<LexerType::Keyword>(nextTok)) {
                                 // Check for 'using original {' pattern
                                 auto& kwNext = std::get<LexerType::Keyword>(nextTok);
+                                if ((kwNext.name == "LLVM" || kwNext.name == "llvm") &&
+                                    __i + 2 < tokens.size() &&
+                                    std::holds_alternative<LexerType::Operator>(tokens[__i + 2]) &&
+                                    std::get<LexerType::Operator>(tokens[__i + 2]).symbol == "{") {
+                                    nextIsLLVM = true;
+                                }
+                                if ((kwNext.name == "VM" || kwNext.name == "vm") &&
+                                    __i + 2 < tokens.size() &&
+                                    std::holds_alternative<LexerType::Operator>(tokens[__i + 2]) &&
+                                    std::get<LexerType::Operator>(tokens[__i + 2]).symbol == "{") {
+                                    nextIsVM = true;
+                                }
                                 if (kwNext.name == "original" && __i + 2 < tokens.size()) {
                                     auto& tokenAfter = tokens[__i + 2];
                                     if (std::holds_alternative<LexerType::Operator>(tokenAfter)) {
@@ -379,7 +437,11 @@ namespace TreeParser {
                         }
                         if (!nextIsAmpersand) {
                             // Check if it's 'using original {' (block scope) or 'using original;' (global scope)
-                            if (nextIsOpenBrace) {
+                            if (nextIsLLVM) {
+                                ndtype = NodeType::USING_LLVM_BLOCK_STMT;
+                            } else if (nextIsVM) {
+                                ndtype = NodeType::USING_VM_BLOCK_STMT;
+                            } else if (nextIsOpenBrace) {
                                 ndtype = NodeType::USING_BLOCK_STMT;
                             } else {
                             ndtype = NodeType::USING_STMT;
@@ -445,9 +507,20 @@ namespace TreeParser {
                         }
                     }
 
-                    // 若当前处于 CLASS 代码块内，并且该语句形如 `using &alias;`，则记录到类的默认实例别名中
+                    if (!blockStack.empty() &&
+                        blockStack.back()->type == CodeBlockType::INTERFACE &&
+                        stack.size() >= 2 &&
+                        std::holds_alternative<LexerType::Keyword>(stack[0]) &&
+                        std::get<LexerType::Keyword>(stack[0]).name == "decl" &&
+                        std::holds_alternative<LexerType::Keyword>(stack[1]) &&
+                        std::get<LexerType::Keyword>(stack[1]).name == "func") {
+                        finalType = NodeType::INTERFACE_METHOD_DECL_STMT;
+                    }
+
+                    // 若当前处于 CLASS/INTERFACE 代码块内，记录默认接收者别名。
                     if (!blockStack.empty() &&
                         (blockStack.back()->type == CodeBlockType::CLASS ||
+                         blockStack.back()->type == CodeBlockType::INTERFACE ||
                          blockStack.back()->type == CodeBlockType::IMPL) &&
                         finalType == NodeType::EXP_STMT) {
                         if (stack.size() >= 3
@@ -462,7 +535,9 @@ namespace TreeParser {
                                 const char* ownerName =
                                     blockStack.back()->type == CodeBlockType::CLASS
                                         ? blockStack.back()->className.c_str()
-                                        : blockStack.back()->implTypeName.c_str();
+                                        : blockStack.back()->type == CodeBlockType::INTERFACE
+                                            ? blockStack.back()->interfaceName.c_str()
+                                            : blockStack.back()->implTypeName.c_str();
                                 ZEUS_DEBUG_PRINT(
                                     "[Parser   ] '%s' captured using &%s",
                                     ownerName, aliasName.c_str());
@@ -619,6 +694,13 @@ namespace TreeParser {
                                     }
                                     
                                     if (prevIfBlock && prevIfBlock->type == CodeBlockType::IF) {
+                                        // Keep an empty then-block in the AST. The IR generator
+                                        // uses the final child to identify an else branch.
+                                        if (prevIfBlock->nodes.empty()) {
+                                            auto emptyThenBlock = makeBlock();
+                                            emptyThenBlock->type = CodeBlockType::BLOCK;
+                                            prevIfBlock->nodes.push_back(std::move(emptyThenBlock));
+                                        }
                                         prevIfBlock->nodes.push_back(std::move(newBlock));
                                         auto &elseVariant = prevIfBlock->nodes.back();
                                         ptr = std::get<std::unique_ptr<CodeBlock>>(elseVariant).get();
@@ -739,10 +821,13 @@ namespace TreeParser {
                         case NodeType::FOR_DECL_STMT:  cdbType = CodeBlockType::FOR;  break;
                         case NodeType::FUNC_DECL_STMT: cdbType = CodeBlockType::FUNC; break;
                         case NodeType::CLASS_DECL_STMT: cdbType = CodeBlockType::CLASS; break;
+                        case NodeType::INTERFACE_DECL_STMT: cdbType = CodeBlockType::INTERFACE; break;
                         case NodeType::IMPL_DECL_STMT: cdbType = CodeBlockType::IMPL; break;
                         case NodeType::TRY_DECL_STMT:  cdbType = CodeBlockType::TRY;  break;
                         case NodeType::WITH_DECL_STMT: cdbType = CodeBlockType::WITH; break;
                         case NodeType::USING_BLOCK_STMT: cdbType = CodeBlockType::USING; break;
+                        case NodeType::USING_LLVM_BLOCK_STMT: cdbType = CodeBlockType::USING_LLVM; break;
+                        case NodeType::USING_VM_BLOCK_STMT: cdbType = CodeBlockType::USING_VM; break;
                         default: cdbType = CodeBlockType::BLOCK; break;
                     }
 
@@ -750,13 +835,27 @@ namespace TreeParser {
                     newBlock->type = cdbType;
 
                     if (cdbType == CodeBlockType::FUNC) {
+                        newBlock->isInline = leadingFunctionPrefix().isInline;
                         newBlock->decorators = leadingDecorators();
+                        newBlock->typeParameters = leadingTypeParameters();
+                        if (!blockStack.empty() &&
+                            blockStack.back()->type == CodeBlockType::CLASS) {
+                            newBlock->classTypeParameters =
+                                blockStack.back()->typeParameters;
+                        }
                         newBlock->nativeSymbol = leadingNativeSymbol();
                         newBlock->isCompileTimeStatic = std::find(
                             newBlock->decorators.begin(),
                             newBlock->decorators.end(),
                             "static"
                         ) != newBlock->decorators.end();
+                        newBlock->isNoSafepoint = std::find(
+                            newBlock->decorators.begin(),
+                            newBlock->decorators.end(),
+                            "no_safepoint"
+                            ) != newBlock->decorators.end();
+                    } else if (cdbType == CodeBlockType::CLASS) {
+                        newBlock->typeParameters = leadingTypeParameters();
                     }
 
                     // for 代码块头部解析（自定义语法）
@@ -1396,6 +1495,13 @@ namespace TreeParser {
 
                                     if (op.symbol == ":") {
                                         expectingParamType = true;
+                                        size_t typePosition = i + 1;
+                                        std::string parameterType;
+                                        if (ZeusParser::parseGenericType(
+                                                stack, typePosition, parameterType)) {
+                                            i = typePosition - 1;
+                                            expectingParamType = false;
+                                        }
                                         continue;
                                     }
                                     
@@ -1437,11 +1543,21 @@ namespace TreeParser {
                                    std::get<LexerType::Operator>(token).symbol == symbol;
                         };
 
-                        size_t openParen = stack.size();
+                        size_t functionKeyword = stack.size();
                         for (size_t i = 0; i < stack.size(); ++i) {
-                            if (isFunctionOperator(stack[i], "(")) {
-                                openParen = i;
+                            if (std::holds_alternative<LexerType::Keyword>(stack[i]) &&
+                                std::get<LexerType::Keyword>(stack[i]).name == "func") {
+                                functionKeyword = i;
                                 break;
+                            }
+                        }
+                        size_t openParen = stack.size();
+                        if (functionKeyword < stack.size()) {
+                            for (size_t i = functionKeyword + 1; i < stack.size(); ++i) {
+                                if (isFunctionOperator(stack[i], "(")) {
+                                    openParen = i;
+                                    break;
+                                }
                             }
                         }
 
@@ -1468,20 +1584,32 @@ namespace TreeParser {
                                 std::string typeName;
                                 bool isReference = false;
                                 size_t colon = end;
+                                size_t assignment = end;
 
                                 for (size_t i = begin; i < end; ++i) {
+                                    if (isFunctionOperator(stack[i], "=")) {
+                                        assignment = i;
+                                        break;
+                                    }
                                     if (std::holds_alternative<LexerType::Keyword>(stack[i])) {
                                         if (paramName.empty()) {
                                             paramName = std::get<LexerType::Keyword>(stack[i]).name;
                                             isReference = i > begin &&
                                                 isFunctionOperator(stack[i - 1], "&");
-                                        } else if (colon < end && typeName.empty()) {
-                                            typeName = std::get<LexerType::Keyword>(stack[i]).name;
                                         }
                                     } else if (isFunctionOperator(stack[i], ":") && colon == end) {
                                         colon = i;
-                                    } else if (isFunctionOperator(stack[i], "=")) {
-                                        break;
+                                    }
+                                }
+
+                                if (colon < assignment) {
+                                    size_t typePosition = colon + 1;
+                                    ZeusParser::parseTypeName(
+                                        stack, typePosition, assignment, typeName);
+                                    if (!typeName.empty() && typeName.front() == '&' &&
+                                        typeName != "&bytes") {
+                                        isReference = true;
+                                        typeName.erase(typeName.begin());
                                     }
                                 }
 
@@ -1496,15 +1624,34 @@ namespace TreeParser {
 
                             size_t paramBegin = openParen + 1;
                             int nestedDepth = 0;
+                            int genericTypeDepth = 0;
+                            bool readingType = false;
 
                             for (size_t i = paramBegin; i <= closeParen; ++i) {
                                 bool atEnd = (i == closeParen);
-                                bool atComma = !atEnd && nestedDepth == 0 && isFunctionOperator(stack[i], ",");
+                                bool atComma = !atEnd && nestedDepth == 0 &&
+                                    genericTypeDepth == 0 &&
+                                    isFunctionOperator(stack[i], ",");
 
                                 if (atEnd || atComma) {
                                     appendParamType(paramBegin, i);
                                     paramBegin = i + 1;
+                                    readingType = false;
+                                    genericTypeDepth = 0;
                                     continue;
+                                }
+
+                                if (nestedDepth == 0) {
+                                    if (isFunctionOperator(stack[i], ":")) {
+                                        readingType = true;
+                                    } else if (isFunctionOperator(stack[i], "=")) {
+                                        readingType = false;
+                                    } else if (readingType && isFunctionOperator(stack[i], "<")) {
+                                        ++genericTypeDepth;
+                                    } else if (readingType && genericTypeDepth > 0 &&
+                                               isFunctionOperator(stack[i], ">")) {
+                                        --genericTypeDepth;
+                                    }
                                 }
 
                                 if (isFunctionOperator(stack[i], "(") || isFunctionOperator(stack[i], "[") ||
@@ -1789,6 +1936,70 @@ namespace TreeParser {
                                 }
                             }
                         }
+
+                        bool seenClassKeyword = false;
+                        bool seenClassName = false;
+                        bool readingInterfaces = false;
+                        std::string currentInterface;
+                        for (const auto& tk : stack) {
+                            if (!seenClassKeyword) {
+                                if (std::holds_alternative<LexerType::Keyword>(tk) &&
+                                    std::get<LexerType::Keyword>(tk).name == "class") {
+                                    seenClassKeyword = true;
+                                }
+                                continue;
+                            }
+
+                            if (!seenClassName) {
+                                if (std::holds_alternative<LexerType::Keyword>(tk) &&
+                                    std::get<LexerType::Keyword>(tk).name != "shared") {
+                                    seenClassName = true;
+                                }
+                                continue;
+                            }
+
+                            if (std::holds_alternative<LexerType::Operator>(tk)) {
+                                const std::string& symbol =
+                                    std::get<LexerType::Operator>(tk).symbol;
+                                if (symbol == "[") {
+                                    readingInterfaces = true;
+                                    continue;
+                                }
+                                if (symbol == "]") {
+                                    if (!currentInterface.empty()) {
+                                        newBlock->implementedInterfaces.push_back(currentInterface);
+                                        currentInterface.clear();
+                                    }
+                                    break;
+                                }
+                                if (readingInterfaces && symbol == ".") {
+                                    currentInterface += ".";
+                                } else if (readingInterfaces && symbol == ",") {
+                                    if (!currentInterface.empty()) {
+                                        newBlock->implementedInterfaces.push_back(currentInterface);
+                                        currentInterface.clear();
+                                    }
+                                }
+                            } else if (readingInterfaces &&
+                                       std::holds_alternative<LexerType::Keyword>(tk)) {
+                                currentInterface +=
+                                    std::get<LexerType::Keyword>(tk).name;
+                            }
+                        }
+                    }
+
+                    if (cdbType == CodeBlockType::INTERFACE) {
+                        bool seenInterface = false;
+                        for (const auto& tk : stack) {
+                            if (!std::holds_alternative<LexerType::Keyword>(tk)) continue;
+                            const auto& kw = std::get<LexerType::Keyword>(tk);
+                            if (!seenInterface) {
+                                seenInterface = kw.name == "interface";
+                            } else {
+                                newBlock->interfaceName = kw.name;
+                                break;
+                            }
+                        }
                     }
 
                     // 检测是否 else 块：当前收集的 stack 中包含关键字 else 且上一兄弟是 IF
@@ -1907,6 +2118,14 @@ namespace TreeParser {
                             }
                             
                             if (attachTarget && attachTarget->type == CodeBlockType::IF && !alreadyHasElse) {
+                                // An empty brace-bodied then-branch is otherwise
+                                // absent from the AST, making this else-if look like
+                                // the IF's only child to the IR generator.
+                                if (attachTarget->nodes.empty()) {
+                                    auto emptyThenBlock = makeBlock();
+                                    emptyThenBlock->type = CodeBlockType::BLOCK;
+                                    attachTarget->nodes.push_back(std::move(emptyThenBlock));
+                                }
                                 attachTarget->nodes.push_back(std::move(newBlock));
                                 // else 块成为 IF 的子块，新的当前块是刚附加的 else
                                 auto &elseVariant = attachTarget->nodes.back();

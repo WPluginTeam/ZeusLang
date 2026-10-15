@@ -14,6 +14,7 @@
 #include <mutex>
 
 #include "../../ZeusRuntimeLib/ZeusVariant.hpp"
+#include "../../ZeusRuntimeLib/ZeusObjectPayload.hpp"
 #include "../ZeusVMOperator.hpp"
 #include "../../ZeusRuntimeLib/ZeusCell.hpp"
 #include "../../ZeusParser/LexerType.hpp"
@@ -56,10 +57,6 @@ namespace ZeusBuiltins {
     inline size_t* g_vmFreeObjectSlotsSize = nullptr;
 
     // Socket 系统
-    inline std::vector<ZeusType::SocketData>* g_vmSockets = nullptr;
-    inline std::vector<int>* g_vmFreeSocketSlots = nullptr;
-    inline size_t* g_vmFreeSocketSlotsSize = nullptr;
-    inline std::mutex* g_vmSocketsMutex = nullptr;
 
     // 闭包系统
     inline std::vector<int>* g_vmFreeClosureSlotsPtr = nullptr;
@@ -72,8 +69,8 @@ namespace ZeusBuiltins {
     inline size_t* g_vmPrototypesSize = nullptr;
 
     // 引用计数管理函数
-    inline std::function<void(int)> g_vmRetainObject = nullptr;
-    inline std::function<void(int)> g_vmReleaseObject = nullptr;
+    inline std::function<void(ZeusType::ObjectHandle)> g_vmRetainObject = nullptr;
+    inline std::function<void(ZeusType::ObjectHandle)> g_vmReleaseObject = nullptr;
     inline std::function<void(int)> g_vmRetainClosure = nullptr;
     inline std::function<void(int)> g_vmReleaseClosure = nullptr;
 

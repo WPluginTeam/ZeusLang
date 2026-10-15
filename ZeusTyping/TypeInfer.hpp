@@ -35,9 +35,11 @@ namespace ZeusTypeInfer {
         std::vector<std::string> parameterNames;
         std::vector<InferredType> parameterTypes;
         std::vector<std::string> parameterTypeNames;
+        std::vector<std::string> typeParameterNames;
         InferredType returnType = InferredType::Unknown;
         std::string returnTypeName;
         std::string ownerType;
+        std::vector<std::string> ownerTypeParameterNames;
         bool isClassMethod = false;
         bool isStaticMethod = false;
         bool returnsReference = false;
@@ -296,8 +298,10 @@ namespace ZeusTypeInfer {
                 return InferredType::Unknown;
             }
 
-            InferredType literalType = inferLiteralType(tokens[begin]);
-            if (literalType != InferredType::Unknown) return literalType;
+            if (begin + 1 == end) {
+                InferredType literalType = inferLiteralType(tokens[begin]);
+                if (literalType != InferredType::Unknown) return literalType;
+            }
 
             if (std::holds_alternative<LexerType::Keyword>(tokens[begin]) && begin + 1 == end) {
                 const auto& name = std::get<LexerType::Keyword>(tokens[begin]).name;
@@ -410,6 +414,8 @@ namespace ZeusTypeInfer {
                         ? ownerType + "::" + block->funcName
                         : block->funcName;
                     info.ownerType = ownerType;
+                    info.ownerTypeParameterNames = block->classTypeParameters;
+                    info.typeParameterNames = block->typeParameters;
                     info.isClassMethod = block->isClassMethod;
                     info.isStaticMethod = block->isStaticMethod || block->isCompileTimeStatic;
                     info.returnTypeName = block->returnTypeName;
@@ -426,7 +432,15 @@ namespace ZeusTypeInfer {
                     ).isReference;
 
                     for (const auto& typeName : block->paramTypeNames) {
-                        info.parameterTypes.push_back(parseTypeName(typeName));
+                        const bool isTypeParameter = std::find(
+                            block->typeParameters.begin(), block->typeParameters.end(),
+                            typeName) != block->typeParameters.end();
+                        const bool isOwnerTypeParameter = std::find(
+                            block->classTypeParameters.begin(),
+                            block->classTypeParameters.end(), typeName) !=
+                            block->classTypeParameters.end();
+                        info.parameterTypes.push_back(isTypeParameter || isOwnerTypeParameter
+                            ? InferredType::TypeParameter : parseTypeName(typeName));
                         info.parameterTypeNames.push_back(typeName);
                     }
                     info.parameterNames = block->paramNames;
@@ -512,7 +526,12 @@ namespace ZeusTypeInfer {
                     for (size_t i = 0; i < block->paramNames.size(); ++i) {
                         InferredType type = InferredType::Unknown;
                         if (i < block->paramTypeNames.size()) {
-                            type = parseTypeName(block->paramTypeNames[i]);
+                            const bool isTypeParameter = std::find(
+                                block->typeParameters.begin(), block->typeParameters.end(),
+                                block->paramTypeNames[i]) != block->typeParameters.end();
+                            type = isTypeParameter
+                                ? InferredType::TypeParameter
+                                : parseTypeName(block->paramTypeNames[i]);
                         }
                         functionEnvironment[block->paramNames[i]] = type;
                     }

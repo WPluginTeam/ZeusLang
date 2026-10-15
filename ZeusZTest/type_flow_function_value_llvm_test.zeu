@@ -1,0 +1,45 @@
+func plusOne(value: int) -> int {
+    return value + 1;
+}
+
+func forwardOne() {
+    return forwardTwo();
+}
+
+func forwardTwo() {
+    return forwardThree();
+}
+
+func forwardThree() {
+    return 40;
+}
+
+func mixedResult(flag: bool) {
+    if (flag) {
+        return 1;
+    }
+    return "1";
+}
+
+func localDynamicValue(flag: bool) {
+    let value = nil;
+    print(value);
+    value = mixedResult(flag);
+    return value + 1;
+}
+
+let text = nil;
+text = "12";
+print(text + "3");
+
+let callback = plusOne;
+print(callback(41));
+
+let forwarded = forwardOne();
+print(forwarded + 2);
+
+let dynamicValue = nil;
+print(dynamicValue);
+dynamicValue = mixedResult(true);
+print(dynamicValue + 1);
+print(localDynamicValue(true));

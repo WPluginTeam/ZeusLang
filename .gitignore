@@ -14,3 +14,6 @@
 /.vs/ipch/
 *.code-workspace
 .vscode
+
+# Codex workspace scratch build cache
+/.codex-ws-build/

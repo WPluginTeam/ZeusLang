@@ -1,0 +1,22 @@
+var shared vm_shared_addr_integer = 5;
+let sharedIntegerAddress = @addr(vm_shared_addr_integer);
+@faddr(sharedIntegerAddress) -> int = 31;
+
+if (vm_shared_addr_integer != 31) {
+    throw new Exception("VM shared raw int address write failed");
+}
+
+var shared vm_shared_addr_text = "hello";
+let sharedTextAddress = @addr(vm_shared_addr_text);
+@faddr(sharedTextAddress) -> string = "X";
+
+if (vm_shared_addr_text != "X") {
+    throw new Exception("VM shared logical slot string assignment failed");
+}
+
+let sharedTextData = @reveal(vm_shared_addr_text);
+if (@faddr(sharedTextData - 8, 8) -> int != 1) {
+    throw new Exception("VM shared reveal length header failed");
+}
+
+print("VM_SHARED_ADDRESS_PASS");

@@ -1,0 +1,155 @@
+import zeus.static;
+
+class BenchItem {
+    using &this;
+    var value: int = 0;
+
+    func init(initial: int) {
+        this.value = initial;
+    }
+}
+
+func makeBuiltinItems(size: int) -> Array {
+    let values = [];
+    var index = 0;
+    for (true) {
+        if (index >= size) break;
+        values.append(new BenchItem(index + 1));
+        index = index + 1;
+    }
+    return values;
+}
+
+func makeStaticItems(size: int) -> StaticArray<BenchItem> {
+    let values = new StaticArray<BenchItem>(size);
+    var index = 0;
+    for (true) {
+        if (index >= size) break;
+        values.append(new BenchItem(index + 1));
+        index = index + 1;
+    }
+    return values;
+}
+
+@no_safepoint
+func readBuiltinItems(values: Array, length: int, iterations: int) -> int {
+    var cursor = 0;
+    var index = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + values[index].value;
+        index = index + 1;
+        if (index >= length) index = 0;
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+@no_safepoint
+func readStaticItems(values: StaticArray<BenchItem>, length: int, iterations: int) -> int {
+    var cursor = 0;
+    var index = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + values[index].value;
+        index = index + 1;
+        if (index >= length) index = 0;
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+@no_safepoint
+func updateBuiltinItems(values: Array, length: int, iterations: int) -> int {
+    var cursor = 0;
+    var index = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        let item = values[index];
+        let current = item.value;
+        item.value = current + 1;
+        checksum = checksum + current;
+        index = index + 1;
+        if (index >= length) index = 0;
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+@no_safepoint
+func updateStaticItems(values: StaticArray<BenchItem>, length: int, iterations: int) -> int {
+    var cursor = 0;
+    var index = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        let item = values[index];
+        let current = item.value;
+        item.value = current + 1;
+        checksum = checksum + current;
+        index = index + 1;
+        if (index >= length) index = 0;
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+let itemCount = 64;
+var iterations = 0;
+var rounds = 0;
+using LLVM {
+    iterations = 500000;
+    rounds = 5;
+}
+using VM {
+    iterations = 20000;
+    rounds = 1;
+}
+
+let builtinItems = makeBuiltinItems(itemCount);
+let staticItems = makeStaticItems(itemCount);
+
+if (readBuiltinItems(builtinItems, itemCount, 100) !=
+    readStaticItems(staticItems, itemCount, 100)) {
+    throw "StaticArray class read benchmark checksum mismatch";
+}
+if (updateBuiltinItems(builtinItems, itemCount, 100) !=
+    updateStaticItems(staticItems, itemCount, 100)) {
+    throw "StaticArray class update benchmark checksum mismatch";
+}
+
+var round = 0;
+for (true) {
+    if (round == rounds) break;
+
+    let builtinReadStart = __time_perf_counter_ns();
+    let builtinReadChecksum = readBuiltinItems(builtinItems, itemCount, iterations);
+    let builtinReadElapsed = __time_perf_counter_ns() - builtinReadStart;
+    let staticReadStart = __time_perf_counter_ns();
+    let staticReadChecksum = readStaticItems(staticItems, itemCount, iterations);
+    let staticReadElapsed = __time_perf_counter_ns() - staticReadStart;
+    if (builtinReadChecksum != staticReadChecksum) {
+        throw "StaticArray class read benchmark checksum mismatch";
+    }
+    print("CLASS_READ_BUILTIN_NS", round, builtinReadElapsed, builtinReadChecksum);
+    print("CLASS_READ_STATIC_NS", round, staticReadElapsed, staticReadChecksum);
+
+    let builtinUpdateStart = __time_perf_counter_ns();
+    let builtinUpdateChecksum = updateBuiltinItems(builtinItems, itemCount, iterations);
+    let builtinUpdateElapsed = __time_perf_counter_ns() - builtinUpdateStart;
+    let staticUpdateStart = __time_perf_counter_ns();
+    let staticUpdateChecksum = updateStaticItems(staticItems, itemCount, iterations);
+    let staticUpdateElapsed = __time_perf_counter_ns() - staticUpdateStart;
+    if (builtinUpdateChecksum != staticUpdateChecksum) {
+        throw "StaticArray class update benchmark checksum mismatch";
+    }
+    print("CLASS_UPDATE_BUILTIN_NS", round, builtinUpdateElapsed, builtinUpdateChecksum);
+    print("CLASS_UPDATE_STATIC_NS", round, staticUpdateElapsed, staticUpdateChecksum);
+
+    round = round + 1;
+}
+
+delete staticItems;

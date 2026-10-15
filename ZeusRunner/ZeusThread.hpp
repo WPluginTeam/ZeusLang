@@ -15,9 +15,15 @@
 #include <queue>
 #include <optional>
 #include <deque>
+#include <limits>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
 
 #include "../ZeusRuntimeLib/ZeusVariant.hpp"
 #include "../ZeusRuntimeLib/ZeusSharedHeap.hpp"
+#include "../ZeusRuntimeLib/ZeusThreadABI.hpp"
 // 包含全局函数指针声明
 #include "ZeusBuiltins.hpp"
 #include "../ZeusIR/IRType.hpp"
@@ -44,6 +50,7 @@ namespace ZeusThread {
     struct SharedObjectSystem {
         // 类和对象（原有）
         std::vector<ZeusType::ClassInfo>* classes = nullptr;
+        void* typeImplementations = nullptr;  // std::unordered_map<std::string, ClassInfo>*
         std::deque<ZeusType::ObjectInstance>* objects = nullptr;  // 使用 deque 指针
         std::shared_mutex* mutex = nullptr;  // 读写锁
         
@@ -78,7 +85,6 @@ namespace ZeusThread {
         std::string name;                   // 线程名称
         ThreadState state = ThreadState::Created;
         std::string errorMessage;           // 错误信息（如果有）
-        std::unique_ptr<std::thread> thread;
         
         // 停止控制标志（用于 eliminate）
         std::atomic<bool> shouldStop{false};
@@ -92,6 +98,7 @@ namespace ZeusThread {
         
         // 共享对象系统（指向主 VM 的数据）
         std::vector<ZeusType::ClassInfo>* sharedClasses = nullptr;
+        void* sharedTypeImplementations = nullptr;
         std::deque<ZeusType::ObjectInstance>* sharedObjects = nullptr;  // 使用 deque 指针
         std::shared_mutex* sharedObjectsMutex = nullptr;  // 读写锁，用于同步对象访问
         std::vector<int>* sharedFreeObjectSlots = nullptr;  // GC: 共享的空闲槽位
@@ -112,43 +119,50 @@ namespace ZeusThread {
     };
 
     // 线程管理器（单例）
+    struct VMThreadTaskContext {
+        ThreadEntryFunc entryFunc;
+        std::shared_ptr<ThreadInfo> info;
+    };
+
+    inline void runVMThreadTask(void* rawContext) {
+        auto* context = static_cast<VMThreadTaskContext*>(rawContext);
+        try {
+            context->entryFunc(context->info);
+        } catch (const std::exception& error) {
+            context->info->state = ThreadState::Error;
+            context->info->errorMessage = error.what();
+        } catch (...) {
+            context->info->state = ThreadState::Error;
+            context->info->errorMessage = "thread entry threw a non-standard exception";
+            ZEUS_DEBUG_PRINT("[ThreadManager] thread entry threw a non-standard exception: id=%d",
+                context->info->id);
+        }
+    }
+
+    inline void destroyVMThreadTask(void* rawContext) {
+        delete static_cast<VMThreadTaskContext*>(rawContext);
+    }
+
     class ThreadManager {
     private:
-
         std::unordered_map<int, std::shared_ptr<ThreadInfo>> threads;
         std::mutex managerMutex;
-        std::atomic<int> nextThreadId{1};
-
-        // 主程序的字节码（用于创建新 VM 时复制）
         std::vector<std::vector<IRType::IRInstr>> mainProgram;
         std::vector<std::string> mainGlobalNames;
 
         ThreadManager() = default;
 
     public:
+        ~ThreadManager() = default;
 
-        // 析构函数：确保所有线程被 join 或 detach
-        ~ThreadManager() {
-            // 遍历所有线程，join 可 joinable 的
-            for (auto& kv : threads) {
-                if (kv.second->thread && kv.second->thread->joinable()) {
-                    kv.second->thread->join();
-                }
-            }
-            threads.clear();
-        }
-
-        // 禁止拷贝
         ThreadManager(const ThreadManager&) = delete;
         ThreadManager& operator=(const ThreadManager&) = delete;
 
-        // 单例访问
         static ThreadManager& instance() {
-            static ThreadManager mgr;
-            return mgr;
+            static ThreadManager manager;
+            return manager;
         }
 
-        // 设置主程序字节码（由主 VM 在启动时调用）
         void setMainProgram(
             const std::vector<std::vector<IRType::IRInstr>>& program,
             const std::vector<std::string>& globalNames
@@ -156,12 +170,10 @@ namespace ZeusThread {
             std::lock_guard<std::mutex> lock(managerMutex);
             mainProgram = program;
             mainGlobalNames = globalNames;
-
             ZEUS_DEBUG_PRINT("[ThreadManager] setMainProgram: chunks=%zu, globals=%zu",
                 program.size(), globalNames.size());
         }
 
-        // 获取主程序
         const std::vector<std::vector<IRType::IRInstr>>& getMainProgram() const {
             return mainProgram;
         }
@@ -170,66 +182,61 @@ namespace ZeusThread {
             return mainGlobalNames;
         }
 
-        // 创建新线程（但不启动）
         int createThread() {
-            std::lock_guard<std::mutex> lock(managerMutex);
-
-            int id = nextThreadId++;
-            auto info = std::make_shared<ThreadInfo>(id);
-            info->program = &mainProgram;  // 使用指针引用，不复制
-            info->sharedGlobalNames = &mainGlobalNames;  // 使用指针引用
-            threads[id] = info;
-
-            ZEUS_DEBUG_PRINT("[ThreadManager] createThread: id=%d", id);
-
-            return id;
+            auto info = std::make_shared<ThreadInfo>(-1);
+            const int64_t id = zeus_thread_create();
+            if (id < 0 || id > std::numeric_limits<int>::max()) {
+                ZEUS_DEBUG_PRINT("[ThreadManager] createThread failed: runtime id=%lld",
+                    static_cast<long long>(id));
+                return -1;
+            }
+            info->id = static_cast<int>(id);
+            info->name = "thread-" + std::to_string(id);
+            info->program = &mainProgram;
+            info->sharedGlobalNames = &mainGlobalNames;
+            try {
+                std::lock_guard<std::mutex> lock(managerMutex);
+                threads[static_cast<int>(id)] = std::move(info);
+            } catch (...) {
+                zeus_thread_eliminate(id);
+                ZEUS_DEBUG_PRINT("[ThreadManager] createThread failed to record runtime id=%d",
+                    static_cast<int>(id));
+                return -1;
+            }
+            ZEUS_DEBUG_PRINT("[ThreadManager] createThread: id=%d", static_cast<int>(id));
+            return static_cast<int>(id);
         }
 
-        // 获取线程信息
         std::shared_ptr<ThreadInfo> getThread(int id) {
             std::lock_guard<std::mutex> lock(managerMutex);
-
-            auto it = threads.find(id);
-            if (it != threads.end()) {
-                return it->second;
-            }
-
-            return nullptr;
+            const auto it = threads.find(id);
+            return it == threads.end() ? nullptr : it->second;
         }
 
-        // 启动线程 - 需要提供线程入口函数和共享环境
-        bool startThread(int id, int protoId, 
-                         const std::vector<ZeusType::UniversalVariant>& args,
-                         ThreadEntryFunc entryFunc,
-                         std::optional<ZeusType::ObjectHandle> boundThis = std::nullopt,
-                         const SharedObjectSystem& shared = SharedObjectSystem()) {
+        bool startThread(
+            int id,
+            int protoId,
+            const std::vector<ZeusType::UniversalVariant>& args,
+            ThreadEntryFunc entryFunc,
+            std::optional<ZeusType::ObjectHandle> boundThis = std::nullopt,
+            const SharedObjectSystem& shared = SharedObjectSystem()
+        ) {
             std::shared_ptr<ThreadInfo> info;
-
             {
                 std::lock_guard<std::mutex> lock(managerMutex);
-
-                auto it = threads.find(id);
-                if (it == threads.end()) {
+                const auto it = threads.find(id);
+                if (it == threads.end() || it->second->state != ThreadState::Created) {
                     return false;
                 }
-
                 info = it->second;
-
-                if (info->state != ThreadState::Created) {
-                    return false;  // 只能启动新创建的线程
-                }
-
                 info->protoId = protoId;
                 info->args = args;
                 info->boundThis = boundThis;
-                
-                // 原有共享
                 info->sharedClasses = shared.classes;
+                info->sharedTypeImplementations = shared.typeImplementations;
                 info->sharedObjects = shared.objects;
                 info->sharedObjectsMutex = shared.mutex;
                 info->sharedFreeObjectSlots = shared.freeObjectSlots;
-                
-                // 扩展共享
                 info->sharedGlobal = shared.global;
                 info->sharedGlobalNames = shared.globalNames;
                 info->sharedClosures = shared.closures;
@@ -240,305 +247,161 @@ namespace ZeusThread {
                 info->sharedNameToClass = shared.nameToClass;
             }
 
-            // 创建并启动新线程
-            info->thread = std::make_unique<std::thread>(entryFunc, info);
-
-            ZEUS_DEBUG_PRINT("[ThreadManager] startThread: id=%d, protoId=%d, hasBoundThis=%d, hasSharedEnv=%d", 
+            auto* context = new VMThreadTaskContext{std::move(entryFunc), info};
+            if (!zeus_thread_start_task(id, runVMThreadTask, context, destroyVMThreadTask)) {
+                delete context;
+                ZEUS_DEBUG_PRINT("[ThreadManager] startThread failed: id=%d protoId=%d",
+                    id, protoId);
+                return false;
+            }
+            ZEUS_DEBUG_PRINT("[ThreadManager] startThread: id=%d protoId=%d hasBoundThis=%d hasSharedEnv=%d",
                 id, protoId, boundThis.has_value(), shared.global != nullptr);
-
             return true;
         }
 
-        // 等待线程完成
         bool joinThread(int id) {
             std::shared_ptr<ThreadInfo> info;
-
             {
                 std::lock_guard<std::mutex> lock(managerMutex);
-                auto it = threads.find(id);
-
-                if (it == threads.end()) {
-                    return false;
-                }
-
+                const auto it = threads.find(id);
+                if (it == threads.end()) return false;
                 info = it->second;
-                
-                // 检查是否是当前线程尝试 join 自己（避免死锁）
-                auto currentId = std::this_thread::get_id();
-                if (info->nativeId == currentId) {
-                    // 不能 join 自己，直接标记为完成并清理
-                    if (info->thread && info->thread->joinable()) {
-                        info->thread->detach();
-                    }
-                    
-                    // 清理资源（program 是指针，不需要清理）
-                    info->program = nullptr;
-                    info->globalNames.clear();
-                    info->globalNames.shrink_to_fit();
-                    info->args.clear();
-                    info->args.shrink_to_fit();
-                    info->state = ThreadState::Finished;
-                    threads.erase(id);
-                    
-                    return true;
-                }
             }
 
-            if (info->thread && info->thread->joinable()) {
-                info->thread->join();
-                
-                // 线程join后，立即清理资源
-                {
-                    std::lock_guard<std::mutex> lock(managerMutex);
-                    
-                    // 清理ThreadInfo中的数据（program 是指针，不需要清理）
-                    info->program = nullptr;
-                    info->globalNames.clear();
-                    info->globalNames.shrink_to_fit();
-                    info->args.clear();
-                    info->args.shrink_to_fit();
-                    
-                    // 更新状态为已完成
-                    info->state = ThreadState::Finished;
-                    
-                    // 从映射中移除
-                    threads.erase(id);
-                    
-                    ZEUS_DEBUG_PRINT("[ThreadManager] joinThread: cleaned up thread %d", id);
-                }
-                
-                return true;
-            }
-
-            return false;
-        }
-
-        // 检查线程是否存活
-        bool isAlive(int id) {
+            if (!zeus_thread_join(id)) return false;
             std::lock_guard<std::mutex> lock(managerMutex);
-
-            auto it = threads.find(id);
-            if (it == threads.end()) {
-                return false;
-            }
-
-            return it->second->state == ThreadState::Running;
-        }
-
-        // 终止线程：设置 shouldStop 标志，等待线程自行退出
-        bool eliminateThread(int id) {
-            std::shared_ptr<ThreadInfo> info;
-            bool isSelfEliminate = false;
-            
-            {
-                std::lock_guard<std::mutex> lock(managerMutex);
-                
-                auto it = threads.find(id);
-                if (it == threads.end()) {
-                    return false;
-                }
-                
-                info = it->second;
-                
-                // 检查是否是当前线程尝试 eliminate 自己（避免死锁）
-                if (info->nativeId == std::this_thread::get_id()) {
-                    isSelfEliminate = true;
-                    ZEUS_DEBUG_PRINT("[ThreadManager] eliminateThread: thread %d trying to eliminate itself, detaching", id);
-                }
-            }
-            
-            // 设置停止标志
-            info->shouldStop.store(true);
-            
-            ZEUS_DEBUG_PRINT("[ThreadManager] eliminateThread: signaling stop for id=%d", id);
-            
-            if (isSelfEliminate) {
-                // 不能 join 自己，直接 detach 并清理
-                if (info->thread && info->thread->joinable()) {
-                    info->thread->detach();
-                }
-                
-                // 清理资源
-                {
-                    std::lock_guard<std::mutex> lock(managerMutex);
-                    info->program = nullptr;
-                    info->globalNames.clear();
-                    info->globalNames.shrink_to_fit();
-                    info->args.clear();
-                    info->args.shrink_to_fit();
-                    info->state = ThreadState::Finished;
-                    threads.erase(id);
-                    ZEUS_DEBUG_PRINT("[ThreadManager] eliminateThread: self-detached thread %d", id);
-                }
-                return true;
-            }
-            
-            // 等待线程结束
-            if (info->thread && info->thread->joinable()) {
-                info->thread->join();
-            }
-            
-            // 清理资源
-            {
-                std::lock_guard<std::mutex> lock(managerMutex);
-                
-                // 清理ThreadInfo中的数据（program 是指针，不需要清理）
-                info->program = nullptr;
-                info->globalNames.clear();
-                info->globalNames.shrink_to_fit();
-                info->args.clear();
-                info->args.shrink_to_fit();
-                
-                // 更新状态
-                info->state = ThreadState::Finished;
-                
-                // 从映射中移除
-                threads.erase(id);
-                
-                ZEUS_DEBUG_PRINT("[ThreadManager] eliminateThread: cleaned up thread %d", id);
-            }
-            
+            const auto it = threads.find(id);
+            if (it == threads.end() || it->second != info) return true;
+            info->program = nullptr;
+            info->globalNames.clear();
+            info->args.clear();
+            info->state = ThreadState::Finished;
+            threads.erase(it);
+            ZEUS_DEBUG_PRINT("[ThreadManager] joinThread: cleaned up thread %d", id);
             return true;
         }
 
-        // 获取线程状态
-        ThreadState getState(int id) {
-            std::lock_guard<std::mutex> lock(managerMutex);
-
-            auto it = threads.find(id);
-            if (it == threads.end()) {
-                return ThreadState::Error;
-            }
-
-            return it->second->state;
+        bool isAlive(int id) {
+            return zeus_thread_is_alive(id);
         }
 
-        // 设置线程名
-        bool setThreadName(int id, const std::string& name) {
-            std::lock_guard<std::mutex> lock(managerMutex);
-
-            auto it = threads.find(id);
-            if (it == threads.end()) {
+        bool eliminateThread(int id) {
+            auto info = getThread(id);
+            if (!info) return false;
+            info->shouldStop.store(true);
+            ZEUS_DEBUG_PRINT("[ThreadManager] eliminateThread: signaling stop for id=%d", id);
+            if (!zeus_thread_eliminate(id)) {
+                ZEUS_DEBUG_PRINT("[ThreadManager] eliminateThread failed: id=%d", id);
                 return false;
             }
 
+            std::lock_guard<std::mutex> lock(managerMutex);
+            const auto it = threads.find(id);
+            if (it != threads.end() && it->second == info) {
+                info->program = nullptr;
+                info->globalNames.clear();
+                info->args.clear();
+                info->state = ThreadState::Finished;
+                threads.erase(it);
+            }
+            ZEUS_DEBUG_PRINT("[ThreadManager] eliminateThread: cleaned up thread %d", id);
+            return true;
+        }
+
+        ThreadState getState(int id) {
+            std::lock_guard<std::mutex> lock(managerMutex);
+            const auto it = threads.find(id);
+            return it == threads.end() ? ThreadState::Error : it->second->state;
+        }
+
+        bool setThreadName(int id, const std::string& name) {
+            if (name.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
+                name.size() > std::numeric_limits<size_t>::max() - sizeof(uint64_t) - 1) {
+                return false;
+            }
+            try {
+                const size_t byteCount = sizeof(uint64_t) + name.size() + 1;
+                const size_t wordCount =
+                    byteCount / sizeof(uint64_t) + (byteCount % sizeof(uint64_t) != 0);
+                std::vector<uint64_t> nativeName(wordCount, 0);
+                nativeName[0] = static_cast<uint64_t>(name.size());
+                char* characters =
+                    reinterpret_cast<char*>(nativeName.data()) + sizeof(uint64_t);
+                if (!name.empty()) std::memcpy(characters, name.data(), name.size());
+                characters[name.size()] = '\0';
+                if (!zeus_thread_set_name(id, characters)) return false;
+            } catch (...) {
+                return false;
+            }
+            std::lock_guard<std::mutex> lock(managerMutex);
+            const auto it = threads.find(id);
+            if (it == threads.end()) return false;
             it->second->name = name;
             return true;
         }
 
-        // 获取线程名
         std::string getThreadName(int id) {
-            std::lock_guard<std::mutex> lock(managerMutex);
-
-            auto it = threads.find(id);
-            if (it == threads.end()) {
-                return "";
+            const ZeusNativeString value = zeus_thread_get_name(id);
+            if (!value) return {};
+            uint64_t length = 0;
+            std::memcpy(&length, value - sizeof(uint64_t), sizeof(length));
+            if (length > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+                length > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                return {};
             }
-
-            return it->second->name;
+            const char* characters = value;
+            if (characters[static_cast<size_t>(length)] != '\0') return {};
+            return std::string(characters, static_cast<size_t>(length));
         }
 
-        // 根据原生线程 ID 获取线程名（用于错误报告）
         std::string getThreadNameByNativeId(std::thread::id nativeId) {
             std::lock_guard<std::mutex> lock(managerMutex);
-
-            for (const auto& kv : threads) {
-                if (kv.second->nativeId == nativeId) {
-                    return kv.second->name;
-                }
+            for (const auto& entry : threads) {
+                if (entry.second->nativeId == nativeId) return entry.second->name;
             }
-
-            return "";
+            return {};
         }
 
-        // 获取当前线程数量
         size_t threadCount() {
-            std::lock_guard<std::mutex> lock(managerMutex);
-            return threads.size();
+            return static_cast<size_t>(zeus_thread_count());
         }
 
-        // 获取活跃线程数量
         size_t activeThreadCount() {
-            std::lock_guard<std::mutex> lock(managerMutex);
-
-            size_t count = 0;
-            for (const auto& kv : threads) {
-                if (kv.second->state == ThreadState::Running) {
-                    ++count;
-                }
-            }
-
-            return count;
+            return static_cast<size_t>(zeus_thread_active_count());
         }
 
-        // 等待所有线程完成
         void joinAll() {
-            std::vector<std::shared_ptr<ThreadInfo>> allThreads;
-            std::vector<int> allThreadIds;
-
-            {
-                std::lock_guard<std::mutex> lock(managerMutex);
-                for (auto& kv : threads) {
-                    allThreadIds.push_back(kv.first);
-                    allThreads.push_back(kv.second);
-                }
-            }
-
-            for (auto& info : allThreads) {
-                if (info->thread && info->thread->joinable()) {
-                    info->thread->join();
-                }
-            }
-
-            // joined entries are no longer useful; clear them to avoid stale
-            // thread records accumulating in long-running processes.
-            {
-                std::lock_guard<std::mutex> lock(managerMutex);
-                for (int id : allThreadIds) {
-                    auto it = threads.find(id);
-                    if (it == threads.end()) continue;
-
-                    it->second->program = nullptr;
-                    it->second->globalNames.clear();
-                    it->second->globalNames.shrink_to_fit();
-                    it->second->args.clear();
-                    it->second->args.shrink_to_fit();
-                    it->second->state = ThreadState::Finished;
-                    threads.erase(it);
-                }
-            }
-        }
-
-        // 清理已完成的线程
-        void cleanup() {
+            zeus_thread_join_all();
             std::lock_guard<std::mutex> lock(managerMutex);
-
-            for (auto it = threads.begin(); it != threads.end(); ) {
-                if (it->second->state == ThreadState::Finished ||
-                    it->second->state == ThreadState::Error) {
-
-                    if (it->second->thread && it->second->thread->joinable()) {
-                        it->second->thread->join();
-                    }
-
-                    it = threads.erase(it);
-                } else {
-                    ++it;
-                }
+            for (auto& entry : threads) {
+                entry.second->program = nullptr;
+                entry.second->globalNames.clear();
+                entry.second->args.clear();
+                entry.second->state = ThreadState::Finished;
             }
+            threads.clear();
         }
 
-        // 重置（清除所有线程）
+        void cleanup() {
+            std::vector<int> completed;
+            {
+                std::lock_guard<std::mutex> lock(managerMutex);
+                for (const auto& entry : threads) {
+                    if (entry.second->state == ThreadState::Finished ||
+                        entry.second->state == ThreadState::Error) {
+                        completed.push_back(entry.first);
+                    }
+                }
+            }
+            for (const int id : completed) joinThread(id);
+        }
+
         void reset() {
             joinAll();
-
-            std::lock_guard<std::mutex> lock(managerMutex);
-            threads.clear();
-            nextThreadId = 1;
+            zeus_thread_reset();
         }
     };
 
-    // 全局线程管理器访问
     inline ThreadManager& getThreadManager() {
         return ThreadManager::instance();
     }
@@ -556,7 +419,7 @@ namespace ZeusThread {
 
     // 全局闭包解析器（由 VM 设置）
     inline ClosureResolverFunc& getGlobalClosureResolver() {
-        static ClosureResolverFunc func = nullptr;
+        static thread_local ClosureResolverFunc func = nullptr;
         return func;
     }
 
@@ -567,7 +430,7 @@ namespace ZeusThread {
     
     // 全局 BoundThis 解析器（由 VM 设置）
     inline BoundThisResolverFunc& getGlobalBoundThisResolver() {
-        static BoundThisResolverFunc func = nullptr;
+        static thread_local BoundThisResolverFunc func = nullptr;
         return func;
     }
     
@@ -580,7 +443,7 @@ namespace ZeusThread {
     
     // 全局共享对象系统解析器（由 VM 设置）
     inline SharedObjectResolverFunc& getGlobalSharedObjectResolver() {
-        static SharedObjectResolverFunc func = nullptr;
+        static thread_local SharedObjectResolverFunc func = nullptr;
         return func;
     }
     
@@ -590,15 +453,15 @@ namespace ZeusThread {
     }
     
     using RetainReleaseResolverFunc = std::function<std::tuple<
-        std::function<void(int)>, // retainObject
-        std::function<void(int)>, // releaseObject
+        std::function<void(ZeusType::ObjectHandle)>, // retainObject
+        std::function<void(ZeusType::ObjectHandle)>, // releaseObject
         std::function<void(int)>, // retainClosure
         std::function<void(int)>  // releaseClosure
     >()>;
     
     // 全局 retain/release 函数解析器（由 VM 设置）
     inline RetainReleaseResolverFunc& getGlobalRetainReleaseResolver() {
-        static RetainReleaseResolverFunc func = nullptr;
+        static thread_local RetainReleaseResolverFunc func = nullptr;
         return func;
     }
     

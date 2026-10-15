@@ -1,0 +1,6 @@
+import zeus.thread [&];
+let pool = new thread.ThreadPool(1);
+print("workers-type", type(pool._workers));
+print("workers-value", pool._workers);
+print("workers-length", len(pool._workers));
+delete pool;

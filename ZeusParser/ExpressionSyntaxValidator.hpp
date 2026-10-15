@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 #include "LexerType.hpp"
+#include "GenericCallSyntax.hpp"
 #include "../ZeusDiagnostics.hpp"
 
 namespace ZeusParser {
@@ -150,6 +151,13 @@ private:
     bool parsePostfix() {
         if (!parsePrimary()) return false;
         while (position_ < tokens_.size()) {
+            std::vector<std::string> explicitTypeArguments;
+            size_t genericCallPosition = position_;
+            if (consumeGenericCallSuffix(
+                    tokens_, genericCallPosition, explicitTypeArguments)) {
+                position_ = genericCallPosition;
+                continue;
+            }
             if (consumeOperator(".")) {
                 if (position_ >= tokens_.size() || !isMemberName(tokens_[position_])) {
                     return fail("expected a member name after '.'");
@@ -174,6 +182,61 @@ private:
 
     bool parsePrimary() {
         if (position_ >= tokens_.size()) return fail("expected an expression");
+
+        if (consumeOperator("@")) {
+            if (position_ >= tokens_.size() ||
+                !std::holds_alternative<LexerType::Keyword>(tokens_[position_])) {
+                return fail("expected 'addr', 'reveal', or 'faddr' after '@'");
+            }
+            const std::string intrinsicName =
+                std::get<LexerType::Keyword>(tokens_[position_]).name;
+            const bool isAddress = intrinsicName == "addr";
+            const bool isReveal = intrinsicName == "reveal";
+            const bool isFetchAddress = intrinsicName == "faddr";
+            if (!isAddress && !isReveal && !isFetchAddress) {
+                return fail("expected 'addr', 'reveal', or 'faddr' after '@'");
+            }
+            ++position_;
+            if (!consumeOperator("(")) {
+                return fail("expected '(' after '@" + intrinsicName + "'");
+            }
+            if (atOperator(")")) {
+                return fail("@" + intrinsicName + " requires one value argument");
+            }
+            if (!parseOr()) return false;
+            if (isFetchAddress && consumeOperator(",")) {
+                if (position_ < tokens_.size() && isIdentifier(tokens_[position_]) &&
+                    (std::get<LexerType::Keyword>(tokens_[position_]).name == "slot" ||
+                     std::get<LexerType::Keyword>(tokens_[position_]).name == "slot_clear")) {
+                    ++position_;
+                } else if (!parseOr()) {
+                    return false;
+                }
+            }
+            if (!consumeOperator(")")) {
+                return fail("expected ')' after @" + intrinsicName + " argument");
+            }
+            if (isFetchAddress) {
+                if (!consumeOperator("->")) {
+                    return fail("@faddr requires '-> <type>' after its address argument");
+                }
+                if (consumeOperator("&")) {
+                    if (position_ >= tokens_.size() ||
+                        !std::holds_alternative<LexerType::Keyword>(tokens_[position_]) ||
+                        std::get<LexerType::Keyword>(tokens_[position_]).name != "bytes") {
+                        return fail("@faddr supports '&bytes' as a raw memory range type");
+                    }
+                    ++position_;
+                    return true;
+                }
+                if (position_ >= tokens_.size() ||
+                    !std::holds_alternative<LexerType::Keyword>(tokens_[position_])) {
+                    return fail("@faddr requires a Zeus type after '->'");
+                }
+                ++position_;
+            }
+            return true;
+        }
 
         if (std::holds_alternative<LexerType::Value>(tokens_[position_]) ||
             std::holds_alternative<LexerType::BytesLiteral>(tokens_[position_])) {

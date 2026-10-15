@@ -1,0 +1,6 @@
+print("int conversions", int("3"), int("001"));
+try {
+    print("invalid int", int("3x"));
+} catch (&error) {
+    print("invalid rejected");
+}

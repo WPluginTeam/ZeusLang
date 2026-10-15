@@ -1,0 +1,56 @@
+// cppfunctions.zeu
+// 底层C++函数封装模块
+
+// array命名空间 - 数组操作
+class array {
+    
+    // 这些是占位符，实际实现在VM的内置函数中
+    func push(arr, value) { return __array_push(arr, value); }
+    func pop(arr) { return __array_pop(arr); }
+    func get(arr, index) { return __array_get(arr, index); }
+    func set(arr, index, value) { return __array_set(arr, index, value); }
+    func clear(arr) { return __array_clear(arr); }
+    func slice(arr, start, end) { return __array_slice(arr, start, end); }
+}
+
+// object命名空间 - 对象操作
+class object {
+    
+    // 零拷贝对象字段访问
+    func objget(obj, field, key) { return __objget(obj, field, key); }
+    func objset(obj, field, key, value) { return __objset(obj, field, key, value); }
+    
+    // 属性访问（同时保留全局版本）
+    func getattr(obj, attrName) { return getattr(obj, attrName); }
+    func setattr(obj, attrName, value) { return setattr(obj, attrName, value); }
+}
+
+// global命名空间 - 全局变量操作
+class global {
+    
+    func get(index) { return __getglobal(index); }
+    func set(index, value) { return __setglobal(index, value); }
+    func load(name) { return __loadglobal(name); }
+    func store(name, value) { return __storeglobal(name, value); }
+}
+
+// dict命名空间 - 字典操作
+class dict {
+    
+    func hasKey(dict, key) { return hasKey(dict, key); }
+}
+
+// conversion命名空间 - 类型转换
+class conversion {
+    
+    func int(value) { return int(value); }
+    func float(value) { return float(value); }
+    func str(value) { return str(value); }
+    func type(value) { return type(value); }
+}
+
+// io命名空间 - 输入输出（保留全局print）
+class io {
+
+    func static input(s="") -> string { print(s); return input(); }
+}

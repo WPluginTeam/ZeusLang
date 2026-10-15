@@ -4,6 +4,7 @@
 // 时间相关函数：time, clock, localtime, strftime 等
 
 #include "core.hpp"
+#include "../../ZeusRuntimeLib/ZeusGC.hpp"
 #include <chrono>
 #include <ctime>
 #include <iomanip>
@@ -74,6 +75,7 @@ namespace ZeusBuiltins {
     // __time_localtime(timestamp?): 返回本地时间结构（字典）
     // 如果不提供 timestamp，使用当前时间
     inline ZeusType::UniversalVariant builtin_time_localtime(const std::vector<ZeusType::UniversalVariant>& args) {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         std::time_t timestamp;
 
         if (args.empty()) {
@@ -109,11 +111,11 @@ namespace ZeusBuiltins {
 
         // 创建时间结构字典
         ZeusType::Object obj;
-        obj.impl = std::make_shared<ZeusType::ObjectData>();
+        obj.impl = ZeusGC::makeObjectData();
         
         auto setField = [&](const std::string& key, int64_t value) {
-            obj.impl->data[key] = ZeusType::UniversalVariant(ZeusType::BigInteger(value));
-            obj.impl->order.push_back(key);
+            obj.impl->setValue(
+                key, ZeusType::UniversalVariant(ZeusType::BigInteger(value)));
         };
 
         setField("tm_year", tm->tm_year + 1900);  // 年份（完整年份）
@@ -131,6 +133,7 @@ namespace ZeusBuiltins {
 
     // __time_gmtime(timestamp?): 返回 UTC 时间结构（字典）
     inline ZeusType::UniversalVariant builtin_time_gmtime(const std::vector<ZeusType::UniversalVariant>& args) {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         std::time_t timestamp;
 
         if (args.empty()) {
@@ -164,11 +167,11 @@ namespace ZeusBuiltins {
         }
 
         ZeusType::Object obj;
-        obj.impl = std::make_shared<ZeusType::ObjectData>();
+        obj.impl = ZeusGC::makeObjectData();
         
         auto setField = [&](const std::string& key, int64_t value) {
-            obj.impl->data[key] = ZeusType::UniversalVariant(ZeusType::BigInteger(value));
-            obj.impl->order.push_back(key);
+            obj.impl->setValue(
+                key, ZeusType::UniversalVariant(ZeusType::BigInteger(value)));
         };
 
         setField("tm_year", tm->tm_year + 1900);

@@ -1,0 +1,39 @@
+import zeus.thread [&];
+
+class Probe {
+    using &this;
+    let value = 7;
+
+    func get_value() {
+        return this.value;
+    }
+}
+
+func run_once() {
+    let object = new Probe();
+    let method = object.get_value;
+    let worker = new thread.Thread(method);
+    worker.start();
+    worker.join();
+    delete worker;
+    delete object;
+}
+
+func main() {
+    let count = 0;
+    for (true) {
+        if (count >= 1000) {
+            break;
+        }
+        count = count + 1;
+        run_once();
+        if (count % 100 == 0) {
+            __gc_collect();
+            print("BOUND_METHOD_PROGRESS", count,
+                  "GC_NODES", __gc_native_nodes());
+        }
+    }
+    print("BOUND_METHOD_FINISHED", count);
+}
+
+main();

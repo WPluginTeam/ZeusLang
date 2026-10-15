@@ -1,0 +1,56 @@
+@type(T)
+func runTypedIndex(array: T, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + array[index];
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func runDynamicIndex(array: Array, index, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + array[index];
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+let values = [3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59];
+let selectedIndex = 7;
+let warmupIterations = 20000;
+let iterations = 500000;
+let expected = 23 * iterations;
+
+if (runTypedIndex<Array>(values, selectedIndex, 1000) != 23000 or
+    runDynamicIndex(values, selectedIndex, 1000) != 23000) {
+    throw "array index benchmark checksum setup failed";
+}
+
+runTypedIndex<Array>(values, selectedIndex, warmupIterations);
+runDynamicIndex(values, selectedIndex, warmupIterations);
+
+var iterationIndex = 0;
+for (true) {
+    if (iterationIndex == 5) break;
+
+    let dynamicStart = __time_perf_counter_ns();
+    let dynamicChecksum = runDynamicIndex(values, selectedIndex, iterations);
+    let dynamicElapsed = __time_perf_counter_ns() - dynamicStart;
+
+    let typedStart = __time_perf_counter_ns();
+    let typedChecksum = runTypedIndex<Array>(values, selectedIndex, iterations);
+    let typedElapsed = __time_perf_counter_ns() - typedStart;
+
+    if (typedChecksum != expected or dynamicChecksum != expected) {
+        throw "array index benchmark checksum mismatch";
+    }
+    print("ARRAY_TYPED_I64_INDEX_NS", iterationIndex, typedElapsed, typedChecksum);
+    print("ARRAY_DYNAMIC_INDEX_NS", iterationIndex, dynamicElapsed, dynamicChecksum);
+    iterationIndex = iterationIndex + 1;
+}

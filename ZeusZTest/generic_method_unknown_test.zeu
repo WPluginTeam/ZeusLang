@@ -1,0 +1,11 @@
+class GenericReceiver {
+    using &this;
+    @type(T)
+    func echo(value: T) -> T { return value; }
+}
+func dynamicReceiver(flag: bool) {
+    if (flag) { return new GenericReceiver(); }
+    return nil;
+}
+let receiver = dynamicReceiver(true);
+print(receiver.echo(1));

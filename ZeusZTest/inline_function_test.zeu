@@ -1,0 +1,9 @@
+inline func addOne(value: int) -> int {
+    return value + 1;
+}
+
+if (addOne(41) != 42) {
+    throw new Exception("inline function result mismatch");
+}
+
+print("INLINE_FUNCTION_PASS");

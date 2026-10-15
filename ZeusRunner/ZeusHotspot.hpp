@@ -34,6 +34,7 @@ struct HotspotContext {
 
     // 辅助回调（由 VM 提供实现）
     std::function<Cell*(const ZeusType::UniversalVariant&, uint8_t, const char*)> newCellCb;
+    std::function<void(Cell*, const ZeusType::UniversalVariant&)> assignCellValueCb;
     std::function<void(int /*slot*/, const ZeusType::UniversalVariant&)> tryRegisterGlobalClosureCb;
     std::function<void()> printGlobalsCb;
     std::function<void()> printStackCb;
@@ -139,7 +140,7 @@ inline void hotspot1(const IRType::IRInstr& instr, HotspotContext& ctx) {
             exp._throw(ctx.vmstat);
             return;
         }
-        ctx.global[slot]->value = newVal;
+        ctx.assignCellValueCb(ctx.global[slot], newVal);
         const bool wantConst = (mutOrConst == "const");
         const bool isConstNow = (ctx.global[slot]->flags & 0x1) != 0;
         if (wantConst != isConstNow) {

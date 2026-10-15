@@ -48,6 +48,26 @@ inline std::string emitResultCall(
     return result;
 }
 
+inline std::string emitArrayIndexCall(
+    const std::string& symbol,
+    const std::string& array,
+    const std::string& index,
+    bool isStore,
+    const std::string& value,
+    const FreshTemporary& freshTemporary,
+    const EmitLine& emitLine
+) {
+    const std::string result = freshTemporary();
+    emitLine(result + " = alloca %ZeusValue, align 8");
+
+    std::string call = "call void " + symbol + "(ptr " + result +
+        ", ptr " + array + ", i64 " + index;
+    if (isStore) call += ", ptr " + value;
+    call += ")";
+    emitLine(call);
+    return result;
+}
+
 inline std::string emitBuildCall(
     bool dictionary,
     std::int64_t count,

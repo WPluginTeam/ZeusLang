@@ -1,0 +1,7 @@
+impl string {
+    using &this;
+    @type(T)
+    func same(left: T, right: T) -> T { return left; }
+}
+let text = "receiver";
+print(text.same(1, "different"));

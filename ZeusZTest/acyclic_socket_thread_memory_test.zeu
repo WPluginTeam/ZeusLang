@@ -1,0 +1,74 @@
+// Loopback-only VM memory-leak probe modeled on SocketThreadTest.
+// Each worker owns the accepted socket through its closure; no owner object
+// stores the Thread, so the lifetime graph has no Thread/ClientRes cycle.
+
+import zeus.thread [&];
+import zeus.socket [&];
+
+var server = new socket.Socket();
+server.bind("127.0.0.1", 53127);
+server.listen(128);
+print("READY 127.0.0.1:53127");
+
+class ClientContext {
+    using &this;
+    let client = nil;
+
+    func init(socket) {
+        this.client = socket;
+    }
+
+    func handle() {
+        let request = this.client.recv(1024);
+        if (len(request) > 0) {
+            this.client.send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+        }
+        this.client.close();
+    }
+}
+
+func serve_one(request_count) {
+    let client = server.accept();
+    let context = new ClientContext(client);
+    let handler = context.handle;
+    let worker = new thread.Thread(handler);
+    worker.start();
+    worker.join();
+
+    // Context does not own the Thread, so the bound method cannot form a cycle.
+    delete worker;
+    delete context;
+    delete client;
+
+    if (request_count % 100 == 0) {
+        print("=== Request:", request_count,
+              "Memory:", __get_memory_usage(), "MB",
+              "Threads:", __thread_count(), "===");
+        __gc_stats();
+        __closure_stats();
+        __vm_stats();
+    }
+}
+
+func main() {
+    let request_count = 0;
+    for (true) {
+        if (request_count >= 1000) {
+            break;
+        }
+        request_count = request_count + 1;
+        serve_one(request_count);
+    }
+
+    // close() releases the bound listener even though it is not connected.
+    // The closed state also prevents delete from closing the handle twice.
+    server.close();
+    delete server;
+    print("=== FINISHED 1000 REQUESTS ===");
+    __gc_stats();
+    __closure_stats();
+    __vm_stats();
+    __dump_objects();
+}
+
+main();

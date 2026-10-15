@@ -1,0 +1,73 @@
+// AOT-compatible version of acyclic_socket_thread_memory_test.zeu.
+// Process memory and handle counts are sampled externally because VM-only
+// __vm_stats/__gc_stats hooks are not part of the standalone runtime ABI.
+
+@native("zeus_runtime_debug_dump")
+decl func runtime_debug_dump() -> int;
+
+@native("zeus_runtime_debug_dump_at_exit")
+decl func runtime_debug_dump_at_exit() -> int;
+
+import zeus.thread [&];
+import zeus.socket [&];
+
+var server = new socket.Socket();
+server.bind("127.0.0.1", 53127);
+server.listen(128);
+print("AOT_READY 127.0.0.1:53127");
+
+class ClientContext {
+    using &this;
+    let client = nil;
+
+    func init(socket) {
+        this.client = socket;
+    }
+
+    func handle() {
+        let request = this.client.recv(1024);
+        if (len(request) > 0) {
+            this.client.send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+        }
+        this.client.close();
+    }
+}
+
+func serve_one(request_count) {
+    let client = server.accept();
+    let context = new ClientContext(client);
+    let handler = context.handle;
+    let worker = new thread.Thread(handler);
+    worker.start();
+    worker.join();
+
+    delete worker;
+    delete context;
+    delete client;
+
+}
+
+func main() {
+    let request_count = 0;
+    for (true) {
+        if (request_count >= 10000) {
+            break;
+        }
+        request_count = request_count + 1;
+        serve_one(request_count);
+        if (request_count % 1000 == 0) {
+            __gc_collect();
+            print("AOT_PROGRESS", request_count,
+                  "THREADS", __thread_count(),
+                  "GC_NODES", __gc_native_nodes());
+        }
+    }
+
+    server.close();
+    delete server;
+    print("AOT_FINISHED 10000 REQUESTS");
+}
+
+main();
+runtime_debug_dump();
+runtime_debug_dump_at_exit();

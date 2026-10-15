@@ -1,0 +1,122 @@
+// Array is the language-facing implementation of the native array value.
+@native("zeus_value_array_push")
+decl func __array_push(array, value);
+
+@native("zeus_value_array_pop")
+decl func __array_pop(array);
+
+@native("zeus_value_array_get")
+decl func __array_get(array, index);
+
+@native("zeus_value_array_set")
+decl func __array_set(array, index, value);
+
+@native("zeus_value_array_clear")
+decl func __array_clear(array);
+
+@native("zeus_value_array_slice")
+decl func __array_slice(array, start, end);
+
+@native("zeus_value_array_length_i64")
+decl func __array_length_i64(array: Array) -> int;
+
+impl Array {
+    using &this;
+
+    func operator[new](value=nil) -> Array {
+        if (value == nil) return [];
+        if (type(value) != "Array") {
+            throw new Exception("Array constructor expects an Array or nil");
+        }
+        return value;
+    }
+
+    func append(value) {
+        __array_push(this, value);
+        return this;
+    }
+
+    func remove(index) {
+        let result = [];
+        for (0..this.length()) [const &i] {
+            if (i != index) result.append(this[i]);
+        }
+        return result;
+    }
+
+    func pop() {
+        return __array_pop(this);
+    }
+
+    @no_safepoint inline func length() -> int {
+        using LLVM {
+            return __array_length_i64(this);
+        }
+        using VM {
+            return len(this);
+        }
+    }
+
+    func get(index) {
+        return this[index];
+    }
+
+    func set(index, value) -> Array {
+        __array_set(this, index, value);
+        return this;
+    }
+
+    func toString() -> string {
+        let result = "[";
+        for (this) [const &item] {
+            result = result + str(item) + ", ";
+        }
+        if (this.length() > 0) {
+            result = result.slice(0, result.length() - 2);
+        }
+        return result + "]";
+    }
+
+    func operator[+](other) -> Array {
+        let result = [];
+        for (this) [const &item] {
+            result.append(item);
+        }
+        for (other) [const &item] {
+            result.append(item);
+        }
+        return result;
+    }
+
+    func sort() -> Array {
+        let target = this;
+        let n = target.length();
+        let i = 0;
+        for (i < n - 1) {
+            let j = 0;
+            for (j < n - i - 1) {
+                if (target[j] > target[j + 1]) {
+                    let tmp = target[j];
+                    target[j] = target[j + 1];
+                    target[j + 1] = tmp;
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        return target;
+    }
+
+    func clear() -> Array {
+        __array_clear(this);
+        return this;
+    }
+
+    func copy() -> Array {
+        let result = [];
+        for (this) [const &item] {
+            result.append(item);
+        }
+        return result;
+    }
+}

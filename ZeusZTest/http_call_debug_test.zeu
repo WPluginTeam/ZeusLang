@@ -1,0 +1,6 @@
+func echoDebug(value) {
+    return "ok";
+}
+
+let callback = echoDebug;
+print("direct call", callback(1));

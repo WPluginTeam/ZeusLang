@@ -42,8 +42,13 @@ namespace ZeusBuiltins {
         }
 
         const auto& obj = (*g_vmObjects)[objId];
-        auto it = obj.values.find(attrName);
-        if (it == obj.values.end()) {
+        const bool hasClassInfo = g_vmClasses && obj.classId >= 0 &&
+            obj.classId < static_cast<int>(g_vmClasses->size());
+        const auto extension = obj.extensionValues.find(attrName);
+        const bool hasField = hasClassInfo
+            ? ZeusType::objectHasField(obj, (*g_vmClasses)[obj.classId], attrName)
+            : extension != obj.extensionValues.end();
+        if (!hasField) {
             // 如果没有第三个参数（默认值），抛出异常
             if (args.size() < 3) {
                 throw std::runtime_error("getattr: attribute '" + attrName + "' not found");
@@ -52,7 +57,10 @@ namespace ZeusBuiltins {
             return args[2];
         }
 
-        return it->second;
+        if (hasClassInfo) {
+            return ZeusType::readObjectField(obj, (*g_vmClasses)[obj.classId], attrName);
+        }
+        return extension->second;
     }
 
     // setattr(obj, attrName, value): 设置对象属性
@@ -87,8 +95,42 @@ namespace ZeusBuiltins {
             throw std::runtime_error("setattr: invalid object id");
         }
 
-        (*g_vmObjects)[objId].values[attrName] = args[2];
+        auto& obj = (*g_vmObjects)[objId];
+        if (g_vmClasses && obj.classId >= 0 && obj.classId < static_cast<int>(g_vmClasses->size())) {
+            ZeusType::writeObjectField(obj, (*g_vmClasses)[obj.classId], attrName, args[2]);
+        } else {
+            obj.extensionValues[attrName] = args[2];
+        }
         return ZeusType::UniversalVariant(LexerType::Value(true));
+    }
+
+    // VM::invokeNative performs the shallow ObjectInstance copy so it can use
+    // the VM's object table and retain each copied field edge.
+    inline ZeusType::UniversalVariant builtin_object_clone(
+        const std::vector<ZeusType::UniversalVariant>& args
+    ) {
+        if (args.size() != 1) {
+            throw std::runtime_error("__zeus_object_clone expects 1 argument");
+        }
+        return args[0];
+    }
+
+    inline ZeusType::UniversalVariant builtin_object_assign(
+        const std::vector<ZeusType::UniversalVariant>& args
+    ) {
+        if (args.size() != 2) {
+            throw std::runtime_error("__zeus_object_assign expects 2 arguments");
+        }
+        return args[0];
+    }
+
+    inline ZeusType::UniversalVariant builtin_object_invalidate(
+        const std::vector<ZeusType::UniversalVariant>& args
+    ) {
+        if (args.size() != 1) {
+            throw std::runtime_error("__zeus_object_invalidate expects 1 argument");
+        }
+        return ZeusType::UniversalVariant(ZeusType::Variant(ZeusType::Null()));
     }
 
     // ===== 全局变量操作函数 =====
@@ -144,6 +186,9 @@ namespace ZeusBuiltins {
         // 对象操作（供cppfunctions.object使用）
         registerBuiltin("__objget", builtin_getattr, 3, 3);  // 零拷贝对象字段访问
         registerBuiltin("__objset", builtin_setattr, 4, 4);  // 零拷贝对象字段修改
+        registerBuiltin("__zeus_object_clone", builtin_object_clone, 1, 1);
+        registerBuiltin("__zeus_object_assign", builtin_object_assign, 2, 2);
+        registerBuiltin("__zeus_object_invalidate", builtin_object_invalidate, 1, 1);
         
         // 全局变量操作（供cppfunctions.global使用）
         registerBuiltin("__getglobal", builtin_getglobal, 1, 1);

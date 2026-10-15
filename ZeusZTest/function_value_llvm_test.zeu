@@ -1,0 +1,34 @@
+import zeus.mem [&];
+import zeus.socket [&socket];
+
+class StaticMath {
+    func static multiply(value: int) -> int {
+        return value * 2;
+    }
+}
+
+func call(callback, value: int) -> int {
+    return callback(value);
+}
+
+let freeValue = mem.free;
+print(freeValue);
+
+let multiplier = StaticMath.multiply;
+print(call(multiplier, 21));
+
+func callLocalStatic(value: int) -> int {
+    let callback = StaticMath.multiply;
+    return callback(value);
+}
+print(callLocalStatic(5));
+
+if (true) {
+    let scopedMultiplier = StaticMath.multiply;
+    print(scopedMultiplier(7));
+}
+
+let namespaceClassStatic = socket.SocketFactory.createSocket;
+print(namespaceClassStatic);
+let openedSocket = namespaceClassStatic();
+openedSocket.close();

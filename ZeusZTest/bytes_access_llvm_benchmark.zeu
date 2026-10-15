@@ -1,0 +1,309 @@
+import zeus.byte;
+
+@native("zeus_bytes_get")
+decl func benchAbiGet(data: bytes, index: int) -> int;
+
+@native("zeus_bytes_len")
+decl func benchAbiLength(data: bytes) -> int;
+
+@native("zeus_bytes_slice")
+decl func benchAbiSlice(data: bytes, start: int, end: int) -> bytes;
+
+@native("zeus_bytes_copy_from_address")
+decl func benchBytesCopyFromAddress(dataAddress: int, length: int) -> bytes;
+
+@native("zeus_bytes_clone")
+decl func benchBytesClone(data: bytes) -> bytes;
+
+func rawGet(data: bytes, index: int) -> int {
+    let dataAddress = @reveal(data);
+    let length = @faddr(dataAddress - 8, 8) -> int;
+    if (index < 0) index = length;
+    return @faddr(dataAddress + index, 1) -> int;
+}
+
+func rawLength(data: bytes) -> int {
+    let dataAddress = @reveal(data);
+    return @faddr(dataAddress - 8, 8) -> int;
+}
+
+func rawSlice(dataAddress: int, sourceLength: int, start: int, end: int) -> bytes {
+    let length = sourceLength;
+    if (start < 0) start = 0;
+    if (end < 0) end = 0;
+    if (end > length) end = length;
+    if (start > end) start = end;
+    return @faddr(dataAddress + start, end - start) -> bytes;
+}
+
+func singleCheckSlice(dataAddress: int, sourceLength: int,
+                      start: int, end: int) -> bytes {
+    let length = sourceLength;
+    if (start < 0) start = 0;
+    if (end < 0) end = 0;
+    if (end > length) end = length;
+    if (start > end) start = end;
+    return benchBytesCopyFromAddress(dataAddress + start, end - start);
+}
+
+func singleCheckCloneSlice(dataAddress: int, sourceLength: int,
+                           start: int, end: int) -> bytes {
+    let length = sourceLength;
+    if (start < 0) start = 0;
+    if (end < 0) end = 0;
+    if (end > length) end = length;
+    if (start > end) start = end;
+    return benchBytesClone(benchBytesCopyFromAddress(
+        dataAddress + start, end - start));
+}
+
+func runAbiGet(data: bytes, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + benchAbiGet(data, index);
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func runMethodGet(data: bytes, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + data.get(index);
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func runRawGet(data: bytes, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + rawGet(data, index);
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func runAbiLength(data: bytes, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + benchAbiLength(data);
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func runMethodLength(data: bytes, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + data.length();
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func runRawLength(data: bytes, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + rawLength(data);
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func runAbiSlice(data: bytes, start: int, end: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + benchAbiSlice(data, start, end).length();
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func runMethodSlice(data: bytes, start: int, end: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + data.slice(start, end).length();
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func runRawSlice(dataAddress: int, sourceLength: int, start: int, end: int,
+                 iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + rawSlice(
+            dataAddress, sourceLength, start, end).length();
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func runSingleCheckSlice(dataAddress: int, sourceLength: int,
+                         start: int, end: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + singleCheckSlice(
+            dataAddress, sourceLength, start, end).length();
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func runSingleCheckCloneSlice(dataAddress: int, sourceLength: int,
+                              start: int, end: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + singleCheckCloneSlice(
+            dataAddress, sourceLength, start, end).length();
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func benchmarkSliceSize(data: bytes, sample: int, sliceSize: int) {
+    let sliceIterations = 10000;
+    let sliceStart = 0;
+    let sliceEnd = sliceStart + sliceSize;
+    let dataAddress = data.dataAddress();
+    let sourceLength = data.length();
+    let abiStart = __time_perf_counter_ns();
+    let abiChecksum = runAbiSlice(data, sliceStart, sliceEnd, sliceIterations);
+    let abiElapsed = __time_perf_counter_ns() - abiStart;
+    let methodStart = __time_perf_counter_ns();
+    let methodChecksum = runMethodSlice(data, sliceStart, sliceEnd, sliceIterations);
+    let methodElapsed = __time_perf_counter_ns() - methodStart;
+    var rawElapsed = 0;
+    var rawChecksum = 0;
+    var cloneElapsed = 0;
+    var cloneChecksum = 0;
+    var singleElapsed = 0;
+    var singleChecksum = 0;
+    var rawStart = 0;
+    var cloneStart = 0;
+    var singleStart = 0;
+    if (sample % 3 == 0) {
+        rawStart = __time_perf_counter_ns();
+        rawChecksum = runRawSlice(dataAddress, sourceLength, sliceStart,
+                                  sliceEnd, sliceIterations);
+        rawElapsed = __time_perf_counter_ns() - rawStart;
+        cloneStart = __time_perf_counter_ns();
+        cloneChecksum = runSingleCheckCloneSlice(
+            dataAddress, sourceLength, sliceStart, sliceEnd, sliceIterations);
+        cloneElapsed = __time_perf_counter_ns() - cloneStart;
+        singleStart = __time_perf_counter_ns();
+        singleChecksum = runSingleCheckSlice(
+            dataAddress, sourceLength, sliceStart, sliceEnd, sliceIterations);
+        singleElapsed = __time_perf_counter_ns() - singleStart;
+    } else if (sample % 3 == 1) {
+        cloneStart = __time_perf_counter_ns();
+        cloneChecksum = runSingleCheckCloneSlice(
+            dataAddress, sourceLength, sliceStart, sliceEnd, sliceIterations);
+        cloneElapsed = __time_perf_counter_ns() - cloneStart;
+        singleStart = __time_perf_counter_ns();
+        singleChecksum = runSingleCheckSlice(
+            dataAddress, sourceLength, sliceStart, sliceEnd, sliceIterations);
+        singleElapsed = __time_perf_counter_ns() - singleStart;
+        rawStart = __time_perf_counter_ns();
+        rawChecksum = runRawSlice(dataAddress, sourceLength, sliceStart,
+                                  sliceEnd, sliceIterations);
+        rawElapsed = __time_perf_counter_ns() - rawStart;
+    } else {
+        singleStart = __time_perf_counter_ns();
+        singleChecksum = runSingleCheckSlice(
+            dataAddress, sourceLength, sliceStart, sliceEnd, sliceIterations);
+        singleElapsed = __time_perf_counter_ns() - singleStart;
+        cloneStart = __time_perf_counter_ns();
+        cloneChecksum = runSingleCheckCloneSlice(
+            dataAddress, sourceLength, sliceStart, sliceEnd, sliceIterations);
+        cloneElapsed = __time_perf_counter_ns() - cloneStart;
+        rawStart = __time_perf_counter_ns();
+        rawChecksum = runRawSlice(dataAddress, sourceLength, sliceStart,
+                                  sliceEnd, sliceIterations);
+        rawElapsed = __time_perf_counter_ns() - rawStart;
+    }
+    print("BYTES_SLICE_NS", sample, sliceSize, abiElapsed, methodElapsed,
+          rawElapsed, singleElapsed, cloneElapsed, abiChecksum, methodChecksum,
+          rawChecksum, singleChecksum, cloneChecksum);
+}
+
+func benchmarkSample(data: bytes, sample: int) {
+    let getIterations = 100000;
+    let lengthIterations = 100000;
+    let selectedIndex = 173;
+    let abiGetStart = __time_perf_counter_ns();
+    let abiGetChecksum = runAbiGet(data, selectedIndex, getIterations);
+    let abiGetElapsed = __time_perf_counter_ns() - abiGetStart;
+    let methodGetStart = __time_perf_counter_ns();
+    let methodGetChecksum = runMethodGet(data, selectedIndex, getIterations);
+    let methodGetElapsed = __time_perf_counter_ns() - methodGetStart;
+    let rawGetStart = __time_perf_counter_ns();
+    let rawGetChecksum = runRawGet(data, selectedIndex, getIterations);
+    let rawGetElapsed = __time_perf_counter_ns() - rawGetStart;
+    print("BYTES_GET_NS", sample, abiGetElapsed, methodGetElapsed,
+          rawGetElapsed, abiGetChecksum, methodGetChecksum, rawGetChecksum);
+
+    let abiLengthStart = __time_perf_counter_ns();
+    let abiLengthChecksum = runAbiLength(data, lengthIterations);
+    let abiLengthElapsed = __time_perf_counter_ns() - abiLengthStart;
+    let methodLengthStart = __time_perf_counter_ns();
+    let methodLengthChecksum = runMethodLength(data, lengthIterations);
+    let methodLengthElapsed = __time_perf_counter_ns() - methodLengthStart;
+    let rawLengthStart = __time_perf_counter_ns();
+    let rawLengthChecksum = runRawLength(data, lengthIterations);
+    let rawLengthElapsed = __time_perf_counter_ns() - rawLengthStart;
+    print("BYTES_LENGTH_NS", sample, abiLengthElapsed, methodLengthElapsed,
+          rawLengthElapsed, abiLengthChecksum, methodLengthChecksum,
+          rawLengthChecksum);
+
+    benchmarkSliceSize(data, sample, 8);
+    benchmarkSliceSize(data, sample, 64);
+    benchmarkSliceSize(data, sample, 1024);
+}
+
+func benchmarkAccess(data: bytes) {
+    let selectedIndex = 173;
+    runAbiGet(data, selectedIndex, 1000);
+    runMethodGet(data, selectedIndex, 1000);
+    runRawGet(data, selectedIndex, 1000);
+    runAbiLength(data, 1000);
+    runMethodLength(data, 1000);
+    runRawLength(data, 1000);
+    let dataAddress = data.dataAddress();
+    let sourceLength = data.length();
+    runRawSlice(dataAddress, sourceLength, 32, 40, 1000);
+    runSingleCheckCloneSlice(dataAddress, sourceLength, 32, 40, 1000);
+    runSingleCheckSlice(dataAddress, sourceLength, 32, 40, 1000);
+
+    benchmarkSample(data, 0);
+    benchmarkSample(data, 1);
+    benchmarkSample(data, 2);
+    benchmarkSample(data, 3);
+    benchmarkSample(data, 4);
+}
+
+let data = bytes(4096);
+benchmarkAccess(data);

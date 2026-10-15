@@ -1,0 +1,14 @@
+import zeus.thread [&];
+let pool = new thread.ThreadPool(2);
+let worker = new thread.Thread(pool._workerLoop);
+print("before-worker-start");
+let started = worker.start();
+print("after-worker-start", started);
+print("before-shutdown");
+pool.shutdown(true);
+print("after-pool-shutdown");
+worker.join();
+print("after-worker-join");
+delete worker;
+delete pool;
+print("after-delete");

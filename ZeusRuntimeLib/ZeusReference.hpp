@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace ZeusType {
@@ -10,6 +11,7 @@ namespace ZeusType {
     struct ReferenceHandle {
         void* address = nullptr;
         std::string typeName;
+        std::uint64_t generation = 0;
     };
 
 }

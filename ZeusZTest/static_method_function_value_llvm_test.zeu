@@ -1,0 +1,15 @@
+class StaticMath {
+    func static multiply(left: int, right: int) -> int {
+        return left * right;
+    }
+}
+
+func main() {
+    let callback = StaticMath.multiply;
+    if (callback(6, 7) != 42) {
+        throw new Exception("static method function value mismatch");
+    }
+    print("PASS static method function value");
+}
+
+main();

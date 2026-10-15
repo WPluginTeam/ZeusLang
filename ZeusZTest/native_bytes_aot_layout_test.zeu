@@ -1,0 +1,78 @@
+import zeus.byte;
+
+func echoBytes(value: bytes) -> bytes { return value; }
+func makeBytes() -> bytes { return b"return"; }
+func dynamicIdentity(value) { return value; }
+func bytesThroughDynamic(value: bytes) -> bytes {
+    return dynamicIdentity(value);
+}
+
+class BytesHolder {
+    using &this;
+
+    var value: bytes = b"";
+
+    func init(value: bytes) { this.value = value; }
+    func get() -> bytes { return this.value; }
+}
+
+let explicitGlobal: bytes = b"global";
+let inferredGlobal = b"inferred";
+var mutableGlobal: bytes = b"before";
+mutableGlobal = b"after";
+
+let explicit: bytes = b"A\0B";
+let inferred = b"hello";
+let returned = makeBytes();
+let passed = echoBytes(explicit);
+let dynamicBoundary = bytesThroughDynamic(b"bridge");
+let holder = new BytesHolder(b"field");
+let fieldValue = holder.get();
+let joined = b"ab" + b"cd";
+let sliced = joined.slice(1, 3);
+let decoded = b"ok".decode("utf-8");
+
+if (explicitGlobal[0] != 103 or inferredGlobal[0] != 105 or
+    mutableGlobal[0] != 97) throw "bytes globals lost their data";
+if (explicit.length() != 3 or explicit[0] != 65 or explicit[1] != 0 or
+    explicit[2] != 66 or inferred[1] != 101) throw "bytes index or NUL data failed";
+if (returned.length() != 6 or passed[0] != 65 or
+    dynamicBoundary[0] != 98) throw "bytes parameter/return bridge failed";
+if (fieldValue.length() != 5 or fieldValue[0] != 102) {
+    throw "native bytes field path failed";
+}
+if (joined.length() != 4 or sliced.length() != 2 or sliced[0] != 98 or
+    decoded != "ok") throw "bytes concat/slice/decode failed";
+
+let copy = explicit;
+if (copy.dataAddress() == explicit.dataAddress()) {
+    throw "ordinary bytes copy reused the source allocation";
+}
+@faddr(copy.dataAddress(), 1) -> int = 90;
+if (copy[0] != 90 or explicit[0] != 65) {
+    throw "independent bytes allocations shared writable data";
+}
+
+let globalAddress = @addr(mutableGlobal);
+let globalCopy = @faddr(globalAddress) -> bytes;
+if (globalCopy.length() != 5 or globalCopy[0] != 97) {
+    throw "typed bytes global slot read failed";
+}
+@faddr(globalAddress) -> bytes = b"updated";
+if (mutableGlobal.length() != 7 or mutableGlobal[0] != 117) {
+    throw "typed bytes global slot write failed";
+}
+
+using LLVM {
+    let data = explicit.dataAddress();
+    let empty = b"";
+    if (@faddr(data - 8, 8) -> int != 3) {
+        throw "native bytes length header was not stored at data - 8";
+    }
+    if (empty.length() != 0 or
+        @faddr(empty.dataAddress() - 8, 8) -> int != 0) {
+        throw "empty native bytes header was invalid";
+    }
+}
+
+print("NATIVE_BYTES_LAYOUT_PASS");

@@ -1,0 +1,29 @@
+var failures = 0;
+
+func fail(message: string) {
+    failures = failures + 1;
+    print("[FAIL]", message);
+}
+
+func main() {
+    var text = "hello";
+    let textAlias = text;
+    text[1] = "a";
+    if (text != "hallo") fail("string index assignment did not replace one byte");
+    if (textAlias != "hello") fail("string index assignment changed an alias");
+
+    text[-1] = "!";
+    if (text != "hall!") fail("string index assignment did not accept a negative index");
+
+    var data = b"abc";
+    let dataAlias = data;
+    data[1] = 90;
+    if (data[1] != 90) fail("bytes index assignment did not store the byte");
+    if (dataAlias[1] != 98) fail("bytes index assignment changed an alias");
+    if (data.length() != 3) fail("bytes index assignment changed the length");
+
+    if (failures == 0) print("STRING_BYTES_INDEX_ASSIGNMENT_PASS");
+    else print("STRING_BYTES_INDEX_ASSIGNMENT_FAIL", failures);
+}
+
+main();

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -7,6 +8,7 @@
 #include <vector>
 
 #include "Types.hpp"
+#include "GenericTypeName.hpp"
 
 namespace ZeusTypeInfer {
 
@@ -16,6 +18,7 @@ namespace ZeusTypeInfer {
         InferredType kind = InferredType::Unknown;
         std::string namedType;
         bool isReference = false;
+        std::vector<std::string> namedTypeArguments;
         std::vector<TypeRef> parameterTypes;
         std::shared_ptr<TypeRef> returnType;
 
@@ -36,7 +39,18 @@ namespace ZeusTypeInfer {
         }
 
         std::string toString() const {
-            if (!namedType.empty()) return isReference ? "&" + namedType : namedType;
+            if (!namedType.empty()) {
+                std::string name = namedType;
+                if (!namedTypeArguments.empty()) {
+                    name += "<";
+                    for (size_t i = 0; i < namedTypeArguments.size(); ++i) {
+                        if (i != 0) name += ", ";
+                        name += namedTypeArguments[i];
+                    }
+                    name += ">";
+                }
+                return isReference ? "&" + name : name;
+            }
             if (!isFunction()) {
                 const std::string baseName = typeName(kind);
                 return isReference ? "&" + baseName : baseName;
@@ -59,12 +73,18 @@ namespace ZeusTypeInfer {
 
         // IR 使用的规范类型名。基础类型与源代码注解保持一致，函数类型保留完整签名。
         std::string toIRTypeName() const {
+            if (!namedType.empty() && !namedTypeArguments.empty()) {
+                const std::string specialized = genericSpecializationName(
+                    namedType, namedTypeArguments);
+                return isReference ? "&" + specialized : specialized;
+            }
             return toString();
         }
 
         bool operator==(const TypeRef& other) const {
             if (kind != other.kind || namedType != other.namedType ||
                 isReference != other.isReference ||
+                namedTypeArguments != other.namedTypeArguments ||
                 parameterTypes != other.parameterTypes) {
                 return false;
             }
@@ -87,7 +107,8 @@ namespace ZeusTypeInfer {
 
     inline TypeRef parseTypeRef(const std::string& name) {
         TypeRef result(parseTypeName(name));
-        result.isReference = !name.empty() && name.front() == '&';
+        result.isReference = !name.empty() && name.front() == '&' &&
+            result.kind != InferredType::RawBytesRange;
         return result;
     }
 
@@ -108,13 +129,29 @@ namespace ZeusTypeInfer {
         bool resolved = false;
         bool compileTimeConstant = false;
         bool explicitAnnotation = false;
+        std::uint32_t bindingNodeId = 0;
 
         bool isKnown() const {
             return resolved && type.isKnown();
         }
 
+        bool isResolved() const {
+            return resolved;
+        }
+
+        bool isDynamic() const {
+            return resolved && type.kind == InferredType::Unknown;
+        }
+
         static TypeInfo unresolved() {
             return {};
+        }
+
+        static TypeInfo dynamic() {
+            TypeInfo result;
+            result.type = TypeRef(InferredType::Unknown);
+            result.resolved = true;
+            return result;
         }
 
         static TypeInfo fromType(

@@ -1,0 +1,73 @@
+import zeus.http;
+import zeus.thread [&];
+import zeus.socket [&];
+import zeus.exception;
+
+var asyncEntered = nil;
+var asyncRelease = nil;
+
+func asyncSlowRoute(request) {
+    asyncEntered.set();
+    asyncRelease.wait();
+    return "SLOW";
+}
+
+func asyncFastRoute(request) {
+    return "FAST";
+}
+
+func assertAsync(condition, message) {
+    if (!condition) throw new Exception("HTTP async test failed: " + message);
+    print("PASS", message);
+}
+
+func main() {
+    asyncEntered = new thread.Event();
+    asyncRelease = new thread.Event();
+
+
+    let server = new HTTPServer("127.0.0.1", 18774);
+    server.get("/slow", asyncSlowRoute);
+    server.get("/fast", asyncFastRoute);
+    let serverThread = server.startAsync(2);
+
+    let slowClient = new socket.Socket("127.0.0.1", 18774);
+    slowClient.send(bytes("GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"));
+    asyncEntered.wait();
+
+    // The slow handler stays blocked until after the fast response arrives.
+    // A server that runs handlers on the accept thread cannot satisfy this.
+    let fastClient = new socket.Socket("127.0.0.1", 18774);
+    fastClient.send(bytes("GET /fast HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"));
+    let fastResponse = fastClient.recv(4096).decode();
+    asyncRelease.set();
+    let slowResponse = slowClient.recv(4096).decode();
+
+    let idleClient = new socket.Socket("127.0.0.1", 18774);
+    idleClient.send(bytes("GET /fast HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    let idleResponse = idleClient.recv(4096).decode();
+
+    fastClient.close();
+    slowClient.close();
+    // Keep the third HTTP/1.1 connection open. close() must interrupt its
+    // worker's next recv so join does not wait forever on keep-alive.
+    server.close();
+    let joined = serverThread.join();
+
+    assertAsync(fastResponse.index("FAST") >= 0, "fast request completes while another handler is blocked");
+    assertAsync(slowResponse.index("SLOW") >= 0, "blocked request resumes and completes");
+    assertAsync(idleResponse.index("FAST") >= 0, "keep-alive request receives its response");
+    assertAsync(joined, "server thread joins after close");
+    assertAsync(!server.isRunning, "server clears running state after join");
+
+    delete fastClient;
+    delete slowClient;
+    delete idleClient;
+    delete serverThread;
+    delete server;
+    delete asyncEntered;
+    delete asyncRelease;
+    print("HTTP_SERVER_ASYNC_TEST_PASS");
+}
+
+main();

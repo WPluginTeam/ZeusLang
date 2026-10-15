@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <utility>
 #include "../ZeusDebug/Utils.hpp"
 
 namespace IRImport {
@@ -28,80 +29,127 @@ namespace IRImport {
     // Zeus可执行文件所在目录 (用于查找内置包)
     static std::string zeusExecutableDir = "";
 
+    // Normalize a path without depending on the process working directory later.
+    inline std::filesystem::path absoluteNormalizedPath(const std::filesystem::path& path) {
+        return std::filesystem::absolute(path).lexically_normal();
+    }
+
+    inline bool packageNameToRelativePath(const std::string& packageName, std::filesystem::path& relativePath) {
+        if (packageName.empty()) return false;
+
+        size_t segmentStart = 0;
+        while (segmentStart <= packageName.size()) {
+            const size_t dot = packageName.find('.', segmentStart);
+            const size_t segmentEnd = dot == std::string::npos ? packageName.size() : dot;
+            const std::string segment = packageName.substr(segmentStart, segmentEnd - segmentStart);
+            if (segment.empty() || segment == "." || segment == ".." ||
+                segment.find('/') != std::string::npos ||
+                segment.find('\\') != std::string::npos ||
+                segment.find(':') != std::string::npos) {
+                return false;
+            }
+
+            relativePath /= segment;
+            if (dot == std::string::npos) break;
+            segmentStart = dot + 1;
+        }
+
+        relativePath += ".zeu";
+        return true;
+    }
+
+    inline bool hasPackagePrefix(const std::string& packageName, const std::string& prefix) {
+        return packageName == prefix ||
+            (packageName.size() > prefix.size() &&
+             packageName.compare(0, prefix.size(), prefix) == 0 &&
+             packageName[prefix.size()] == '.');
+    }
+
+    // Legacy package IDs are canonicalized before entering the import graph so
+    // one source file cannot be loaded under both its old and new names.
+    inline std::string canonicalPackageName(const std::string& packageName) {
+        static const std::string legacyRoot = "ZeusBuiltins";
+        if (packageName == legacyRoot || !hasPackagePrefix(packageName, legacyRoot)) {
+            return packageName;
+        }
+        return "zeus" + packageName.substr(legacyRoot.size());
+    }
+
     // 设置Zeus可执行文件目录
     inline void setZeusExecutableDir(const std::string& exePath) {
         std::filesystem::path p(exePath);
-        
+
         if (p.has_parent_path()) {
-            zeusExecutableDir = p.parent_path().string();
+            zeusExecutableDir = absoluteNormalizedPath(p.parent_path()).string();
         } else {
-            zeusExecutableDir = std::filesystem::current_path().string();
+            zeusExecutableDir = absoluteNormalizedPath(std::filesystem::current_path()).string();
         }
-        
+
         ZEUS_DEBUG_PRINT("[IRImport] Set Zeus executable directory: %s", zeusExecutableDir.c_str());
     }
 
     // 设置当前工作目录
     inline void setWorkingDirectory(const std::string& sourceFilePath) {
         std::filesystem::path p(sourceFilePath);
-        
+
         if (p.has_parent_path()) {
-            currentWorkingDir = p.parent_path().string();
+            currentWorkingDir = absoluteNormalizedPath(p.parent_path()).string();
         } else {
-            currentWorkingDir = std::filesystem::current_path().string();
+            currentWorkingDir = absoluteNormalizedPath(std::filesystem::current_path()).string();
         }
-        
+
         ZEUS_DEBUG_PRINT("[IRImport] Set working directory: %s", currentWorkingDir.c_str());
     }
 
-    // 解析包路径: "package.math" -> "package/math.zeu"
-    // 查找顺序:
-    // 1. Zeus.exe所在目录的ZeusBuiltins/
-    // 2. 当前脚本所在目录
+    // Resolve compiler modules and project modules from explicit roots.
+    //   zeus.mem          -> <compiler-dir>/ZeusBuiltins/zeus/mem.zeu
+    //   ZeusBuiltins.mem  -> canonicalized to zeus.mem
+    //   package.math      -> importer directory/package/math.zeu, then process CWD
     inline std::string resolvePackagePath(const std::string& packageName) {
-        std::string relPath = packageName;
-        
-        // 替换 '.' 为路径分隔符
-        for (char& c : relPath) {
-            if (c == '.') {
-                c = std::filesystem::path::preferred_separator;
-            }
+        const std::string canonicalName = canonicalPackageName(packageName);
+        std::filesystem::path relativePath;
+        if (!packageNameToRelativePath(canonicalName, relativePath)) {
+            ZEUS_DEBUG_PRINT("[IRImport] Invalid package name: %s", packageName.c_str());
+            return "";
         }
-        
-        // 添加 .zeu 后缀
-        relPath += ".zeu";
-        
-        // 1. 先尝试从Zeus.exe所在目录的ZeusBuiltins/查找
-        if (!zeusExecutableDir.empty()) {
-            std::filesystem::path builtinPath = std::filesystem::path(zeusExecutableDir) / "ZeusBuiltins" / relPath;
-            
-            ZEUS_DEBUG_PRINT("[IRImport] Trying builtin path: %s", builtinPath.string().c_str());
-            
+
+        const bool isZeusModule = hasPackagePrefix(canonicalName, "zeus");
+        if (isZeusModule) {
+            if (zeusExecutableDir.empty()) return "";
+            const std::filesystem::path builtinRoot =
+                std::filesystem::path(zeusExecutableDir) / "ZeusBuiltins";
+            const std::filesystem::path builtinPath = absoluteNormalizedPath(builtinRoot / relativePath);
+            ZEUS_DEBUG_PRINT("[IRImport] Trying compiler module path: %s", builtinPath.string().c_str());
             if (std::filesystem::exists(builtinPath)) {
-                ZEUS_DEBUG_PRINT("[IRImport] Found in builtins: '%s' -> '%s'", packageName.c_str(), builtinPath.string().c_str());
+                ZEUS_DEBUG_PRINT("[IRImport] Found compiler module: '%s' -> '%s'",
+                    canonicalName.c_str(), builtinPath.string().c_str());
                 return builtinPath.string();
             }
+
+            ZEUS_DEBUG_PRINT("[IRImport] Compiler module '%s' not found under '%s'",
+                canonicalName.c_str(), builtinRoot.string().c_str());
+            return "";
         }
-        
-        // 2. 再尝试从当前脚本所在目录查找
+
+        // Project modules are relative to the importing source, then the process CWD.
         if (!currentWorkingDir.empty()) {
-            std::filesystem::path workingPath = std::filesystem::path(currentWorkingDir) / relPath;
-            
-            ZEUS_DEBUG_PRINT("[IRImport] Trying working dir path: %s", workingPath.string().c_str());
-            
+            const std::filesystem::path workingPath =
+                absoluteNormalizedPath(std::filesystem::path(currentWorkingDir) / relativePath);
+            ZEUS_DEBUG_PRINT("[IRImport] Trying importer path: %s", workingPath.string().c_str());
             if (std::filesystem::exists(workingPath)) {
-                ZEUS_DEBUG_PRINT("[IRImport] Found in working dir: '%s' -> '%s'", packageName.c_str(), workingPath.string().c_str());
+                ZEUS_DEBUG_PRINT("[IRImport] Found project module: '%s' -> '%s'",
+                    packageName.c_str(), workingPath.string().c_str());
                 return workingPath.string();
             }
         }
-        
-        // 3. 最后尝试当前目录(兼容旧行为)
-        std::filesystem::path currentPath(relPath);
+
+        const std::filesystem::path currentPath = absoluteNormalizedPath(relativePath);
         if (std::filesystem::exists(currentPath)) {
-            ZEUS_DEBUG_PRINT("[IRImport] Found in current dir: '%s' -> '%s'", packageName.c_str(), currentPath.string().c_str());
+            ZEUS_DEBUG_PRINT("[IRImport] Found project module in CWD: '%s' -> '%s'",
+                packageName.c_str(), currentPath.string().c_str());
             return currentPath.string();
         }
-        
+
         ZEUS_DEBUG_PRINT("[IRImport] Package '%s' not found in any search path", packageName.c_str());
         return "";
     }
@@ -136,14 +184,18 @@ namespace IRImport {
 
     // 缓存包信息
     inline void cachePackage(const std::string& packageName, const PackageInfo& info) {
-        packageCache[packageName] = info;
+        const std::string canonicalName = canonicalPackageName(packageName);
+        PackageInfo canonicalInfo = info;
+        canonicalInfo.packageName = canonicalName;
+        packageCache[canonicalName] = std::move(canonicalInfo);
         
-        ZEUS_DEBUG_PRINT("[IRImport] Cached package: %s", packageName.c_str());
+        ZEUS_DEBUG_PRINT("[IRImport] Cached package: %s", canonicalName.c_str());
     }
 
     // 获取缓存的包
     inline PackageInfo* getCachedPackage(const std::string& packageName) {
-        auto it = packageCache.find(packageName);
+        const std::string canonicalName = canonicalPackageName(packageName);
+        auto it = packageCache.find(canonicalName);
         
         if (it != packageCache.end()) {
             ZEUS_DEBUG_PRINT("[IRImport] Found cached package: %s", packageName.c_str());
@@ -155,33 +207,34 @@ namespace IRImport {
 
     // 加载包 (返回包文件的完整路径)
     inline std::string loadPackage(const std::string& packageName) {
+        const std::string canonicalName = canonicalPackageName(packageName);
         // 检查缓存
-        PackageInfo* cached = getCachedPackage(packageName);
+        PackageInfo* cached = getCachedPackage(canonicalName);
         
         if (cached && cached->isLoaded) {
-            ZEUS_DEBUG_PRINT("[IRImport] Package already loaded: %s", packageName.c_str());
+            ZEUS_DEBUG_PRINT("[IRImport] Package already loaded: %s", canonicalName.c_str());
             return cached->fullPath;
         }
         
         // 解析路径
-        std::string packagePath = resolvePackagePath(packageName);
+        std::string packagePath = resolvePackagePath(canonicalName);
         
         // 检查文件是否存在
         if (!packageExists(packagePath)) {
-            ZEUS_DEBUG_PRINT("[IRImport] Package not found: %s", packageName.c_str());
+            ZEUS_DEBUG_PRINT("[IRImport] Package not found: %s", canonicalName.c_str());
             return "";
         }
         
         // 创建包信息
         PackageInfo info;
         info.fullPath = packagePath;
-        info.packageName = packageName;
+        info.packageName = canonicalName;
         info.isLoaded = true;
         
         // 缓存包信息
-        cachePackage(packageName, info);
+        cachePackage(canonicalName, info);
         
-        ZEUS_DEBUG_PRINT("[IRImport] Loaded package: %s -> %s", packageName.c_str(), packagePath.c_str());
+        ZEUS_DEBUG_PRINT("[IRImport] Loaded package: %s -> %s", canonicalName.c_str(), packagePath.c_str());
         
         return packagePath;
     }

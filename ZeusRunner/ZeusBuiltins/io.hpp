@@ -33,6 +33,9 @@ namespace ZeusBuiltins {
         else if (std::holds_alternative<ZeusType::ClosureHandle>(v)) {
             std::cout << "<closure:#" << std::get<ZeusType::ClosureHandle>(v).id << ">";
         }
+        else if (std::holds_alternative<ZeusType::NativeClosureHandle>(v)) {
+            std::cout << "<closure>";
+        }
         else if (std::holds_alternative<ZeusType::NativeFuncHandle>(v)) {
             std::cout << "<native:#" << std::get<ZeusType::NativeFuncHandle>(v).id << ">";
         }
@@ -81,12 +84,16 @@ namespace ZeusBuiltins {
                 } else {
                     std::cout << "{";
 
+                    bool first = true;
                     for (size_t i = 0; i < obj.impl->order.size(); ++i) {
+                        if (!obj.impl->isLiveOrderEntry(i)) continue;
                         const std::string& key = obj.impl->order[i];
+                        auto found = obj.impl->data.find(key);
+                        if (found == obj.impl->data.end()) continue;
+                        if (!first) std::cout << ", ";
+                        first = false;
                         std::cout << key << ": ";
-                        _printValue(obj.impl->data.at(key), depth + 1);
-
-                        if (i + 1 < obj.impl->order.size()) std::cout << ", ";
+                        _printValue(found->second, depth + 1);
                     }
 
                     std::cout << "}";

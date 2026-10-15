@@ -192,8 +192,8 @@ Zeus.exe test.zeu --debug-channels=VM
 - `docs/memory_leak_analysis.md` - 问题分析文档
 
 ### 待修改
-- `ZeusBuiltins/thread.zeu` - 确保join时清理
-- `ZeusBuiltins/socket.zeu` - 添加close析构
+- `ZeusBuiltins/zeus/thread.zeu` - 确保join时清理
+- `ZeusBuiltins/zeus/socket.zeu` - 添加close析构
 - `ZeusRunner/ZeusCell.hpp` - 参考引用计数实现
 
 ## 注意事项

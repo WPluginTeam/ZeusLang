@@ -29,10 +29,23 @@ zeusc example.zeu --link native.obj -o example.exe
 the DLL itself must also be available beside the resulting executable at run
 time; Zeus does not load DLLs by path yet.
 
+## VM native injection
+
+The VM uses the same `@native` declarations for functions explicitly supported
+by its injection table. Each entry maps the declaration name and link symbol to
+a VM adapter in `ZeusRunner/ZeusBuiltins/NativeInjectionRegistry.hpp`; these
+injected functions do not use `registerBuiltin`. Other external symbols remain
+available to LLVM/AOT when linked, but cannot be called by the VM until a VM
+adapter exists.
+
 ## ABI mapping
 
 - `int` maps to LLVM `i64`; `bool` maps to `i1`.
-- `string` maps to a pointer to `ZeusStringView`.
+- `string` maps to `ZeusNativeString` (`const char*`, LLVM `ptr`), pointing at the first UTF-8 byte in `[u64 byte length][UTF-8 bytes][NUL]`; the byte length is stored at `data - 8`. Static AOT string slots store this data pointer.
+  Dynamic `ZeusValue` slots own the same length-prefixed buffer; decoding into a VM `UniversalVariant` copies it into `std::string`.
+- `bytes` uses an owned pointer to the first byte of `[u64 byte length][bytes]`. The length is read from `data - 8`. Dynamic `ZeusValue` slots own the same layout; decoding into a VM `Bytes` value copies it into a vector. Each native allocation is released with `zeus_bytes_release`.
+- Dynamic values use a 16-byte `{tag, flags, payload}` slot. `nil`, `bool`, `int64`, and `char` are inline; strings and bytes point to their owned buffers; BigInteger and BigDecimal point directly to typed native allocations. Arrays, objects, closures, class handles, and other graph-managed values still use a rooted `ZeusBox`.
+- `&bytes` uses a by-value `{ptr, i64}` raw range. Its pointer addresses the first byte and its length is explicit; it does not read a header or retain the source allocation.
 - `&T` maps to an LLVM pointer. Returning `new Class()` from a `->&Class`
   function returns the allocated instance pointer directly; a caller can pass
   it to `delete` to run `operator[~]` and free the allocation.

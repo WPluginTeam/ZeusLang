@@ -16,6 +16,8 @@
 #include "../ZeusParser/LexerParser.hpp"
 #include "../ZeusParser/SyntaxValidator.hpp"
 #include "../ZeusParser/TreeParser.hpp"
+#include "../ZeusParser/BackendBlockSelector.hpp"
+#include "../ZeusParser/InterfaceConformance.hpp"
 #include "../ZeusBuiltins/BuiltinRegistry.hpp"
 
 namespace ZeusLLVM {
@@ -32,12 +34,19 @@ struct ModuleFunctionInterface {
     std::vector<std::string> parameterTypes;
 };
 
+struct ModuleClassInterface {
+    std::string name;
+    std::vector<std::pair<std::string, std::string>> fields;
+};
+
 struct ModuleNode {
     std::string packageName;
     std::string path;
     std::string source;
     std::vector<ModuleImport> imports;
     std::vector<ModuleFunctionInterface> functions;
+    std::vector<ModuleClassInterface> classes;
+    ZeusParser::InterfaceContractRegistry interfaceContracts;
 };
 
 struct ModuleGraphResult {
@@ -105,6 +114,7 @@ inline std::vector<ModuleImport> readImports(const std::string& source) {
             }
         }
 
+        item.packageName = IRImport::canonicalPackageName(item.packageName);
         imports.push_back(std::move(item));
     }
 
@@ -121,7 +131,8 @@ inline std::vector<ModuleFunctionInterface> readInterfaces(
     if (!diagnostics.empty()) {
         throw std::runtime_error(ZeusDiagnostics::render(diagnostics.front(), sourcePath, source));
     }
-    const auto nodes = TreeParser::parse(tokens, &diagnostics);
+    auto nodes = TreeParser::parse(tokens, &diagnostics);
+    ZeusParser::selectBackendBlocks(nodes, ZeusParser::BackendTarget::LLVM);
     ZeusDiagnostics::append(diagnostics, ZeusParser::validateParsedSyntax(nodes));
     if (!diagnostics.empty()) {
         throw std::runtime_error(ZeusDiagnostics::render(diagnostics.front(), sourcePath, source));
@@ -157,6 +168,97 @@ inline std::vector<ModuleFunctionInterface> readInterfaces(
     return functions;
 }
 
+inline std::vector<ModuleClassInterface> readClassInterfaces(
+    const std::string& source,
+    const std::string& sourcePath = {}
+) {
+    std::vector<ZeusDiagnostics::Diagnostic> diagnostics;
+    const auto tokens = LexerParser::parse(source, &diagnostics);
+    ZeusDiagnostics::append(diagnostics, ZeusParser::validateSyntax(tokens));
+    if (!diagnostics.empty()) {
+        throw std::runtime_error(ZeusDiagnostics::render(diagnostics.front(), sourcePath, source));
+    }
+    auto nodes = TreeParser::parse(tokens, &diagnostics);
+    ZeusParser::selectBackendBlocks(nodes, ZeusParser::BackendTarget::LLVM);
+    ZeusDiagnostics::append(diagnostics, ZeusParser::validateParsedSyntax(nodes));
+    if (!diagnostics.empty()) {
+        throw std::runtime_error(ZeusDiagnostics::render(diagnostics.front(), sourcePath, source));
+    }
+
+    std::vector<ModuleClassInterface> classes;
+    const auto collectClasses = [&](const auto& self,
+                                    const std::vector<TreeParser::NodeAndBlock>& elements) -> void {
+        for (const auto& node : elements) {
+            TreeParser::AstElementView element(node);
+            if (!element.isBlock()) continue;
+            const auto* block = element.block();
+            if (block == nullptr) continue;
+
+            if (block->type == CodeBlockType::CLASS && !block->className.empty()) {
+                ModuleClassInterface classInterface;
+                classInterface.name = block->className;
+                for (const auto& child : block->nodes) {
+                    if (!std::holds_alternative<TreeParser::Node>(child)) continue;
+                    const auto& field = std::get<TreeParser::Node>(child);
+                    if (field.type != NodeType::VAR_DECL_STMT) continue;
+
+                    std::string fieldName;
+                    std::string fieldType;
+                    bool readingType = false;
+                    for (const auto& token : field.tokens) {
+                        if (ModuleGraphDetail::operatorText(token) == "=") break;
+                        if (ModuleGraphDetail::operatorText(token) == ":") {
+                            readingType = true;
+                            continue;
+                        }
+                        if (!std::holds_alternative<LexerType::Keyword>(token)) continue;
+                        const std::string& name =
+                            std::get<LexerType::Keyword>(token).name;
+                        if (name == "let" || name == "var" || name == "const") continue;
+                        if (readingType) {
+                            fieldType = name;
+                            readingType = false;
+                        } else if (fieldName.empty()) {
+                            fieldName = name;
+                        }
+                    }
+                    if (!fieldName.empty() && !fieldType.empty()) {
+                        classInterface.fields.emplace_back(fieldName, fieldType);
+                    }
+                }
+                classes.push_back(std::move(classInterface));
+            }
+
+            if (block->type == CodeBlockType::BLOCK) {
+                self(self, block->nodes);
+            }
+        }
+    };
+    collectClasses(collectClasses, nodes);
+    return classes;
+}
+
+inline ZeusParser::InterfaceContractRegistry readInterfaceContracts(
+    const std::string& source,
+    const std::string& sourcePath = {}
+) {
+    std::vector<ZeusDiagnostics::Diagnostic> diagnostics;
+    const auto tokens = LexerParser::parse(source, &diagnostics);
+    ZeusDiagnostics::append(diagnostics, ZeusParser::validateSyntax(tokens));
+    if (!diagnostics.empty()) {
+        throw std::runtime_error(ZeusDiagnostics::render(
+            diagnostics.front(), sourcePath, source));
+    }
+    auto nodes = TreeParser::parse(tokens, &diagnostics);
+    ZeusParser::selectBackendBlocks(nodes, ZeusParser::BackendTarget::LLVM);
+    ZeusDiagnostics::append(diagnostics, ZeusParser::validateParsedSyntax(nodes));
+    if (!diagnostics.empty()) {
+        throw std::runtime_error(ZeusDiagnostics::render(
+            diagnostics.front(), sourcePath, source));
+    }
+    return ZeusParser::collectInterfaceContracts(nodes);
+}
+
 class Builder {
     ModuleGraphResult result;
     std::map<std::string, int> visitState;
@@ -171,7 +273,8 @@ class Builder {
         return value.lexically_normal().string();
     }
 
-    bool visit(const std::string& packageName, const std::string& importerPath) {
+    bool visit(std::string packageName, const std::string& importerPath) {
+        packageName = IRImport::canonicalPackageName(packageName);
         auto stateIt = visitState.find(packageName);
         if (stateIt != visitState.end()) {
             if (stateIt->second == 2) return true;
@@ -185,8 +288,22 @@ class Builder {
 
         const std::string oldWorkingDirectory = IRImport::currentWorkingDir;
         IRImport::setWorkingDirectory(importerPath);
-        const std::string resolvedPath = IRImport::resolvePackagePath(packageName);
+        std::string resolvedPath = IRImport::resolvePackagePath(packageName);
         IRImport::currentWorkingDir = oldWorkingDirectory;
+        if (!resolvedPath.empty()) {
+            const auto* implementation = ZeusBuiltins::findImplementationModule(packageName);
+            if (implementation != nullptr && !implementation->llvmSourceFile.empty()) {
+                const std::filesystem::path llvmPath =
+                    std::filesystem::path(resolvedPath).parent_path() /
+                    std::string(implementation->llvmSourceFile);
+                if (!std::filesystem::exists(llvmPath)) {
+                    result.error = "[emit-llvm] LLVM source for built-in implementation module '" +
+                                   packageName + "' was not found at '" + llvmPath.string() + "'";
+                    return false;
+                }
+                resolvedPath = llvmPath.string();
+            }
+        }
         if (resolvedPath.empty()) {
             const std::string moduleKind = ZeusBuiltins::isImplementationModule(packageName)
                 ? "built-in implementation module '"
@@ -219,6 +336,8 @@ class Builder {
         node.imports = readImports(node.source);
         try {
             node.functions = readInterfaces(node.source, node.path);
+            node.classes = readClassInterfaces(node.source, node.path);
+            node.interfaceContracts = readInterfaceContracts(node.source, node.path);
         } catch (const std::exception& ex) {
             result.error = ex.what();
             return false;
@@ -257,7 +376,8 @@ public:
             result.error = ZeusDiagnostics::render(rootDiagnostics.front(), rootPath, rootSource);
             return std::move(result);
         }
-        const auto rootAst = TreeParser::parse(rootTokens, &rootDiagnostics);
+        auto rootAst = TreeParser::parse(rootTokens, &rootDiagnostics);
+        ZeusParser::selectBackendBlocks(rootAst, ZeusParser::BackendTarget::LLVM);
         ZeusDiagnostics::append(rootDiagnostics, ZeusParser::validateParsedSyntax(rootAst));
         if (!rootDiagnostics.empty()) {
             result.error = ZeusDiagnostics::render(rootDiagnostics.front(), rootPath, rootSource);

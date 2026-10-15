@@ -1,0 +1,9 @@
+func dynamicValue(flag: bool) {
+    if (flag) { return 1; }
+    return "unknown";
+}
+@type(T)
+func identity(value: T) -> T { return value; }
+let value = dynamicValue(true);
+if (true) { value = 1; } else { value = "text"; }
+print(identity(value));

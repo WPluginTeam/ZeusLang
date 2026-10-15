@@ -1,0 +1,26 @@
+impl int {
+    using &this;
+    @type(T)
+    func choose(value: T, other: int = 5) -> T { return value; }
+    @type(T)
+    func update(value: T, &target: int) { target = 99; }
+}
+let receiver=1;
+print(receiver.choose(12));
+print(receiver.choose(value="named", other=7));
+let target=0;
+receiver.update(12, target);
+print(target);
+class GenericArguments {
+    using &this;
+    @type(T)
+    func update(value: T, &target: int) { target = 88; }
+    @type(T)
+    func static updateStatic(value: T, &target: int) { target = 77; }
+}
+let owner: GenericArguments = new GenericArguments();
+owner.update("class", target);
+print(target);
+GenericArguments.updateStatic(true, target);
+print(target);
+print(receiver.choose(other=7, value="reordered"));

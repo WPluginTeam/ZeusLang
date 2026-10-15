@@ -87,8 +87,27 @@ namespace IRHotspotCompiler {
                         continue;
                     }
 
+                    // Do not fuse instructions across source locations: a fused
+                    // instruction must remain attributable to one breakpoint line.
+                    const int sourceLine = instrs[i].line;
+                    const int sourceFileId = instrs[i].sourceFileId;
+                    bool sameSourceLocation = true;
+                    for (size_t j = 1; j < m; ++j) {
+                        if (instrs[i + j].line != sourceLine ||
+                            instrs[i + j].sourceFileId != sourceFileId) {
+                            sameSourceLocation = false;
+                            break;
+                        }
+                    }
+                    if (!sameSourceLocation) {
+                        continue;
+                    }
+
                     // 命中热点：基于 compiled 生成新指令，并把匹配到的原指令的参数依次追加
                     IRInstr newInstr = hotspot.compiled; // 使用热点定义中的 compiled 作为模板
+                    newInstr.line = sourceLine;
+                    newInstr.sourceFileId = sourceFileId;
+                    newInstr.column = instrs[i].column;
 
                     for (size_t j = 0; j < m; ++j) {
                         const auto& opj  = instrs[i + j].op;

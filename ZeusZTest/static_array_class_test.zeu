@@ -1,0 +1,113 @@
+import zeus.static;
+
+var sharedFinalized = 0;
+
+class Child {
+    using &this;
+    var value: int = 0;
+
+    func init(initial: int) {
+        this.value = initial;
+    }
+}
+
+class Payload {
+    using &this;
+    var count: int = 0;
+    var child: Child;
+
+    func init(initial: int, nested: Child) {
+        this.count = initial;
+        this.child = nested;
+    }
+}
+
+class SharedPayload {
+    using &this;
+    var value: int = 0;
+
+    func init(initial: int) {
+        this.value = initial;
+    }
+
+    func operator[@=]() -> &SharedPayload {
+        return this;
+    }
+
+    func operator[~]() {
+        sharedFinalized = sharedFinalized + 1;
+    }
+}
+
+let child = new Child(7);
+let source = new Payload(1, child);
+let secondSource = new Payload(99, child);
+let values = new StaticArray<Payload>(2);
+values.append(source);
+values.append(secondSource);
+source.count = 2;
+source.child.value = 8;
+if (values[0].count != 1 or values[1].count != 99 or
+    values[0].child.value != 7) {
+    throw "StaticArray append did not recursively copy class fields";
+}
+
+let slotCopy = values[0];
+slotCopy.count = 3;
+slotCopy.child.value = 9;
+if (values[0].count != 1 or values[0].child.value != 7) {
+    throw "StaticArray reads did not create independent values";
+}
+
+values.set(0, source);
+if (values[0].count != 2 or values[1].count != 99 or
+    values[0].child.value != 8) {
+    throw "StaticArray set did not copy the replacement value";
+}
+values.set(0, values[0]);
+if (values[0].count != 2 or values[0].child.value != 8) {
+    throw "StaticArray self-assignment changed the stored value";
+}
+
+values.clear();
+if (values.length() != 0) throw "StaticArray clear did not empty the array";
+values.append(source);
+if (values.length() != 1 or values[0].count != 2 or
+    values[0].child.value != 8) {
+    throw "StaticArray reuse failed after clear";
+}
+values.clear();
+
+let sharedSource = new SharedPayload(30);
+let owners = new StaticArray<SharedPayload>(1);
+owners.append(sharedSource);
+let retainedOwner = sharedSource;
+owners.clear();
+if (sharedFinalized != 0 or retainedOwner.value != 30) {
+    throw "StaticArray clear destroyed an object with another owner";
+}
+retainedOwner.value = 31;
+if (sharedSource.value != 31) {
+    throw "the owning return stopped sharing the object after clear";
+}
+
+owners.append(sharedSource);
+owners.clear();
+if (sharedFinalized != 0 or retainedOwner.value != 31) {
+    throw "StaticArray reuse released an external owning result";
+}
+delete retainedOwner;
+if (sharedFinalized != 1) {
+    throw "explicit delete did not run the shared object destructor once";
+}
+var deletedOwnerCaught = false;
+try {
+    let deletedValue = sharedSource.value;
+} catch (&error) {
+    deletedOwnerCaught = true;
+}
+if (!deletedOwnerCaught) throw "delete did not invalidate the remaining owner";
+
+delete values;
+delete owners;
+print("STATIC_ARRAY_CLASS_PASS");

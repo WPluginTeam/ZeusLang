@@ -7,6 +7,7 @@
 #include <climits>
 #include "../ZeusParser/LexerType.hpp"      // LexerType::Value
 #include "ZeusVariant.hpp"                // ZeusType::UniversalVariant
+#include "ZeusGC.hpp"
 
 // 全局指针声明：访问VM的classes和objects（定义在ZeusBuiltins.hpp中）
 inline std::vector<ZeusType::ClassInfo>* g_vmClassesPtr = nullptr;
@@ -170,14 +171,21 @@ inline const ZeusType::Array* getArrayConst(const ZeusType::UniversalVariant& u)
     return &std::get<ZeusType::Array>(var);
 }
 
-inline size_t arrayLength(const ZeusType::UniversalVariant& u) {
+// Caller must hold ZeusGC::graphMutex().
+inline size_t arrayLengthUnlocked(const ZeusType::UniversalVariant& u) {
     auto arr = getArrayConst(u);
     if (!arr) return 0;
     if (!arr->impl) return 0;
     return arr->impl->data.size();
 }
 
+inline size_t arrayLength(const ZeusType::UniversalVariant& u) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    return arrayLengthUnlocked(u);
+}
+
 inline ZeusType::UniversalVariant arrayRead(const ZeusType::UniversalVariant& u, int i) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     auto arr = getArrayConst(u);
     if (!arr || !arr->impl) return LexerType::Value(0);
     if (i < 0 || (size_t)i >= arr->impl->data.size()) return LexerType::Value(0);
@@ -185,6 +193,7 @@ inline ZeusType::UniversalVariant arrayRead(const ZeusType::UniversalVariant& u,
 }
 
 inline bool arrayWrite(ZeusType::UniversalVariant& u, int i, const ZeusType::UniversalVariant& v) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     auto arr = getArray(u);
     if (!arr || !arr->impl) return false;
     if (i < 0 || (size_t)i >= arr->impl->data.size()) return false;
@@ -193,8 +202,9 @@ inline bool arrayWrite(ZeusType::UniversalVariant& u, int i, const ZeusType::Uni
 }
 
 inline ZeusType::UniversalVariant makeArray(int n, std::vector<ZeusType::UniversalVariant>& stack) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     ZeusType::Array arr;
-    arr.impl = std::make_shared<ZeusType::ArrayData>();
+    arr.impl = ZeusGC::makeArrayData();
     if (n > 0) {
         arr.impl->data.resize(n);
         for (int i = n - 1; i >= 0; --i) {
@@ -253,6 +263,9 @@ inline std::string valueToDebugString(const ZeusType::UniversalVariant& u) {
     }
     if (std::holds_alternative<ZeusType::ClosureHandle>(u)) {
         return std::string("<closure:#") + std::to_string(std::get<ZeusType::ClosureHandle>(u).id) + ">";
+    }
+    if (std::holds_alternative<ZeusType::NativeClosureHandle>(u)) {
+        return "<closure>";
     }
     if (std::holds_alternative<ZeusType::NativeFuncHandle>(u)) {
         return std::string("<native:#") + std::to_string(std::get<ZeusType::NativeFuncHandle>(u).id) + ">";
@@ -331,9 +344,11 @@ inline std::string valueToDebugString(const ZeusType::UniversalVariant& u) {
             std::string out = "{";
             bool first = true;
             // 按插入顺序输出
-            for (const auto &k : obj.impl->order) {
+            for (std::size_t i = 0; i < obj.impl->order.size(); ++i) {
+                if (!obj.impl->isLiveOrderEntry(i)) continue;
+                const auto& k = obj.impl->order[i];
                 auto it = obj.impl->data.find(k);
-                if (it == obj.impl->data.end()) continue; // 理论不该发生
+                if (it == obj.impl->data.end()) continue;
                 if (!first) out += ", ";
                 first = false;
                 out += k;

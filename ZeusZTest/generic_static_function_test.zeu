@@ -1,0 +1,61 @@
+@type(T)
+func identity(value: T) -> T {
+    return value;
+}
+
+@type(T)
+func save(address: int, value: T) {
+    @faddr(address) -> T = value;
+}
+
+let target = 7;
+let address = @addr(target);
+save(address, 123);
+print(target);
+print(identity("generic string"));
+print(identity(identity(321)));
+print(identity(true));
+print(identity(1.5));
+save(value = 456, address = address);
+print(target);
+
+@type(T)
+@no_safepoint
+inline func duplicate(value: T) -> T {
+    return value + value;
+}
+print(duplicate(12));
+print(duplicate("ab"));
+
+@type(T)
+func read(address: int, exemplar: T) -> T {
+    return @faddr(address) -> T;
+}
+print(read(address, 0));
+
+@type(T)
+func forward(value: T) -> T {
+    return identity(value);
+}
+let nested: int = forward(identity(789));
+print(nested);
+
+@type(T)
+func inferredIdentity(value: T) {
+    return value;
+}
+print(inferredIdentity(42));
+
+@type(T)
+func chained(value: T) -> T {
+    return identity(value + value);
+}
+print(chained(9));
+print(chained("xy"));
+
+@type(T)
+func repeatIdentity(value: T, rounds: int) -> T {
+    if (rounds == 0) { return value; }
+    return repeatIdentity(value, rounds - 1);
+}
+print(repeatIdentity(88, 3));

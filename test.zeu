@@ -1,0 +1,23 @@
+
+
+var globalVar = 123;
+
+class MyTest {
+    using &this;
+
+    func test() {
+        print("this is test func", this.a);
+    }
+
+    func init() {
+        this.a = 123;
+        print(this.a);
+    }
+}
+
+var b = [];
+for (10) [&i] {
+    b.append(new MyTest());
+}
+
+print(b);

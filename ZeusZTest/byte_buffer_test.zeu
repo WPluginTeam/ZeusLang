@@ -1,0 +1,83 @@
+import zeus.byte;
+import zeus.exception;
+
+func main() {
+    let buffer = new ByteBuffer();
+    if (buffer.length() != 0) {
+        throw new Exception("ByteBuffer should start empty");
+    }
+
+    buffer.append(b"abc\r\n");
+    buffer.append(b"\r");
+    buffer.append(b"\nxyz");
+    if (buffer.length() != 10) {
+        throw new Exception("ByteBuffer append length mismatch");
+    }
+    if (buffer.indexOf(b"\r\n\r\n") != 3) {
+        throw new Exception("ByteBuffer should find delimiters across appended fragments");
+    }
+    if (buffer.slice(0, 3).decode() != "abc") {
+        throw new Exception("ByteBuffer slice mismatch");
+    }
+    if (buffer.get(9) != 122) {
+        throw new Exception("ByteBuffer indexed read mismatch");
+    }
+
+    buffer.consume(5);
+    if (buffer.length() != 5 or buffer.toBytes().decode() != "\r\nxyz") {
+        throw new Exception("ByteBuffer consume range mismatch");
+    }
+    buffer.append(b"tail");
+    if (buffer.toBytes().decode() != "\r\nxyztail") {
+        throw new Exception("ByteBuffer append after consume mismatch");
+    }
+    if (buffer.slice(1, 6).decode() != "\nxyzt") {
+        throw new Exception("ByteBuffer slice after consume mismatch");
+    }
+
+    let matches = new ByteBuffer();
+    matches.append(b"xx\r\n");
+    matches.append(b"\r\nx\r\n\r\n");
+    if (matches.indexOf(b"\r\n\r\n") != 2 or
+        matches.indexOf(b"\r\n\r\n", 3) != 7) {
+        throw new Exception("ByteBuffer search cursor mismatch");
+    }
+    if (matches.indexOf(b"missing") != -1) {
+        throw new Exception("ByteBuffer missing search should return -1");
+    }
+
+    let fragments = new ByteBuffer();
+    for (0..70) [const &i] {
+        fragments.append(bytes([i]));
+    }
+    fragments.consume(40);
+    for (70..130) [const &i] {
+        fragments.append(bytes([i]));
+    }
+    if (fragments.length() != 90 or fragments.get(0) != 40 or
+        fragments.get(89) != 129 or
+        fragments.indexOf(bytes([43, 44, 45])) != 3) {
+        throw new Exception("ByteBuffer compaction after consume mismatch");
+    }
+
+    buffer.clear();
+    if (buffer.length() != 0 or buffer.toBytes().length() != 0) {
+        throw new Exception("ByteBuffer clear mismatch");
+    }
+    buffer.append(b"reused");
+    if (buffer.toBytes().decode() != "reused") {
+        throw new Exception("ByteBuffer should be reusable after clear");
+    }
+    buffer.consume(buffer.length());
+    if (buffer.length() != 0) {
+        throw new Exception("ByteBuffer full consume mismatch");
+    }
+    buffer.append(b"again");
+    if (buffer.toBytes().decode() != "again") {
+        throw new Exception("ByteBuffer should be reusable after full consume");
+    }
+
+    print("PASS ByteBuffer");
+}
+
+main();

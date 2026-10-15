@@ -1,0 +1,12 @@
+import zeus.http [&];
+
+let wire = bytes("POST /echo?source=test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nabcGET /next HTTP/1.1\r\nHost: localhost\r\n\r\n");
+let first = __http_parse_request(wire, 16384, 1024);
+print("first", first.status, first.message, first.consumed);
+print("method", first.request.method, "path", first.request.path, "query", first.request.query);
+print("host", first.request.getHeader("HOST"));
+print("body", first.request.text(), "persistent", first.request.persistent);
+let tail = wire.slice(first.consumed, wire.length());
+print("tail length", tail.length());
+let second = __http_parse_request(tail, 16384, 1024);
+print("second", second.status, second.incomplete);

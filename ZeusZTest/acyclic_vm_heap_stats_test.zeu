@@ -1,0 +1,60 @@
+// VM-only heap counters for acyclic object churn.
+// Run with: Zeus.exe ZeusZTest/acyclic_vm_heap_stats_test.zeu
+
+class Payload {
+    using &this;
+    var text = "";
+
+    func init(value) {
+        this.text = value;
+    }
+
+    func operator[~]() {
+        print("PAYLOAD_DESTROYED");
+    }
+}
+
+func make_temporary_object(i: int) {
+    let text = "payload-" + str(i);
+    let object = new Payload(text);
+}
+
+func make_temporary_closure(i: int) {
+    let captured = i;
+    func read() [captured] {
+        return captured;
+    }
+    return read;
+}
+
+func churn(n: int) {
+    let i = 0;
+    for (true) {
+        if (i >= n) {
+            break;
+        }
+        make_temporary_object(i);
+        let closure = make_temporary_closure(i);
+        closure();
+        i = i + 1;
+    }
+}
+
+print("=== BEFORE ===");
+__gc_stats();
+__vm_stats();
+__dump_objects();
+
+churn(1000);
+
+print("=== AFTER 1000 ACYCLIC OBJECTS ===");
+__gc_stats();
+__vm_stats();
+__dump_objects();
+
+churn(9000);
+
+print("=== AFTER 10000 TOTAL ACYCLIC OBJECTS ===");
+__gc_stats();
+__vm_stats();
+__dump_objects();

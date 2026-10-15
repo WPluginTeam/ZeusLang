@@ -1,0 +1,86 @@
+import zeus.exception;
+import zeus.list;
+import zeus.dict;
+
+var destroyedCount = 0;
+
+class Tracked {
+    using &this;
+    let name = "";
+
+    func init(nameValue) {
+        this.name = nameValue;
+    }
+
+    func operator[~]() {
+        destroyedCount = destroyedCount + 1;
+    }
+}
+
+func check(label, actual, expected) {
+    if (actual != expected) {
+        print("[FAIL]", label, actual, expected);
+        throw new Exception("container edge lifetime check failed: " + label);
+    }
+    print("[PASS]", label);
+}
+
+func makeTrackedArray(name: string) -> Array {
+    let values = [];
+    let item = new Tracked(name);
+    values.append(item);
+    return values;
+}
+
+func makeTrackedDict(name: string) -> Dict {
+    let values = new Dict();
+    let item = new Tracked(name);
+    values["item"] = item;
+    return values;
+}
+
+let source = makeTrackedArray("slice source");
+let sliced = __array_slice(source, 0, 1);
+source.clear();
+check("slice keeps a copied object edge", destroyedCount, 0);
+sliced.clear();
+check("clearing the last slice releases once", destroyedCount, 1);
+
+let popSource = makeTrackedArray("popped object");
+let popped = popSource.pop();
+popSource.clear();
+check("pop transfers the object to its result", destroyedCount, 1);
+popped = nil;
+check("dropping the pop result releases once", destroyedCount, 2);
+
+let replaceSource = makeTrackedArray("replaced object");
+let extracted = replaceSource[0];
+var replacement = new Tracked("replacement object");
+replaceSource[0] = replacement;
+check("read result keeps a replaced object alive", destroyedCount, 2);
+extracted = nil;
+check("dropping read result releases replaced object", destroyedCount, 3);
+replaceSource.clear();
+check("array edge release respects a second owner", destroyedCount, 3);
+replacement = nil;
+check("dropping final array value releases once", destroyedCount, 4);
+
+let dictionary = makeTrackedDict("copied dictionary value");
+check("dictionary source keeps its value before cloning", destroyedCount, 4);
+let dictionaryCopy = dictionary.copy();
+check("dictionary clone keeps value while both copies exist", destroyedCount, 4);
+dictionary.deleteKey("item");
+check("dictionary copy keeps value after source deletion", destroyedCount, 4);
+dictionaryCopy.deleteKey("item");
+check("deleting final copied dictionary edge releases once", destroyedCount, 5);
+
+let replaceDict = makeTrackedDict("replaced dictionary value");
+var dictReplacement = new Tracked("dictionary replacement");
+replaceDict["item"] = dictReplacement;
+check("dictionary replacement releases the old edge", destroyedCount, 6);
+replaceDict.deleteKey("item");
+check("dictionary deletion keeps an external owner alive", destroyedCount, 6);
+dictReplacement = nil;
+check("dropping final dictionary value releases once", destroyedCount, 7);
+
+print("GC_CONTAINER_EDGE_LIFETIME_PASS", destroyedCount);

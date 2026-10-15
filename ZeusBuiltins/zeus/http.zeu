@@ -1,0 +1,870 @@
+// Minimal blocking HTTP/1.1 server built on the shared Zeus Socket/bytes ABI.
+// This first version supports GET/POST, Host, Content-Length, routing and
+// persistent connections, and thread-pool based concurrent connection handling.
+// Chunked bodies, TLS, and nonblocking socket I/O are not included.
+
+
+// These are package implementation dependencies. Global imports merge their
+// symbols into the package; namespace imports would try to create runtime
+// namespace objects while the package itself is being linked.
+import zeus.socket;
+import zeus.byte;
+import zeus.list;
+import zeus.string;
+import zeus.exception;
+import zeus.thread;
+
+class HTTPParseResult {
+    using &this;
+    let status = 0;
+    let message = "";
+    let request = nil;
+    let consumed = 0;
+    let incomplete = false;
+    let nextHeaderSearchStart = 0;
+}
+
+func __http_result(status=0, message="", request=nil, consumed=0, incomplete=false, nextHeaderSearchStart=0) {
+    let result = new HTTPParseResult();
+    result.status = status;
+    result.message = message;
+    result.request = request;
+    result.consumed = consumed;
+    result.incomplete = incomplete;
+    result.nextHeaderSearchStart = nextHeaderSearchStart;
+    return result;
+}
+
+func __http_find_header_end(buffer: ByteBuffer, startAt: int=0) -> int {
+    return buffer.indexOf(b"\r\n\r\n", startAt);
+}
+
+func __http_trim(value: string) -> string {
+    let start = 0;
+    let end = value.length();
+    for (0..value.length()) [const &i] {
+        let ch = value.slice(i, i + 1);
+        if (i == start and (ch == " " or ch == "\t")) {
+            start = start + 1;
+        } else {
+            break;
+        }
+    }
+    for (0..value.length()) [const &offset] {
+        let i = value.length() - 1 - offset;
+        if (i >= start and (value.slice(i, i + 1) == " " or value.slice(i, i + 1) == "\t")) {
+            end = i;
+        } else {
+            break;
+        }
+    }
+    return value.slice(start, end);
+}
+
+// RFC token characters used by HTTP methods and field names.
+func __http_is_token(value: string) -> bool {
+    if (value.length() == 0) return false;
+    let allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'*+-.^_`|~";
+    for (0..value.length()) [const &i] {
+        if (__str_index(allowed, value.slice(i, i + 1)) < 0) return false;
+    }
+    return true;
+}
+
+func __http_parse_content_length(value: string, max_body_bytes: int) -> int {
+    let parsed = 0;
+    let digits = "0123456789";
+    for (0..value.length()) [const &i] {
+        let digit = __str_index(digits, value.slice(i, i + 1));
+        if (digit < 0) return -1;
+        if (parsed > 922337203685477580 or
+            (parsed == 922337203685477580 and digit > 7)) {
+            return -1;
+        }
+        parsed = parsed * 10 + digit;
+        if (parsed > max_body_bytes) return -2;
+    }
+    if (parsed > max_body_bytes) return -2;
+    return parsed;
+}
+
+func __http_header_value(header_text: string, header_name: string) {
+    let marker = "\r\n" + header_name.lower() + ":";
+    let markerIndex = header_text.lower().index(marker);
+    if (markerIndex < 0) return nil;
+    let valueStart = markerIndex + marker.length();
+    let remaining = header_text.slice(valueStart, header_text.length());
+    let lineEnd = remaining.index("\r\n");
+    if (lineEnd < 0) lineEnd = remaining.length();
+    return __http_trim(remaining.slice(0, lineEnd));
+}
+
+func __http_has_token(value: string, token: string) -> bool {
+    let parts = value.split(",");
+    for (0..parts.length()) [const &i] {
+        if (__http_trim(parts.get(i)).lower() == token) return true;
+    }
+    return false;
+}
+
+func __http_parse_request_buffer(buffer: ByteBuffer, max_header_bytes: int, max_body_bytes: int, headerSearchStart: int=0) {
+    let headerEnd = __http_find_header_end(buffer, headerSearchStart);
+    if (headerEnd < 0) {
+        if (buffer.length() > max_header_bytes) {
+            return __http_result(431, "request headers too large");
+        }
+        let nextSearchStart = buffer.length() - 3;
+        if (nextSearchStart < 0) nextSearchStart = 0;
+        return __http_result(0, "", nil, 0, true, nextSearchStart);
+    }
+    if (headerEnd > max_header_bytes) {
+        return __http_result(431, "request headers too large");
+    }
+
+    let headerText = "";
+    try {
+        headerText = buffer.slice(0, headerEnd).decode("utf-8");
+    } catch (&error) {
+        return __http_result(400, "request headers must be valid UTF-8");
+    }
+    let headerLines = headerText.split("\r\n");
+    if (headerLines.length() == 0) return __http_result(400, "empty request");
+    let requestLine = headerLines.get(0);
+
+    let firstSpace = requestLine.index(" ");
+    if (firstSpace <= 0) return __http_result(400, "invalid request line");
+    let remainder = requestLine.slice(firstSpace + 1, requestLine.length());
+    let secondSpace = remainder.index(" ");
+    if (secondSpace <= 0) return __http_result(400, "invalid request line");
+
+    let method = requestLine.slice(0, firstSpace);
+    let target = remainder.slice(0, secondSpace);
+    let version = remainder.slice(secondSpace + 1, remainder.length());
+    if (!__http_is_token(method) or target.length() == 0 or
+        target.index("\t") >= 0 or target.index("\r") >= 0 or
+        target.index("\n") >= 0 or version.index(" ") >= 0) {
+        return __http_result(400, "invalid request line");
+    }
+    if (version != "HTTP/1.1") {
+        return __http_result(505, "only HTTP/1.1 is supported");
+    }
+    if (!target.startswith("/")) {
+        return __http_result(400, "origin-form request target required");
+    }
+
+    let request = new HTTPRequest();
+    let contentLength = 0;
+    for (1..headerLines.length()) [const &lineIndex] {
+        let line = headerLines.get(lineIndex);
+        if (line.length() > 0) {
+            if (line.index("\n") >= 0 or line.index("\r") >= 0) {
+                return __http_result(400, "invalid header line ending");
+            }
+            let colon = line.index(":");
+            if (colon <= 0) return __http_result(400, "invalid header field");
+            let name = line.slice(0, colon);
+            if (!__http_is_token(name)) {
+                return __http_result(400, "invalid header name");
+            }
+        }
+    }
+
+    let lowerHeaders = headerText.lower();
+    let hostValue = __http_header_value(headerText, "host");
+    if (hostValue == nil) {
+        return __http_result(400, "Host header is required for HTTP/1.1");
+    }
+    if (hostValue.length() == 0 or lowerHeaders.count("\r\nhost:") != 1) {
+        return __http_result(400, "exactly one non-empty Host header is required");
+    }
+    let contentLengthValue = __http_header_value(headerText, "content-length");
+    if (lowerHeaders.count("\r\ncontent-length:") > 1) {
+        return __http_result(400, "duplicate Content-Length header");
+    }
+    if (lowerHeaders.index("\r\ntransfer-encoding:") >= 0) {
+        return __http_result(501, "Transfer-Encoding is not supported");
+    }
+    if (lowerHeaders.index("\r\nexpect:") >= 0) {
+        return __http_result(417, "Expect is not supported");
+    }
+    if (method == "POST" and contentLengthValue == nil) {
+        return __http_result(411, "Content-Length is required for POST");
+    }
+    if (contentLengthValue != nil) {
+        if (contentLengthValue.length() == 0 or contentLengthValue.startswith("+") or
+            contentLengthValue.startswith("-")) {
+            return __http_result(400, "invalid Content-Length");
+        }
+        contentLength = __http_parse_content_length(contentLengthValue, max_body_bytes);
+        if (contentLength == -1) {
+            return __http_result(400, "invalid Content-Length");
+        }
+        if (contentLength == -2) return __http_result(413, "request body too large");
+    }
+    let connectionValue = __http_header_value(headerText, "connection");
+
+    let bodyStart = headerEnd + 4;
+    if (buffer.length() < bodyStart + contentLength) {
+        return __http_result(0, "", nil, 0, true, 0);
+    }
+
+    request.method = method;
+    request.target = target;
+    request.version = version;
+    request.rawHeaders = headerText;
+    request.body = buffer.slice(bodyStart, bodyStart + contentLength);
+    request.textBody = "";
+    request.hasTextBody = false;
+    request.persistent = true;
+    if (connectionValue != nil) {
+        if (__http_has_token(connectionValue.lower(), "close")) request.persistent = false;
+    }
+
+    let queryIndex = target.index("?");
+    request.path = target;
+    request.query = "";
+    if (queryIndex >= 0) {
+        request.path = target.slice(0, queryIndex);
+        request.query = target.slice(queryIndex + 1, target.length());
+    }
+
+    return __http_result(0, "", request, bodyStart + contentLength, false);
+}
+
+func __http_parse_request(buffer: bytes, max_header_bytes: int, max_body_bytes: int, headerSearchStart: int=0) {
+    let byteBuffer = new ByteBuffer();
+    byteBuffer.append(buffer);
+    return __http_parse_request_buffer(
+        byteBuffer, max_header_bytes, max_body_bytes, headerSearchStart);
+}
+
+func __http_reason(status: int) -> string {
+    if (status == 200) return "OK";
+    if (status == 201) return "Created";
+    if (status == 202) return "Accepted";
+    if (status == 204) return "No Content";
+    if (status == 301) return "Moved Permanently";
+    if (status == 302) return "Found";
+    if (status == 400) return "Bad Request";
+    if (status == 404) return "Not Found";
+    if (status == 405) return "Method Not Allowed";
+    if (status == 403) return "Forbidden";
+    if (status == 408) return "Request Timeout";
+    if (status == 411) return "Length Required";
+    if (status == 413) return "Content Too Large";
+    if (status == 414) return "URI Too Long";
+    if (status == 417) return "Expectation Failed";
+    if (status == 426) return "Upgrade Required";
+    if (status == 431) return "Request Header Fields Too Large";
+    if (status == 500) return "Internal Server Error";
+    if (status == 501) return "Not Implemented";
+    if (status == 505) return "HTTP Version Not Supported";
+    return "Status";
+}
+
+func __http_send_all(client, data: bytes) {
+    let sent = client.sendAll(data);
+    if (sent != data.length()) throw new Exception("socket send made no progress");
+}
+
+func __http_validate_field_value(value: string) {
+    let raw = bytes(value);
+    for (0..raw.length()) [const &i] {
+        let ch = raw.get(i);
+        if ((ch < 32 and ch != 9) or ch == 127) {
+            throw new Exception("HTTP field value contains a control byte");
+        }
+    }
+}
+
+func __http_validate_response_headers(rawHeaders: string) {
+    let lines = rawHeaders.split("\r\n");
+    for (0..lines.length()) [const &i] {
+        let line = lines.get(i);
+        if (line.length() == 0) {
+            if (i + 1 < lines.length()) {
+                throw new Exception("HTTP response contains an empty header line");
+            }
+        } else {
+            let colon = line.index(":");
+            if (colon <= 0 or !__http_is_token(line.slice(0, colon))) {
+                throw new Exception("HTTP response contains an invalid header name");
+            }
+            let key = line.slice(0, colon).lower();
+            if (key == "content-length" or key == "connection" or
+                key == "transfer-encoding") {
+                throw new Exception("HTTP response framing headers are controlled by the server");
+            }
+            __http_validate_field_value(line.slice(colon + 1, line.length()));
+        }
+    }
+}
+
+func __http_response_bytes(response, keep_alive: bool, suppressBody: bool=false) -> bytes {
+    if (response.status < 100 or response.status > 599) {
+        throw new Exception("HTTP response status must be between 100 and 599");
+    }
+    __http_validate_field_value(response.reason);
+    __http_validate_response_headers(response.headerLines);
+
+    let body = response.body;
+    let bodyForbidden = (response.status >= 100 and response.status < 200) or
+        response.status == 204 or response.status == 205 or response.status == 304;
+    let contentLengthForbidden = (response.status >= 100 and response.status < 200) or
+        response.status == 204 or response.status == 304;
+    if (bodyForbidden) body = b"";
+    let wireBody = body;
+    if (suppressBody or bodyForbidden) wireBody = b"";
+
+    let statusLine = "HTTP/1.1 " + str(response.status) + " " + response.reason + "\r\n";
+    let output = statusLine + response.headerLines;
+    if (!contentLengthForbidden) {
+        output = output + "Content-Length: " + str(body.length()) + "\r\n";
+    }
+    if (keep_alive) {
+        output = output + "Connection: keep-alive\r\n\r\n";
+    } else {
+        output = output + "Connection: close\r\n\r\n";
+    }
+    return bytes(output) + wireBody;
+}
+
+class HTTPRequest {
+    using &this;
+    let method = "GET";
+    let target = "/";
+    let path = "/";
+    let query = "";
+    let version = "HTTP/1.1";
+    let rawHeaders = "";
+    let body = b"";
+    let textBody = "";
+    let hasTextBody = false;
+    let persistent = true;
+
+    func init() {
+        this.rawHeaders = "";
+        this.method = "GET";
+        this.target = "/";
+        this.path = "/";
+        this.query = "";
+        this.version = "HTTP/1.1";
+        this.body = b"";
+        this.textBody = "";
+        this.hasTextBody = false;
+        this.persistent = true;
+    }
+
+    func getHeader(name: string, defaultValue=nil) {
+        let normalized = name.lower();
+        let lowerHeaders = this.rawHeaders.lower();
+        let marker = "\r\n" + normalized + ":";
+        let markerIndex = lowerHeaders.index(marker);
+        if (markerIndex < 0) return defaultValue;
+        let valueStart = markerIndex + marker.length();
+        let remaining = this.rawHeaders.slice(valueStart, this.rawHeaders.length());
+        let lineEnd = remaining.index("\r\n");
+        if (lineEnd < 0) lineEnd = remaining.length();
+        return __http_trim(remaining.slice(0, lineEnd));
+    }
+
+    func text(encoding: string="utf-8") -> string {
+        if (encoding == "utf-8") {
+            if (!this.hasTextBody) {
+                this.textBody = this.body.decode(encoding);
+                this.hasTextBody = true;
+            }
+            return this.textBody;
+        }
+        return this.body.decode(encoding);
+    }
+}
+
+class HTTPResponse {
+    using &this;
+    let status: int = 200;
+    let reason = "OK";
+    let headerLines = "";
+    let body: bytes = b"";
+    let shouldClose: bool = false;
+
+    func init(body="", status: int=200) {
+        this.headerLines = "";
+        this.body = b"";
+        this.shouldClose = false;
+        this.status = status;
+        this.reason = __http_reason(status);
+        if (type(body) == "bytes") {
+            this.body = body;
+        } else if (body != nil and status != 204) {
+            this.body = bytes(str(body));
+            this.headerLines = "content-type: text/plain; charset=utf-8\r\n";
+        }
+    }
+
+    func setHeader(name: string, value) {
+        let trimmedName = __http_trim(name);
+        let key = trimmedName.lower();
+        let text = str(value);
+        if (!__http_is_token(trimmedName) or key == "content-length" or
+            key == "connection" or key == "transfer-encoding") {
+            throw new Exception("invalid HTTP response header");
+        }
+        __http_validate_field_value(text);
+        this.headerLines = this.headerLines + key + ": " + text + "\r\n";
+        return this;
+    }
+
+    func setBody(value) {
+        if (type(value) == "bytes") {
+            this.body = value;
+        } else {
+            this.body = bytes(str(value));
+        }
+        return this;
+    }
+}
+
+class HTTPRouter {
+    using &this;
+    let routeMethods = [];
+    let routePaths = [];
+    let routeHandlers = [];
+
+    func init() {
+        this.routeMethods = [];
+        this.routePaths = [];
+        this.routeHandlers = [];
+    }
+
+    func add(method: string, path: string, handler) {
+        let normalizedMethod = method.upper();
+        if (normalizedMethod != "GET" and normalizedMethod != "POST") {
+            throw new Exception("HTTP routes support GET and POST only");
+        }
+        this.routeMethods.append(normalizedMethod);
+        this.routePaths.append(path);
+        this.routeHandlers.append(handler);
+        return this;
+    }
+
+    func get(path: string, handler) {
+        return this.add("GET", path, handler);
+    }
+
+    func post(path: string, handler) {
+        return this.add("POST", path, handler);
+    }
+
+    func dispatch(request: HTTPRequest) {
+        let pathExists = false;
+        let allowed = "";
+        for (0..this.routeMethods.length()) [const &index] {
+            if (this.routePaths.get(index) == request.path) {
+                pathExists = true;
+                let routeMethod = this.routeMethods.get(index);
+                if (allowed.length() > 0) allowed = allowed + ", ";
+                allowed = allowed + routeMethod;
+                if (routeMethod == "GET") allowed = allowed + ", HEAD";
+                if (routeMethod == request.method or
+                    (request.method == "HEAD" and routeMethod == "GET")) {
+                    let handler = this.routeHandlers.get(index);
+                    let result = handler(request);
+                    if (type(result) == "string" or type(result) == "bytes") {
+                        return new HTTPResponse(result, 200);
+                    }
+                    if (result == nil) return new HTTPResponse("", 204);
+                    return result;
+                }
+            }
+        }
+        let knownMethod = request.method == "GET" or request.method == "HEAD" or
+            request.method == "POST" or request.method == "PUT" or
+            request.method == "DELETE" or request.method == "CONNECT" or
+            request.method == "OPTIONS" or request.method == "TRACE" or
+            request.method == "PATCH";
+        if (pathExists and knownMethod) {
+            let methodError = new HTTPResponse("Method Not Allowed", 405);
+            methodError.setHeader("Allow", allowed);
+            return methodError;
+        }
+        if (!knownMethod) return new HTTPResponse("Not Implemented", 501);
+        return new HTTPResponse("Not Found", 404);
+    }
+}
+
+class HTTPServer {
+    using &this;
+    let listener = nil;
+    let router = nil;
+    let isRunning = false;
+    let _serveState = 0; // 0=ready, 1=serving, 2=stop requested
+    let _stateMutex = -1;
+    let _activeClients = [];
+    let _protocolUpgradePaths = [];
+    let _protocolUpgradeHandlers = [];
+    let _protocolUpgradeContexts = [];
+    let maxHeaderBytes = 16384;
+    let maxBodyBytes = 1048576;
+    let readBufferBytes = 4096;
+
+    func init(host: string="127.0.0.1", port: int=8080, backlog: int=128) {
+        this.listener = new Socket();
+        this.listener.bind(host, port);
+        this.listener.listen(backlog);
+        this.router = new HTTPRouter();
+        this._serveState = 0;
+        this._activeClients = [];
+        this._protocolUpgradePaths = [];
+        this._protocolUpgradeHandlers = [];
+        this._protocolUpgradeContexts = [];
+        this._stateMutex = create_shared_lock();
+    }
+
+    func get(path: string, handler) -> &HTTPServer {
+        this.router.get(path, handler);
+        return this;
+    }
+
+    func post(path: string, handler) -> &HTTPServer {
+        this.router.post(path, handler);
+        return this;
+    }
+
+    func route(method: string, path: string, handler) -> &HTTPServer {
+        this.router.add(method, path, handler);
+        return this;
+    }
+
+    // Register a protocol handler that takes ownership of a parsed HTTP
+    // connection. The callback receives (request, socket, unreadBytes, context).
+    func registerProtocolUpgrade(path: string, handler, context=nil) -> &HTTPServer {
+        if (!path.startswith("/")) {
+            throw new Exception("protocol upgrade path must start with /");
+        }
+        for (0..this._protocolUpgradePaths.length()) [const &i] {
+            if (this._protocolUpgradePaths.get(i) == path) {
+                throw new Exception("protocol upgrade path is already registered");
+            }
+        }
+        this._protocolUpgradePaths.append(path);
+        this._protocolUpgradeHandlers.append(handler);
+        this._protocolUpgradeContexts.append(context);
+        return this;
+    }
+
+    func _dispatchProtocolUpgrade(request, client, unreadBytes) -> bool {
+        for (0..this._protocolUpgradePaths.length()) [const &i] {
+            if (this._protocolUpgradePaths.get(i) == request.path) {
+                let handler = this._protocolUpgradeHandlers.get(i);
+                let context = this._protocolUpgradeContexts.get(i);
+                handler(request, client, unreadBytes, context);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    func serveOne() {
+        if (!this._beginServing()) return false;
+        let client = nil;
+        let served = false;
+        let errorMessage = "";
+        try {
+            client = this.listener.accept();
+            if (client != nil) {
+                served = true;
+                this._serveClient(client);
+            }
+        } catch (&error) {
+            if (!this._stopRequested()) errorMessage = error.getMessage();
+        }
+        this._endServing();
+        if (len(errorMessage) > 0) throw new Exception(errorMessage);
+        return served;
+    }
+
+    // maxConnections < 0 means run until close/error; otherwise accept at most
+    // that many TCP clients. Requests on each client may reuse the connection.
+    func serve(maxConnections: int=-1) {
+        if (!this._beginServing()) return 0;
+        let accepted = 0;
+        let keepServing = true;
+        let errorMessage = "";
+        for (keepServing) {
+            if ((maxConnections >= 0 and accepted >= maxConnections) or
+                this._stopRequested()) {
+                keepServing = false;
+            } else {
+                let client = nil;
+                try {
+                    client = this.listener.accept();
+                } catch (&error) {
+                    if (!this._stopRequested()) errorMessage = error.getMessage();
+                    keepServing = false;
+                }
+                if (client != nil) {
+                    try {
+                        this._serveClient(client);
+                        accepted = accepted + 1;
+                    } catch (&error) {
+                        errorMessage = str(error);
+                        keepServing = false;
+                    }
+                }
+            }
+        }
+        this._endServing();
+        if (len(errorMessage) > 0) throw new Exception(errorMessage);
+        return accepted;
+    }
+
+    // Own the accept loop and pool cleanup. The pool is created and started by
+    // the caller so its worker closures belong to the root VM's closure table.
+    func _serveAsyncWithPool(maxConnections, pool, clientHandler) {
+        let accepted = 0;
+        let errorMessage = "";
+        let keepServing = true;
+        for (keepServing) {
+            if ((maxConnections >= 0 and accepted >= maxConnections) or
+                this._stopRequested()) {
+                keepServing = false;
+            } else {
+                let client = nil;
+                try {
+                    client = this.listener.accept();
+                } catch (&error) {
+                    if (!this._stopRequested()) errorMessage = error.getMessage();
+                    keepServing = false;
+                }
+                if (client != nil) {
+                    let clientHandle = client.detachHandle();
+                    if (pool.submitWithArgument(clientHandler, clientHandle)) {
+                        accepted = accepted + 1;
+                    } else {
+                        let rejectedClient = new Socket();
+                        rejectedClient.adoptHandle(clientHandle);
+                        rejectedClient.close();
+                        errorMessage = "HTTP worker pool stopped before scheduling client";
+                        keepServing = false;
+                    }
+                }
+            }
+        }
+
+        pool.shutdown(true);
+        this._endServing();
+        if (len(errorMessage) > 0) throw new Exception(errorMessage);
+        return accepted;
+    }
+
+    // Run the accept loop on the current thread and dispatch each client to a
+    // fixed-size worker pool.
+    func serveAsync(maxConnections: int=-1, workerCount: int=4) {
+        if (workerCount <= 0) throw new Exception("HTTP worker count must be positive");
+        if (!this._beginServing()) return 0;
+
+        let pool = new ThreadPool(workerCount);
+        let clientHandler = this._serveClientWithHandle;
+        let started = false;
+        let startupError = "";
+        try {
+            pool.start();
+            started = true;
+        } catch (&error) {
+            startupError = error.getMessage();
+        }
+        if (!started) {
+            pool.shutdown(true);
+            this._endServing();
+            throw new Exception(startupError);
+        }
+        return this._serveAsyncWithPool(maxConnections, pool, clientHandler);
+    }
+
+    // Starts workers before creating the acceptor thread. This keeps worker
+    // closures in the VM that owns the global closure resolver.
+    func startAsync(workerCount: int=4, maxConnections: int=-1) {
+        if (workerCount <= 0) throw new Exception("HTTP worker count must be positive");
+        if (!this._beginServing()) throw new Exception("HTTP server is closed");
+
+        let pool = new ThreadPool(workerCount);
+        let startupError = "";
+        let clientHandler = this._serveClientWithHandle;
+        try {
+            pool.start();
+            let serverThread = new Thread(
+                this._serveAsyncWithPool,
+                [maxConnections, pool, clientHandler]
+            );
+            serverThread.start();
+            return serverThread;
+        } catch (&error) {
+            startupError = error.getMessage();
+        }
+        pool.shutdown(true);
+        this._endServing();
+        throw new Exception(startupError);
+    }
+
+    func _beginServing() -> bool {
+        lock_acquire(this._stateMutex);
+        if (this._serveState == 2) {
+            lock_release(this._stateMutex);
+            this.listener.close();
+            return false;
+        }
+        if (this._serveState == 1) {
+            lock_release(this._stateMutex);
+            throw new Exception("HTTP server is already serving");
+        }
+        this._serveState = 1;
+        this.isRunning = true;
+        lock_release(this._stateMutex);
+        return true;
+    }
+
+    func _stopRequested() -> bool {
+        lock_acquire(this._stateMutex);
+        let stopping = this._serveState == 2;
+        lock_release(this._stateMutex);
+        return stopping;
+    }
+
+    func _registerActiveClient(client) -> bool {
+        lock_acquire(this._stateMutex);
+        if (this._serveState == 2) {
+            client.requestClose();
+            lock_release(this._stateMutex);
+            return false;
+        }
+        this._activeClients.append(client);
+        lock_release(this._stateMutex);
+        return true;
+    }
+
+    func _unregisterActiveClient(client) {
+        lock_acquire(this._stateMutex);
+        let found = -1;
+        for (0..this._activeClients.length()) [const &i] {
+            if (this._activeClients.get(i) == client) {
+                found = i;
+                break;
+            }
+        }
+        if (found >= 0) {
+            let last = this._activeClients.length() - 1;
+            if (found != last) {
+                this._activeClients.set(found, this._activeClients.get(last));
+            }
+            this._activeClients.pop();
+        }
+        lock_release(this._stateMutex);
+    }
+
+    func _endServing() {
+        lock_acquire(this._stateMutex);
+        let stopped = this._serveState == 2;
+        if (!stopped) this._serveState = 0;
+        this.isRunning = false;
+        lock_release(this._stateMutex);
+        if (stopped) this.listener.close();
+    }
+
+    func _dispatchSafely(request) {
+        try {
+            return this.router.dispatch(request);
+        } catch (&error) {
+            print("HTTP route failed:", str(error));
+            let errorResponse = new HTTPResponse("Internal Server Error", 500);
+            errorResponse.shouldClose = true;
+            return errorResponse;
+        }
+    }
+
+    func _serveClientWithHandle(clientHandle) {
+        let client = new Socket();
+        client.adoptHandle(clientHandle);
+        this._serveClient(client);
+    }
+
+    func _serveClient(client) {
+        if (!this._registerActiveClient(client)) {
+            client.close();
+            return;
+        }
+        let buffer = new ByteBuffer();
+        let headerSearchStart = 0;
+        let clientTransferred = false;
+        try {
+            for (true) {
+                let parsed = __http_parse_request_buffer(
+                    buffer, this.maxHeaderBytes, this.maxBodyBytes, headerSearchStart);
+                if (parsed.incomplete) {
+                    headerSearchStart = parsed.nextHeaderSearchStart;
+                    let received = client.recv(this.readBufferBytes);
+                    if (received.length() == 0) break;
+                    buffer.append(received);
+                } else if (parsed.status != 0) {
+                    let errorResponse = new HTTPResponse(parsed.message, parsed.status);
+                    errorResponse.shouldClose = true;
+                    __http_send_all(client, __http_response_bytes(errorResponse, false));
+                    break;
+                } else {
+                    headerSearchStart = 0;
+                    buffer.consume(parsed.consumed);
+                    let request = parsed.request;
+                    if (this._dispatchProtocolUpgrade(request, client, buffer.toBytes())) {
+                        clientTransferred = true;
+                        break;
+                    }
+                    let response = this._dispatchSafely(request);
+
+                    let requestPersistent = request.persistent;
+                    if (response.shouldClose) {
+                        __http_send_all(client, __http_response_bytes(
+                            response, false, request.method == "HEAD"));
+                        break;
+                    }
+                    __http_send_all(client, __http_response_bytes(
+                        response, requestPersistent, request.method == "HEAD"));
+                    if (!requestPersistent) break;
+                }
+            }
+        } catch (&error) {
+            if (!this._stopRequested()) {
+                print("HTTP connection failed:", error.getMessage());
+            }
+        }
+        this._unregisterActiveClient(client);
+        if (!clientTransferred) client.close();
+    }
+
+    func close() {
+        if (this._stateMutex < 0) {
+            if (this.listener != nil) this.listener.close();
+            return true;
+        }
+        lock_acquire(this._stateMutex);
+        if (this._serveState != 2) {
+            if (this.listener != nil) this.listener.requestClose();
+            this._serveState = 2;
+            this.isRunning = false;
+            for (0..this._activeClients.length()) [const &i] {
+                let activeClient = this._activeClients.get(i);
+                activeClient.requestClose();
+            }
+        }
+        lock_release(this._stateMutex);
+        return true;
+    }
+
+    func operator[~]() {
+        this.close();
+        if (this.listener != nil) this.listener.close();
+        if (this._stateMutex >= 0) {
+            lock_destroy(this._stateMutex);
+            this._stateMutex = -1;
+        }
+    }
+}

@@ -1,0 +1,36 @@
+func require(condition: bool, message: string) {
+    if (!condition) throw new Exception(message);
+}
+
+let values = [1, 2];
+require(__array_push(values, 3) == 3, "array push result");
+require(__array_get(values, 2) == 3, "array get result");
+require(__array_set(values, 1, 8) == true, "array set result");
+require(__array_get(values, 1) == 8, "array set value");
+
+let sliced = __array_slice(values, 1, 3);
+require(sliced.length() == 2, "array slice length");
+require(sliced[0] == 8 and sliced[1] == 3, "array slice values");
+require(__array_pop(values) == 3, "array pop result");
+require(__array_clear(values) == true, "array clear result");
+require(values.length() == 0, "array clear value");
+
+let source = new Dict();
+source["alpha"] = 11;
+source["beta"] = 22;
+let copied = source.copy();
+source.deleteKey("alpha");
+require(!source.hasKey("alpha"), "dict delete source");
+require(copied.hasKey("alpha"), "dict clone preserves key");
+require(copied["alpha"] == 11, "dict clone preserves value");
+require(source.length() == 1 and copied.length() == 2, "dict clone independence");
+
+let missingKeyThrows = false;
+try {
+    let missing = copied["missing"];
+} catch (&error) {
+    missingKeyThrows = true;
+}
+require(missingKeyThrows, "dict missing key raises an error");
+
+print("ARRAY_DICT_NATIVE_ABI_PASS");

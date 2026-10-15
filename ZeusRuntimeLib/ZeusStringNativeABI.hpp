@@ -2,7 +2,7 @@
 
 #include "ZeusABI.hpp"
 
-// C ABI wrappers used by ZeusBuiltins/string.zeu. Each argument and the
+// C ABI wrappers used by ZeusBuiltins/zeus/string.zeu. Each argument and the
 // result use the dynamic ZeusValue representation, keeping the builtin
 // semantics shared with the VM implementation.
 extern "C" {

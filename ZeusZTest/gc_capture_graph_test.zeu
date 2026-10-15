@@ -1,0 +1,169 @@
+// Capture semantics and lifetime through nested container/object graphs.
+// Run in both the VM and AOT executable; failures are emitted as [FAIL] lines.
+
+var failures = 0;
+var markerDestroyed = 0;
+
+class CaptureMarker {
+    using &this;
+
+    func value() -> int { return 73; }
+
+    func operator[~]() {
+        markerDestroyed = markerDestroyed + 1;
+    }
+}
+
+func check(label, condition) {
+    if (condition) print("[PASS]", label);
+    else {
+        failures = failures + 1;
+        print("[FAIL]", label);
+    }
+}
+
+func make_copy_array_capture() {
+    let values = [10];
+    func next() [values] {
+        values[0] = values[0] + 1;
+        return values[0];
+    }
+    values[0] = 15;
+    values = [90];
+    return next;
+}
+
+func make_ref_array_capture() {
+    let values = [10];
+    func next() [&values] {
+        values[0] = values[0] + 1;
+        return values[0];
+    }
+    values = [90];
+    return next;
+}
+
+func make_mixed_capture() {
+    let values = [1];
+    let offset = 7;
+    func next() [&values, offset] {
+        values[0] = values[0] + 1;
+        offset = offset + 1;
+        return values[0] * 100 + offset;
+    }
+    values = [10];
+    offset = 20;
+    return next;
+}
+
+func make_ref_pair() {
+    let value = 0;
+    func increment() [&value] {
+        value = value + 1;
+        return value;
+    }
+    func read() [&value] {
+        return value;
+    }
+    return [increment, read];
+}
+
+func make_three_level_ref_capture() {
+    let value = 40;
+    func middle() [&value] {
+        func deeper() [&value] {
+            func inner() [&value] {
+                value = value + 1;
+                return value;
+            }
+            return inner;
+        }
+        return deeper();
+    }
+    return middle()();
+}
+
+func make_copy_dict_capture() {
+    let state = {"items": [20]};
+    func next() [state] {
+        let items = state["items"];
+        items[0] = items[0] + 1;
+        return items[0];
+    }
+    let originalItems = state["items"];
+    originalItems[0] = 25;
+    state = {"items": [80]};
+    return next;
+}
+
+func make_nested_copy_capture() {
+    let state = {"items": [30]};
+    func make_inner() [state] {
+        func next() [state] {
+            let items = state["items"];
+            items[0] = items[0] + 1;
+            return items[0];
+        }
+        return next;
+    }
+    let next = make_inner();
+    let originalItems = state["items"];
+    originalItems[0] = 35;
+    state = {"items": [80]};
+    return next;
+}
+
+func make_marker_container_cycle() {
+    let values = {};
+    let marker = new CaptureMarker();
+    values["marker"] = marker;
+    values["value"] = 73;
+    func read() [values] {
+        return values["value"];
+    }
+    values["callback"] = read;
+    print("MARKER_BEFORE_CYCLE_RETURN", markerDestroyed);
+    return read;
+}
+
+let copyArray = make_copy_array_capture();
+check("copy capture shares the original array storage", copyArray() == 16);
+check("copy capture is isolated from outer array rebinding", copyArray() == 17);
+
+let refArray = make_ref_array_capture();
+check("reference capture observes reassigned outer array", refArray() == 91);
+check("reference-captured array stays mutable across calls", refArray() == 92);
+
+let mixed = make_mixed_capture();
+check("mixed reference and copy captures keep separate rules", mixed() == 1108);
+
+let refPair = make_ref_pair();
+let increment = refPair[0];
+let read = refPair[1];
+check("sibling closure increments shared reference cell", increment() == 1);
+check("sibling closure reads shared reference cell", read() == 1);
+check("three-level closure forwards a reference cell", make_three_level_ref_capture() == 41);
+
+let copyDict = make_copy_dict_capture();
+check("copy capture shares nested dictionary storage", copyDict() == 26);
+check("copied dictionary stays isolated from outer rebinding", copyDict() == 27);
+
+let nestedCopy = make_nested_copy_capture();
+check("nested closure forwards a copied reference graph", nestedCopy() == 36);
+check("nested copied graph remains mutable", nestedCopy() == 37);
+
+__gc_collect();
+let baseline = __gc_native_nodes();
+let keepCycle = make_marker_container_cycle();
+print("MARKER_AFTER_CYCLE_CREATE", markerDestroyed);
+__gc_collect();
+print("MARKER_AFTER_ROOTED_COLLECT", markerDestroyed);
+check("rooted closure keeps its container value", keepCycle() == 73);
+check("rooted closure keeps the nested object alive", markerDestroyed == 0);
+keepCycle = nil;
+let afterRelease = __gc_collect();
+check("released closure-container cycle destroys nested object once", markerDestroyed == 1);
+print("CAPTURE_GRAPH_NODES", baseline, afterRelease, __gc_native_nodes());
+
+if (failures == 0) print("GC_CAPTURE_GRAPH_PASS");
+else print("GC_CAPTURE_GRAPH_FAIL", failures);

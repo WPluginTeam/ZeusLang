@@ -1,0 +1,6 @@
+import ZeusBuiltins.list;
+
+let values = new Array([3, 4]);
+if (values.length() != 2) throw "legacy module import failed";
+
+print("MODULE_IMPORT_LEGACY_TEST_PASS");

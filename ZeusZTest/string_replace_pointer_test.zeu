@@ -1,0 +1,28 @@
+func expectReplace(value: string, old: string, replacement: string, expected: string) {
+    let actual = value.replace(old, replacement);
+    if (actual != expected) {
+        throw new Exception("pointer replace result mismatch");
+    }
+}
+
+expectReplace("ab::cd::ef", "::", "-long-", "ab-long-cd-long-ef");
+expectReplace("ab--cd--ef", "--", "x", "abxcdxef");
+expectReplace("aaaaa", "aa", "b", "bba");
+expectReplace("banana", "a", "", "bnn");
+expectReplace("banana", "a", "a", "banana");
+expectReplace("abc", "z", "replacement", "abc");
+expectReplace("abc", "abc", "", "");
+expectReplace("", "x", "y", "");
+expectReplace("ab你cd你", "你", "語", "ab語cd語");
+
+let emptyPatternThrows = false;
+try {
+    let ignored = "abc".replace("", "x");
+} catch (&error) {
+    emptyPatternThrows = true;
+}
+if (emptyPatternThrows == false) {
+    throw new Exception("empty replace pattern must fail");
+}
+
+print("STRING_REPLACE_POINTER_PASS");

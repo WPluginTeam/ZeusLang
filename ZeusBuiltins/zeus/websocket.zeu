@@ -1,0 +1,648 @@
+// RFC 6455 WebSocket support over the HTTP/1.1 Upgrade path.
+// v1 supports ws://, text/binary messages, fragmentation, and control frames.
+
+import zeus.http;
+import zeus.socket;
+import zeus.thread;
+import zeus.crypto;
+import zeus.exception;
+
+@native("zeus_websocket_mask")
+decl func __websocket_mask(payload: bytes, mask: bytes) -> bytes;
+
+@native("zeus_websocket_join")
+decl func __websocket_join(chunks: list) -> bytes;
+
+func __ws_count_header(rawHeaders: string, name: string) -> int {
+    let lines = rawHeaders.split("\r\n");
+    let count = 0;
+    for (1..lines.length()) [const &i] {
+        let line = lines.get(i);
+        let colon = line.index(":");
+        if (colon > 0 and line.slice(0, colon).lower() == name.lower()) {
+            count = count + 1;
+        }
+    }
+    return count;
+}
+
+func __ws_has_token(value: string, token: string) -> bool {
+    let parts = value.split(",");
+    for (0..parts.length()) [const &i] {
+        if (__http_trim(parts.get(i)).lower() == token.lower()) return true;
+    }
+    return false;
+}
+
+func __ws_valid_close_code(code: int) -> bool {
+    if (code >= 1000 and code <= 1014) {
+        return code != 1004 and code != 1005 and code != 1006;
+    }
+    return code >= 3000 and code <= 4999;
+}
+
+func __ws_length_byte(length: int, divisor: int) -> int {
+    return int(length / divisor) % 256;
+}
+
+class WebSocketURL {
+    using &this;
+    let host = "";
+    let authority = "";
+    let port = 80;
+    let target = "/";
+}
+
+func __ws_parse_port(text: string) -> int {
+    if (text.length() == 0) throw new Exception("WebSocket URL has an empty port");
+    let port = 0;
+    let digits = "0123456789";
+    for (0..text.length()) [const &i] {
+        let digit = __str_index(digits, text.slice(i, i + 1));
+        if (digit < 0) throw new Exception("WebSocket URL port must contain digits only");
+        port = port * 10 + digit;
+        if (port > 65535) throw new Exception("WebSocket URL port is out of range");
+    }
+    if (port == 0) throw new Exception("WebSocket URL port must be between 1 and 65535");
+    return port;
+}
+
+func __ws_parse_url(url: string) {
+    if (url.slice(0, 5).lower() != "ws://") {
+        throw new Exception("WebSocketClient supports ws:// URLs only");
+    }
+    let remainder = url.slice(5, url.length());
+    let fragment = remainder.index("#");
+    if (fragment >= 0) remainder = remainder.slice(0, fragment);
+
+    let pathStart = remainder.index("/");
+    let queryStart = remainder.index("?");
+    if (pathStart < 0 or (queryStart >= 0 and queryStart < pathStart)) {
+        pathStart = queryStart;
+    }
+    let authority = remainder;
+    let target = "/";
+    if (pathStart >= 0) {
+        authority = remainder.slice(0, pathStart);
+        target = remainder.slice(pathStart, remainder.length());
+        if (target.startswith("?")) target = "/" + target;
+    }
+    if (authority.length() == 0 or authority.index("@") >= 0) {
+        throw new Exception("WebSocket URL requires a host without user information");
+    }
+
+    let host = authority;
+    let port = 80;
+    let firstColon = authority.index(":");
+    let lastColon = authority.rindex(":");
+    if (firstColon >= 0) {
+        if (firstColon != lastColon) {
+            throw new Exception("WebSocket URL does not support IPv6 literals");
+        }
+        host = authority.slice(0, firstColon);
+        port = __ws_parse_port(authority.slice(firstColon + 1, authority.length()));
+    }
+    if (host.length() == 0) throw new Exception("WebSocket URL host is empty");
+    if (host.index(" ") >= 0 or host.index("\t") >= 0 or host.index("\r") >= 0 or
+        host.index("\n") >= 0) {
+        throw new Exception("WebSocket URL host contains whitespace");
+    }
+
+    let result = new WebSocketURL();
+    result.host = host;
+    result.authority = authority;
+    result.port = port;
+    result.target = target;
+    return result;
+}
+
+func __ws_find_header_end(buffer: bytes) -> int {
+    let length = buffer.length();
+    if (length < 4) return -1;
+    for (0..(length - 3)) [const &i] {
+        if (buffer.get(i) == 13 and buffer.get(i + 1) == 10 and
+            buffer.get(i + 2) == 13 and buffer.get(i + 3) == 10) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+class WebSocketHandshakeResponse {
+    using &this;
+    let headerText = "";
+    let pendingBytes: bytes = b"";
+}
+
+func __ws_read_handshake_response(socket) {
+    let buffer = b"";
+    let headerEnd = -1;
+    for (headerEnd < 0) {
+        if (buffer.length() >= 16384) {
+            throw new Exception("WebSocket handshake response headers are too large");
+        }
+        let received = socket.recv(4096);
+        if (received.length() == 0) {
+            throw new Exception("connection closed during WebSocket handshake");
+        }
+        buffer = buffer + received;
+        headerEnd = __ws_find_header_end(buffer);
+    }
+    let result = new WebSocketHandshakeResponse();
+    result.headerText = buffer.slice(0, headerEnd).decode("utf-8");
+    result.pendingBytes = buffer.slice(headerEnd + 4, buffer.length());
+    return result;
+}
+
+class WebSocketMessage {
+    using &this;
+    let opcode = 0;
+    let data: bytes = b"";
+    let text = nil;
+
+    func isText() -> bool {
+        return this.opcode == 1;
+    }
+
+    func isBinary() -> bool {
+        return this.opcode == 2;
+    }
+}
+
+class WebSocketFrame {
+    using &this;
+    let fin = false;
+    let opcode = 0;
+    let payload: bytes = b"";
+}
+
+class WebSocketConnection {
+    using &this;
+    let socket = nil;
+    let isClient = false;
+    let isOpen = false;
+    let closeSent = false;
+    let closeReceived = false;
+    let pendingBytes: bytes = b"";
+    let maxMessageBytes = 1048576;
+    let sendLock = nil;
+    let receiveLock = nil;
+    let _failureCloseCode = 1002;
+
+    func init(socket, isClient: bool, pendingBytes: bytes=b"", maxMessageBytes: int=1048576) {
+        if (maxMessageBytes <= 0 or maxMessageBytes > 16777216) {
+            throw new Exception("WebSocket maxMessageBytes must be between 1 and 16777216");
+        }
+        this.socket = new Socket();
+        this.socket.adoptHandle(socket.detachHandle());
+        this.isClient = isClient;
+        this.isOpen = true;
+        this.closeSent = false;
+        this.closeReceived = false;
+        this.pendingBytes = pendingBytes;
+        this.maxMessageBytes = maxMessageBytes;
+        this.sendLock = new Lock();
+        this.receiveLock = new Lock();
+        this._failureCloseCode = 1002;
+    }
+
+    func _readExact(size: int) -> bytes {
+        if (size < 0) throw new Exception("WebSocket read size cannot be negative");
+        if (size == 0) return b"";
+        let available = this.pendingBytes.length();
+        if (available >= size) {
+            let output = this.pendingBytes.slice(0, size);
+            this.pendingBytes = this.pendingBytes.slice(size, available);
+            return output;
+        }
+
+        let output = this.pendingBytes;
+        this.pendingBytes = b"";
+        let missing = size - output.length();
+        let received = this.socket.recvExact(missing);
+        return output + received;
+    }
+
+    func _readFrame() {
+        let header = this._readExact(2);
+        if (header.length() == 0) return nil;
+        if (header.length() != 2) throw new Exception("truncated WebSocket frame header");
+
+        let first = header.get(0);
+        let second = header.get(1);
+        let fin = first >= 128;
+        let firstLow = first % 128;
+        if (firstLow >= 16) throw new Exception("WebSocket reserved bits are non-zero");
+        let opcode = first % 16;
+        if (opcode != 0 and opcode != 1 and opcode != 2 and opcode != 8 and
+            opcode != 9 and opcode != 10) {
+            throw new Exception("unknown WebSocket opcode");
+        }
+
+        let masked = second >= 128;
+        if (masked == this.isClient) {
+            throw new Exception("WebSocket frame masking does not match endpoint role");
+        }
+        let payloadLength = second % 128;
+        if (payloadLength == 126) {
+            let extended = this._readExact(2);
+            if (extended.length() != 2) throw new Exception("truncated WebSocket frame length");
+            payloadLength = extended.get(0) * 256 + extended.get(1);
+            if (payloadLength < 126) throw new Exception("non-canonical WebSocket frame length");
+        } else if (payloadLength == 127) {
+            let extended = this._readExact(8);
+            if (extended.length() != 8) throw new Exception("truncated WebSocket frame length");
+            for (0..4) [const &i] {
+                if (extended.get(i) != 0) {
+                    this._failureCloseCode = 1009;
+                    throw new Exception("WebSocket frame length exceeds configured limit");
+                }
+            }
+            payloadLength = extended.get(4) * 16777216 +
+                extended.get(5) * 65536 + extended.get(6) * 256 + extended.get(7);
+            if (payloadLength < 65536) throw new Exception("non-canonical WebSocket frame length");
+        }
+
+        let controlFrame = opcode >= 8;
+        if (controlFrame and (!fin or payloadLength > 125)) {
+            throw new Exception("WebSocket control frames must be final and at most 125 bytes");
+        }
+        if (payloadLength > this.maxMessageBytes) {
+            this._failureCloseCode = 1009;
+            throw new Exception("WebSocket frame exceeds configured message limit");
+        }
+
+        let mask = b"";
+        if (masked) {
+            mask = this._readExact(4);
+            if (mask.length() != 4) throw new Exception("truncated WebSocket mask");
+        }
+        let payload = this._readExact(payloadLength);
+        if (payload.length() != payloadLength) throw new Exception("truncated WebSocket payload");
+        if (masked) {
+            payload = __websocket_mask(payload, mask);
+            Crypto.checkNativeError();
+        }
+
+        let result = new WebSocketFrame();
+        result.fin = fin;
+        result.opcode = opcode;
+        result.payload = payload;
+        return result;
+    }
+
+    func _makeMessage(opcode: int, chunks, byteLength: int) {
+        if (byteLength > this.maxMessageBytes) {
+            this._failureCloseCode = 1009;
+            throw new Exception("WebSocket message exceeds configured limit");
+        }
+        let message = new WebSocketMessage();
+        message.opcode = opcode;
+        message.data = __websocket_join(chunks);
+        Crypto.checkNativeError();
+        if (opcode == 1) {
+            try {
+                message.text = message.data.decode("utf-8");
+            } catch (&error) {
+                this._failureCloseCode = 1007;
+                throw new Exception("WebSocket text message is not valid UTF-8");
+            }
+        }
+        return message;
+    }
+
+    func _readMessage() {
+        let activeOpcode = 0;
+        let chunks = [];
+        let totalBytes = 0;
+        for (true) {
+            let frame = this._readFrame();
+            if (frame == nil) {
+                this._closeTransport();
+                return nil;
+            }
+
+            let closeFrame = frame.opcode == 8;
+            if (closeFrame) {
+                let closePayload = frame.payload;
+                if (closePayload.length() == 1) {
+                    throw new Exception("WebSocket close payload cannot contain one byte");
+                }
+                if (closePayload.length() >= 2) {
+                    let closeCode = closePayload.get(0) * 256 + closePayload.get(1);
+                    if (!__ws_valid_close_code(closeCode)) {
+                        throw new Exception("WebSocket close code is invalid");
+                    }
+                    if (closePayload.length() > 2) {
+                        try {
+                            closePayload.slice(2, closePayload.length()).decode("utf-8");
+                        } catch (&error) {
+                            this._failureCloseCode = 1007;
+                            throw new Exception("WebSocket close reason is not valid UTF-8");
+                        }
+                    }
+                }
+                this.closeReceived = true;
+                if (!this.closeSent) this._sendFrame(8, closePayload, true);
+                this._closeTransport();
+                return nil;
+            }
+
+            let pingFrame = frame.opcode == 9;
+            if (pingFrame) {
+                this._sendFrame(10, frame.payload, true);
+            }
+            if (frame.opcode == 0) {
+                if (activeOpcode == 0) throw new Exception("unexpected WebSocket continuation frame");
+                if (frame.payload.length() > this.maxMessageBytes - totalBytes) {
+                    this._failureCloseCode = 1009;
+                    throw new Exception("WebSocket message exceeds configured limit");
+                }
+                totalBytes = totalBytes + frame.payload.length();
+                chunks.append(frame.payload);
+                if (frame.fin) {
+                    let message = this._makeMessage(activeOpcode, chunks, totalBytes);
+                    return message;
+                }
+            }
+            if (frame.opcode == 1 or frame.opcode == 2) {
+                if (activeOpcode != 0) throw new Exception("new data frame before fragmented message ended");
+                activeOpcode = frame.opcode;
+                totalBytes = frame.payload.length();
+                chunks.append(frame.payload);
+                if (frame.fin) {
+                    let message = this._makeMessage(activeOpcode, chunks, totalBytes);
+                    return message;
+                }
+            }
+        }
+    }
+
+    func _sendFrame(opcode: int, payload: bytes, fin: bool=true) {
+        if (!this.isOpen) throw new Exception("WebSocket connection is closed");
+        if (payload.length() > this.maxMessageBytes) {
+            throw new Exception("WebSocket payload exceeds configured message limit");
+        }
+        if (opcode >= 8 and (!fin or payload.length() > 125)) {
+            throw new Exception("WebSocket control frame is too large");
+        }
+
+        let first = opcode;
+        if (fin) first = first + 128;
+        let length = payload.length();
+        let maskFlag = 0;
+        let mask = b"";
+        let wirePayload = payload;
+        if (this.isClient) {
+            maskFlag = 128;
+            mask = Crypto.randomBytes(4);
+            wirePayload = __websocket_mask(payload, mask);
+            Crypto.checkNativeError();
+        }
+
+        let header = b"";
+        if (length < 126) {
+            header = bytes([first, maskFlag + length]);
+        } else if (length <= 65535) {
+            header = bytes([first, maskFlag + 126,
+                __ws_length_byte(length, 256), length % 256]);
+        } else {
+            header = bytes([first, maskFlag + 127, 0, 0, 0, 0,
+                __ws_length_byte(length, 16777216),
+                __ws_length_byte(length, 65536),
+                __ws_length_byte(length, 256), length % 256]);
+        }
+        if (this.isClient) header = header + mask;
+        let frameBytes = header + wirePayload;
+
+        this.sendLock.acquire();
+        try {
+            let sent = this.socket.sendAll(frameBytes);
+            if (sent != frameBytes.length()) throw new Exception("incomplete WebSocket frame write");
+        } catch (&error) {
+            this.sendLock.release();
+            throw error;
+        }
+        this.sendLock.release();
+        return frameBytes.length();
+    }
+
+    func sendText(text: string) {
+        return this._sendFrame(1, bytes(text), true);
+    }
+
+    func sendBytes(data: bytes) {
+        return this._sendFrame(2, data, true);
+    }
+
+    func ping(payload: bytes=b"") {
+        return this._sendFrame(9, payload, true);
+    }
+
+    func close(code: int=1000, reason: string="") {
+        if (!this.isOpen or this.closeSent) return false;
+        if (!__ws_valid_close_code(code)) throw new Exception("WebSocket close code is invalid");
+        let reasonBytes = bytes(reason);
+        if (reasonBytes.length() > 123) {
+            throw new Exception("WebSocket close reason exceeds 123 UTF-8 bytes");
+        }
+        let payload = bytes([int(code / 256), code % 256]) + reasonBytes;
+        this.closeSent = true;
+        this._sendFrame(8, payload, true);
+        return true;
+    }
+
+    func receive() {
+        if (!this.isOpen) return nil;
+        this.receiveLock.acquire();
+        try {
+            let message = this._readMessage();
+            this.receiveLock.release();
+            return message;
+        } catch (&error) {
+            let code = this._failureCloseCode;
+            if (this.isOpen and !this.closeSent) {
+                try {
+                    this._sendFrame(8, bytes([int(code / 256), code % 256]), true);
+                    this.closeSent = true;
+                } catch (&sendError) {
+                }
+            }
+            this._closeTransport();
+            this.receiveLock.release();
+            throw error;
+        }
+    }
+
+    func _closeTransport() {
+        if (this.isOpen) {
+            this.isOpen = false;
+            this.socket.close();
+        }
+    }
+
+    func operator[~]() {
+        if (this.isOpen) {
+            try {
+                this.close(1000, "");
+            } catch (&error) {
+            }
+            this._closeTransport();
+        }
+    }
+}
+
+class WebSocketRoute {
+    using &this;
+    let handler = nil;
+    let authorize = nil;
+    let maxMessageBytes = 1048576;
+}
+
+func __ws_reject(socket, status: int, message: string, includeVersion: bool=false) {
+    let response = new HTTPResponse(message, status);
+    response.shouldClose = true;
+    if (includeVersion) response.setHeader("Sec-WebSocket-Version", "13");
+    try {
+        __http_send_all(socket, __http_response_bytes(response, false));
+    } catch (&error) {
+    }
+    socket.close();
+}
+
+func __ws_server_upgrade(request, socket, pendingBytes: bytes, route) {
+    if (request.method != "GET") {
+        __ws_reject(socket, 405, "WebSocket requires GET");
+        return false;
+    }
+    if (__ws_count_header(request.rawHeaders, "upgrade") != 1 or
+        __ws_count_header(request.rawHeaders, "connection") != 1 or
+        __ws_count_header(request.rawHeaders, "sec-websocket-key") != 1 or
+        __ws_count_header(request.rawHeaders, "sec-websocket-version") != 1) {
+        __ws_reject(socket, 400, "Invalid WebSocket handshake headers");
+        return false;
+    }
+    if (!__ws_has_token(request.getHeader("connection", ""), "upgrade") or
+        !__ws_has_token(request.getHeader("upgrade", ""), "websocket")) {
+        __ws_reject(socket, 400, "Invalid WebSocket Upgrade request");
+        return false;
+    }
+    if (request.getHeader("sec-websocket-version", "") != "13") {
+        __ws_reject(socket, 426, "WebSocket version 13 is required", true);
+        return false;
+    }
+    if (request.body.length() != 0) {
+        __ws_reject(socket, 400, "WebSocket handshake must not have a body");
+        return false;
+    }
+
+    let key = request.getHeader("sec-websocket-key", "");
+    let nonce = nil;
+    try {
+        nonce = Crypto.base64Decode(key);
+    } catch (&error) {
+        __ws_reject(socket, 400, "Invalid Sec-WebSocket-Key");
+        return false;
+    }
+    if (nonce.length() != 16) {
+        __ws_reject(socket, 400, "Sec-WebSocket-Key must decode to 16 bytes");
+        return false;
+    }
+    let authorize = route.authorize;
+    if (authorize != nil) {
+        if (!authorize(request)) {
+            __ws_reject(socket, 403, "WebSocket origin or credentials were rejected");
+            return false;
+        }
+    }
+
+    let accept = Crypto.base64Encode(Crypto.sha1(bytes(
+        key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+    let handshake = bytes(
+        "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        "Sec-WebSocket-Accept: " + accept + "\r\n\r\n");
+    let connection = nil;
+    try {
+        __http_send_all(socket, handshake);
+        connection = new WebSocketConnection(
+            socket, false, pendingBytes, route.maxMessageBytes);
+        let handler = route.handler;
+        handler(connection, request);
+    } catch (&error) {
+        print("WebSocket route failed:", error.getMessage());
+    }
+    if (connection != nil) {
+        if (connection.isOpen and !connection.closeSent) {
+            try {
+                connection.close(1000, "");
+            } catch (&error) {
+            }
+        }
+        connection._closeTransport();
+    } else {
+        socket.close();
+    }
+    return true;
+}
+
+func __ws_validate_server_response(headerText: string, key: string) -> bool {
+    let lines = headerText.split("\r\n");
+    if (lines.length() == 0 or !lines.get(0).startswith("HTTP/1.1 101 ")) return false;
+    if (__ws_count_header(headerText, "upgrade") != 1 or
+        __ws_count_header(headerText, "connection") != 1 or
+        __ws_count_header(headerText, "sec-websocket-accept") != 1) return false;
+    if (!__ws_has_token(__http_header_value(headerText, "upgrade"), "websocket") or
+        !__ws_has_token(__http_header_value(headerText, "connection"), "upgrade")) return false;
+    let expected = Crypto.base64Encode(Crypto.sha1(bytes(
+        key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+    return __http_trim(__http_header_value(headerText, "sec-websocket-accept")) == expected;
+}
+
+class WebSocketClient {
+    func static connect(url: string, maxMessageBytes: int=1048576) {
+        let parsedURL = __ws_parse_url(url);
+        let socket = new Socket(parsedURL.host, parsedURL.port);
+        let key = Crypto.base64Encode(Crypto.randomBytes(16));
+        let request = bytes(
+            "GET " + parsedURL.target + " HTTP/1.1\r\n" +
+            "Host: " + parsedURL.authority + "\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            "Sec-WebSocket-Key: " + key + "\r\n" +
+            "Sec-WebSocket-Version: 13\r\n\r\n");
+        try {
+            __http_send_all(socket, request);
+            let response = __ws_read_handshake_response(socket);
+            if (!__ws_validate_server_response(response.headerText, key)) {
+                throw new Exception("server rejected the WebSocket handshake");
+            }
+            return new WebSocketConnection(
+                socket, true, response.pendingBytes, maxMessageBytes);
+        } catch (&error) {
+            socket.close();
+            throw error;
+        }
+    }
+}
+
+class WebSocketServer {
+    func static attach(
+        &server: HTTPServer,
+        path: string,
+        handler,
+        authorize=nil,
+        maxMessageBytes: int=1048576
+    ) -> &HTTPServer {
+        if (maxMessageBytes <= 0 or maxMessageBytes > 16777216) {
+            throw new Exception("WebSocket maxMessageBytes must be between 1 and 16777216");
+        }
+        let route = new WebSocketRoute();
+        route.handler = handler;
+        route.authorize = authorize;
+        route.maxMessageBytes = maxMessageBytes;
+        server.registerProtocolUpgrade(path, __ws_server_upgrade, route);
+        return server;
+    }
+}

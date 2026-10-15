@@ -1,0 +1,17 @@
+func make_adder(seed: int) {
+    let total = seed;
+    func add(left: int, right: int = 2) [total] -> int {
+        total = total + left + right;
+        return total;
+    }
+    return add;
+}
+
+func invoke(callback, left: int, right: int) -> int {
+    return callback(right = right, left = left);
+}
+
+let add = make_adder(10);
+print("two args", add(1, 2));
+print("indirect named", invoke(add, 3, 4));
+print("default", add(left = 5));

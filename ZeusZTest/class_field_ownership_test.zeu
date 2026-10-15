@@ -1,0 +1,80 @@
+var destroyedCount = 0;
+var nestedDestroyedCount = 0;
+
+class NestedMarker {
+    using &this;
+
+    func operator[~]() {
+        nestedDestroyedCount = nestedDestroyedCount + 1;
+    }
+}
+
+class AllocatesDuringDestroy {
+    using &this;
+
+    func operator[~]() {
+        let marker = new NestedMarker();
+    }
+}
+
+class Leaf {
+    using &this;
+
+    func value() -> int { return 23; }
+
+    func operator[~]() {
+        destroyedCount = destroyedCount + 1;
+    }
+}
+
+class Holder {
+    using &this;
+    let leaf: Leaf;
+
+    func init() {
+        this.leaf = new Leaf();
+    }
+
+    func value() -> int {
+        return this.leaf.value();
+    }
+}
+
+func createTemporaryLeaf() {
+    let leaf = new Leaf();
+}
+
+func deleteTemporaryLeaf() {
+    let leaf = new Leaf();
+    delete leaf;
+}
+
+func createAllocatingTemporary() {
+    let value = new AllocatesDuringDestroy();
+}
+
+func check(label, actual, expected) {
+    if (actual != expected) {
+        print("FAIL", label, "expected", expected, "got", actual);
+        throw "typed class field ownership test failed";
+    }
+    print("PASS", label);
+}
+
+createTemporaryLeaf();
+check("last local reference runs destructor", destroyedCount, 1);
+
+let explicitlyDeleted = new Leaf();
+delete explicitlyDeleted;
+check("explicit delete runs destructor once", destroyedCount, 2);
+
+let holder = new Holder();
+check("field keeps newly assigned object alive", holder.value(), 23);
+check("child not destroyed during assignment", destroyedCount, 2);
+delete holder;
+check("child destroyed with owning object", destroyedCount, 3);
+deleteTemporaryLeaf();
+check("explicit delete does not run twice at scope exit", destroyedCount, 4);
+createAllocatingTemporary();
+check("destructor may allocate and release another object", nestedDestroyedCount, 1);
+print("CLASS_FIELD_OWNERSHIP_TEST_PASS");

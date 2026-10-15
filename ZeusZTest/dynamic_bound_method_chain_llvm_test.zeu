@@ -1,0 +1,87 @@
+class DynamicChainLeaf {
+    using &this;
+
+    func method(value) {
+        return value + 40;
+    }
+
+    func _workerLoop() {
+        return 99;
+    }
+}
+
+class DynamicChainLevel4 {
+    using &this;
+    let obj4;
+
+    func init(value) {
+        this.obj4 = value;
+    }
+}
+
+class DynamicChainLevel3 {
+    using &this;
+    let obj3;
+
+    func init(value) {
+        this.obj3 = value;
+    }
+}
+
+class DynamicChainLevel2 {
+    using &this;
+    let obj2;
+
+    func init(value) {
+        this.obj2 = value;
+    }
+}
+
+class DynamicChainRoot {
+    using &this;
+    let obj1;
+
+    func init(value) {
+        this.obj1 = value;
+    }
+}
+
+class DynamicMethodFieldShadow {
+    using &this;
+
+    func value() {
+        return -1;
+    }
+
+    func init() {
+        this.value = 55;
+    }
+}
+
+func readUnannotated(value) {
+    return value.value;
+}
+
+func extractUnannotatedMethod(value) {
+    return value.method;
+}
+
+let leaf = new DynamicChainLeaf();
+let level4 = new DynamicChainLevel4(leaf);
+let level3 = new DynamicChainLevel3(level4);
+let level2 = new DynamicChainLevel2(level3);
+let root = new DynamicChainRoot(level2);
+print(root.obj1.obj2.obj3.obj4.method(7));
+let callback = root.obj1.obj2.obj3.obj4.method;
+print(callback(8));
+let workerCallback = root.obj1.obj2.obj3.obj4._workerLoop;
+print(workerCallback());
+
+let shadow = new DynamicMethodFieldShadow();
+print(readUnannotated(shadow));
+
+let callbackFromUntypedParameter = extractUnannotatedMethod(leaf);
+print(callbackFromUntypedParameter(9));
+
+let callbackFromTemporary = extractUnannotatedMethod(new DynamicChainLeaf());
+print(callbackFromTemporary(10));

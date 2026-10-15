@@ -22,6 +22,8 @@ struct NodeEntry {
     std::weak_ptr<void> owner;
     TraceFunction trace = nullptr;
     BreakCyclesFunction breakCycles = nullptr;
+    HasExternalRootsFunction hasExternalRoots = nullptr;
+    std::size_t nonGraphOwners = 0;
 };
 
 class Collector {
@@ -32,13 +34,17 @@ public:
     void registerNode(
         const std::shared_ptr<void>& node,
         TraceFunction trace,
-        BreakCyclesFunction breakCycles
+        BreakCyclesFunction breakCycles,
+        HasExternalRootsFunction hasExternalRoots,
+        std::size_t nonGraphOwners
     ) {
         if (!node || !trace || !breakCycles) {
             throw std::invalid_argument("managed GC nodes require an owner and callbacks");
         }
         std::lock_guard<std::recursive_mutex> lock(mutex_);
-        nodes_[node.get()] = NodeEntry{ node, trace, breakCycles };
+        nodes_[node.get()] = NodeEntry{
+            node, trace, breakCycles, hasExternalRoots, nonGraphOwners
+        };
         pendingRegistrations_.fetch_add(1, std::memory_order_relaxed);
         if ((nodes_.size() & 63u) == 0) pruneExpired();
     }
@@ -66,6 +72,26 @@ public:
 
     void collect(const std::vector<std::shared_ptr<void>>& additionalRoots) {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
+        std::unordered_map<const void*, std::size_t> internalReferences;
+        std::unordered_set<const void*> countedNamedArguments;
+        std::unordered_set<const void*> countedBoxes;
+        ReferenceCountState referenceState{
+            *this, internalReferences, countedNamedArguments, countedBoxes
+        };
+        Visitor referenceVisitor{
+            &referenceState,
+            countValueCallback,
+            countVariantCallback,
+            countNodeCallback
+        };
+
+        // Count graph-owned shared_ptr edges first. Any remaining strong owner
+        // is an external root (VM value, rooted box, shared cell, or iterator).
+        for (const auto& item : nodes_) {
+            const auto owner = item.second.owner.lock();
+            if (owner) item.second.trace(owner.get(), referenceVisitor);
+        }
+
         std::unordered_set<const void*> marked;
         std::function<void(const ZeusType::UniversalVariant&)> markVariant;
         std::function<void(const ZeusValue&)> markValue;
@@ -96,21 +122,31 @@ public:
                 if (native->state) state.markNode(native->state);
                 return;
             }
+            if (const auto* classHandle =
+                    std::get_if<ZeusType::LLVMClassHandle>(&value)) {
+                if (classHandle->state) {
+                    state.markNode(std::static_pointer_cast<void>(classHandle->state));
+                }
+                return;
+            }
             if (const auto* wrapped = std::get_if<ZeusType::Variant>(&value)) {
                 std::visit([&](const auto& inner) {
                     using T = std::decay_t<decltype(inner)>;
                     if constexpr (std::is_same_v<T, ZeusType::Array>) {
-                        if (!inner.impl) return;
-                        for (const auto& item : inner.impl->data) state.markVariant(item);
+                        if (inner.impl) {
+                            state.markNode(std::static_pointer_cast<void>(inner.impl));
+                        }
                     } else if constexpr (std::is_same_v<T, ZeusType::Object>) {
-                        if (!inner.impl) return;
-                        for (const auto& item : inner.impl->data) state.markVariant(item.second);
+                        if (inner.impl) {
+                            state.markNode(std::static_pointer_cast<void>(inner.impl));
+                        }
                     }
                 }, *wrapped);
             }
         };
         state.markValue = [&](const ZeusValue& value) {
-            if (value.flags != ZEUS_VALUE_FLAG_OWNS_BOX || value.payload == 0) return;
+            if (value.tag != ZEUS_VALUE_TAG_BOXED ||
+                value.flags != ZEUS_VALUE_FLAG_OWNS_BOX || value.payload == 0) return;
             const auto* box = reinterpret_cast<const ZeusBox*>(
                 static_cast<uintptr_t>(value.payload));
             state.markVariant(box->v);
@@ -124,7 +160,8 @@ public:
             entry->second.trace(keepAlive.get(), state.visitor);
         };
 
-        for (const ZeusType::UniversalVariant* root : snapshotRoots()) {
+        const auto roots = snapshotRoots();
+        for (const ZeusType::UniversalVariant* root : roots) {
             state.markVariant(*root);
         }
         for (const auto& root : nodeRoots_) {
@@ -134,6 +171,22 @@ public:
             if (keepAlive) state.markNode(keepAlive);
         }
         for (const auto& root : additionalRoots) state.markNode(root);
+
+        for (const auto& item : nodes_) {
+            auto owner = item.second.owner.lock();
+            if (!owner) continue;
+            const auto found = internalReferences.find(item.first);
+            const std::size_t internal =
+                found == internalReferences.end() ? 0 : found->second;
+            // `owner` itself is the one temporary shared_ptr held by this loop.
+            const bool sharedRoot = owner.use_count() >
+                internal + item.second.nonGraphOwners + 1;
+            const bool nativeRoot = item.second.hasExternalRoots &&
+                item.second.hasExternalRoots(owner.get(), internal);
+            if (sharedRoot || nativeRoot) {
+                state.markNode(owner);
+            }
+        }
 
         std::vector<std::pair<std::shared_ptr<void>, BreakCyclesFunction>> unreachable;
         unreachable.reserve(nodes_.size());
@@ -146,6 +199,10 @@ public:
         for (const auto& item : unreachable) {
             item.second(item.first.get());
         }
+        // Release the temporary owners before pruning and calculating the next
+        // trigger. Otherwise every just-broken node still appears live here,
+        // causing the threshold to double after each collection batch.
+        unreachable.clear();
         pruneExpired();
         pendingRegistrations_.store(0, std::memory_order_relaxed);
         nextThreshold_.store(
@@ -189,18 +246,48 @@ public:
     }
 
     void enterAllocation() {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
         allocationDepth_.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Runs at the outermost allocation exit, where every node built during the
-    // scope is already rooted and can be marked.
+    // scope is already rooted and can be marked. The same check is exposed to
+    // compiled code at explicit control-flow safe points.
     void leaveAllocation() {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
         if (allocationDepth_.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
-        if (pendingRegistrations_.load(std::memory_order_relaxed) < kCollectInterval) return;
-        collect({});
+        collectIfNeededLocked();
+    }
+
+    void collectIfNeeded() {
+        // Safe points sit on hot loop backedges. Avoid taking the graph lock
+        // unless the allocation threshold has actually been reached.
+        if (allocationDepth_.load(std::memory_order_acquire) != 0) return;
+        if (pendingRegistrations_.load(std::memory_order_relaxed) <
+            nextThreshold_.load(std::memory_order_relaxed)) {
+            return;
+        }
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        collectIfNeededLocked();
     }
 
 private:
+    struct ReferenceCountState {
+        Collector& owner;
+        std::unordered_map<const void*, std::size_t>& references;
+        std::unordered_set<const void*>& countedNamedArguments;
+        std::unordered_set<const void*>& countedBoxes;
+    };
+
+    void collectIfNeededLocked() {
+        if (allocationDepth_.load(std::memory_order_acquire) != 0) return;
+        if (pendingRegistrations_.load(std::memory_order_relaxed) <
+            nextThreshold_.load(std::memory_order_relaxed)) {
+            return;
+        }
+        collect({});
+    }
+
     struct MarkState {
         Collector& owner;
         std::unordered_set<const void*>& marked;
@@ -217,9 +304,77 @@ private:
         std::vector<std::shared_ptr<void>> pending;
     };
 
+    static void countReference(
+        ReferenceCountState& state,
+        const std::shared_ptr<void>& node
+    ) {
+        if (node && state.owner.nodes_.find(node.get()) != state.owner.nodes_.end()) {
+            ++state.references[node.get()];
+        }
+    }
+
+    static void countVariantReferences(
+        ReferenceCountState& state,
+        const ZeusType::UniversalVariant& value
+    ) {
+        if (const auto* named = std::get_if<std::shared_ptr<ZeusType::NamedArg>>(&value)) {
+            if (*named && state.countedNamedArguments.insert(named->get()).second) {
+                countVariantReferences(state, (*named)->value);
+            }
+            return;
+        }
+        if (const auto* native = std::get_if<ZeusType::NativeClosureHandle>(&value)) {
+            countReference(state, native->state);
+            return;
+        }
+        if (const auto* classHandle =
+                std::get_if<ZeusType::LLVMClassHandle>(&value)) {
+            if (classHandle->state) {
+                countReference(state,
+                    std::static_pointer_cast<void>(classHandle->state));
+            }
+            return;
+        }
+        const auto* wrapped = std::get_if<ZeusType::Variant>(&value);
+        if (!wrapped) return;
+        std::visit([&](const auto& inner) {
+            using T = std::decay_t<decltype(inner)>;
+            if constexpr (std::is_same_v<T, ZeusType::Array>) {
+                countReference(state, std::static_pointer_cast<void>(inner.impl));
+            } else if constexpr (std::is_same_v<T, ZeusType::Object>) {
+                countReference(state, std::static_pointer_cast<void>(inner.impl));
+            }
+        }, *wrapped);
+    }
+
+    static void countValueCallback(void* context, const ZeusValue* value) {
+        auto* state = static_cast<ReferenceCountState*>(context);
+        if (!value || value->tag != ZEUS_VALUE_TAG_BOXED ||
+            value->flags != ZEUS_VALUE_FLAG_OWNS_BOX || value->payload == 0) return;
+        const auto* box = reinterpret_cast<const ZeusBox*>(
+            static_cast<uintptr_t>(value->payload));
+        if (state->countedBoxes.insert(box).second) {
+            countVariantReferences(*state, box->v);
+        }
+    }
+
+    static void countVariantCallback(
+        void* context,
+        const ZeusType::UniversalVariant* value
+    ) {
+        auto* state = static_cast<ReferenceCountState*>(context);
+        if (value) countVariantReferences(*state, *value);
+    }
+
+    static void countNodeCallback(void* context, const std::shared_ptr<void>* node) {
+        auto* state = static_cast<ReferenceCountState*>(context);
+        if (node && *node) countReference(*state, *node);
+    }
+
     static void traceValue(const ZeusValue& value,
         const std::function<void(const ZeusType::UniversalVariant&)>& callback) {
-        if (value.flags != ZEUS_VALUE_FLAG_OWNS_BOX || value.payload == 0) return;
+        if (value.tag != ZEUS_VALUE_TAG_BOXED ||
+            value.flags != ZEUS_VALUE_FLAG_OWNS_BOX || value.payload == 0) return;
         const auto* box = reinterpret_cast<const ZeusBox*>(
             static_cast<uintptr_t>(value.payload));
         callback(box->v);
@@ -274,7 +429,7 @@ private:
     RootLink* rootHead_ = nullptr;
     std::unordered_map<const void*, NodeEntry> nodes_;
     std::unordered_map<const void*, std::size_t> nodeRoots_;
-    std::atomic<std::size_t> nextThreshold_{ kMinCollectNodes };
+    std::atomic<std::size_t> nextThreshold_{ kCollectInterval };
     std::atomic<std::size_t> pendingRegistrations_{ 0 };
     std::atomic<std::size_t> allocationDepth_{ 0 };
 };
@@ -339,9 +494,12 @@ void RootLink::retract() noexcept {
 void registerSharedNode(
     const std::shared_ptr<void>& node,
     TraceFunction trace,
-    BreakCyclesFunction breakCycles
+    BreakCyclesFunction breakCycles,
+    HasExternalRootsFunction hasExternalRoots,
+    std::size_t nonGraphOwners
 ) {
-    collectorInstance().registerNode(node, trace, breakCycles);
+    collectorInstance().registerNode(
+        node, trace, breakCycles, hasExternalRoots, nonGraphOwners);
 }
 
 void rootNode(const std::shared_ptr<void>& node) { collectorInstance().rootNode(node); }
@@ -378,12 +536,20 @@ void collect(const std::vector<std::shared_ptr<void>>& additionalRoots) {
     collectorInstance().collect(additionalRoots);
 }
 
+void collectIfNeeded() {
+    collectorInstance().collectIfNeeded();
+}
+
 std::size_t liveNodeCount() { return collectorInstance().liveNodeCount(); }
 
 } // namespace ZeusGC
 
 extern "C" void zeus_gc_collect(void) {
     ZeusGC::collect();
+}
+
+extern "C" void zeus_gc_safepoint(void) {
+    ZeusGC::collectIfNeeded();
 }
 
 extern "C" uint64_t zeus_gc_live_node_count(void) {

@@ -1,0 +1,43 @@
+var field_initializer_count = 0;
+
+func next_field_initializer() {
+    field_initializer_count = field_initializer_count + 1;
+    return field_initializer_count;
+}
+
+class FieldInitializerProbe {
+    using &this;
+
+    var sequence = next_field_initializer();
+    var global_snapshot: int = field_initializer_count;
+    var observed = this.sequence + 100;
+    var values = [0];
+    var initialized = 0;
+
+    func init() {
+        this.initialized = this.observed;
+    }
+}
+
+let first_probe = new FieldInitializerProbe();
+let second_probe = new FieldInitializerProbe();
+
+if (first_probe.sequence != 1 or second_probe.sequence != 2) {
+    throw new Exception("field defaults were not evaluated for each new");
+}
+if (first_probe.global_snapshot != 1 or second_probe.global_snapshot != 2) {
+    throw new Exception("field defaults could not read a global variable");
+}
+if (first_probe.observed != 101 or second_probe.observed != 102) {
+    throw new Exception("field defaults did not observe earlier fields through this");
+}
+if (first_probe.initialized != 101 or second_probe.initialized != 102) {
+    throw new Exception("init ran before field defaults");
+}
+
+first_probe.values.append(7);
+if (first_probe.values.length() != 2 or second_probe.values.length() != 1) {
+    throw new Exception("mutable field default was shared between instances");
+}
+
+print("CLASS_FIELD_INITIALIZER_TEST_PASS");

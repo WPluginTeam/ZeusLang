@@ -1,6 +1,6 @@
 
 
-import ZeusBuiltins.time [&];
+import zeus.time [&];
 print("What can i say?!");
 print("This is a test file with an error!");
 

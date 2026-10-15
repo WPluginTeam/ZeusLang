@@ -1,0 +1,197 @@
+class FaddrNode {
+    let value = 0;
+}
+
+func faddrCallback() -> int {
+    return 1;
+}
+
+func nativeStringLength(value: string) -> int {
+    using LLVM {
+        return @faddr(@reveal(value) - 8, 8) -> int;
+    }
+    using VM {
+        return len(value);
+    }
+}
+
+func nativeIntRoundTrip(value: int) -> int {
+    using LLVM {
+        return @faddr(@addr(value)) -> int;
+    }
+    using VM {
+        return value;
+    }
+}
+
+func nativeBoolRoundTrip(value: bool) -> bool {
+    using LLVM {
+        return @faddr(@addr(value)) -> bool;
+    }
+    using VM {
+        return value;
+    }
+}
+
+func nativeIntWriteRoundTrip(value: int) -> int {
+    using LLVM {
+        let address = @addr(value);
+        @faddr(address) -> int = 73;
+        return @faddr(address) -> int;
+    }
+    using VM {
+        return 73;
+    }
+}
+
+func nativeBoolWriteRoundTrip(value: bool) -> bool {
+    using LLVM {
+        let address = @addr(value);
+        @faddr(address) -> bool = true;
+        return @faddr(address) -> bool;
+    }
+    using VM {
+        return true;
+    }
+}
+
+func compileFaddrInt32Store(address: int, value: int32) {
+    using LLVM {
+        @faddr(address) -> int32 = value;
+    }
+    using VM {
+    }
+}
+
+func compileFaddrInt64Store(address: int, value: int64) {
+    using LLVM {
+        @faddr(address) -> int64 = value;
+    }
+    using VM {
+    }
+}
+
+func compileFaddrStringStore(address: int, value: string) {
+    using LLVM {
+        @faddr(address) -> string = value;
+    }
+    using VM {
+    }
+}
+
+func compileFaddrBytesStore(address: int, value: bytes) {
+    using LLVM {
+        @faddr(address) -> bytes = value;
+    }
+    using VM {
+    }
+}
+
+func compileFaddrArrayStore(address: int, value: Array) {
+    using LLVM {
+        @faddr(address) -> Array = value;
+    }
+    using VM {
+    }
+}
+
+func compileFaddrDictStore(address: int, value: dict) {
+    using LLVM {
+        @faddr(address) -> dict = value;
+    }
+    using VM {
+    }
+}
+
+func compileFaddrFloatStore(address: int, value: float) {
+    using LLVM {
+        @faddr(address) -> float = value;
+    }
+    using VM {
+    }
+}
+
+func compileFaddrBigintStore(address: int, value: bigint) {
+    using LLVM {
+        @faddr(address) -> bigint = value;
+    }
+    using VM {
+    }
+}
+
+func compileFaddrCharStore(address: int, value: char) {
+    using LLVM {
+        @faddr(address) -> char = value;
+    }
+    using VM {
+    }
+}
+
+func compileFaddrObjectStore(address: int, value: object) {
+    using LLVM {
+        @faddr(address) -> object = value;
+    }
+    using VM {
+    }
+}
+
+func compileFaddrNilStore(address: int) {
+    using LLVM {
+        @faddr(address) -> nil = nil;
+    }
+    using VM {
+    }
+}
+
+func compileFaddrFunctionStore(address: int) {
+    using LLVM {
+        @faddr(address) -> function = faddrCallback;
+    }
+    using VM {
+    }
+}
+
+func compileFaddrClassStore(address: int, value: FaddrNode) {
+    using LLVM {
+        @faddr(address) -> FaddrNode = value;
+    }
+    using VM {
+    }
+}
+
+func compileFaddrArrayLoad(address: int) -> Array {
+    using LLVM {
+        return @faddr(address) -> Array;
+    }
+    using VM {
+        return [];
+    }
+}
+
+func compileFaddrClassLoad(address: int) -> FaddrNode {
+    using LLVM {
+        return @faddr(address) -> FaddrNode;
+    }
+    using VM {
+        return new FaddrNode();
+    }
+}
+
+print(nativeStringLength("zeus"));
+print(nativeStringLength(""));
+print(nativeIntRoundTrip(42));
+print(nativeBoolRoundTrip(true));
+print(nativeBoolRoundTrip(false));
+print(nativeIntWriteRoundTrip(1));
+print(nativeBoolWriteRoundTrip(false));
+
+using LLVM {
+    let topLevelValue = 1;
+    let topLevelAddress = @addr(topLevelValue);
+    @faddr(topLevelAddress) -> int = 88;
+    print(@faddr(topLevelAddress) -> int);
+}
+
+using VM {
+    print(88);
+}

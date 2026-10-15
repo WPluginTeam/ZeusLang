@@ -2,6 +2,7 @@
 
 #include "ZeusDynamicABI.hpp"
 #include "ZeusABIInternal.hpp"
+#include "ZeusContainerOps.hpp"
 #include "ZeusVMUtils.hpp"
 
 #include <cstdint>
@@ -21,8 +22,8 @@ ZeusType::UniversalVariant nullVariant() {
 }
 
 ZeusBox* makeBox(const ZeusType::UniversalVariant& value) {
-    ZeusBox* box = new ZeusBox();
-    box->v = value;
+    ZeusBox* box = ZEUS_NEW_BOX();
+    box->assignVariant(value);
     return box;
 }
 
@@ -93,12 +94,15 @@ std::string keyString(const ZeusType::UniversalVariant& value) {
     if (std::holds_alternative<bool>(value)) {
         return std::get<bool>(value) ? "true" : "false";
     }
+    if (const auto* character = std::get_if<char>(&value)) {
+        return std::string(1, *character);
+    }
 
     if (const auto* handle =
             std::get_if<ZeusType::LLVMClassHandle>(&value)) {
         if (handle->state && handle->state->typeName == "String") {
             ZeusBox boxedString;
-            boxedString.v = value;
+            boxedString.assignVariant(value);
 
             ZeusValue dynamicString{};
             zeus_value_init_nil(&dynamicString);
@@ -106,24 +110,23 @@ std::string keyString(const ZeusType::UniversalVariant& value) {
                 &dynamicString, &zeus_value_release);
             zeus_value_from_box(ownedString.get(), &boxedString);
 
-            const ZeusStringView* view =
-                zeus_value_intern_string_view(ownedString.get());
-            if (!view || view->length >
-                    static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+            const ZeusNativeString view =
+                zeus_value_intern_string(ownedString.get());
+            uint64_t length = 0;
+            if (view) std::memcpy(&length, view - sizeof(uint64_t), sizeof(length));
+            if (!view || length >
+                    static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+                length > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
                 throw std::length_error("String dictionary key is too large");
             }
-            return std::string(
-                view->data ? view->data : "",
-                static_cast<size_t>(view->length));
+            return std::string(view, static_cast<size_t>(length));
         }
     }
 
     return "<obj>";
 }
 
-int arrayIndex(const ZeusType::UniversalVariant& value) {
-    int64_t integer = 0;
-    if (!ZeusVMUtils::tryGetInt64(value, integer)) return 0;
+int arrayIndexFromI64(int64_t integer) {
     if (integer < std::numeric_limits<int>::min() ||
         integer > std::numeric_limits<int>::max()) {
         throw std::overflow_error("Value too large for array index");
@@ -131,11 +134,47 @@ int arrayIndex(const ZeusType::UniversalVariant& value) {
     return static_cast<int>(integer);
 }
 
-void consume(ZeusBox* box) {
-    delete box;
+int arrayIndex(const ZeusType::UniversalVariant& value) {
+    int64_t integer = 0;
+    if (!ZeusVMUtils::tryGetInt64(value, integer)) return 0;
+    return arrayIndexFromI64(integer);
 }
 
 using OwnedZeusBox = std::unique_ptr<ZeusBox, decltype(&zeus_box_release)>;
+
+class OwnedZeusBoxRange {
+public:
+    OwnedZeusBoxRange(ZeusBox* const* boxes, size_t count) noexcept
+        : boxes_(boxes), count_(count) {}
+
+    OwnedZeusBoxRange(const OwnedZeusBoxRange&) = delete;
+    OwnedZeusBoxRange& operator=(const OwnedZeusBoxRange&) = delete;
+
+    ~OwnedZeusBoxRange() noexcept {
+        releaseNext(count_ - next_);
+    }
+
+    void releaseNext(size_t count) noexcept {
+        while (count > 0 && next_ < count_) {
+            zeus_box_release(boxes_[next_]);
+            ++next_;
+            --count;
+        }
+    }
+
+private:
+    ZeusBox* const* boxes_;
+    size_t count_;
+    size_t next_ = 0;
+};
+
+struct DeferredContainerEdgeRelease {
+    const ZeusType::UniversalVariant* value = nullptr;
+
+    ~DeferredContainerEdgeRelease() noexcept {
+        if (value) ZeusGC::releaseContainerClassEdgeNoexcept(*value);
+    }
+};
 
 [[noreturn]] void valueContainerPanic(const char* message) {
     throw std::runtime_error(std::string("[ZeusValue container ABI] ") + message);
@@ -160,6 +199,7 @@ struct ZeusDynamicIteratorImpl {
     size_t index = 0;
     std::shared_ptr<ZeusType::ArrayData> array;
     std::shared_ptr<ZeusType::ObjectData> dict;
+    std::shared_ptr<void> rootedNode;
 };
 
 } // namespace
@@ -169,50 +209,61 @@ struct ZeusDynamicIterator {
 };
 
 ZeusBox* zeus_array_build(int64_t count, ZeusBox* const* values) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     if (count < 0 || (count > 0 && !values)) return makeNullBox();
+    OwnedZeusBoxRange ownedValues(values, static_cast<size_t>(count));
 
     ZeusType::Array array;
-    array.impl = std::make_shared<ZeusType::ArrayData>();
+    array.impl = ZeusGC::makeArrayData();
     array.impl->data.reserve(static_cast<size_t>(count));
 
     for (int64_t i = 0; i < count; ++i) {
         ZeusBox* value = values[i];
-        array.impl->data.push_back(value ? value->v : nullVariant());
-        consume(value);
+        ZeusGC::appendContainerValue(
+            array.impl->data, value ? value->v : nullVariant());
+        ownedValues.releaseNext(1);
     }
 
     return makeBox(ZeusType::UniversalVariant(ZeusType::Variant(array)));
 }
 
 ZeusBox* zeus_dict_build(int64_t pairCount, ZeusBox* const* keyValues) {
-    if (pairCount < 0 || (pairCount > 0 && !keyValues)) return makeNullBox();
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (pairCount < 0 ||
+        static_cast<uint64_t>(pairCount) >
+            static_cast<uint64_t>(std::numeric_limits<size_t>::max() / 2) ||
+        (pairCount > 0 && !keyValues)) {
+        return makeNullBox();
+    }
+    const size_t valueCount = static_cast<size_t>(pairCount) * 2;
+    OwnedZeusBoxRange ownedValues(keyValues, valueCount);
 
     ZeusType::Object object;
-    object.impl = std::make_shared<ZeusType::ObjectData>();
+    object.impl = ZeusGC::makeObjectData();
 
     for (int64_t i = 0; i < pairCount; ++i) {
-        ZeusBox* key = keyValues[i * 2];
-        ZeusBox* value = keyValues[i * 2 + 1];
+        const size_t valueOffset = static_cast<size_t>(i) * 2;
+        ZeusBox* key = keyValues[valueOffset];
+        ZeusBox* value = keyValues[valueOffset + 1];
         const std::string name = key ? keyString(key->v) : "<obj>";
 
-        if (object.impl->data.find(name) == object.impl->data.end()) {
-            object.impl->order.push_back(name);
-        }
-        object.impl->data[name] = value ? value->v : nullVariant();
-        consume(key);
-        consume(value);
+        ZeusGC::storeObjectContainerValue(
+            *object.impl, name, value ? value->v : nullVariant());
+        ownedValues.releaseNext(2);
     }
 
     return makeBox(ZeusType::UniversalVariant(ZeusType::Variant(object)));
 }
 
 int64_t zeus_array_length(const ZeusBox* array) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     const ZeusType::Array* value = getArray(array);
     if (!value || !value->impl) return 0;
     return static_cast<int64_t>(value->impl->data.size());
 }
 
 ZeusBox* zeus_array_load(const ZeusBox* array, int64_t index) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     const ZeusType::Array* value = getArray(array);
     if (!value || !value->impl || index < 0 ||
         static_cast<size_t>(index) >= value->impl->data.size()) {
@@ -223,27 +274,36 @@ ZeusBox* zeus_array_load(const ZeusBox* array, int64_t index) {
 }
 
 ZeusBox* zeus_dict_load(const ZeusBox* dict, const ZeusBox* key) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     if (getArray(dict) && key) {
         return zeus_array_load(dict, arrayIndex(key->v));
     }
     const ZeusType::Object* object = getDict(dict);
-    if (!object || !object->impl || !key) return makeNullBox();
+    if (!object || !key) return makeNullBox();
 
     const std::string name = keyString(key->v);
+    if (!object->impl) {
+        throw std::runtime_error("KeyError: missing key '" + name + "'");
+    }
     auto it = object->impl->data.find(name);
-    if (it == object->impl->data.end()) return makeNullBox();
+    if (it == object->impl->data.end()) {
+        throw std::runtime_error("KeyError: missing key '" + name + "'");
+    }
     return makeBox(it->second);
 }
 
 ZeusBox* zeus_dict_keys(const ZeusBox* dict) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     const ZeusType::Object* object = getDict(dict);
     ZeusType::Array array;
-    array.impl = std::make_shared<ZeusType::ArrayData>();
+    array.impl = ZeusGC::makeArrayData();
 
     if (object && object->impl) {
-        array.impl->data.reserve(object->impl->order.size());
-        for (const auto& key : object->impl->order) {
-            array.impl->data.push_back(LexerType::Value(key));
+        array.impl->data.reserve(object->impl->data.size());
+        for (std::size_t i = 0; i < object->impl->order.size(); ++i) {
+            if (!object->impl->isLiveOrderEntry(i)) continue;
+            array.impl->data.push_back(
+                LexerType::Value(object->impl->order[i]));
         }
     }
 
@@ -251,51 +311,56 @@ ZeusBox* zeus_dict_keys(const ZeusBox* dict) {
 }
 
 ZeusBox* zeus_array_store(ZeusBox* array, int64_t index, ZeusBox* value) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     ZeusType::Array* target = getArray(array);
-    ZeusType::UniversalVariant stored = value ? value->v : nullVariant();
+    OwnedZeusBox ownedValue(value, &zeus_box_release);
+    ZeusType::UniversalVariant stored = ownedValue ? ownedValue->v : nullVariant();
+    OwnedZeusBox result(makeBox(stored), &zeus_box_release);
 
     if (target && target->impl && index >= 0 &&
         static_cast<size_t>(index) < target->impl->data.size()) {
-        target->impl->data[static_cast<size_t>(index)] = stored;
+        ZeusGC::replaceContainerValue(
+            target->impl->data[static_cast<size_t>(index)], stored);
     }
 
-    consume(value);
-    return makeBox(stored);
+    return result.release();
 }
 
 ZeusBox* zeus_dict_store(ZeusBox* dict, ZeusBox* key, ZeusBox* value) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    OwnedZeusBox ownedKey(key, &zeus_box_release);
+    OwnedZeusBox ownedValue(value, &zeus_box_release);
     if (getArray(dict) && key) {
-        const int index = arrayIndex(key->v);
-        consume(key);
-        return zeus_array_store(dict, index, value);
+        const int index = arrayIndex(ownedKey->v);
+        return zeus_array_store(dict, index, ownedValue.release());
     }
     ZeusType::Object* target = getDict(dict);
-    ZeusType::UniversalVariant stored = value ? value->v : nullVariant();
+    ZeusType::UniversalVariant stored = ownedValue ? ownedValue->v : nullVariant();
+    OwnedZeusBox result(makeBox(stored), &zeus_box_release);
 
-    if (target && target->impl && key) {
-        const std::string name = keyString(key->v);
-        if (target->impl->data.find(name) == target->impl->data.end()) {
-            target->impl->order.push_back(name);
-        }
-        target->impl->data[name] = stored;
+    if (target && target->impl && ownedKey) {
+        const std::string name = keyString(ownedKey->v);
+        ZeusGC::storeObjectContainerValue(*target->impl, name, stored);
     }
 
-    consume(key);
-    consume(value);
-    return makeBox(stored);
+    return result.release();
 }
 
 ZeusDynamicIterator* zeus_array_iter_begin(const ZeusBox* array) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     const ZeusType::Array* value = getArray(array);
     if (!value || !value->impl) return nullptr;
 
     auto* iterator = new ZeusDynamicIterator();
     iterator->impl.kind = ZeusDynamicIteratorImpl::Kind::Array;
     iterator->impl.array = value->impl;
+    iterator->impl.rootedNode = std::static_pointer_cast<void>(value->impl);
+    ZeusGC::rootNode(iterator->impl.rootedNode);
     return iterator;
 }
 
 int32_t zeus_array_iter_next(ZeusDynamicIterator* iterator, ZeusBox** value) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     if (!iterator || !value ||
         iterator->impl.kind != ZeusDynamicIteratorImpl::Kind::Array ||
         !iterator->impl.array ||
@@ -308,12 +373,15 @@ int32_t zeus_array_iter_next(ZeusDynamicIterator* iterator, ZeusBox** value) {
 }
 
 ZeusDynamicIterator* zeus_dict_iter_begin(const ZeusBox* dict) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     const ZeusType::Object* value = getDict(dict);
     if (!value || !value->impl) return nullptr;
 
     auto* iterator = new ZeusDynamicIterator();
     iterator->impl.kind = ZeusDynamicIteratorImpl::Kind::Dict;
     iterator->impl.dict = value->impl;
+    iterator->impl.rootedNode = std::static_pointer_cast<void>(value->impl);
+    ZeusGC::rootNode(iterator->impl.rootedNode);
     return iterator;
 }
 
@@ -322,23 +390,31 @@ int32_t zeus_dict_iter_next(
     ZeusBox** key,
     ZeusBox** value
 ) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     if (!iterator || !key || !value ||
         iterator->impl.kind != ZeusDynamicIteratorImpl::Kind::Dict ||
-        !iterator->impl.dict ||
-        iterator->impl.index >= iterator->impl.dict->order.size()) {
+        !iterator->impl.dict) {
         return 0;
     }
 
-    const std::string& name = iterator->impl.dict->order[iterator->impl.index++];
-    auto found = iterator->impl.dict->data.find(name);
-    if (found == iterator->impl.dict->data.end()) return 0;
+    while (iterator->impl.index < iterator->impl.dict->order.size()) {
+        const std::size_t position = iterator->impl.index++;
+        if (!iterator->impl.dict->isLiveOrderEntry(position)) continue;
 
-    *key = makeBox(LexerType::Value(name));
-    *value = makeBox(found->second);
-    return 1;
+        const std::string& name = iterator->impl.dict->order[position];
+        auto found = iterator->impl.dict->data.find(name);
+        if (found == iterator->impl.dict->data.end()) continue;
+
+        *key = makeBox(LexerType::Value(name));
+        *value = makeBox(found->second);
+        return 1;
+    }
+    return 0;
 }
 
 void zeus_dynamic_iter_release(ZeusDynamicIterator* iterator) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (iterator) ZeusGC::unrootNode(iterator->impl.rootedNode);
     delete iterator;
 }
 
@@ -347,6 +423,7 @@ void zeus_value_array_build(
     int64_t count,
     const ZeusValue* const* values
 ) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     if (!out) valueContainerPanic("null array build output");
     zeus_value_init_nil(out);
     if (count < 0 || (count > 0 && !values)) {
@@ -376,6 +453,7 @@ void zeus_value_dict_build(
     int64_t pairCount,
     const ZeusValue* const* keyValues
 ) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     if (!out) valueContainerPanic("null dictionary build output");
     zeus_value_init_nil(out);
     if (pairCount < 0 ||
@@ -404,12 +482,22 @@ void zeus_value_dict_build(
     }
 }
 
+int32_t zeus_value_is_array(const ZeusValue* value) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (!value) return 0;
+    try {
+        OwnedZeusBox boxedValue = boxFromValue(value);
+        return getArray(boxedValue.get()) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
 void zeus_value_array_length(ZeusValue* out, const ZeusValue* array) {
     if (!out) valueContainerPanic("null array length output");
     zeus_value_init_nil(out);
     try {
-        OwnedZeusBox boxedArray = boxFromValue(array);
-        zeus_value_init_i64(out, zeus_array_length(boxedArray.get()));
+        zeus_value_init_i64(out, zeus_value_array_length_i64(array));
     } catch (const std::exception&) {
         throw;
     } catch (...) {
@@ -422,6 +510,7 @@ void zeus_value_array_load(
     const ZeusValue* array,
     const ZeusValue* index
 ) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     if (!out || !index) valueContainerPanic("null array load argument");
     zeus_value_init_nil(out);
     try {
@@ -448,12 +537,104 @@ void zeus_value_array_load(
     }
 }
 
+void zeus_value_array_load_checked(
+    ZeusValue* out,
+    const ZeusValue* array,
+    const ZeusValue* index
+) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (!out || !index) valueContainerPanic("null checked array load argument");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedArray = boxFromValue(array);
+        OwnedZeusBox boxedIndex = boxFromValue(index);
+        const ZeusType::Array* target = getArray(boxedArray.get());
+        if (!target) {
+            throw std::runtime_error("TypeError: attempted subscript on non-container");
+        }
+
+        const int arrayElement = arrayIndex(boxedIndex->v);
+        const size_t arraySize = target->impl ? target->impl->data.size() : 0;
+        if (!target->impl || arrayElement < 0 ||
+            static_cast<size_t>(arrayElement) >= arraySize) {
+            throw std::runtime_error(
+                "Array index out of bounds: index=" + std::to_string(arrayElement) +
+                ", size=" + std::to_string(arraySize));
+        }
+        writeValueFromBox(out, zeus_array_load(boxedArray.get(), arrayElement));
+    } catch (const std::exception&) {
+        throw;
+    } catch (...) {
+        valueContainerPanic("failed to read checked dynamic array element");
+    }
+}
+
+void zeus_value_array_load_i64(
+    ZeusValue* out,
+    const ZeusValue* array,
+    int64_t index
+) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (!out) valueContainerPanic("null array load output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedArray = boxFromValue(array);
+        const ZeusType::Array* target = getArray(boxedArray.get());
+        if (!target || !target->impl) {
+            zeus_value_init_i64(out, 0);
+            return;
+        }
+        const int arrayElement = arrayIndexFromI64(index);
+        if (arrayElement < 0 ||
+            static_cast<size_t>(arrayElement) >= target->impl->data.size()) {
+            zeus_value_init_i64(out, 0);
+            return;
+        }
+        writeValueFromBox(out, zeus_array_load(boxedArray.get(), arrayElement));
+    } catch (const std::exception&) {
+        throw;
+    } catch (...) {
+        valueContainerPanic("failed to read dynamic array element");
+    }
+}
+
+void zeus_value_array_load_i64_checked(
+    ZeusValue* out,
+    const ZeusValue* array,
+    int64_t index
+) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (!out) valueContainerPanic("null array load output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedArray = boxFromValue(array);
+        const ZeusType::Array* target = getArray(boxedArray.get());
+        if (!target) {
+            throw std::runtime_error("TypeError: attempted subscript on non-container");
+        }
+        const int arrayElement = arrayIndexFromI64(index);
+        const size_t arraySize = target->impl ? target->impl->data.size() : 0;
+        if (!target->impl || arrayElement < 0 ||
+            static_cast<size_t>(arrayElement) >= arraySize) {
+            throw std::runtime_error(
+                "Array index out of bounds: index=" + std::to_string(arrayElement) +
+                ", size=" + std::to_string(arraySize));
+        }
+        writeValueFromBox(out, zeus_array_load(boxedArray.get(), arrayElement));
+    } catch (const std::exception&) {
+        throw;
+    } catch (...) {
+        valueContainerPanic("failed to read dynamic array element");
+    }
+}
+
 void zeus_value_array_store(
     ZeusValue* out,
     const ZeusValue* array,
     const ZeusValue* index,
     const ZeusValue* value
 ) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     if (!out || !index) valueContainerPanic("null array store argument");
     zeus_value_init_nil(out);
     try {
@@ -472,7 +653,32 @@ void zeus_value_array_store(
     }
 }
 
+void zeus_value_array_store_i64(
+    ZeusValue* out,
+    const ZeusValue* array,
+    int64_t index,
+    const ZeusValue* value
+) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (!out) valueContainerPanic("null array store output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedArray = boxFromValue(array);
+        OwnedZeusBox boxedValue = boxFromValue(value);
+        writeValueFromBox(
+            out,
+            zeus_array_store(
+                boxedArray.get(), arrayIndexFromI64(index), boxedValue.release())
+        );
+    } catch (const std::exception&) {
+        throw;
+    } catch (...) {
+        valueContainerPanic("failed to write dynamic array element");
+    }
+}
+
 void zeus_value_dict_keys(ZeusValue* out, const ZeusValue* dict) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     if (!out) valueContainerPanic("null dictionary keys output");
     zeus_value_init_nil(out);
     try {
@@ -490,6 +696,7 @@ void zeus_value_dict_load(
     const ZeusValue* dict,
     const ZeusValue* key
 ) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     if (!out) valueContainerPanic("null dictionary load output");
     zeus_value_init_nil(out);
     try {
@@ -525,6 +732,7 @@ void zeus_value_dict_store(
     const ZeusValue* key,
     const ZeusValue* value
 ) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     if (!out) valueContainerPanic("null dictionary store output");
     zeus_value_init_nil(out);
     try {
@@ -540,5 +748,168 @@ void zeus_value_dict_store(
         throw;
     } catch (...) {
         valueContainerPanic("failed to write dynamic dictionary value");
+    }
+}
+
+void zeus_value_array_push(
+    ZeusValue* out,
+    const ZeusValue* array,
+    const ZeusValue* value
+) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (!out) valueContainerPanic("null array push output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedArray = boxFromValue(array);
+        OwnedZeusBox boxedValue = boxFromValue(value);
+        writeValueFromBox(
+            out,
+            makeBox(ZeusContainerOps::arrayPush(boxedArray->v, boxedValue->v)));
+    } catch (const std::exception&) {
+        throw;
+    } catch (...) {
+        valueContainerPanic("failed to append dynamic array value");
+    }
+}
+
+void zeus_value_array_pop(ZeusValue* out, const ZeusValue* array) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (!out) valueContainerPanic("null array pop output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedArray = boxFromValue(array);
+        ZeusType::UniversalVariant removed =
+            ZeusContainerOps::arrayPop(boxedArray->v, true);
+        DeferredContainerEdgeRelease releaseEdge{ &removed };
+        writeValueFromBox(out, makeBox(removed));
+    } catch (const std::exception&) {
+        throw;
+    } catch (...) {
+        valueContainerPanic("failed to remove dynamic array value");
+    }
+}
+
+void zeus_value_array_get(
+    ZeusValue* out,
+    const ZeusValue* array,
+    const ZeusValue* index
+) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (!out) valueContainerPanic("null array get output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedArray = boxFromValue(array);
+        OwnedZeusBox boxedIndex = boxFromValue(index);
+        writeValueFromBox(
+            out,
+            makeBox(ZeusContainerOps::arrayGet(boxedArray->v, boxedIndex->v)));
+    } catch (const std::exception&) {
+        throw;
+    } catch (...) {
+        valueContainerPanic("failed to read dynamic array value");
+    }
+}
+
+void zeus_value_array_set(
+    ZeusValue* out,
+    const ZeusValue* array,
+    const ZeusValue* index,
+    const ZeusValue* value
+) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (!out) valueContainerPanic("null array set output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedArray = boxFromValue(array);
+        OwnedZeusBox boxedIndex = boxFromValue(index);
+        OwnedZeusBox boxedValue = boxFromValue(value);
+        writeValueFromBox(
+            out,
+            makeBox(ZeusContainerOps::arraySet(
+                boxedArray->v, boxedIndex->v, boxedValue->v)));
+    } catch (const std::exception&) {
+        throw;
+    } catch (...) {
+        valueContainerPanic("failed to write dynamic array value");
+    }
+}
+
+void zeus_value_array_clear(ZeusValue* out, const ZeusValue* array) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (!out) valueContainerPanic("null array clear output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedArray = boxFromValue(array);
+        writeValueFromBox(out, makeBox(ZeusContainerOps::arrayClear(boxedArray->v)));
+    } catch (const std::exception&) {
+        throw;
+    } catch (...) {
+        valueContainerPanic("failed to clear dynamic array");
+    }
+}
+
+void zeus_value_array_slice(
+    ZeusValue* out,
+    const ZeusValue* array,
+    const ZeusValue* start,
+    const ZeusValue* end
+) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (!out) valueContainerPanic("null array slice output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedArray = boxFromValue(array);
+        OwnedZeusBox boxedStart = boxFromValue(start);
+        OwnedZeusBox boxedEnd = boxFromValue(end);
+        writeValueFromBox(
+            out,
+            makeBox(ZeusContainerOps::arraySlice(
+                boxedArray->v, boxedStart->v, boxedEnd->v)));
+    } catch (const std::exception&) {
+        throw;
+    } catch (...) {
+        valueContainerPanic("failed to slice dynamic array");
+    }
+}
+
+void zeus_value_dict_delete(
+    ZeusValue* out,
+    const ZeusValue* dict,
+    const ZeusValue* key
+) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (!out) valueContainerPanic("null dictionary delete output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedDict = boxFromValue(dict);
+        OwnedZeusBox boxedKey = boxFromValue(key);
+        writeValueFromBox(
+            out,
+            [&]() {
+                ZeusType::UniversalVariant removed =
+                    ZeusContainerOps::dictDelete(
+                        boxedDict->v, boxedKey->v, true);
+                DeferredContainerEdgeRelease releaseEdge{ &removed };
+                return makeBox(removed);
+            }());
+    } catch (const std::exception&) {
+        throw;
+    } catch (...) {
+        valueContainerPanic("failed to delete dynamic dictionary value");
+    }
+}
+
+void zeus_value_dict_clone(ZeusValue* out, const ZeusValue* dict) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (!out) valueContainerPanic("null dictionary clone output");
+    zeus_value_init_nil(out);
+    try {
+        OwnedZeusBox boxedDict = boxFromValue(dict);
+        writeValueFromBox(
+            out, makeBox(ZeusContainerOps::dictClone(boxedDict->v)));
+    } catch (const std::exception&) {
+        throw;
+    } catch (...) {
+        valueContainerPanic("failed to clone dynamic dictionary");
     }
 }

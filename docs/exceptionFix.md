@@ -3,7 +3,7 @@
 ## 已修复问题
 
 ### 1. throw 任意类型异常捕获 ✓
-- **问题**: 原来 catch 仅能捕获 Exception 类型，其他类型（字符串、数字、布尔值、null）输出为 `<Namespace:#0>`
+- **问题**: 原来 catch 仅能捕获 Exception 类型，其他类型（字符串、数字、布尔值、nil）输出为 `<Namespace:#0>`
 - **根因**: VM 的 CATCH_BEGIN 指令中有检查 `hasUnhandledException=true`，导致异常未正确存储到 catch 变量
 - **修复**: 移除 CATCH_BEGIN 中的 `hasUnhandledException` 检查，使异常无论如何都能被正确存储到指定槽位
 - **测试结果**: 
@@ -11,7 +11,7 @@
   throw "string error" → caught: string error ✓
   throw 123 → caught: 123 ✓
   throw true → caught: true ✓
-  throw null → caught: <RuntimeError:#2> ✓
+  throw nil → caught: <RuntimeError:#2> ✓
   ```
 
 ### 2. catch 块无参数异常捕获 ✓
@@ -106,7 +106,7 @@ Test 2: throw number
 Test 3: throw boolean
   caught: true ✓
 
-Test 4: throw null
+Test 4: throw nil
   caught: <RuntimeError:#1> ✓
 
 Test 5: throw Exception

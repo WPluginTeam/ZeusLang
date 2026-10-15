@@ -19,6 +19,9 @@
                 "/Fe${fileDirname}\\${fileBasenameNoExtension}.exe",
                 "${file}",
                 "${workspaceFolder}\\ZeusRuntimeLib\\ZeusGCABI.cpp",
+                "${workspaceFolder}\\ZeusRuntimeLib\\ZeusThreadABI.cpp",
+                "${workspaceFolder}\\ZeusRuntimeLib\\ZeusSocketABI.cpp",
+                "${workspaceFolder}\\ZeusRuntimeLib\\ZeusRuntimeDebug.cpp",
                 "/link",
                 "/LTCG"
             ],
@@ -50,7 +53,10 @@
                 "/bigobj",
                 "/Fe${fileDirname}\\${fileBasenameNoExtension}.exe",
                 "${file}",
-                "${workspaceFolder}\\ZeusRuntimeLib\\ZeusGCABI.cpp"
+                "${workspaceFolder}\\ZeusRuntimeLib\\ZeusGCABI.cpp",
+                "${workspaceFolder}\\ZeusRuntimeLib\\ZeusThreadABI.cpp",
+                "${workspaceFolder}\\ZeusRuntimeLib\\ZeusSocketABI.cpp",
+                "${workspaceFolder}\\ZeusRuntimeLib\\ZeusRuntimeDebug.cpp"
             ],
             "options": {
                 "cwd": "${fileDirname}"

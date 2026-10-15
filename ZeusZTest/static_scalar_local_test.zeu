@@ -1,0 +1,46 @@
+func writeNativeInt(value: int) -> int {
+    let local: int = value;
+    let address = @addr(local);
+    @faddr(address) -> int = 42;
+    return local;
+}
+
+func writeNativeBool(value: bool) -> bool {
+    let local: bool = value;
+    let address = @addr(local);
+    @faddr(address) -> bool = false;
+    return local;
+}
+
+func readStringViewLength(value: string) -> int {
+    let dataAddress = @reveal(value);
+    return @faddr(dataAddress - 8, 8) -> int;
+}
+
+func updateNativeLocalAcrossBranch(value: int) -> int {
+    let local: int = value;
+    if (value > 0) {
+        local = local + 1;
+    } else {
+        local = local - 1;
+    }
+    return local;
+}
+
+if (writeNativeInt(7) != 42) {
+    throw new Exception("native int local address write failed");
+}
+if (writeNativeBool(true) != false) {
+    throw new Exception("native bool local address write failed");
+}
+if (readStringViewLength("hello") != 5) {
+    throw new Exception("string reveal outside using LLVM failed");
+}
+if (updateNativeLocalAcrossBranch(4) != 5) {
+    throw new Exception("native scalar local positive branch failed");
+}
+if (updateNativeLocalAcrossBranch(-4) != -5) {
+    throw new Exception("native scalar local branch update failed");
+}
+
+print("STATIC_SCALAR_LOCAL_PASS");

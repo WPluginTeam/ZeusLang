@@ -1,0 +1,8 @@
+import zeus.mem;
+
+let address = malloc(8);
+@faddr(address) -> int = 20261007;
+print(@faddr(address) -> int);
+free(address);
+free(0);
+print(malloc(-1));

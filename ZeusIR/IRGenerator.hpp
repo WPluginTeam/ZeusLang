@@ -11,6 +11,7 @@
 #include "../ZeusParser/TreeType.hpp"
 #include "../ZeusParser/TreeParser.hpp" 
 #include "../ZeusParser/FunctionTypeSyntax.hpp"
+#include "../ZeusParser/GenericCallSyntax.hpp"
 
 #include "../ZeusRunner/ZeusVMOperator.hpp"
 
@@ -36,7 +37,6 @@
 namespace IRGen {
 
     class IRGenerator; // 前置声明，供解析辅助函数使用
-
     // 表达式解析上下文：只携带状态与严格模式所需信息，避免传整个 IRGenerator
     struct ExprParseCtx {
         IRType::IRCompilerStatus& status;
@@ -67,6 +67,24 @@ namespace IRGen {
 
     static bool _isOperator(const LexerType::Token& tk) {
         return std::holds_alternative<LexerType::Operator>(tk);
+    }
+
+    static bool _extractFaddrIntegerWidth(
+        const std::vector<IRType::IRInstr>& expression,
+        int64_t& width
+    ) {
+        if (expression.size() != 1 ||
+            expression.front().op != VMOperator::PUSH ||
+            expression.front().args.size() != 1 ||
+            !std::holds_alternative<LexerType::Value>(
+                expression.front().args.front())) {
+            return false;
+        }
+        const auto& literal = std::get<LexerType::Value>(
+            expression.front().args.front());
+        const auto* integer = std::get_if<ZeusType::BigInteger>(&literal.data);
+        if (!integer || !integer->tryToInt64(width)) return false;
+        return width == 1 || width == 2 || width == 4 || width == 8;
     }
 
     static std::string _opSym(const LexerType::Token& tk) {
@@ -139,6 +157,46 @@ namespace IRGen {
         return result;
     }
 
+    static IRType::SymbolRef _lastMethodReceiverSource(
+        const std::vector<IRType::IRInstr>& instructions
+    ) {
+        if (instructions.empty()) return {};
+        const auto& load = instructions.back();
+        if (load.op != VMOperator::LOAD_VALUE &&
+            load.op != VMOperator::LOAD_VALUE_SHARED) {
+            return {};
+        }
+        const auto& source = load.metadata.symbol;
+        switch (source.kind) {
+            case IRType::SymbolRefKind::Local:
+            case IRType::SymbolRefKind::Global:
+            case IRType::SymbolRefKind::Upvalue:
+            case IRType::SymbolRefKind::Shared:
+                return source;
+            default:
+                return {};
+        }
+    }
+
+    static void _appendMethodReceiverSource(
+        IRType::IRInstr& call,
+        const IRType::SymbolRef& source
+    ) {
+        std::string scope;
+        switch (source.kind) {
+            case IRType::SymbolRefKind::Local: scope = "local"; break;
+            case IRType::SymbolRefKind::Global: scope = "global"; break;
+            case IRType::SymbolRefKind::Upvalue: scope = "upvalue"; break;
+            case IRType::SymbolRefKind::Shared: scope = "shared"; break;
+            default: return;
+        }
+        call.args.push_back(std::string("__zeus_receiver_source"));
+        call.args.push_back(std::move(scope));
+        call.args.push_back(LexerType::Value(source.index));
+        call.args.push_back(source.name);
+        call.args.push_back(LexerType::Value(source.isConst ? 1 : 0));
+    }
+
     static std::string _canonicalIRTypeName(const std::string& sourceName) {
         const ZeusTypeInfer::TypeRef type = ZeusTypeInfer::parseTypeRef(sourceName);
         return type.isKnown() ? type.toIRTypeName() : sourceName;
@@ -202,7 +260,7 @@ namespace IRGen {
                 return;
             }
 
-            // nil 关键字 -> 推入 Zeus Null 值
+            // nil 字面量 -> 推入 VM 的空值表示
             if (name == "nil") {
                 IRType::IRInstr ins;
                 ins.op = VMOperator::PUSH;
@@ -390,7 +448,9 @@ namespace IRGen {
                 : std::string(),
             codeBlock.isClassMethod && codeBlock.isStaticMethod,
             std::move(parameterNames),
-            std::move(parameterIsReference)
+            std::move(parameterIsReference),
+            codeBlock.isInline,
+            codeBlock.isNoSafepoint
         );
 
         return annotation;
@@ -430,11 +490,12 @@ namespace IRGen {
         }
         if (!signature.nativeSymbol.empty()) {
             annotation.args.push_back(signature.nativeSymbol);
+            annotation.args.push_back(signature.nativeReferenceABI);
         }
         annotation.metadata = IRType::IRMetadata::externalFunctionSignature(
             signatureName, returnType, std::move(parameterTypes),
             signature.nativeSymbol, std::move(parameterNames),
-            std::move(parameterIsReference)
+            std::move(parameterIsReference), signature.nativeReferenceABI
         );
         return annotation;
     }
@@ -471,7 +532,8 @@ namespace IRGen {
     // 生成指令: LOAD Array类 -> SWAP -> OBJ_BUILD 1
     static void _wrapListAsArray(ExprParseCtx& ctx, std::vector<IRType::IRInstr>& out) {
         // 如果使用原生模式(using original),直接返回,不包装
-        if (ctx.useOriginal) {
+        if (!ZeusBuiltins::shouldWrapLiteral(
+                ZeusBuiltins::BuiltinLiteralKind::Array, ctx.useOriginal)) {
             ZEUS_DEBUG_PRINT("[IRGen] Using original list (not wrapping as Array)");
             return;
         }
@@ -479,8 +541,8 @@ namespace IRGen {
         ZEUS_DEBUG_PRINT("[IRGen] _wrapListAsArray called (useOriginal=%d)", ctx.useOriginal);
         
         // 加载Array类(从全局符号表)
-        // 注意: Array类在ZeusBuiltins.list包中,需要使用完整的包名前缀
-        IRScope::SymRef arrayRef = IRScope::resolve("ZeusBuiltins.list.Array");
+        // Array lives in zeus.list and is resolved by its qualified package name.
+        IRScope::SymRef arrayRef = IRScope::resolve("zeus.list.Array");
         
         // 如果找不到完整路径,尝试短名称(用于向后兼容)
         if (arrayRef.kind != IRScope::Kind::GLOBAL) {
@@ -679,6 +741,233 @@ namespace IRGen {
         }
 
         const auto& tk = tokens[pos];
+
+        if (_isKeyword(tk) &&
+            std::get<LexerType::Keyword>(tk).name == "sizeof" &&
+            pos + 1 < tokens.size() && _isOperator(tokens[pos + 1]) &&
+            _opSym(tokens[pos + 1]) == "(") {
+            const int sourceLine = _getTokenLine(tk);
+            TreeParser::Node dummy;
+            dummy.sourceLine = sourceLine;
+            if (!IRScope::isUsingLLVM()) {
+                IRExceptionNS::IRException ex(
+                    "sizeof(T) is supported inside using LLVM blocks",
+                    0, dummy);
+                ex._throw(ctx.status);
+                return false;
+            }
+
+            size_t typePosition = pos + 2;
+            std::string typeName;
+            if (!ZeusParser::parseGenericType(tokens, typePosition, typeName) ||
+                typePosition >= tokens.size() ||
+                !_isOperator(tokens[typePosition]) ||
+                _opSym(tokens[typePosition]) != ")") {
+                IRExceptionNS::IRException ex(
+                    "sizeof requires one Zeus type, for example sizeof(int)",
+                    0, dummy);
+                ex._throw(ctx.status);
+                return false;
+            }
+
+            IRType::IRInstr sizeOf;
+            sizeOf.op = VMOperator::LLVM_SIZEOF;
+            sizeOf.line = sourceLine;
+            sizeOf.metadata.kind = IRType::IRMetadataKind::IntrinsicOperator;
+            sizeOf.metadata.tag = "llvm_sizeof_type";
+            sizeOf.metadata.typeName = _canonicalIRTypeName(typeName);
+            out.push_back(std::move(sizeOf));
+            pos = typePosition + 1;
+            return true;
+        }
+
+        if (_isOperator(tk) && _opSym(tk) == "@") {
+            if (pos + 2 >= tokens.size() || !_isKeyword(tokens[pos + 1]) ||
+                !_isOperator(tokens[pos + 2]) || _opSym(tokens[pos + 2]) != "(") {
+                return false;
+            }
+            const std::string intrinsicName =
+                std::get<LexerType::Keyword>(tokens[pos + 1]).name;
+            const bool isAddress = intrinsicName == "addr" ||
+                intrinsicName == "reveal";
+            const bool isReveal = intrinsicName == "reveal";
+            const bool isFetchAddress = intrinsicName == "faddr";
+            if (!isAddress && !isFetchAddress) return false;
+            const int addressLine = _getTokenLine(tk);
+            const size_t addressExpressionStart = out.size();
+            size_t sizeExpressionStart = 0;
+            size_t sizeExpressionEnd = 0;
+            bool hasSizeArgument = false;
+            std::string nativeSlotMode;
+            pos += 3;
+            IRType::IRInstr intrinsic;
+            intrinsic.op = isAddress ? VMOperator::LLVM_ADDR : VMOperator::LLVM_FADDR;
+            intrinsic.line = addressLine;
+            if (isAddress) {
+                if (pos >= tokens.size() || !_isKeyword(tokens[pos])) {
+                    TreeParser::Node dummy;
+                    dummy.sourceLine = addressLine;
+                    IRExceptionNS::IRException ex(
+                        "@addr requires a named variable; temporary values have no address",
+                        0, dummy);
+                    ex._throw(ctx.status);
+                    return false;
+                }
+                const std::string variableName =
+                    std::get<LexerType::Keyword>(tokens[pos]).name;
+                const IRScope::SymRef variable = IRScope::resolve(variableName);
+                std::string storageKind;
+                switch (variable.kind) {
+                    case IRScope::Kind::LOCAL: storageKind = "local"; break;
+                    case IRScope::Kind::GLOBAL: storageKind = "global"; break;
+                    case IRScope::Kind::UPVALUE: storageKind = "upvalue"; break;
+                    case IRScope::Kind::SHARED: storageKind = "shared"; break;
+                    default: {
+                        TreeParser::Node dummy;
+                        dummy.sourceLine = addressLine;
+                        IRExceptionNS::IRException ex(
+                            "@addr requires a local, global, shared, or captured variable",
+                            0, dummy);
+                        ex._throw(ctx.status);
+                        return false;
+                    }
+                }
+                intrinsic.metadata.symbol.isConst = variable.isConst;
+                intrinsic.args.push_back(storageKind);
+                intrinsic.args.push_back(LexerType::Value(variable.index));
+                intrinsic.args.push_back(variableName);
+                intrinsic.args.push_back(std::string(isReveal ? "reveal" : "addr"));
+                ++pos;
+            } else {
+                if (!_parseExpression(ctx, tokens, pos, 1, out)) return false;
+                if (isFetchAddress && pos < tokens.size() &&
+                    _isOperator(tokens[pos]) && _opSym(tokens[pos]) == ",") {
+                    ++pos;
+                    if (pos < tokens.size() && _isKeyword(tokens[pos])) {
+                        const std::string& mode =
+                            std::get<LexerType::Keyword>(tokens[pos]).name;
+                        if (mode == "slot" || mode == "slot_clear") {
+                            nativeSlotMode = mode;
+                            ++pos;
+                        } else {
+                            hasSizeArgument = true;
+                            sizeExpressionStart = out.size();
+                            if (!_parseExpression(ctx, tokens, pos, 1, out)) return false;
+                            sizeExpressionEnd = out.size();
+                        }
+                    } else {
+                        hasSizeArgument = true;
+                        sizeExpressionStart = out.size();
+                        if (!_parseExpression(ctx, tokens, pos, 1, out)) return false;
+                        sizeExpressionEnd = out.size();
+                    }
+                }
+            }
+            if (pos >= tokens.size() || !_isOperator(tokens[pos]) ||
+                _opSym(tokens[pos]) != ")") {
+                return false;
+            }
+            ++pos;
+            if (isFetchAddress) {
+                if (pos >= tokens.size() || !_isOperator(tokens[pos]) ||
+                    _opSym(tokens[pos]) != "->") {
+                    TreeParser::Node dummy;
+                    dummy.sourceLine = addressLine;
+                    IRExceptionNS::IRException ex(
+                        "@faddr requires '-> <type>' after its address argument",
+                        0, dummy);
+                    ex._throw(ctx.status);
+                    return false;
+                }
+                ++pos;
+                std::string targetType;
+                bool isRawBytesRange = false;
+                if (pos + 1 < tokens.size() && _isOperator(tokens[pos]) &&
+                    _opSym(tokens[pos]) == "&" && _isKeyword(tokens[pos + 1]) &&
+                    std::get<LexerType::Keyword>(tokens[pos + 1]).name == "bytes") {
+                    targetType = "&bytes";
+                    isRawBytesRange = true;
+                    pos += 2;
+                } else if (pos < tokens.size() && _isKeyword(tokens[pos])) {
+                    targetType = std::get<LexerType::Keyword>(tokens[pos]).name;
+                    ++pos;
+                } else {
+                    TreeParser::Node dummy;
+                    dummy.sourceLine = addressLine;
+                    IRExceptionNS::IRException ex(
+                        "@faddr requires a Zeus type after '->'", 0, dummy);
+                    ex._throw(ctx.status);
+                    return false;
+                }
+                const bool isStringType = targetType == "string" ||
+                    targetType == "str" || targetType == "String";
+                const bool isBytesType = targetType == "bytes";
+                const bool isIntegerType = targetType == "int" ||
+                    targetType == "int32" || targetType == "int64";
+                if (isRawBytesRange && (!hasSizeArgument || !nativeSlotMode.empty())) {
+                    TreeParser::Node dummy;
+                    dummy.sourceLine = addressLine;
+                    IRExceptionNS::IRException ex(
+                        "@faddr -> &bytes requires an explicit byte length",
+                        0, dummy);
+                    ex._throw(ctx.status);
+                    return false;
+                }
+                if ((isStringType || isBytesType) &&
+                    !hasSizeArgument && nativeSlotMode.empty() &&
+                    out.size() == addressExpressionStart + 1 &&
+                    out.back().op == VMOperator::LLVM_ADDR &&
+                    out.back().args.size() > 3 &&
+                    std::holds_alternative<std::string>(out.back().args[3]) &&
+                    std::get<std::string>(out.back().args[3]) == "addr") {
+                    TreeParser::Node dummy;
+                    dummy.sourceLine = addressLine;
+                    IRExceptionNS::IRException ex(
+                        "@faddr -> string/bytes requires @reveal, or pass a byte length for string data",
+                        0, dummy);
+                    ex._throw(ctx.status);
+                    return false;
+                }
+                intrinsic.args.push_back(targetType);
+                if (!nativeSlotMode.empty()) {
+                    intrinsic.args.push_back(nativeSlotMode);
+                } else if (hasSizeArgument) {
+                    if (isIntegerType) {
+                        std::vector<IRType::IRInstr> sizeExpression(
+                            out.begin() + static_cast<std::ptrdiff_t>(sizeExpressionStart),
+                            out.begin() + static_cast<std::ptrdiff_t>(sizeExpressionEnd));
+                        int64_t width = 0;
+                        if (!_extractFaddrIntegerWidth(sizeExpression, width)) {
+                            TreeParser::Node dummy;
+                            dummy.sourceLine = addressLine;
+                            IRExceptionNS::IRException ex(
+                                "@faddr integer width must be a literal 1, 2, 4, or 8",
+                                0, dummy);
+                            ex._throw(ctx.status);
+                            return false;
+                        }
+                        out.erase(
+                            out.begin() + static_cast<std::ptrdiff_t>(sizeExpressionStart),
+                            out.begin() + static_cast<std::ptrdiff_t>(sizeExpressionEnd));
+                        intrinsic.args.push_back(LexerType::Value(width));
+                    } else if (isStringType || isBytesType) {
+                        intrinsic.args.push_back(std::string("length"));
+                    } else if (isRawBytesRange) {
+                        intrinsic.args.push_back(std::string("raw_range"));
+                    } else {
+                        TreeParser::Node dummy;
+                        dummy.sourceLine = addressLine;
+                        IRExceptionNS::IRException ex(
+                            "@faddr size is supported for int widths and byte ranges",
+                            0, dummy);
+                        ex._throw(ctx.status);
+                        return false;
+                    }
+                }
+            }
+            out.push_back(std::move(intrinsic));
+            return true;
+        }
 
         if (_isKeyword(tk) && pos + 3 < tokens.size() &&
             _isOperator(tokens[pos + 1]) && _opSym(tokens[pos + 1]) == "." &&
@@ -888,8 +1177,10 @@ namespace IRGen {
                     
                     // 检查是否是方法调用
                     if (pos < tokens.size() && _isOperator(tokens[pos]) && _opSym(tokens[pos]) == "(") {
+                        const auto receiverSource = _lastMethodReceiverSource(out);
                         int argc = 0;
-                        if (!_parseArguments(ctx, tokens, pos, argc, out)) {
+                        std::vector<IRType::CallArgumentSource> callArguments;
+                        if (!_parseArguments(ctx, tokens, pos, argc, out, &callArguments)) {
                             return false;
                         }
                         IRType::IRInstr call;
@@ -897,6 +1188,9 @@ namespace IRGen {
                         call.line = attrLine;
                         call.args.push_back(attrName);
                         call.args.push_back(LexerType::Value(argc));
+                        call.metadata = IRType::IRMetadata::callArgumentSources(
+                            std::move(callArguments));
+                        _appendMethodReceiverSource(call, receiverSource);
                         out.push_back(call);
                     } else {
                         // 属性访问
@@ -971,6 +1265,9 @@ namespace IRGen {
             
             std::string name = std::get<LexerType::Keyword>(tokens[pos]).name;
             pos++; // consume identifier
+
+            std::string constructionClassName = name;
+            std::vector<std::string> genericClassArguments;
             
             // 加载初始标识符
             IRScope::SymRef s = IRScope::resolve(name);
@@ -980,6 +1277,7 @@ namespace IRGen {
                 s.kind == IRScope::Kind::UNDEFINED && !hasMemberSuffix
                     ? _nativeConstructionType(name)
                     : std::string();
+            const size_t classReferenceStart = out.size();
             IRType::IRInstr load;
             load.op = VMOperator::LOAD_VALUE;
             
@@ -994,9 +1292,15 @@ namespace IRGen {
                         load.args.push_back(name); // 添加变量名用于错误报告
                         break;
                     case IRScope::Kind::GLOBAL:
-                        load.args.push_back(std::string("global"));
-                        load.args.push_back(LexerType::Value(s.index));
-                        load.args.push_back(name); // 添加变量名用于错误报告
+                        if (!hasMemberSuffix) {
+                            load.args.push_back(std::string("global"));
+                            load.args.push_back(LexerType::Value(s.index));
+                            load.args.push_back(name);
+                        } else {
+                            load.args.push_back(std::string("global"));
+                            load.args.push_back(LexerType::Value(s.index));
+                            load.args.push_back(name); // 添加变量名用于错误报告
+                        }
                         break;
                     case IRScope::Kind::UPVALUE:
                         load.args.push_back(std::string("upvalue"));
@@ -1014,6 +1318,15 @@ namespace IRGen {
                 // 未解析的标识符，发出字符串（支持延迟解析）
                 load.args.push_back(LexerType::Value(name));
             }
+            if (nativeConstructionType.empty() &&
+                !hasMemberSuffix &&
+                s.kind == IRScope::Kind::UNDEFINED) {
+                // Unresolved names in `new Name(...)` are static class
+                // references. Scope-bound names remain runtime expressions.
+                load.metadata.symbol = IRType::SymbolRef::classType(
+                    constructionClassName);
+                load.metadata.typeName = constructionClassName;
+            }
             if (nativeConstructionType.empty()) out.push_back(load);
             
             // 处理属性访问链（如 .JSON）
@@ -1025,6 +1338,7 @@ namespace IRGen {
                 }
                 
                 std::string attrName = std::get<LexerType::Keyword>(tokens[pos]).name;
+                constructionClassName += "." + attrName;
                 int attrLine = _getTokenLine(tokens[pos]);
                 pos++; // consume attribute name
                 
@@ -1034,6 +1348,26 @@ namespace IRGen {
                 loadAttr.line = attrLine;
                 loadAttr.args.push_back(attrName);
                 out.push_back(loadAttr);
+            }
+
+            size_t afterGenericArguments = pos;
+            if (ZeusParser::parseGenericTypeArguments(
+                    tokens, pos, afterGenericArguments, genericClassArguments)) {
+                pos = afterGenericArguments;
+                if (nativeConstructionType.empty()) {
+                    out.erase(out.begin() + static_cast<std::ptrdiff_t>(classReferenceStart),
+                              out.end());
+                    IRType::IRInstr classReference;
+                    classReference.op = VMOperator::LOAD_VALUE;
+                    classReference.args.push_back(LexerType::Value(constructionClassName));
+                    const std::string specializedClassName =
+                        ZeusTypeInfer::genericSpecializationName(
+                            constructionClassName, genericClassArguments);
+                    classReference.metadata.symbol =
+                        IRType::SymbolRef::classType(specializedClassName);
+                    classReference.metadata.typeName = specializedClassName;
+                    out.push_back(std::move(classReference));
+                }
             }
 
             // 解析构造函数参数（支持命名参数）
@@ -1052,6 +1386,10 @@ namespace IRGen {
             if (!nativeConstructionType.empty()) {
                 build.args.push_back(nativeConstructionType);
             }
+            if (nativeConstructionType.empty()) {
+                build.metadata = IRType::IRMetadata::classInstantiation(
+                    constructionClassName, std::move(genericClassArguments));
+            }
             out.push_back(build);
             return true;
         }
@@ -1068,7 +1406,7 @@ namespace IRGen {
                 pos++;
                 return true;
             }
-            // nil 关键字 -> 推入 Zeus Null 值
+                // nil 字面量 -> 推入 VM 的空值表示
             if (name == "nil") {
                 IRType::IRInstr ins;
                 ins.op = VMOperator::PUSH;
@@ -1084,16 +1422,30 @@ namespace IRGen {
             bool unresolvedIdent = false; // 记录是否未解析成符号/内置
             bool directFunctionCandidate = false;
 
-            // 如果在包编译上下文中，优先查找内置函数，避免与包内全局变量冲突
-            // 必须在resolve之前检查，因为包内可能有同名的全局函数定义
-            // 例如：在 cppfunctions.zeu 中 func static input() { return input(); }
-            // 这里的 return input() 应该调用内置 input，而不是递归调用自己
+            // In package compilation, builtins take precedence over package globals,
+            // while lexical locals and captures still shadow builtins.
+            IRScope::SymRef s = IRScope::resolve(name);
+            const bool hasLexicalBinding =
+                s.kind != IRScope::Kind::UNDEFINED &&
+                s.kind != IRScope::Kind::GLOBAL;
             if (IRScope::isCompilingPackage) {
+                const auto native = IRScope::nativeFunctionHandles.find(name);
+                if (native != IRScope::nativeFunctionHandles.end() &&
+                    !hasLexicalBinding) {
+                    IRType::IRInstr ins;
+                    ins.op = VMOperator::LOAD_NATIVE;
+                    ins.args.push_back(LexerType::Value(native->second));
+                    ins.metadata = IRType::IRMetadata::nativeFunction(name);
+                    out.push_back(ins);
+                    calleeKind = CalleeKind::Native;
+                    goto _after_resolve_in_package;
+                }
                 int bid = ZeusBuiltins::findId(name);
-                if (bid >= 0) {
+                if (bid >= 0 && !hasLexicalBinding) {
                     IRType::IRInstr ins;
                     ins.op = VMOperator::LOAD_NATIVE;
                     ins.args.push_back(LexerType::Value(bid));
+                    ins.metadata = IRType::IRMetadata::nativeFunction(name);
                     out.push_back(ins);
                     calleeKind = CalleeKind::Native;
                     goto _after_resolve_in_package;
@@ -1101,7 +1453,6 @@ namespace IRGen {
             }
 
             // 解析用户定义符号（含引用）
-            IRScope::SymRef s = IRScope::resolve(name);
             if (s.kind != IRScope::Kind::UNDEFINED) {
                 if (s.kind == IRScope::Kind::LIST_ELEM_REF) {
                     IRType::IRInstr loadList;
@@ -1179,25 +1530,48 @@ namespace IRGen {
             }
             else {
                 // 如果在包编译上下文中，优先查找内置函数，避免与包内全局变量冲突
-                // 例如：在 cppfunctions.zeu 中调用 input()，应该解析为内置的 input 而不是 ZeusBuiltins.cppfunctions.input
+                // 例如：在 zeus.cppfunctions.zeu 中调用 input()，应该解析为内置的 input 而不是 zeus.cppfunctions.input
                 if (IRScope::isCompilingPackage) {
+                    const auto native = IRScope::nativeFunctionHandles.find(name);
+                    if (native != IRScope::nativeFunctionHandles.end()) {
+                        IRType::IRInstr ins;
+                        ins.op = VMOperator::LOAD_NATIVE;
+                        ins.args.push_back(LexerType::Value(native->second));
+                        ins.metadata = IRType::IRMetadata::nativeFunction(name);
+                        out.push_back(ins);
+                        calleeKind = CalleeKind::Native;
+                        goto _after_resolve_in_package;
+                    }
                     int bid = ZeusBuiltins::findId(name);
                     if (bid >= 0) {
                         IRType::IRInstr ins;
                         ins.op = VMOperator::LOAD_NATIVE;
                         ins.args.push_back(LexerType::Value(bid));
+                        ins.metadata = IRType::IRMetadata::nativeFunction(name);
                         out.push_back(ins);
                         calleeKind = CalleeKind::Native;
                         goto _after_resolve_in_package;
                     }
                 }
                 
+                const auto native = IRScope::nativeFunctionHandles.find(name);
+                if (native != IRScope::nativeFunctionHandles.end()) {
+                    IRType::IRInstr ins;
+                    ins.op = VMOperator::LOAD_NATIVE;
+                    ins.args.push_back(LexerType::Value(native->second));
+                    ins.metadata = IRType::IRMetadata::nativeFunction(name);
+                    out.push_back(ins);
+                    calleeKind = CalleeKind::Native;
+                    goto _after_resolve_in_package;
+                }
+
                 // 尝试匹配内置
                 int bid = ZeusBuiltins::findId(name);
                 if (bid >= 0) {
                     IRType::IRInstr ins;
                     ins.op = VMOperator::LOAD_NATIVE;
                     ins.args.push_back(LexerType::Value(bid));
+                    ins.metadata = IRType::IRMetadata::nativeFunction(name);
                     out.push_back(ins);
                     calleeKind = CalleeKind::Native;
 
@@ -1214,6 +1588,15 @@ namespace IRGen {
             }
 
             _after_resolve_in_package:
+            std::vector<std::string> explicitTypeArguments;
+            if (directFunctionCandidate) {
+                size_t genericCallPosition = pos;
+                if (ZeusParser::consumeGenericCallSuffix(
+                        tokens, genericCallPosition, explicitTypeArguments)) {
+                    pos = genericCallPosition;
+                }
+            }
+
             // 处理零个或多个调用后缀
             // 如果是严格模式且该标识符未解析，同时后面紧跟 '('，判定为对未声明函数的调用 -> 编译期报错
             if (ctx.strictDecl && unresolvedIdent && pos < tokens.size() && _isOperator(tokens[pos]) && _opSym(tokens[pos]) == "(") {
@@ -1287,7 +1670,7 @@ namespace IRGen {
                 callInstr.args.push_back(LexerType::Value(argc));
                 if (calleeKind != CalleeKind::Native) {
                     callInstr.metadata = IRType::IRMetadata::callArgumentSources(
-                        std::move(callArguments));
+                        std::move(callArguments), explicitTypeArguments);
                 }
                 out.push_back(callInstr);
 
@@ -1317,20 +1700,44 @@ namespace IRGen {
                 if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == ".") {
                     // 属性访问：要求后面紧跟标识符
                     // Lookahead: if pattern is . ident '(' -> method call on object
-                    if (pos + 2 < tokens.size() && _isKeyword(tokens[pos+1]) && _isOperator(tokens[pos+2]) && _opSym(tokens[pos+2]) == "(") {
-                        // consume '.'
-                        pos++;
-                        std::string method = std::get<LexerType::Keyword>(tokens[pos]).name;
-                        int methodLine = _getTokenLine(tokens[pos]);
-                        pos++; // consume method name
-                        // parse arguments starting at '('
-                        int argc = 0;
-                        if (!_parseArguments(ctx, tokens, pos, argc, out)) {
-                            return false;
+                    if (pos + 1 < tokens.size() && _isKeyword(tokens[pos + 1])) {
+                        const std::string method =
+                            std::get<LexerType::Keyword>(tokens[pos + 1]).name;
+                        size_t callPosition = pos + 2;
+                        std::vector<std::string> explicitTypeArguments;
+                        const bool hasExplicitTypeArguments =
+                            ZeusParser::consumeGenericCallSuffix(
+                                tokens, callPosition, explicitTypeArguments);
+                        const bool hasCallSuffix = hasExplicitTypeArguments ||
+                            (callPosition < tokens.size() &&
+                             _isOperator(tokens[callPosition]) &&
+                             _opSym(tokens[callPosition]) == "(");
+                        if (hasCallSuffix) {
+                            ++pos; // consume '.'
+                            const int methodLine = _getTokenLine(tokens[pos]);
+                            ++pos; // consume method name
+                            if (hasExplicitTypeArguments) pos = callPosition;
+
+                            const auto receiverSource = _lastMethodReceiverSource(out);
+                            int argc = 0;
+                            std::vector<IRType::CallArgumentSource> callArguments;
+                            if (!_parseArguments(ctx, tokens, pos, argc, out, &callArguments)) {
+                                return false;
+                            }
+
+                            IRType::IRInstr call;
+                            call.op = VMOperator::OBJ_CALL_METHOD;
+                            call.line = methodLine;
+                            call.args.push_back(method);
+                            call.args.push_back(LexerType::Value(argc));
+                            call.metadata = IRType::IRMetadata::callArgumentSources(
+                                std::move(callArguments), explicitTypeArguments);
+                            _appendMethodReceiverSource(call, receiverSource);
+                            out.push_back(call);
+                            continue;
                         }
-                        IRType::IRInstr call; call.op = VMOperator::OBJ_CALL_METHOD; call.line = methodLine; call.args.push_back(method); call.args.push_back(LexerType::Value(argc)); out.push_back(call);
-                        continue;
-                    } else {
+                    }
+                    {
                         pos++; // consume '.'
                         if (pos >= tokens.size() || !_isKeyword(tokens[pos])) {
                             return false; // 语法错误
@@ -1406,22 +1813,44 @@ namespace IRGen {
             }
 
             if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == ".") {
-                if (pos + 2 < tokens.size() && _isKeyword(tokens[pos + 1]) &&
-                    _isOperator(tokens[pos + 2]) && _opSym(tokens[pos + 2]) == "(") {
-                    ++pos;
+                if (pos + 1 < tokens.size() && _isKeyword(tokens[pos + 1])) {
                     const std::string method =
-                        std::get<LexerType::Keyword>(tokens[pos]).name;
-                    const int methodLine = _getTokenLine(tokens[pos]);
-                    ++pos;
-                    int argc = 0;
-                    if (!_parseArguments(ctx, tokens, pos, argc, out)) return false;
-                    IRType::IRInstr call;
-                    call.op = VMOperator::OBJ_CALL_METHOD;
-                    call.line = methodLine;
-                    call.args.push_back(method);
-                    call.args.push_back(LexerType::Value(argc));
-                    out.push_back(std::move(call));
-                } else {
+                        std::get<LexerType::Keyword>(tokens[pos + 1]).name;
+                    size_t callPosition = pos + 2;
+                    std::vector<std::string> explicitTypeArguments;
+                    const bool hasExplicitTypeArguments =
+                        ZeusParser::consumeGenericCallSuffix(
+                            tokens, callPosition, explicitTypeArguments);
+                    const bool hasCallSuffix = hasExplicitTypeArguments ||
+                        (callPosition < tokens.size() &&
+                         _isOperator(tokens[callPosition]) &&
+                         _opSym(tokens[callPosition]) == "(");
+                    if (hasCallSuffix) {
+                        const auto receiverSource = _lastMethodReceiverSource(out);
+                        ++pos;
+                        const int methodLine = _getTokenLine(tokens[pos]);
+                        ++pos;
+                        if (hasExplicitTypeArguments) pos = callPosition;
+
+                        int argc = 0;
+                        std::vector<IRType::CallArgumentSource> callArguments;
+                        if (!_parseArguments(ctx, tokens, pos, argc, out, &callArguments)) {
+                            return false;
+                        }
+
+                        IRType::IRInstr call;
+                        call.op = VMOperator::OBJ_CALL_METHOD;
+                        call.line = methodLine;
+                        call.args.push_back(method);
+                        call.args.push_back(LexerType::Value(argc));
+                        call.metadata = IRType::IRMetadata::callArgumentSources(
+                            std::move(callArguments), explicitTypeArguments);
+                        _appendMethodReceiverSource(call, receiverSource);
+                        out.push_back(std::move(call));
+                        continue;
+                    }
+                }
+                {
                     ++pos;
                     if (pos >= tokens.size() || !_isKeyword(tokens[pos])) return false;
                     const std::string attr =
@@ -1638,7 +2067,7 @@ namespace IRGen {
                             ZeusBuiltins::BuiltinLiteralKind::Array,
                             IRScope::isUsingOriginal(
                                 ZeusBuiltins::BuiltinLiteralKind::Array))) {
-                        IRScope::SymRef arrayRef = IRScope::resolve("ZeusBuiltins.list.Array");
+                        IRScope::SymRef arrayRef = IRScope::resolve("zeus.list.Array");
                         if (arrayRef.kind != IRScope::Kind::GLOBAL) {
                             arrayRef = IRScope::resolve("Array");
                         }
@@ -1780,32 +2209,6 @@ namespace IRGen {
                             IRType::IRInstr p; p.op = VMOperator::PUSH; p.args.push_back(LexerType::Value(e)); out.push_back(p);
                         }
                         IRType::IRInstr build; build.op = VMOperator::LIST_BUILD; build.args.push_back(LexerType::Value((int)elems.size())); out.push_back(build);
-                        
-                        // 包装为Array对象 (内联_wrapListAsArray逻辑)
-                        IRScope::SymRef arrayRef = IRScope::resolve("ZeusBuiltins.list.Array");
-                        if (arrayRef.kind != IRScope::Kind::GLOBAL) {
-                            arrayRef = IRScope::resolve("Array");
-                        }
-                        if (arrayRef.kind == IRScope::Kind::GLOBAL) {
-                            // LOAD Array类
-                            IRType::IRInstr loadArray;
-                            loadArray.op = VMOperator::LOAD_VALUE;
-                            loadArray.args.push_back(std::string("global"));
-                            loadArray.args.push_back(LexerType::Value(arrayRef.index));
-                            out.push_back(loadArray);
-                            
-                            // SWAP (交换list和Array的位置)
-                            IRType::IRInstr swap;
-                            swap.op = VMOperator::SWAP;
-                            out.push_back(swap);
-                            
-                            // OBJ_BUILD 1 (构建Array对象)
-                            IRType::IRInstr objBuild;
-                            objBuild.op = VMOperator::OBJ_BUILD;
-                            objBuild.args.push_back(LexerType::Value(1));
-                            out.push_back(objBuild);
-                        }
-                        
                         return out;
                     }
                 }
@@ -1866,7 +2269,7 @@ namespace IRGen {
                     IRScope::SymRef stringRef = wrapper
                         ? IRScope::resolve(std::string(wrapper->qualifiedClassName))
                         : IRScope::SymRef{};
-                    ZEUS_DEBUG_PRINT("[IRGen] String wrapping: trying 'ZeusBuiltins.string.String', kind=%d", (int)stringRef.kind);
+                    ZEUS_DEBUG_PRINT("[IRGen] String wrapping: trying 'zeus.string.String', kind=%d", (int)stringRef.kind);
                     if (stringRef.kind != IRScope::Kind::GLOBAL) {
                         stringRef = wrapper
                             ? IRScope::resolve(std::string(wrapper->shortClassName))
@@ -2053,12 +2456,13 @@ namespace IRGen {
             }
 
             int argc = 0;
-            for (auto &seg : argTokList) {
-                if (!seg.empty()) {
-                    auto argIR = IRGen::emitExprIR(status, strictDecl, futureFuncDefs, seg);
-                    out.insert(out.end(), argIR.begin(), argIR.end());
-                    argc++;
-                }
+            size_t argumentPos = 3;
+            ExprParseCtx methodCtx{status, strictDecl, futureFuncDefs,
+                IRScope::isUsingOriginal(ZeusBuiltins::BuiltinLiteralKind::Array)};
+            std::vector<IRType::CallArgumentSource> callArguments;
+            if (!_parseArguments(methodCtx, toks, argumentPos, argc, out,
+                                 &callArguments)) {
+                return 0;
             }
 
             int methodLine = _getTokenLine(toks[2]);
@@ -2067,11 +2471,26 @@ namespace IRGen {
             if (lhsRef.kind == IRScope::Kind::LOCAL || lhsRef.kind == IRScope::Kind::GLOBAL || lhsRef.kind == IRScope::Kind::UPVALUE || lhsRef.kind == IRScope::Kind::SHARED) {
                 ZEUS_DEBUG_PRINT("[IRGen    ] %s.%s() -> OBJ_CALL_METHOD (instance)", 
                                  leftName.c_str(), std::get<LexerType::Keyword>(toks[2]).name.c_str());
-                IRType::IRInstr call; call.op = VMOperator::OBJ_CALL_METHOD; call.line = methodLine; call.args.push_back(std::get<LexerType::Keyword>(toks[2]).name); call.args.push_back(LexerType::Value(argc)); out.push_back(call);
+                IRType::IRInstr call;
+                call.op = VMOperator::OBJ_CALL_METHOD;
+                call.line = methodLine;
+                call.args.push_back(std::get<LexerType::Keyword>(toks[2]).name);
+                call.args.push_back(LexerType::Value(argc));
+                call.metadata = IRType::IRMetadata::callArgumentSources(
+                    std::move(callArguments));
+                _appendMethodReceiverSource(call, _makeSymbolRef(leftName, lhsRef));
+                out.push_back(call);
             } else {
                 ZEUS_DEBUG_PRINT("[IRGen    ] %s.%s() -> CLASS_STATIC_METHOD_CALL (static)", 
                                  leftName.c_str(), std::get<LexerType::Keyword>(toks[2]).name.c_str());
-                IRType::IRInstr call; call.op = VMOperator::CLASS_STATIC_METHOD_CALL; call.line = methodLine; call.args.push_back(std::get<LexerType::Keyword>(toks[2]).name); call.args.push_back(LexerType::Value(argc)); out.push_back(call);
+                IRType::IRInstr call;
+                call.op = VMOperator::CLASS_STATIC_METHOD_CALL;
+                call.line = methodLine;
+                call.args.push_back(std::get<LexerType::Keyword>(toks[2]).name);
+                call.args.push_back(LexerType::Value(argc));
+                call.metadata = IRType::IRMetadata::callArgumentSources(
+                    std::move(callArguments));
+                out.push_back(call);
             }
 
             return closePos + 1; // 消费到 ')'
@@ -2119,8 +2538,21 @@ namespace IRGen {
             
             if (classExprTokens.empty()) return 0;
 
+            size_t genericClassNameEnd = 0;
+            std::string genericClassName;
+            std::vector<std::string> genericClassArguments;
+            const bool simpleClassExpression = ZeusParser::parseGenericTypeName(
+                classExprTokens, genericClassNameEnd, genericClassName);
+            const bool isGenericClassConstruction = simpleClassExpression &&
+                ZeusParser::parseGenericTypeArguments(
+                    classExprTokens, genericClassNameEnd, genericClassNameEnd,
+                    genericClassArguments) &&
+                genericClassNameEnd == classExprTokens.size();
+            const bool isPlainClassConstruction = simpleClassExpression &&
+                genericClassNameEnd == classExprTokens.size();
+
             std::string nativeConstructionType;
-            if (classExprTokens.size() == 1 &&
+            if (!isGenericClassConstruction && classExprTokens.size() == 1 &&
                 std::holds_alternative<LexerType::Keyword>(classExprTokens.front())) {
                 const std::string& targetName =
                     std::get<LexerType::Keyword>(classExprTokens.front()).name;
@@ -2130,9 +2562,45 @@ namespace IRGen {
             }
             
             // 递归调用emitExprIR来计算类表达式（可能包含函数调用、属性访问等）
-            if (nativeConstructionType.empty()) {
-                auto classExprIR = emitExprIR(status, strictDecl, futureFuncDefs, classExprTokens);
+            if (isGenericClassConstruction) {
+                IRType::IRInstr classReference;
+                classReference.op = VMOperator::LOAD_VALUE;
+                classReference.args.push_back(LexerType::Value(genericClassName));
+                const std::string specializedClassName =
+                    ZeusTypeInfer::genericSpecializationName(
+                        genericClassName, genericClassArguments);
+                classReference.metadata.symbol =
+                    IRType::SymbolRef::classType(specializedClassName);
+                classReference.metadata.typeName = specializedClassName;
+                out.push_back(std::move(classReference));
+            } else if (nativeConstructionType.empty()) {
+                std::vector<IRType::IRInstr> classExprIR = emitExprIR(
+                    status, strictDecl, futureFuncDefs, classExprTokens);
                 if (classExprIR.empty()) return 0;
+
+                if (classExprTokens.size() == 1 &&
+                    std::holds_alternative<LexerType::Keyword>(classExprTokens.front())) {
+                    const std::string& className =
+                        std::get<LexerType::Keyword>(classExprTokens.front()).name;
+                    if (classExprIR.size() == 1 &&
+                        classExprIR.front().op == VMOperator::LOAD_VALUE &&
+                        classExprIR.front().args.size() == 1) {
+                        bool loadsClassName = false;
+                        if (const auto* loadedName = std::get_if<std::string>(
+                                &classExprIR.front().args[0])) {
+                            loadsClassName = *loadedName == className;
+                        } else if (const auto* loadedValue = std::get_if<LexerType::Value>(
+                                       &classExprIR.front().args[0])) {
+                            const auto* loadedName =
+                                std::get_if<std::string>(&loadedValue->data);
+                            loadsClassName = loadedName != nullptr && *loadedName == className;
+                        }
+                        if (loadsClassName) {
+                            classExprIR.front().metadata.symbol =
+                                IRType::SymbolRef::classType(className);
+                        }
+                    }
+                }
             
                 // 将类表达式的IR添加到输出（结果在栈顶就是要实例化的类）
                 out.insert(out.end(), classExprIR.begin(), classExprIR.end());
@@ -2156,6 +2624,10 @@ namespace IRGen {
             build.args.push_back(LexerType::Value(argc));
             if (!nativeConstructionType.empty()) {
                 build.args.push_back(nativeConstructionType);
+            }
+            if (nativeConstructionType.empty() && isPlainClassConstruction) {
+                build.metadata = IRType::IRMetadata::classInstantiation(
+                    genericClassName, std::move(genericClassArguments));
             }
             out.push_back(build);
             
@@ -2239,35 +2711,6 @@ namespace IRGen {
             }
             if (!found) return 0;
 
-            // split args (4..closePos-1)
-            std::vector<std::vector<LexerType::Token>> argTokList;
-            {
-                size_t p = 4; size_t end = closePos; int brace=0, brack=0, paren=0; size_t segStart=p;
-                while (p < end) {
-                    if (_isOperator(toks[p])) {
-                        std::string sym = _opSym(toks[p]);
-                        if (sym == "(") paren++;
-                        else if (sym == ")") paren--;
-                        else if (sym == "[") brack++;
-                        else if (sym == "]") brack--;
-                        else if (sym == "{") brace++;
-                        else if (sym == "}") brace--;
-                        else if (sym == "," && brace==0 && brack==0 && paren==0) {
-                            std::vector<LexerType::Token> seg;
-                            for (size_t k = segStart; k < p; ++k) seg.push_back(toks[k]);
-                            argTokList.push_back(seg);
-                            segStart = p + 1;
-                        }
-                    }
-                    p++;
-                }
-                if (segStart < end) {
-                    std::vector<LexerType::Token> seg;
-                    for (size_t k = segStart; k < end; ++k) seg.push_back(toks[k]);
-                    argTokList.push_back(seg);
-                }
-            }
-
             // emit: LOAD_VALUE base
             std::string baseName = std::get<LexerType::Keyword>(toks[0]).name;
             IRScope::SymRef base = IRScope::resolve(baseName);
@@ -2285,16 +2728,25 @@ namespace IRGen {
             out.push_back(load);
 
             int argc = 0;
-            for (auto &seg : argTokList) {
-                if (!seg.empty()) {
-                    auto argIR = emitExprIR(status, strictDecl, futureFuncDefs, seg);
-                    out.insert(out.end(), argIR.begin(), argIR.end());
-                    argc++;
-                }
+            size_t argumentPos = 3;
+            ExprParseCtx methodCtx{status, strictDecl, futureFuncDefs,
+                IRScope::isUsingOriginal(ZeusBuiltins::BuiltinLiteralKind::Array)};
+            std::vector<IRType::CallArgumentSource> callArguments;
+            if (!_parseArguments(methodCtx, toks, argumentPos, argc, out,
+                                 &callArguments)) {
+                return 0;
             }
 
             int methodLine = _getTokenLine(toks[2]);
-            IRType::IRInstr call; call.op = VMOperator::OBJ_CALL_METHOD; call.line = methodLine; call.args.push_back(std::get<LexerType::Keyword>(toks[2]).name); call.args.push_back(LexerType::Value(argc)); out.push_back(call);
+            IRType::IRInstr call;
+            call.op = VMOperator::OBJ_CALL_METHOD;
+            call.line = methodLine;
+            call.args.push_back(std::get<LexerType::Keyword>(toks[2]).name);
+            call.args.push_back(LexerType::Value(argc));
+            call.metadata = IRType::IRMetadata::callArgumentSources(
+                std::move(callArguments));
+            _appendMethodReceiverSource(call, _makeSymbolRef(baseName, base));
+            out.push_back(call);
             return closePos + 1;
         };
 
@@ -2333,6 +2785,8 @@ namespace IRGen {
             std::string baseName = std::get<LexerType::Keyword>(toks[0]).name;
             IRScope::SymRef s = IRScope::resolve(baseName);
             ZEUS_DEBUG_PRINT("[IRGen] tryEmitLeadingSubscript: baseName='%s' kind=%d", baseName.c_str(), (int)s.kind);
+            const bool isRawBytesRange =
+                IRScope::isRawBytesRangeBinding(baseName);
             if (s.kind == IRScope::Kind::UNDEFINED) {
                 // 尝试强制查找全局变量(可能刚声明但还未完成STORE)
                 // 如果确实不存在,则让VM在运行时报错
@@ -2378,6 +2832,9 @@ namespace IRGen {
             {
                 IRType::IRInstr load; load.op = VMOperator::DICT_LOAD_VALUE; 
                 load.line = !keyTokens.empty() ? _getTokenLine(keyTokens[0]) : _getTokenLine(toks[1]); // 从 key 或 '[' 获取行号
+                if (isRawBytesRange) {
+                    load.metadata = IRType::IRMetadata::rawBytesRangeIndexLoad();
+                }
                 out.push_back(load);
             }
             return closePos + 1; // 已消费到 ']' 之后
@@ -2471,9 +2928,12 @@ namespace IRGen {
                     
                     // Check if followed by () -> method call
                     if (pos < tokens.size() && _isOperator(tokens[pos]) && _opSym(tokens[pos]) == "(") {
+                        const auto receiverSource = _lastMethodReceiverSource(out);
                         // Push arguments for method call
                         int argc = 0;
-                        if (!_parseArguments(suffixCtx, tokens, pos, argc, out)) {
+                        std::vector<IRType::CallArgumentSource> callArguments;
+                        if (!_parseArguments(suffixCtx, tokens, pos, argc, out,
+                                             &callArguments)) {
                             return std::vector<IRType::IRInstr>();
                         }
                         // Generate OBJ_CALL_METHOD
@@ -2482,6 +2942,9 @@ namespace IRGen {
                         call.line = attrLine;
                         call.args.push_back(attrName);
                         call.args.push_back(LexerType::Value(argc));
+                        call.metadata = IRType::IRMetadata::callArgumentSources(
+                            std::move(callArguments));
+                        _appendMethodReceiverSource(call, receiverSource);
                         out.push_back(call);
                     } else {
                         // Just attribute access
@@ -2586,7 +3049,8 @@ void parseVarDecl(
     bool strictDecl,
     const std::unordered_set<std::string>& futureFuncDefs,
     const TreeParser::Node& node,
-    std::vector<IRType::IRInstr>& instructions
+    std::vector<IRType::IRInstr>& instructions,
+    const std::unordered_map<TreeParser::NodeId, std::string>* bindingTypesByNode
 ) {
 
     if (node.type == NodeType::VAR_DECL_STMT) {
@@ -2688,15 +3152,42 @@ void parseVarDecl(
                 
                 if (!hasParens) {
                     // 没有参数的构造函数: new ClassName
-                    std::string clsName = std::get<LexerType::Keyword>(rightValue[1]).name;
-                    const std::string nativeConstructionType = rightValue.size() == 2 &&
+                    size_t classNameEnd = 1;
+                    std::string clsName;
+                    std::vector<std::string> genericClassArguments;
+                    const bool hasClassName = ZeusParser::parseGenericTypeName(
+                        rightValue, classNameEnd, clsName);
+                    size_t afterGenericArguments = classNameEnd;
+                    const bool isGenericClassConstruction = hasClassName &&
+                        ZeusParser::parseGenericTypeArguments(
+                            rightValue, classNameEnd, afterGenericArguments,
+                            genericClassArguments) &&
+                        afterGenericArguments == rightValue.size();
+                    const bool isPlainClassConstruction = hasClassName &&
+                        classNameEnd == rightValue.size();
+                    if (!isGenericClassConstruction && !isPlainClassConstruction) {
+                        // Leave qualified or otherwise complex targets to the
+                        // expression parser below.
+                    } else {
+                    const std::string nativeConstructionType = isPlainClassConstruction &&
                         IRScope::resolve(clsName).kind == IRScope::Kind::UNDEFINED
                             ? IRGen::_nativeConstructionType(clsName)
                             : std::string();
                     // 生成：LOAD_VALUE class + OBJ_BUILD
                     // 优先尝试解析为符号，如果失败则使用类名字符串（支持 forward declaration）
                     IRScope::SymRef cls = IRScope::resolve(clsName);
-                    if (nativeConstructionType.empty()) {
+                    if (isGenericClassConstruction) {
+                        IRType::IRInstr load;
+                        load.op = VMOperator::LOAD_VALUE;
+                        load.args.push_back(LexerType::Value(clsName));
+                        const std::string specializedClassName =
+                            ZeusTypeInfer::genericSpecializationName(
+                                clsName, genericClassArguments);
+                        load.metadata.symbol =
+                            IRType::SymbolRef::classType(specializedClassName);
+                        load.metadata.typeName = specializedClassName;
+                        instructions.push_back(std::move(load));
+                    } else if (nativeConstructionType.empty()) {
                         IRType::IRInstr load; load.op = VMOperator::LOAD_VALUE;
                         if (cls.kind == IRScope::Kind::LOCAL) {
                             load.args.push_back(std::string("local"));
@@ -2715,6 +3206,7 @@ void parseVarDecl(
                             // VM 会直接压入 args[0] 的值
                             load.args.push_back(clsName);
                             load.args.push_back(LexerType::Value(0)); // dummy arg[1]
+                            load.metadata.symbol = IRType::SymbolRef::classType(clsName);
                         }
                         instructions.push_back(load);
                     }
@@ -2723,8 +3215,13 @@ void parseVarDecl(
                     if (!nativeConstructionType.empty()) {
                         build.args.push_back(nativeConstructionType);
                     }
+                    if (nativeConstructionType.empty() && isPlainClassConstruction) {
+                        build.metadata = IRType::IRMetadata::classInstantiation(
+                            clsName, std::move(genericClassArguments));
+                    }
                     instructions.push_back(build);
                     handledNew = true;
+                    }
                 }
             }
             if (!handledNew) {
@@ -2755,7 +3252,7 @@ void parseVarDecl(
                         ZeusBuiltins::BuiltinLiteralKind::Array,
                         IRScope::isUsingOriginal(
                             ZeusBuiltins::BuiltinLiteralKind::Array))) {
-                    IRScope::SymRef arrayRef = IRScope::resolve("ZeusBuiltins.list.Array");
+                    IRScope::SymRef arrayRef = IRScope::resolve("zeus.list.Array");
                     if (arrayRef.kind != IRScope::Kind::GLOBAL) {
                         arrayRef = IRScope::resolve("Array");
                     }
@@ -2807,6 +3304,13 @@ void parseVarDecl(
                 st.op = VMOperator::STORE_VALUE_SHARED;
                 st.args.push_back(varName);  // 按名称访问
                 st.args.push_back(std::string(isConst ? "const" : "mutable"));
+                if (bindingTypesByNode != nullptr) {
+                    const auto bindingType = bindingTypesByNode->find(node.id);
+                    if (bindingType != bindingTypesByNode->end()) {
+                        st.metadata = IRType::IRMetadata::sharedBindingType(
+                            bindingType->second);
+                    }
+                }
             }
             else if (isGlobal) {
                 int gid = IRScope::declareGlobal(varName);
@@ -2814,12 +3318,26 @@ void parseVarDecl(
                 st.args.push_back(LexerType::Value(gid));
                 st.args.push_back(std::string(isConst ? "const" : "mutable"));
                 st.args.push_back(varName); // inline 名称，供 VM 旧格式登记
+                if (bindingTypesByNode != nullptr) {
+                    const auto bindingType = bindingTypesByNode->find(node.id);
+                    if (bindingType != bindingTypesByNode->end()) {
+                        st.metadata = IRType::IRMetadata::globalBindingType(
+                            bindingType->second);
+                    }
+                }
             }
             else {
                 int lid = IRScope::declareLocal(varName);
                 st.op = VMOperator::STORE_VALUE_LOCAL;
                 st.args.push_back(LexerType::Value(lid));
                 st.args.push_back(std::string(isConst ? "const" : "mutable"));
+                if (bindingTypesByNode != nullptr) {
+                    const auto localType = bindingTypesByNode->find(node.id);
+                    if (localType != bindingTypesByNode->end()) {
+                        st.metadata = IRType::IRMetadata::localBindingType(
+                            localType->second);
+                    }
+                }
             }
 
             instructions.push_back(st);
@@ -2859,7 +3377,216 @@ void parseVarAssignStmt(
         exprTokens.push_back(tk);
     }
 
+    const bool isThisAssignment = leftTokens.size() == 2 &&
+        std::holds_alternative<LexerType::Operator>(leftTokens[0]) &&
+        std::get<LexerType::Operator>(leftTokens[0]).symbol == "@" &&
+        std::holds_alternative<LexerType::Keyword>(leftTokens[1]) &&
+        std::get<LexerType::Keyword>(leftTokens[1]).name == "this";
+    if (isThisAssignment) {
+        const IRScope::ReceiverContext* receiverContext =
+            IRScope::currentReceiverContext();
+        if (receiverContext == nullptr || receiverContext->ownerType.empty() ||
+            receiverContext->alias.empty()) {
+            IR_THROW_NODE(0, mirror,
+                "@this assignment is only valid inside an instance method",
+                status);
+            return;
+        }
+        if (exprTokens.empty()) {
+            IR_THROW_NODE(0, mirror, "@this assignment requires a value", status);
+            return;
+        }
+
+        IRScope::SymRef receiver = IRScope::resolve(receiverContext->alias);
+        if (receiver.kind == IRScope::Kind::UNDEFINED &&
+            (IRScope::allowImplicitCapture || IRScope::isCaptureAllActive())) {
+            receiver = IRScope::forceCapture(receiverContext->alias);
+        }
+        if (receiver.kind != IRScope::Kind::LOCAL &&
+            receiver.kind != IRScope::Kind::UPVALUE) {
+            IR_THROW_NODE(0, mirror,
+                "@this receiver is not available in this function",
+                status);
+            return;
+        }
+
+        IRType::IRInstr loadReceiver;
+        loadReceiver.op = VMOperator::LOAD_VALUE;
+        loadReceiver.line = IRGen::_getTokenLine(leftTokens[0]);
+        loadReceiver.args.push_back(receiver.kind == IRScope::Kind::LOCAL
+            ? std::string("local") : std::string("upvalue"));
+        loadReceiver.args.push_back(LexerType::Value(receiver.index));
+        loadReceiver.args.push_back(receiverContext->alias);
+        instructions.push_back(std::move(loadReceiver));
+
+        auto replacementIR = IRGen::emitExprIR(
+            status, strictDecl, futureFuncDefs, exprTokens);
+        if (replacementIR.empty()) {
+            IR_THROW_NODE(0, mirror,
+                "@this replacement value could not be compiled",
+                status);
+            return;
+        }
+        instructions.insert(
+            instructions.end(), replacementIR.begin(), replacementIR.end());
+
+        IRType::IRInstr replace;
+        replace.op = VMOperator::OBJ_REPLACE_STATE;
+        replace.line = IRGen::_getTokenLine(leftTokens[0]);
+        replace.args.push_back(receiverContext->ownerType);
+        instructions.push_back(std::move(replace));
+        return;
+    }
+
     // 提取基础变量名（左侧第一个 keyword）
+    if (leftTokens.size() >= 7 &&
+        std::holds_alternative<LexerType::Operator>(leftTokens[0]) &&
+        std::get<LexerType::Operator>(leftTokens[0]).symbol == "@" &&
+        std::holds_alternative<LexerType::Keyword>(leftTokens[1]) &&
+        std::get<LexerType::Keyword>(leftTokens[1]).name == "faddr" &&
+        std::holds_alternative<LexerType::Operator>(leftTokens[2]) &&
+        std::get<LexerType::Operator>(leftTokens[2]).symbol == "(") {
+        size_t close = leftTokens.size();
+        int depth = 0;
+        for (size_t i = 2; i < leftTokens.size(); ++i) {
+            if (!std::holds_alternative<LexerType::Operator>(leftTokens[i])) continue;
+            const std::string& symbol = std::get<LexerType::Operator>(leftTokens[i]).symbol;
+            if (symbol == "(") ++depth;
+            else if (symbol == ")" && --depth == 0) {
+                close = i;
+                break;
+            }
+        }
+
+        const bool hasArrow = close + 1 < leftTokens.size() &&
+            std::holds_alternative<LexerType::Operator>(leftTokens[close + 1]) &&
+            std::get<LexerType::Operator>(leftTokens[close + 1]).symbol == "->";
+        const bool isRawBytesRangeTarget = close + 4 == leftTokens.size() &&
+            std::holds_alternative<LexerType::Operator>(leftTokens[close + 2]) &&
+            std::get<LexerType::Operator>(leftTokens[close + 2]).symbol == "&" &&
+            std::holds_alternative<LexerType::Keyword>(leftTokens[close + 3]) &&
+            std::get<LexerType::Keyword>(leftTokens[close + 3]).name == "bytes";
+        const bool isSimpleFaddrTarget = close + 3 == leftTokens.size() &&
+            close + 2 < leftTokens.size() &&
+            std::holds_alternative<LexerType::Keyword>(leftTokens[close + 2]);
+        const bool validFaddrTarget = hasArrow &&
+            (isRawBytesRangeTarget || isSimpleFaddrTarget);
+        if (!validFaddrTarget || close <= 3 || exprTokens.empty()) {
+            IR_THROW_NODE(0, mirror, "invalid @faddr assignment; expected @faddr(address[, width]) -> T = value", status);
+            return;
+        }
+
+        size_t sizeSeparator = close;
+        int nestedParen = 0;
+        int nestedSquare = 0;
+        int nestedBrace = 0;
+        for (size_t i = 3; i < close; ++i) {
+            if (!std::holds_alternative<LexerType::Operator>(leftTokens[i])) continue;
+            const std::string& symbol = std::get<LexerType::Operator>(leftTokens[i]).symbol;
+            if (symbol == "(") ++nestedParen;
+            else if (symbol == ")") --nestedParen;
+            else if (symbol == "[") ++nestedSquare;
+            else if (symbol == "]") --nestedSquare;
+            else if (symbol == "{") ++nestedBrace;
+            else if (symbol == "}") --nestedBrace;
+            else if (symbol == "," && nestedParen == 0 &&
+                     nestedSquare == 0 && nestedBrace == 0) {
+                sizeSeparator = i;
+                break;
+            }
+        }
+        const bool hasNativeSlotArgument = sizeSeparator != close &&
+            sizeSeparator + 2 == close &&
+            std::holds_alternative<LexerType::Keyword>(leftTokens[sizeSeparator + 1]) &&
+            std::get<LexerType::Keyword>(leftTokens[sizeSeparator + 1]).name == "slot";
+        const bool hasSizeArgument = sizeSeparator != close && !hasNativeSlotArgument;
+        const std::string targetType = isRawBytesRangeTarget
+            ? std::string("&bytes")
+            : std::get<LexerType::Keyword>(leftTokens[close + 2]).name;
+        const bool isRawBytesRange = targetType == "&bytes";
+        const bool isBytesType = targetType == "bytes";
+        const bool isIntegerType = targetType == "int" ||
+            targetType == "int32" || targetType == "int64";
+        const bool isStringType = targetType == "string" ||
+            targetType == "str" || targetType == "String";
+        int64_t integerWidth = 0;
+        if (hasSizeArgument && !hasNativeSlotArgument) {
+            if (isStringType) {
+                IR_THROW_NODE(0, mirror,
+                    "@faddr string length is supported for reads; string writes use the source byte length",
+                    status);
+                return;
+            }
+            if ((!isIntegerType && !isBytesType && !isRawBytesRange) ||
+                sizeSeparator + 1 >= close) {
+                IR_THROW_NODE(0, mirror,
+                    "@faddr assignment size is supported for int widths and bytes ranges",
+                    status);
+                return;
+            }
+        }
+        if (isRawBytesRange && (!hasSizeArgument || hasNativeSlotArgument)) {
+            IR_THROW_NODE(0, mirror,
+                "@faddr -> &bytes assignment requires an explicit byte length",
+                status);
+            return;
+        }
+
+        std::vector<LexerType::Token> addressTokens(
+            leftTokens.begin() + 3,
+            leftTokens.begin() + static_cast<std::ptrdiff_t>(sizeSeparator));
+        auto addressIR = IRGen::emitExprIR(
+            status, strictDecl, futureFuncDefs, addressTokens);
+        if (addressIR.empty()) {
+            IR_THROW_NODE(0, mirror, "@faddr assignment requires an address expression", status);
+            return;
+        }
+        std::vector<IRType::IRInstr> sizeIR;
+        if (hasSizeArgument) {
+            std::vector<LexerType::Token> sizeTokens(
+                leftTokens.begin() + static_cast<std::ptrdiff_t>(sizeSeparator + 1),
+                leftTokens.begin() + static_cast<std::ptrdiff_t>(close));
+            sizeIR = IRGen::emitExprIR(
+                status, strictDecl, futureFuncDefs, sizeTokens);
+            if (sizeIR.empty()) {
+                IR_THROW_NODE(0, mirror, "@faddr assignment requires a byte length", status);
+                return;
+            }
+            if (isIntegerType &&
+                !IRGen::_extractFaddrIntegerWidth(sizeIR, integerWidth)) {
+                IR_THROW_NODE(0, mirror,
+                    "@faddr integer width must be a literal 1, 2, 4, or 8",
+                    status);
+                return;
+            }
+        }
+        auto valueIR = IRGen::emitExprIR(
+            status, strictDecl, futureFuncDefs, exprTokens);
+        instructions.insert(instructions.end(), addressIR.begin(), addressIR.end());
+        if (hasSizeArgument && (isBytesType || isRawBytesRange)) {
+            instructions.insert(instructions.end(), sizeIR.begin(), sizeIR.end());
+        }
+        instructions.insert(instructions.end(), valueIR.begin(), valueIR.end());
+
+        IRType::IRInstr store;
+        store.op = VMOperator::LLVM_FSTORE;
+        store.line = IRGen::_getTokenLine(leftTokens[0]);
+        store.args.push_back(targetType);
+        if (hasNativeSlotArgument) {
+            store.args.push_back(std::string("slot"));
+        } else if (hasSizeArgument) {
+            if (isRawBytesRange) {
+                store.args.push_back(std::string("raw_range"));
+            } else if (isBytesType) {
+                store.args.push_back(std::string("length"));
+            } else {
+                store.args.push_back(LexerType::Value(integerWidth));
+            }
+        }
+        instructions.push_back(std::move(store));
+        return;
+    }
+
     for (auto &tk : leftTokens) {
         if (std::holds_alternative<LexerType::Keyword>(tk)) {
             varName = std::get<LexerType::Keyword>(tk).name;
@@ -3075,10 +3802,62 @@ void parseVarAssignStmt(
 
         // store (当前仅实现字典，后续可加入运行时判别 list/dict 分派)
         {
-            IRType::IRInstr store; store.op = VMOperator::DICT_STORE_VALUE; instructions.push_back(store);
+            IRType::IRInstr store;
+            store.op = VMOperator::DICT_STORE_VALUE;
+            store.line = !leftTokens.empty()
+                ? IRGen::_getTokenLine(leftTokens[0]) : -1;
+            if (IRScope::isRawBytesRangeBinding(varName)) {
+                store.metadata = IRType::IRMetadata::rawBytesRangeIndexStore();
+            }
+            store.metadata.subscriptWritebackTarget =
+                IRGen::_makeSymbolRef(varName, s);
+            instructions.push_back(store);
         }
         instructions.push_back(IRUtils::makePop());
         return;
+    }
+
+    // A subscripted class value can be the receiver of a field assignment:
+    // values[index].field = rhs. Evaluate the complete receiver expression,
+    // then store only its final attribute. The old base-name assignment path
+    // treated this form as `values = rhs`, which corrupted the container in VM.
+    if (leftTokens.size() >= 5 &&
+        std::holds_alternative<LexerType::Keyword>(leftTokens.back()) &&
+        std::holds_alternative<LexerType::Operator>(leftTokens[leftTokens.size() - 2]) &&
+        std::get<LexerType::Operator>(leftTokens[leftTokens.size() - 2]).symbol == ".") {
+        const size_t receiverEnd = leftTokens.size() - 2;
+        const bool receiverContainsSubscript = std::any_of(
+            leftTokens.begin(), leftTokens.begin() + receiverEnd,
+            [](const LexerType::Token& token) {
+                const auto* op = std::get_if<LexerType::Operator>(&token);
+                return op != nullptr && op->symbol == "[";
+            });
+        if (receiverContainsSubscript) {
+            if (s.isConst) {
+                IR_THROW_NODE(0, mirror,
+                    "assignment to const variable (subscripted object base)", status);
+                return;
+            }
+
+            std::vector<LexerType::Token> receiverTokens(
+                leftTokens.begin(), leftTokens.begin() + receiverEnd);
+            auto receiverIR = IRGen::emitExprIR(
+                status, strictDecl, futureFuncDefs, receiverTokens);
+            instructions.insert(
+                instructions.end(), receiverIR.begin(), receiverIR.end());
+
+            auto rhsIR = IRGen::emitExprIR(
+                status, strictDecl, futureFuncDefs, exprTokens);
+            instructions.insert(instructions.end(), rhsIR.begin(), rhsIR.end());
+
+            IRType::IRInstr store;
+            store.op = VMOperator::OBJ_STORE_ATTR;
+            store.line = IRGen::_getTokenLine(leftTokens.back());
+            store.args.push_back(
+                std::get<LexerType::Keyword>(leftTokens.back()).name);
+            instructions.push_back(std::move(store));
+            return;
+        }
     }
 
     // 对象属性赋值： pattern <ident> '.' <attr> '=' expr
@@ -3512,6 +4291,7 @@ namespace IRGen {
             std::vector<std::string> globalNamesByIndex; // index -> name
             std::vector<std::string> returnReferenceTypeStack;
             std::unordered_map<TreeParser::NodeId, std::string> inferredFunctionReturnTypes;
+            std::unordered_map<TreeParser::NodeId, std::string> inferredBindingTypesByNode;
 
             // --- Forward Declaration Helpers (Refactored) ---
             FuncProto* findProto(const std::string& name) {
@@ -3716,6 +4496,13 @@ namespace IRGen {
                             );
                             if (signature.valid && !signature.name.empty()) {
                                 IRScope::functionNames.insert(signature.name);
+                                if (!signature.nativeSymbol.empty()) {
+                                    const int handle = ZeusBuiltins::nativeInjectionHandle(
+                                        signature.nativeSymbol);
+                                    if (handle < 0) {
+                                        IRScope::nativeFunctionHandles[signature.name] = handle;
+                                    }
+                                }
                             }
                         }
                         continue;
@@ -3739,6 +4526,7 @@ namespace IRGen {
 
                 // 先收集函数名，使定义前的直接调用也能获得后端标注。
                 IRScope::functionNames.clear();
+                IRScope::nativeFunctionHandles.clear();
                 collectFunctionNames(nodes);
 
                 ZEUS_DEBUG_PRINT("[IRGen] ===== PARSE START (top-level variant count=%zu) =====", nodes.size());
@@ -3804,7 +4592,8 @@ namespace IRGen {
 
                     case NodeType::VAR_DECL_STMT: {
 
-                        parseVarDecl(status, strictDecl, futureFuncDefs, node, instructions);
+                        parseVarDecl(status, strictDecl, futureFuncDefs, node,
+                                     instructions, &inferredBindingTypesByNode);
                         ZEUS_DEBUG_EXEC({
                             ZEUS_DEBUG_PRINT("[IRGen    ] {VarDecl} Instr:");
                             IRDebugUtils::printVectorInstructions(instructions);
@@ -3832,28 +4621,7 @@ namespace IRGen {
                                 ? std::string()
                                 : returnReferenceTypeStack.back();
                         const bool returnsReference = !referenceTargetType.empty();
-                        const bool returnsScalarCellReference = returnsReference &&
-                            (referenceTargetType == "int" ||
-                             referenceTargetType == "int32" ||
-                             referenceTargetType == "int64" ||
-                             referenceTargetType == "bool") &&
-                            exprTokens.size() == 1 &&
-                            std::holds_alternative<LexerType::Keyword>(exprTokens.front());
-                        if (returnsScalarCellReference) {
-                            const auto& name = std::get<LexerType::Keyword>(exprTokens.front()).name;
-                            const auto symbol = IRScope::resolve(name);
-                            if (symbol.kind != IRScope::Kind::GLOBAL) {
-                                IR_THROW_NODE(node.id, node,
-                                    "reference return currently requires stable global storage", status);
-                                break;
-                            }
-                            IRType::IRInstr reference;
-                            reference.op = VMOperator::LOAD_CELL_REFERENCE;
-                            reference.args.push_back(std::string("global"));
-                            reference.args.push_back(LexerType::Value(symbol.index));
-                            reference.args.push_back(name);
-                            instructions.push_back(std::move(reference));
-                        } else if (!exprTokens.empty()) {
+                        if (!exprTokens.empty()) {
                             auto rhs = IRGen::emitExprIR(status, strictDecl, futureFuncDefs, exprTokens);
                             instructions.insert(instructions.end(), rhs.begin(), rhs.end());
                         } else if (returnsReference) {
@@ -4046,6 +4814,8 @@ namespace IRGen {
                             ZEUS_DEBUG_PRINT("[IRGen] !! IMPORT_STMT: empty package name");
                             break;
                         }
+
+                        packageName = IRImport::canonicalPackageName(packageName);
                         
                         // 如果是命名空间导入但没有指定别名,使用包名的最后一部分作为别名
                         // 例如: import pkg.sub [&]; 使用 'sub' 作为别名
@@ -4286,6 +5056,9 @@ namespace IRGen {
                         ZEUS_DEBUG_PRINT("[IRGen] .. IF END addr=%p", (void*)&codeBlock);
                         return; // guard 自动 pop
 
+                    case CodeBlockType::INTERFACE:
+                        return; // compile-time contract; interfaces have no runtime representation
+
                     case CodeBlockType::CLASS: {
                         // 语义：在进入类体前注册一个类原型
                         // 1) 解析类名
@@ -4314,7 +5087,9 @@ namespace IRGen {
                         struct FieldInfo {
                             std::vector<IRType::IRInstr> defaultIR;
                             std::vector<LexerType::Token> defaultTokens;
+                            std::string initializerName;
                             std::string typeName;
+                            bool typeExplicit = false;
                             bool isConst = false;
                         };
                         std::unordered_map<std::string, FieldInfo> fieldsMap;
@@ -4345,35 +5120,54 @@ namespace IRGen {
                                 std::string fieldType;
                                 bool isConst = false;
                                 std::vector<LexerType::Token> rhs;
-                                bool saving = false;
-                                bool readingType = false;
-                                for (auto &tk : nd.tokens) {
-                                    if (std::holds_alternative<LexerType::Operator>(tk)) {
-                                        const auto& op = std::get<LexerType::Operator>(tk).symbol;
-                                        if (op == "=") { saving = true; continue; }
-                                        if (!saving && op == ":") {
-                                            readingType = true;
-                                            continue;
-                                        }
+                                size_t assignment = nd.tokens.size();
+                                size_t colon = nd.tokens.size();
+                                for (size_t i = 0; i < nd.tokens.size(); ++i) {
+                                    if (!std::holds_alternative<LexerType::Operator>(nd.tokens[i])) {
+                                        continue;
                                     }
-                                    if (!saving) {
-                                        if (std::holds_alternative<LexerType::Keyword>(tk)) {
-                                            auto &kw = std::get<LexerType::Keyword>(tk);
-                                            if (kw.name == "const") { isConst = true; continue; }
-                                            if (kw.name == "let" || kw.name == "var" || kw.name == "const") continue;
-                                            if (readingType) {
-                                                fieldType = kw.name;
-                                                readingType = false;
-                                            } else if (vname.empty()) {
-                                                vname = kw.name;
-                                            }
-                                        }
-                                    } else rhs.push_back(tk);
+                                    const std::string& op =
+                                        std::get<LexerType::Operator>(nd.tokens[i]).symbol;
+                                    if (op == "=" && assignment == nd.tokens.size()) {
+                                        assignment = i;
+                                    } else if (op == ":" && colon == nd.tokens.size()) {
+                                        colon = i;
+                                    }
+                                }
+                                for (size_t i = 0; i < assignment; ++i) {
+                                    if (!std::holds_alternative<LexerType::Keyword>(nd.tokens[i])) {
+                                        continue;
+                                    }
+                                    const std::string& keyword =
+                                        std::get<LexerType::Keyword>(nd.tokens[i]).name;
+                                    if (keyword == "const") {
+                                        isConst = true;
+                                        continue;
+                                    }
+                                    if (keyword == "let" || keyword == "var") continue;
+                                    if (vname.empty()) vname = keyword;
+                                }
+                                if (colon < assignment) {
+                                    size_t typePosition = colon + 1;
+                                    ZeusParser::parseGenericType(
+                                        nd.tokens, typePosition, fieldType);
+                                }
+                                if (assignment < nd.tokens.size()) {
+                                    rhs.assign(nd.tokens.begin() +
+                                                   static_cast<std::ptrdiff_t>(assignment + 1),
+                                               nd.tokens.end());
                                 }
                                 if (!vname.empty()) {
                                     FieldInfo finfo;
                                     finfo.isConst = isConst;
+                                    finfo.typeExplicit = colon < assignment;
                                     finfo.typeName = fieldType;
+                                    if (!finfo.typeExplicit) {
+                                        const auto inferred = inferredBindingTypesByNode.find(nd.id);
+                                        if (inferred != inferredBindingTypesByNode.end()) {
+                                            finfo.typeName = inferred->second;
+                                        }
+                                    }
                                     if (finfo.typeName.empty() && rhs.size() == 1 &&
                                         std::holds_alternative<LexerType::Value>(rhs[0])) {
                                         const auto& value = std::get<LexerType::Value>(rhs[0]);
@@ -4395,10 +5189,6 @@ namespace IRGen {
                                         std::holds_alternative<ZeusType::BigInteger>(
                                             std::get<LexerType::Value>(rhs[1]).data)) {
                                         finfo.typeName = "int";
-                                    }
-                                    if (!rhs.empty()) {
-                                        auto ir = emitExprIR(status, strictDecl, futureFuncDefs, rhs);
-                                        finfo.defaultIR = std::move(ir);
                                     }
                                     finfo.defaultTokens = rhs;
                                     if (fieldsMap.find(vname) == fieldsMap.end()) {
@@ -4429,6 +5219,134 @@ namespace IRGen {
                                 }
                                 continue;
                             }
+                        }
+
+                        auto isStaticFieldDefault = [](
+                            const std::vector<IRType::IRInstr>& expressionIR
+                        ) {
+                            if (expressionIR.size() != 1 ||
+                                expressionIR.front().op != VMOperator::PUSH ||
+                                expressionIR.front().args.empty()) {
+                                return false;
+                            }
+                            const auto& value = expressionIR.front().args.front();
+                            if (std::holds_alternative<IRType::NullLiteral>(value) ||
+                                std::holds_alternative<ZeusType::Bytes>(value)) {
+                                return true;
+                            }
+                            const auto* literal = std::get_if<LexerType::Value>(&value);
+                            if (literal == nullptr) return false;
+                            if (std::holds_alternative<bool>(literal->data) ||
+                                std::holds_alternative<std::string>(literal->data)) {
+                                return true;
+                            }
+                            if (const auto* integer =
+                                    std::get_if<ZeusType::BigInteger>(&literal->data)) {
+                                int64_t ignored = 0;
+                                return integer->tryToInt64(ignored);
+                            }
+                            return false;
+                        };
+
+                        for (size_t fieldIndex = 0; fieldIndex < fieldOrder.size(); ++fieldIndex) {
+                            auto& field = fieldsMap.at(fieldOrder[fieldIndex]);
+                            if (field.defaultTokens.empty()) continue;
+
+                            const std::string initializerName = className +
+                                "::__zeus_field_initializer_" + std::to_string(fieldIndex);
+                            const bool previousImplicitCapture = IRScope::allowImplicitCapture;
+                            IRScope::allowImplicitCapture = true;
+                            IRScope::beginFunction();
+                            IRScope::funcStack.back().name = initializerName;
+                            const int receiverSlot = IRScope::declareLocal("this");
+                            if (!usingThisAlias.empty() && usingThisAlias != "this") {
+                                IRScope::funcStack.back().locals[usingThisAlias] = receiverSlot;
+                                IRScope::scopeStack.back().nameToLocal[usingThisAlias] = receiverSlot;
+                            }
+
+                            auto expressionIR = emitExprIR(
+                                status, strictDecl, futureFuncDefs, field.defaultTokens);
+                            IRScope::FuncEnv initializerEnv = IRScope::endFunction();
+                            IRScope::allowImplicitCapture = previousImplicitCapture;
+
+                            if (status != IRType::IRCompilerStatus::Running || expressionIR.empty()) {
+                                if (status == IRType::IRCompilerStatus::Running) {
+                                    TreeParser::Node dummy;
+                                    IRExceptionNS::IRException ex(
+                                        "Could not compile field default for '" +
+                                            className + "." + fieldOrder[fieldIndex] + "'",
+                                        0, dummy);
+                                    ex._throw(status);
+                                }
+                                return;
+                            }
+
+                            if (!initializerEnv.captures.empty() ||
+                                !initializerEnv.referencedOuters.empty()) {
+                                std::string capturedName;
+                                if (!initializerEnv.captures.empty()) {
+                                    capturedName = initializerEnv.captures.front().name;
+                                } else {
+                                    capturedName = *initializerEnv.referencedOuters.begin();
+                                }
+                                TreeParser::Node dummy;
+                                IRExceptionNS::IRException ex(
+                                    "Field default '" + className + "." +
+                                        fieldOrder[fieldIndex] +
+                                        "' cannot capture enclosing variable '" +
+                                        capturedName + "'; use this or a global variable",
+                                    0, dummy);
+                                ex._throw(status);
+                                return;
+                            }
+
+                            field.defaultIR = std::move(expressionIR);
+                            if (isStaticFieldDefault(field.defaultIR)) continue;
+
+                            field.initializerName = initializerName;
+                            std::vector<IRType::IRInstr> initializerChunk;
+                            IRType::IRInstr begin;
+                            begin.op = VMOperator::FUNC_BEGIN;
+                            begin.args.push_back(LexerType::Value(1));
+                            begin.args.push_back(LexerType::Value(0));
+                            begin.args.push_back(LexerType::Value(0));
+                            begin.args.push_back(std::string());
+                            begin.args.push_back(std::string());
+                            begin.args.push_back(LexerType::Value(1));
+                            begin.args.push_back(LexerType::Value(0));
+                            begin.args.push_back(LexerType::Value(1));
+                            begin.args.push_back(std::string("this"));
+                            initializerChunk.push_back(std::move(begin));
+
+                            const std::string returnType = field.typeName.empty()
+                                ? std::string("any")
+                                : field.typeName;
+                            IRType::IRInstr signature;
+                            signature.op = VMOperator::IR_ANNOTATION;
+                            signature.args.push_back(std::string("function_signature"));
+                            signature.args.push_back(initializerName);
+                            signature.args.push_back(returnType);
+                            signature.args.push_back(LexerType::Value(0));
+                            signature.args.push_back(LexerType::Value(1));
+                            signature.args.push_back(className);
+                            signature.metadata = IRType::IRMetadata::functionSignature(
+                                initializerName,
+                                returnType,
+                                0,
+                                std::vector<std::string>{className},
+                                className,
+                                std::string(),
+                                false,
+                                std::vector<std::string>{"this"},
+                                std::vector<bool>{false});
+                            initializerChunk.push_back(std::move(signature));
+                            initializerChunk.insert(
+                                initializerChunk.end(),
+                                field.defaultIR.begin(), field.defaultIR.end());
+                            IRType::IRInstr ret;
+                            ret.op = VMOperator::RETURN;
+                            initializerChunk.push_back(std::move(ret));
+                            bytecodes.push_back(std::move(initializerChunk));
                         }
 
                         // Second pass: first emit function protos for methods so we know protoIds,
@@ -4506,15 +5424,18 @@ namespace IRGen {
                                         cbPtr->isStaticMethod = !classifyAsInstance;
                                         size_t before = bytecodes.size();
 
+                                        std::string aliasToInsert;
+                                        if (classifyAsInstance) {
+                                            aliasToInsert = !usingThisAlias.empty()
+                                                ? usingThisAlias
+                                                : declaredCaptureAlias;
+                                        }
+                                        IRScope::ScopedReceiverContext receiverContext(
+                                            classifyAsInstance ? className : std::string(),
+                                            aliasToInsert);
+
                                         if (classifyAsInstance) {
                                             // Determine alias to inject (implicit or declared)
-                                            std::string aliasToInsert;
-                                            if (!usingThisAlias.empty()) {
-                                                aliasToInsert = usingThisAlias;
-                                            } else {
-                                                aliasToInsert = declaredCaptureAlias;
-                                            }
-
                                             if (aliasToInsert.empty()) {
                                                 // Unreachable: classifyAsInstance is only set when
                                                 // the class declares an alias or the method captures
@@ -4646,7 +5567,7 @@ namespace IRGen {
                                 const auto& field = fieldsMap.at(fieldName);
                                 out.push_back(IRUtils::makePushString(fieldName));
 
-                                if (!field.defaultIR.empty()) {
+                                if (!field.defaultIR.empty() && field.initializerName.empty()) {
                                     out.insert(out.end(), field.defaultIR.begin(), field.defaultIR.end());
                                 } else {
                                     IRType::IRInstr pushnil;
@@ -4672,23 +5593,57 @@ namespace IRGen {
 
                         std::vector<std::string> fieldNames;
                         std::vector<std::string> fieldTypes;
+                        std::vector<bool> fieldTypeExplicit;
                         std::vector<bool> fieldConstness;
                         std::vector<IRType::ClassFieldDefault> fieldDefaults;
+                        std::vector<std::string> fieldInitializerNames;
                         fieldNames.reserve(fieldOrder.size());
                         fieldTypes.reserve(fieldOrder.size());
+                        fieldTypeExplicit.reserve(fieldOrder.size());
                         fieldConstness.reserve(fieldOrder.size());
                         fieldDefaults.reserve(fieldOrder.size());
+                        fieldInitializerNames.reserve(fieldOrder.size());
                         for (const auto& fieldName : fieldOrder) {
                             fieldNames.push_back(fieldName);
                             const auto& field = fieldsMap.at(fieldName);
-                            fieldTypes.push_back(field.typeName);
+                            fieldTypes.push_back(
+                                field.typeName.empty() && !field.initializerName.empty()
+                                    ? std::string("any")
+                                    : field.typeName);
+                            fieldTypeExplicit.push_back(field.typeExplicit);
                             fieldConstness.push_back(field.isConst);
+                            fieldInitializerNames.push_back(field.initializerName);
 
                             IRType::ClassFieldDefault defaultValue;
-                            if (!field.defaultIR.empty()) {
+                            if (!field.initializerName.empty()) {
+                                defaultValue.kind = IRType::ClassFieldDefaultKind::Unsupported;
+                            } else if (!field.defaultIR.empty()) {
                                 const auto& defaultTokens = field.defaultTokens;
-                                bool classifiedSignedInteger = false;
+                                const auto isDefaultOperator = [&](
+                                    size_t index,
+                                    const std::string& symbol
+                                ) {
+                                    return index < defaultTokens.size() &&
+                                        std::holds_alternative<LexerType::Operator>(
+                                            defaultTokens[index]) &&
+                                        std::get<LexerType::Operator>(
+                                            defaultTokens[index]).symbol == symbol;
+                                };
+                                bool classifiedDefault = false;
                                 if (defaultTokens.size() == 2 &&
+                                    isDefaultOperator(0, "[") &&
+                                    isDefaultOperator(1, "]")) {
+                                    defaultValue.kind = IRType::ClassFieldDefaultKind::EmptyArray;
+                                    classifiedDefault = true;
+                                } else if (defaultTokens.size() == 2 &&
+                                    isDefaultOperator(0, "{") &&
+                                    isDefaultOperator(1, "}")) {
+                                    defaultValue.kind = IRType::ClassFieldDefaultKind::EmptyDict;
+                                    classifiedDefault = true;
+                                }
+
+                                bool classifiedSignedInteger = false;
+                                if (!classifiedDefault && defaultTokens.size() == 2 &&
                                     std::holds_alternative<LexerType::Operator>(defaultTokens[0]) &&
                                     (std::get<LexerType::Operator>(defaultTokens[0]).symbol == "+" ||
                                      std::get<LexerType::Operator>(defaultTokens[0]).symbol == "-") &&
@@ -4711,11 +5666,12 @@ namespace IRGen {
                                             IRType::ClassFieldDefaultKind::Unsupported;
                                     }
                                     classifiedSignedInteger = true;
+                                    classifiedDefault = true;
                                 }
 
-                                if (classifiedSignedInteger) {
-                                    // Unary signed integer defaults are constants even when
-                                    // the expression IR is not a single PUSH instruction.
+                                if (classifiedDefault || classifiedSignedInteger) {
+                                    // Literal container and signed integer defaults are
+                                    // classified from source tokens, independent of IR shape.
                                 } else if (field.defaultIR.size() == 1 &&
                                     (field.defaultIR.front().op == VMOperator::LIST_BUILD ||
                                      field.defaultIR.front().op == VMOperator::DICT_BUILD) &&
@@ -4787,7 +5743,10 @@ namespace IRGen {
                             std::move(fieldNames),
                             std::move(fieldTypes),
                             std::move(fieldConstness),
-                            std::move(fieldDefaults)
+                            std::move(fieldDefaults),
+                            codeBlock.typeParameters,
+                            std::move(fieldTypeExplicit),
+                            std::move(fieldInitializerNames)
                         );
 
                         out.push_back(mk);
@@ -5232,6 +6191,18 @@ namespace IRGen {
                         return;
                     }
 
+                    case CodeBlockType::USING_LLVM: {
+                        IRScope::LLVMModeGuard llvmMode;
+                        for (const auto& node : codeBlock.nodes) {
+                            if (std::holds_alternative<TreeParser::Node>(node)) {
+                                parseNodeToBytecodes(std::get<TreeParser::Node>(node));
+                            } else if (std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(node)) {
+                                parseCodeBlock(*std::get<std::unique_ptr<TreeParser::CodeBlock>>(node));
+                            }
+                        }
+                        return;
+                    }
+
                     case CodeBlockType::USING: {
                         // ===== using original { } 作用域块处理 =====
                         // 语义：
@@ -5425,10 +6396,14 @@ namespace IRGen {
                     ZEUS_DEBUG_PRINT("[IRGen    ] Function '%s' pre-resolving %zu captures (funcStack depth=%zu)",
                                     codeBlock.funcName.c_str(), explicitCaptureNames.size(), IRScope::funcStack.size());
                     for (const auto &capName : explicitCaptureNames) {
-                        auto resolved = IRScope::resolve(capName);
+                        // An explicit capture names the lexical binding even when a
+                        // global with the same name exists. In strict-capture mode,
+                        // resolve() intentionally skips outer functions and would
+                        // otherwise bind names such as `values` to a builtin global.
+                        auto resolved = IRScope::forceCapture(capName);
                         if (resolved.kind == IRScope::Kind::UNDEFINED) {
-                            ZEUS_DEBUG_PRINT("[IRGen    ]   '%s' not found by resolve, trying forceCapture...", capName.c_str());
-                            resolved = IRScope::forceCapture(capName);
+                            ZEUS_DEBUG_PRINT("[IRGen    ]   '%s' has no outer binding, resolving as global", capName.c_str());
+                            resolved = IRScope::resolve(capName);
                         }
                         ZEUS_DEBUG_PRINT("[IRGen    ]   '%s' -> kind=%d index=%d",
                                         capName.c_str(), (int)resolved.kind, resolved.index);
@@ -5530,6 +6505,18 @@ namespace IRGen {
                     inferredReturnType = inferredReturn->second;
                 }
                 funcIR.push_back(makeFunctionSignatureAnnotation(codeBlock, inferredReturnType));
+                if (!codeBlock.typeParameters.empty()) {
+                    IRType::IRInstr typeParameterAnnotation;
+                    typeParameterAnnotation.op = VMOperator::IR_ANNOTATION;
+                    typeParameterAnnotation.line = codeBlock.sourceLine;
+                    typeParameterAnnotation.column = codeBlock.sourceColumn;
+                    typeParameterAnnotation.args.push_back(
+                        std::string("generic_type_parameters"));
+                    for (const auto& typeParameter : codeBlock.typeParameters) {
+                        typeParameterAnnotation.args.push_back(typeParameter);
+                    }
+                    funcIR.push_back(std::move(typeParameterAnnotation));
+                }
 
                 if (strictDecl && funcSink == nullptr && !codeBlock.funcName.empty()) {
                     for (auto & fp : collected) {
@@ -5731,9 +6718,15 @@ namespace IRGen {
                 if (codeBlock.nodes.size() >= 2) {
                     const auto& lastNode = codeBlock.nodes.back();
                     if (std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(lastNode)) {
-                        // 最后一个节点是 CodeBlock，这是 else 块
-                        hasElse = true;
-                        thenCount = codeBlock.nodes.size() - 1;
+                        const auto* lastBlock =
+                            std::get<std::unique_ptr<TreeParser::CodeBlock>>(lastNode).get();
+                        // Nested if/loop blocks are ordinary then-statements.
+                        // Only the parser's explicit else marker makes the final
+                        // child an else branch.
+                        if (lastBlock != nullptr && lastBlock->isElseBranch) {
+                            hasElse = true;
+                            thenCount = codeBlock.nodes.size() - 1;
+                        }
                     }
                 }
                 

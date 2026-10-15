@@ -1,0 +1,47 @@
+func require(condition: bool, message: string) {
+    if (!condition) throw new Exception(message);
+}
+
+let values = new Dict();
+require(!values.hasKey("missing"), "empty dict lookup");
+values.set("alpha", 1);
+values.set(2, "numeric key");
+values.set("alpha", 3);
+require(values.hasKey("alpha"), "string key lookup");
+require(values.hasKey(2), "normalized integer key lookup");
+require(values.hasKey("2"), "normalized string-equivalent key lookup");
+require(!values.hasKey(9), "missing key lookup");
+require(values.get("alpha") == 3, "Dict.get returns stored value");
+require(values.get(2) == "numeric key", "Dict.get normalizes keys");
+require(values["alpha"] == 3, "Dict operator lookup returns stored value");
+values["operator"] = 4;
+require(values.get("operator") == 4, "Dict operator inserts value");
+values["operator"] = 5;
+require(values.get("operator") == 5, "Dict operator replaces value");
+let nested = [7, 8];
+values.set("nested", nested);
+let nestedRead = values.get("nested");
+require(nestedRead[1] == 8, "Dict.get returns nested container");
+let missingGetThrows = false;
+try {
+    let missing = values.get("missing");
+} catch (&error) {
+    missingGetThrows = true;
+}
+require(missingGetThrows, "Dict.get preserves missing-key error");
+let missingOperatorThrows = false;
+try {
+    let missing = values["missing"];
+} catch (&error) {
+    missingOperatorThrows = true;
+}
+require(missingOperatorThrows, "Dict operator preserves missing-key error");
+values.deleteKey(2);
+require(!values.hasKey("2"), "deleted normalized key lookup");
+let remainingKeys = values.keys();
+require(remainingKeys[0] == "alpha", "delete preserves first key order");
+require(remainingKeys[1] == "operator", "delete preserves second key order");
+require(remainingKeys[2] == "nested", "delete preserves third key order");
+values.clear();
+require(!values.hasKey("alpha"), "lookup after clear");
+print("DICT_HAS_KEY_HASH_PASS");

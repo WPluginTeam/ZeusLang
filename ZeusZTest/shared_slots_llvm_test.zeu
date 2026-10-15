@@ -23,6 +23,13 @@ func main() {
         throw new Exception("shared bool mismatch");
     }
 
+    shared_flag = false;
+    if (!shared_flag) {
+        print("PASS shared bool write");
+    } else {
+        throw new Exception("shared bool write mismatch");
+    }
+
     delete shared_count;
     try {
         print(shared_count);

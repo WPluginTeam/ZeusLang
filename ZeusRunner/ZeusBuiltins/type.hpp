@@ -277,7 +277,7 @@ namespace ZeusBuiltins {
             if (std::holds_alternative<ZeusType::Null>(var)) {
                 typeName = "nil";
             } else if (std::holds_alternative<ZeusType::Array>(var)) {
-                typeName = "array";
+                typeName = "Array";
             } else if (std::holds_alternative<ZeusType::Object>(var)) {
                 typeName = "object";
             } else if (std::holds_alternative<ZeusType::Bytes>(var)) {

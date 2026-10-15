@@ -1,5 +1,5 @@
-import ZeusBuiltins.thread [&];
-import ZeusBuiltins.socket [&];
+import zeus.thread [&];
+import zeus.socket [&];
 
 
 var server = new socket.Socket();

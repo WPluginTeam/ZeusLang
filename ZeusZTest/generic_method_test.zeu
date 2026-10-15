@@ -1,0 +1,94 @@
+class GenericOps {
+    using &this;
+    let factor: int = 2;
+
+    @type(T)
+    func echo(value: T) -> T { return value; }
+
+    @type(T)
+    func forward(value: T) -> T { return this.echo(value); }
+
+    @type(T)
+    func save(address: int, value: T) {
+        @faddr(address) -> T = value;
+    }
+
+    @type(T)
+    func static identity(value: T) -> T { return value; }
+}
+
+impl string {
+    using &this;
+    @type(T)
+    inline func genericEcho(value: T) -> T { return value; }
+}
+
+impl int {
+    using &this;
+    @type(T)
+    inline func genericEcho(value: T) -> T { return value; }
+}
+
+let ops: GenericOps = new GenericOps();
+print(ops.echo(12));
+print(ops.echo("class"));
+print(ops.forward(34));
+print(GenericOps.identity(56));
+print(GenericOps.identity("static"));
+let target = 0;
+ops.save(@addr(target), 78);
+print(target);
+let text = "receiver";
+print(text.genericEcho(90));
+print(text.genericEcho("impl"));
+let number = 1;
+print(number.genericEcho(123));
+
+class MemoryWriter {
+    using &this;
+    var ptr: int = 0;
+    func init(address: int) { this.ptr = address; }
+    @type(T)
+    func save(value: T) { @faddr(this.ptr) -> T = value; }
+    @type(T)
+    func read(exemplar: T) -> T { return @faddr(this.ptr) -> T; }
+}
+let writer: MemoryWriter = new MemoryWriter(@addr(target));
+writer.save(456);
+print(target);
+print(writer.read(0));
+
+impl GenericOps {
+    @type(T)
+    func static implIdentity(value: T) -> T { return value; }
+}
+print(GenericOps.implIdentity(789));
+
+impl bool {
+    using &this;
+    @type(T)
+    func genericEcho(value: T) -> T { return value; }
+}
+impl bytes {
+    using &this;
+    @type(T)
+    func genericEcho(value: T) -> T { return value; }
+}
+impl list {
+    using &this;
+    @type(T)
+    func genericEcho(value: T) -> T { return value; }
+}
+impl dict {
+    using &this;
+    @type(T)
+    func genericEcho(value: T) -> T { return value; }
+}
+let flag = true;
+let raw = b"AB";
+let items = [1, 2];
+let mapping = {"value": 1};
+print(flag.genericEcho(100));
+print(raw.genericEcho(200));
+print(items.genericEcho(300));
+print(mapping.genericEcho(400));

@@ -1,0 +1,76 @@
+import zeus.exception;
+import zeus.list;
+
+let destroyedCount = 0;
+
+class Tracked {
+    using &this;
+    let name = "";
+
+    func init(nameValue) {
+        this.name = nameValue;
+    }
+
+    func operator[~]() {
+        destroyedCount = destroyedCount + 1;
+    }
+}
+
+func check(label, actual, expected) {
+    if (actual != expected) {
+        throw new Exception("Array lifetime check failed: " + label);
+    }
+}
+
+func makeTrackedArray(name: string) -> Array {
+    let values = [];
+    let value = new Tracked(name);
+    values.append(value);
+    return values;
+}
+
+func makeIndexedTrackedArray(name: string) -> Array {
+    let values = [nil];
+    let value = new Tracked(name);
+    values[0] = value;
+    return values;
+}
+
+func replaceAfterRead(values: Array) {
+    let extracted = values[0];
+    values[0] = nil;
+    check("read result keeps the replaced value", destroyedCount, 1);
+}
+
+func popAndRelease(values: Array) {
+    let poppedValue = values.pop();
+    check("pop transfers the value", destroyedCount, 2);
+}
+
+func appendTrackedValue(values: Array, name: string) {
+    let value = new Tracked(name);
+    values.append(value);
+}
+
+let appended = makeTrackedArray("append");
+check("append keeps the value", destroyedCount, 0);
+appended.clear();
+check("clear releases the stored value once", destroyedCount, 1);
+
+let indexed = makeIndexedTrackedArray("index");
+replaceAfterRead(indexed);
+check("replaced value releases after the read result", destroyedCount, 2);
+
+let poppedFrom = makeTrackedArray("pop");
+popAndRelease(poppedFrom);
+check("popped value releases once", destroyedCount, 3);
+
+let aliasSource = makeTrackedArray("alias source");
+let aliasCopy = aliasSource;
+appendTrackedValue(aliasSource, "alias value");
+check("array aliases share values", destroyedCount, 3);
+aliasCopy.clear();
+check("clear releases each aliased element once", destroyedCount, 5);
+check("array aliases share mutations", aliasSource.length(), 0);
+
+print("ARRAY_REFERENCE_LIFETIME_TEST_PASS");

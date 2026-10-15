@@ -1,0 +1,11 @@
+let values = new Dict();
+print(values.length());
+values.set("alpha", 1);
+values.set(2, 2);
+values.set("alpha", 3);
+print(values.length());
+values.deleteKey(2);
+print(values.length());
+values.clear();
+print(values.length());
+print("DICT_LENGTH_FAST_PATH_PASS");

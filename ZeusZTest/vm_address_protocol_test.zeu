@@ -1,0 +1,76 @@
+func vmWriteInt(value: int) -> int {
+    let local: int = value;
+    let address = @addr(local);
+    @faddr(address) -> int = 42;
+    return local;
+}
+
+func vmWriteBool(value: bool) -> bool {
+    let local: bool = value;
+    let address = @addr(local);
+    @faddr(address) -> bool = false;
+    return local;
+}
+
+func vmWriteFloat(value: float) -> float {
+    let local: float = value;
+    let address = @addr(local);
+    @faddr(address) -> float = 3.5;
+    return local;
+}
+
+func vmReadStringLength(value: string) -> int {
+    let dataAddress = @reveal(value);
+    return @faddr(dataAddress - 8, 8) -> int;
+}
+
+func vmReadBytesLength(value: bytes) -> int {
+    let dataAddress = @reveal(value);
+    return @faddr(dataAddress - 8, 8) -> int;
+}
+
+func vmWriteStringByte() -> string {
+    let value: string = "hello";
+    let address = @addr(value);
+    @faddr(address) -> string = "x";
+    return value;
+}
+
+func vmWriteBytesByte() -> bytes {
+    let value = b"abc";
+    let address = @addr(value);
+    @faddr(address) -> bytes = b"x";
+    return value;
+}
+
+let globalValue: int = 8;
+let globalAddress = @addr(globalValue);
+@faddr(globalAddress) -> int = 99;
+
+if (vmWriteInt(7) != 42) {
+    throw new Exception("VM int address write failed");
+}
+if (globalValue != 99) {
+    throw new Exception("VM global address write failed");
+}
+if (vmWriteBool(true) != false) {
+    throw new Exception("VM bool address write failed");
+}
+if (vmWriteFloat(1.25) != 3.5) {
+    throw new Exception("VM float address write failed");
+}
+if (vmReadStringLength("hello") != 5) {
+    throw new Exception("VM reveal string length failed");
+}
+if (vmReadBytesLength(b"abc") != 3) {
+    throw new Exception("VM reveal bytes length failed");
+}
+if (vmWriteStringByte() != "x") {
+    throw new Exception("VM string slot assignment failed");
+}
+let changedBytes = vmWriteBytesByte();
+if (changedBytes[0] != 120) {
+    throw new Exception("VM raw bytes write failed");
+}
+
+print("VM_ADDRESS_PROTOCOL_PASS");

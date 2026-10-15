@@ -1,0 +1,38 @@
+class Child {
+    var value = 0;
+}
+
+class Record {
+    using &this;
+    var value = 0;
+    var child = nil;
+
+    func init() {
+        this.child = new Child();
+    }
+
+    func reset() {
+        @this = new Record();
+    }
+
+    func replaceFrom(other) {
+        @this = other;
+    }
+}
+
+let a: Record = new Record();
+a.value = 37;
+a.child.value = 14;
+let b: Record = a;
+a.reset();
+print(a.value);
+print(b.value);
+print(b.child.value);
+
+let replacement = new Record();
+replacement.value = 91;
+replacement.child.value = 73;
+a.replaceFrom(replacement);
+print(a.value);
+print(b.value);
+print(b.child.value);

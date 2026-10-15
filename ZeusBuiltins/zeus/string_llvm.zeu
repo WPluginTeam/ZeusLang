@@ -1,0 +1,155 @@
+using original;
+
+// Generic value conversion and list-producing split keep the dynamic ABI.
+@native("zeus_string_builtin_str")
+decl func __builtin_str(value);
+
+@native("zeus_string_builtin_type")
+decl func type(value);
+
+@native("zeus_string_builtin_len")
+decl func len(value);
+
+@native("zeus_string_data_address")
+decl func __str_data_address(value: string) -> int;
+
+@native("zeus_native_string_get")
+decl func __str_get(value: string, index: int) -> string;
+
+@native("zeus_native_string_slice")
+decl func __str_slice(value: string, start: int, end: int) -> string;
+
+@native("zeus_native_string_index")
+decl func __str_index(value: string, substring: string) -> int;
+
+@native("zeus_native_string_rindex")
+decl func __str_rindex(value: string, substring: string) -> int;
+
+@native("zeus_native_string_replace")
+decl func __str_replace(value: string, old: string, replacement: string) -> string;
+
+@native("zeus_string_split")
+decl func __str_split(value, separator);
+
+@native("zeus_native_string_startswith")
+decl func __str_startswith(value: string, prefix: string) -> bool;
+
+@native("zeus_native_string_endswith")
+decl func __str_endswith(value: string, suffix: string) -> bool;
+
+@native("zeus_native_string_lower")
+decl func __str_lower(value: string) -> string;
+
+@native("zeus_native_string_upper")
+decl func __str_upper(value: string) -> string;
+
+@native("zeus_native_string_count")
+decl func __str_count(value: string, substring: string) -> int;
+
+// String literals and all methods use the native `string` representation.
+impl string {
+    using &this;
+
+    // new string(value) is a value factory; it does not allocate a class object.
+    func operator[new](value = "") -> string {
+        if (type(value) == "string") {
+            return value;
+        }
+        return __builtin_str(value);
+    }
+
+    func length() -> int {
+        using LLVM {
+            let dataAddress = @reveal(this);
+            return @faddr(dataAddress - 8, 8) -> int;
+        }
+    }
+
+    func dataAddress() -> int {
+        using LLVM {
+            return __str_data_address(this);
+        }
+    }
+
+    func toString() -> string {
+        return this;
+    }
+
+    func nativeString() -> string {
+        return this;
+    }
+
+    func isEmpty() -> bool {
+        using LLVM {
+            let dataAddress = @reveal(this);
+            return (@faddr(dataAddress - 8, 8) -> int) == 0;
+        }
+    }
+
+    func clone() -> string {
+        return this;
+    }
+
+    func get(index: int) -> string {
+        return __str_get(this, index);
+    }
+
+    func slice(start: int, end: int) -> string {
+        return __str_slice(this, start, end);
+    }
+
+    func index(substring: string) -> int {
+        return __str_index(this, substring);
+    }
+
+    func rindex(substring: string) -> int {
+        return __str_rindex(this, substring);
+    }
+
+    func replace(old: string, replacement: string) -> string {
+        return __str_replace(this, old, replacement);
+    }
+
+    func split(separator: string) {
+        return __str_split(this, separator);
+    }
+
+    func startswith(prefix: string) -> bool {
+        return __str_startswith(this, prefix);
+    }
+
+    func endswith(suffix: string) -> bool {
+        return __str_endswith(this, suffix);
+    }
+
+    func lower() -> string {
+        return __str_lower(this);
+    }
+
+    func upper() -> string {
+        return __str_upper(this);
+    }
+
+    func count(substring: string) -> int {
+        return __str_count(this, substring);
+    }
+}
+
+func str(obj) -> string {
+    if (type(obj) == "string") {
+        return obj;
+    }
+
+    // Class instances have their class name as type(obj), not "object".
+    // Try the user-visible conversion protocol for every non-string value;
+    // primitives without toString() keep the native conversion below.
+    try {
+        let converted = obj.toString();
+        if (type(converted) == "string") {
+            return converted;
+        }
+        return __builtin_str(converted);
+    } catch (e) {
+        return __builtin_str(obj);
+    }
+}

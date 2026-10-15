@@ -1,0 +1,25 @@
+import zeus.websocket;
+
+func staticSum() -> int {
+    let total = 0;
+    for (0..4) [const &i] {
+        total = total + i;
+    }
+    return total;
+}
+
+func main() {
+    if (__ws_parse_port("29904") == 29904) {
+        print("PASS actual WebSocket port parser");
+    } else {
+        print("FAIL actual WebSocket port parser");
+    }
+
+    if (staticSum() == 6) {
+        print("PASS static integer loop");
+    } else {
+        print("FAIL static integer loop");
+    }
+}
+
+main();

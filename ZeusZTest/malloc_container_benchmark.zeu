@@ -1,0 +1,199 @@
+import zeus.mem;
+import zeus.dict;
+
+func makeBuiltinArray(size: int) -> Array {
+    let values = [];
+    var index = 0;
+    for (true) {
+        if (index >= size) break;
+        values.append(index + 1);
+        index = index + 1;
+    }
+    return values;
+}
+
+@no_safepoint
+func resetRawArray(address: int, size: int) {
+    var index = 0;
+    for (true) {
+        if (index >= size) break;
+        @faddr(address + index * 8) -> int = index + 1;
+        index = index + 1;
+    }
+}
+
+func readBuiltinArray(values: Array, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + values[index];
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+@no_safepoint
+func readRawArray(address: int, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    let elementAddress = address + index * 8;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + @faddr(elementAddress) -> int;
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func updateBuiltinDict(count: int, iterations: int, round: int) -> int {
+    let values = new Dict();
+    var key = 1;
+    for (true) {
+        if (key > count) break;
+        values.set(key * 4, key * 2);
+        key = key + 1;
+    }
+    let started = __time_perf_counter_ns();
+    var cursor = 0;
+    var logicalKey = 1;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        let key = logicalKey * 4;
+        let current = values.get(key);
+        values.set(key, current + 1);
+        checksum = checksum + current;
+        logicalKey = logicalKey + 1;
+        if (logicalKey > count) logicalKey = 1;
+        cursor = cursor + 1;
+    }
+    let elapsed = __time_perf_counter_ns() - started;
+    print("DICT_BUILTIN_INT_KEY_UPDATE_NS", round, elapsed, checksum);
+    return checksum;
+}
+
+@no_safepoint
+func findRawDictSlot(address: int, capacity: int, key: int) -> int {
+    var slot = key;
+    var probes = 0;
+    for (true) {
+        if (slot < capacity) break;
+        slot = slot - capacity;
+    }
+    for (true) {
+        let keyAddress = address + slot * 16;
+        let currentKey = @faddr(keyAddress) -> int;
+        if (currentKey == 0 or currentKey == key) return slot;
+        slot = slot + 1;
+        if (slot >= capacity) slot = 0;
+        probes = probes + 1;
+        if (probes >= capacity) return -1;
+    }
+    return -1;
+}
+
+@no_safepoint
+func resetRawDict(address: int, capacity: int, count: int) {
+    var slot = 0;
+    for (true) {
+        if (slot >= capacity) break;
+        let keyAddress = address + slot * 16;
+        @faddr(keyAddress) -> int = 0;
+        @faddr(keyAddress + 8) -> int = 0;
+        slot = slot + 1;
+    }
+
+    var key = 1;
+    for (true) {
+        if (key > count) break;
+        let tableKey = key * 4;
+        let targetSlot = findRawDictSlot(address, capacity, tableKey);
+        let keyAddress = address + targetSlot * 16;
+        @faddr(keyAddress) -> int = tableKey;
+        @faddr(keyAddress + 8) -> int = key * 2;
+        key = key + 1;
+    }
+}
+
+@no_safepoint
+func updateRawDict(address: int, capacity: int, count: int, iterations: int) -> int {
+    var cursor = 0;
+    var logicalKey = 1;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        let key = logicalKey * 4;
+        let slot = findRawDictSlot(address, capacity, key);
+        if (slot < 0) return -1;
+        let valueAddress = address + slot * 16 + 8;
+        let current = @faddr(valueAddress) -> int;
+        @faddr(valueAddress) -> int = current + 1;
+        checksum = checksum + current;
+        logicalKey = logicalKey + 1;
+        if (logicalKey > count) logicalKey = 1;
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+let arraySize = 256;
+let selectedIndex = 127;
+let arrayIterations = 500000;
+let dictCount = 256;
+let dictCapacity = 512;
+let dictIterations = 200000;
+let roundCount = 5;
+
+let builtinArray = makeBuiltinArray(arraySize);
+let rawArrayAddress = malloc(arraySize * 8);
+resetRawArray(rawArrayAddress, arraySize);
+
+let rawDictAddress = malloc(dictCapacity * 16);
+if (rawArrayAddress == 0 or rawDictAddress == 0) {
+    throw "malloc container benchmark allocation failed";
+}
+resetRawDict(rawDictAddress, dictCapacity, dictCount);
+
+if (readBuiltinArray(builtinArray, selectedIndex, 1000) !=
+    readRawArray(rawArrayAddress, selectedIndex, 1000)) {
+    throw "Array benchmark warmup checksum mismatch";
+}
+if (updateBuiltinDict(dictCount, 1000, -1) !=
+    updateRawDict(rawDictAddress, dictCapacity, dictCount, 1000)) {
+    throw "Dict benchmark warmup checksum mismatch";
+}
+
+var round = 0;
+for (true) {
+    if (round == roundCount) break;
+
+    let arrayBuiltinStart = __time_perf_counter_ns();
+    let arrayBuiltinChecksum = readBuiltinArray(builtinArray, selectedIndex, arrayIterations);
+    let arrayBuiltinElapsed = __time_perf_counter_ns() - arrayBuiltinStart;
+
+    let arrayRawStart = __time_perf_counter_ns();
+    let arrayRawChecksum = readRawArray(rawArrayAddress, selectedIndex, arrayIterations);
+    let arrayRawElapsed = __time_perf_counter_ns() - arrayRawStart;
+
+    if (arrayBuiltinChecksum != arrayRawChecksum) {
+        throw "Array benchmark checksum mismatch";
+    }
+    print("ARRAY_BUILTIN_READ_NS", round, arrayBuiltinElapsed, arrayBuiltinChecksum);
+    print("ARRAY_MALLOC_READ_NS", round, arrayRawElapsed, arrayRawChecksum);
+
+    let dictBuiltinChecksum = updateBuiltinDict(dictCount, dictIterations, round);
+    resetRawDict(rawDictAddress, dictCapacity, dictCount);
+    let dictRawStart = __time_perf_counter_ns();
+    let dictRawChecksum = updateRawDict(rawDictAddress, dictCapacity, dictCount, dictIterations);
+    let dictRawElapsed = __time_perf_counter_ns() - dictRawStart;
+
+    if (dictBuiltinChecksum != dictRawChecksum) {
+        throw "Dict benchmark checksum mismatch";
+    }
+    print("DICT_MALLOC_INT_KEY_UPDATE_NS", round, dictRawElapsed, dictRawChecksum);
+    round = round + 1;
+}
+
+free(rawArrayAddress);
+free(rawDictAddress);

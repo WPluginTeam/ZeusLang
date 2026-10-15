@@ -4,9 +4,11 @@
 #include <limits>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "../ZeusBuiltins/NativeTypeABI.hpp"
 #include "IRType.hpp"
 
 namespace IRStaticOperator {
@@ -17,6 +19,8 @@ namespace IRStaticOperator {
         std::string ownerType;
         std::string operatorSymbol;
         std::vector<std::string> parameterTypes;
+        std::vector<std::string> parameterNames;
+        std::vector<bool> parameterIsReference;
         bool isStaticMethod = false;
     };
 
@@ -57,6 +61,9 @@ namespace IRStaticOperator {
     class Resolver {
         std::unordered_map<std::string, FunctionSignature> functions;
         std::unordered_map<std::string, ClassLayout> classLayouts;
+        std::unordered_map<int, std::string> globalBindingTypes;
+        std::unordered_map<std::string, std::string> sharedBindingTypes;
+        std::unordered_set<std::string> ambiguousSharedBindingTypes;
 
         static bool isLocalLoad(const IRType::IRInstr& ins, int& index) {
             if (ins.op != VMOperator::LOAD_VALUE || ins.args.size() < 2 ||
@@ -164,10 +171,12 @@ namespace IRStaticOperator {
         const FunctionSignature* findIndexOperator(
             const std::string& containerType,
             const std::vector<std::string>& argumentTypes,
-            const std::string& op
+            const std::string& op,
+            bool allowUniqueUnknownArguments = false
         ) const {
             if (containerType.empty() || argumentTypes.empty()) return nullptr;
 
+            const FunctionSignature* match = nullptr;
             for (const auto& entry : functions) {
                 const auto& signature = entry.second;
                 if (signature.ownerType != containerType ||
@@ -179,15 +188,20 @@ namespace IRStaticOperator {
 
                 bool matches = true;
                 for (size_t i = 0; i < argumentTypes.size(); ++i) {
-                    if (argumentTypes[i].empty() ||
-                        signature.parameterTypes[i + 1] != argumentTypes[i]) {
+                    if (argumentTypes[i].empty()) {
+                        if (!allowUniqueUnknownArguments) matches = false;
+                        continue;
+                    }
+                    if (signature.parameterTypes[i + 1] != argumentTypes[i]) {
                         matches = false;
                         break;
                     }
                 }
-                if (matches) return &signature;
+                if (!matches) continue;
+                if (match != nullptr) return nullptr;
+                match = &signature;
             }
-            return nullptr;
+            return match;
         }
 
         const FunctionSignature* findClassMethod(
@@ -240,9 +254,19 @@ namespace IRStaticOperator {
         ) {
             functions.clear();
             classLayouts.clear();
+            globalBindingTypes.clear();
 
             for (const auto& chunk : program) {
                 for (const auto& ins : chunk) {
+                    if (ins.op == VMOperator::STORE_VALUE_GLOBAL &&
+                        ins.metadata.kind == IRType::IRMetadataKind::GlobalBindingType &&
+                        !ins.metadata.typeName.empty()) {
+                        int globalIndex = -1;
+                        if (readGlobalStoreIndex(ins, globalIndex)) {
+                            globalBindingTypes[globalIndex] = ins.metadata.typeName;
+                        }
+                    }
+
                     if (ins.metadata.kind == IRType::IRMetadataKind::ClassLayout) {
                         std::string className;
                         ClassLayout layout;
@@ -268,12 +292,54 @@ namespace IRStaticOperator {
                             captures,
                             signature.parameterTypes,
                             &signature.ownerType,
-                            &signature.operatorSymbol)) {
+                            &signature.operatorSymbol,
+                            nullptr,
+                            &signature.parameterNames,
+                            &signature.parameterIsReference)) {
                         continue;
                     }
                     signature.isStaticMethod = ins.metadata.isStaticMethod;
 
                     functions[signature.name] = std::move(signature);
+                }
+            }
+        }
+
+        void collectSharedBindingTypes(
+            const std::vector<std::vector<IRType::IRInstr>>& program
+        ) {
+            sharedBindingTypes.clear();
+            ambiguousSharedBindingTypes.clear();
+
+            for (const auto& chunk : program) {
+                for (const auto& ins : chunk) {
+                    if (ins.op != VMOperator::STORE_VALUE_SHARED ||
+                        ins.args.empty() ||
+                        !std::holds_alternative<std::string>(ins.args[0])) {
+                        continue;
+                    }
+
+                    const std::string& name = std::get<std::string>(ins.args[0]);
+                    if (name.empty() || ins.metadata.kind !=
+                            IRType::IRMetadataKind::SharedBindingType ||
+                        ins.metadata.typeName.empty()) {
+                        ambiguousSharedBindingTypes.insert(name);
+                        sharedBindingTypes.erase(name);
+                        continue;
+                    }
+
+                    if (ambiguousSharedBindingTypes.find(name) !=
+                        ambiguousSharedBindingTypes.end()) {
+                        continue;
+                    }
+
+                    auto existing = sharedBindingTypes.find(name);
+                    if (existing == sharedBindingTypes.end()) {
+                        sharedBindingTypes.emplace(name, ins.metadata.typeName);
+                    } else if (existing->second != ins.metadata.typeName) {
+                        sharedBindingTypes.erase(existing);
+                        ambiguousSharedBindingTypes.insert(name);
+                    }
                 }
             }
         }
@@ -306,7 +372,8 @@ namespace IRStaticOperator {
                         signature.name,
                         signature.returnType,
                         captures,
-                        signature.parameterTypes)) {
+                        signature.parameterTypes,
+                        &signature.ownerType, &signature.operatorSymbol)) {
                     return;
                 }
             }
@@ -317,13 +384,50 @@ namespace IRStaticOperator {
                     locals[static_cast<int>(i)] = signature.parameterTypes[i];
                 }
             }
+            std::unordered_map<int, std::string> declaredLocalTypes;
+            for (const auto& ins : chunk) {
+                if (ins.op != VMOperator::STORE_VALUE_LOCAL ||
+                    ins.metadata.kind != IRType::IRMetadataKind::LocalBindingType ||
+                    ins.metadata.typeName.empty() || ins.args.empty() ||
+                    !std::holds_alternative<LexerType::Value>(ins.args[0])) {
+                    continue;
+                }
+                const auto& indexValue = std::get<LexerType::Value>(ins.args[0]);
+                if (!std::holds_alternative<ZeusType::BigInteger>(indexValue.data)) {
+                    continue;
+                }
+                int64_t raw = -1;
+                if (std::get<ZeusType::BigInteger>(indexValue.data).tryToInt64(raw) &&
+                    raw >= 0 && raw <= std::numeric_limits<int>::max()) {
+                    const int index = static_cast<int>(raw);
+                    declaredLocalTypes[index] = ins.metadata.typeName;
+                    locals[index] = ins.metadata.typeName;
+                }
+            }
+            // Globals assigned inside a function need a local type flow too:
+            // the module-level map cannot safely be updated from one function,
+            // but subsequent reads in that same function must see the value
+            // just stored there.
+            std::unordered_map<int, std::string> functionGlobalTypes;
 
-            std::vector<std::string> stack;
+            struct FlowType : std::string {
+                bool borrowed = true;
+                std::string nativeFunctionName;
+                FlowType() = default;
+                FlowType(const std::string& type, bool borrow = true)
+                    : std::string(type), borrowed(borrow) {}
+                FlowType(const std::string& type, bool borrow,
+                         std::string nativeName)
+                    : std::string(type), borrowed(borrow),
+                      nativeFunctionName(std::move(nativeName)) {}
+                FlowType(const char* type) : std::string(type) {}
+            };
+            std::vector<FlowType> stack;
             std::string pendingDirectCall;
 
             auto popType = [&]() {
-                if (stack.empty()) return std::string();
-                std::string result = stack.back();
+                if (stack.empty()) return FlowType();
+                FlowType result = stack.back();
                 stack.pop_back();
                 return result;
             };
@@ -354,11 +458,112 @@ namespace IRStaticOperator {
                 return true;
             };
 
-            for (auto& ins : chunk) {
+            auto valueResultType = [](const std::string& returnType) {
+                return !returnType.empty() && returnType.front() == '&'
+                    ? returnType.substr(1) : returnType;
+            };
+
+            auto annotateCopy = [&](IRType::IRInstr& store, const FlowType& value) {
+                store.metadata.classAssignmentCopy = false;
+                store.metadata.classCopyType.clear();
+                store.metadata.classCopyHook.clear();
+                if (!value.borrowed || (!value.empty() && value.front() == '&') ||
+                    (!store.metadata.typeName.empty() && store.metadata.typeName.front() == '&')) return;
+                store.metadata.classAssignmentCopy = true;
+                store.metadata.classCopyType = value;
+                for (const auto& function : functions) {
+                    const auto& candidate = function.second;
+                    if (candidate.ownerType == value && candidate.operatorSymbol == "@=" &&
+                        !candidate.isStaticMethod && candidate.parameterTypes.size() == 1) {
+                        store.metadata.classCopyHook = candidate.name;
+                        break;
+                    }
+                }
+            };
+
+            for (size_t instructionIndex = 0;
+                 instructionIndex < chunk.size(); ++instructionIndex) {
+                auto& ins = chunk[instructionIndex];
+
+                // Branch instructions consume their condition at runtime.
+                // Keep the abstract operand stack aligned when scanning a
+                // function linearly; stale condition types otherwise shift
+                // every later LOAD_VALUE type after an if/loop.
+                if (ins.op == VMOperator::JUMP_IF_TRUE ||
+                    ins.op == VMOperator::JUMP_IF_FALSE) {
+                    popType();
+                    stack.clear();
+                    pendingDirectCall.clear();
+                    continue;
+                }
+                if (ins.op == VMOperator::JUMP ||
+                    ins.op == VMOperator::LOOP_BREAK) {
+                    stack.clear();
+                    pendingDirectCall.clear();
+                    continue;
+                }
+
+                // A value-type operator[[]=] returns the replacement value.
+                // The assignment generator already emitted POP for the old
+                // in-place container path; turn that POP into the base-slot
+                // assignment only after the resolver proves this is a
+                // same-type, non-class value setter.
+                if (ins.op == VMOperator::POP && instructionIndex > 0) {
+                    const auto& store = chunk[instructionIndex - 1];
+                    if (store.op == VMOperator::DICT_STORE_VALUE &&
+                        store.metadata.isSubscriptValueWriteback) {
+                        const auto& target = store.metadata.subscriptWritebackTarget;
+                        ins.line = store.line;
+                        ins.args.clear();
+                        switch (target.kind) {
+                            case IRType::SymbolRefKind::Local:
+                                ins.op = VMOperator::ASSIGN_VALUE_LOCAL;
+                                ins.args.push_back(LexerType::Value(target.index));
+                                break;
+                            case IRType::SymbolRefKind::Global:
+                                ins.op = VMOperator::ASSIGN_VALUE_GLOBAL;
+                                ins.args.push_back(LexerType::Value(target.index));
+                                break;
+                            case IRType::SymbolRefKind::Upvalue:
+                                ins.op = VMOperator::ASSIGN_VALUE_UPVALUE;
+                                ins.args.push_back(LexerType::Value(target.index));
+                                break;
+                            case IRType::SymbolRefKind::Shared:
+                                ins.op = VMOperator::ASSIGN_VALUE_SHARED;
+                                ins.args.push_back(target.name);
+                                break;
+                            default:
+                                break;
+                        }
+                    }
+                }
+
                 if (ins.op == VMOperator::IR_ANNOTATION) {
                     if (ins.metadata.kind == IRType::IRMetadataKind::DirectCall ||
                         ins.metadata.kind == IRType::IRMetadataKind::CallTarget) {
                         ins.metadata.readDirectCall(pendingDirectCall);
+                    }
+                    continue;
+                }
+
+                if (ins.op == VMOperator::HOTSPOT && ins.args.size() >= 4) {
+                    int64_t hotspotId = -1;
+                    int64_t globalIndex = -1;
+                    if (readOperandCount(ins, 0, hotspotId) && hotspotId == 0 &&
+                        readOperandCount(ins, 2, globalIndex) &&
+                        globalIndex <= std::numeric_limits<int>::max()) {
+                        std::string valueType;
+                        if (std::holds_alternative<LexerType::Value>(ins.args[1])) {
+                            valueType = literalType(
+                                std::get<LexerType::Value>(ins.args[1]));
+                        } else if (std::holds_alternative<ZeusType::Bytes>(ins.args[1])) {
+                            valueType = "bytes";
+                        }
+                        if (!valueType.empty()) {
+                            auto& types = isFunctionChunk
+                                ? functionGlobalTypes : globalTypes;
+                            types[static_cast<int>(globalIndex)] = valueType;
+                        }
                     }
                     continue;
                 }
@@ -381,6 +586,73 @@ namespace IRStaticOperator {
                     continue;
                 }
 
+                if (ins.op == VMOperator::LOAD_NATIVE) {
+                    stack.push_back(ins.metadata.kind ==
+                            IRType::IRMetadataKind::NativeFunction
+                        ? FlowType(std::string(), true, ins.metadata.nativeSymbol)
+                        : FlowType());
+                    continue;
+                }
+
+                if (ins.op == VMOperator::LOAD_VALUE &&
+                    ins.metadata.symbol.kind == IRType::SymbolRefKind::Class) {
+                    stack.push_back("class:" + ins.metadata.symbol.name);
+                    continue;
+                }
+
+                if (ins.op == VMOperator::LIST_BUILD || ins.op == VMOperator::DICT_BUILD) {
+                    int64_t count = 0;
+                    if (!readOperandCount(ins, 0, count) ||
+                        (ins.op == VMOperator::DICT_BUILD &&
+                         count > std::numeric_limits<int64_t>::max() / 2) ||
+                        !popValues(count * (ins.op == VMOperator::DICT_BUILD ? 2 : 1))) {
+                        stack.clear();
+                        continue;
+                    }
+                    stack.push_back(ins.op == VMOperator::DICT_BUILD ? "dict" : "Array");
+                    continue;
+                }
+
+                if (ins.op == VMOperator::LIST_LENGTH || ins.op == VMOperator::DICT_KEYS_BUILD) {
+                    popType();
+                    stack.push_back(ins.op == VMOperator::LIST_LENGTH ? "int" : "Array");
+                    continue;
+                }
+
+                if (ins.op == VMOperator::LLVM_ADDR) {
+                    stack.push_back("int");
+                    continue;
+                }
+                if (ins.op == VMOperator::LLVM_SIZEOF) {
+                    stack.push_back("int");
+                    continue;
+                }
+                if (ins.op == VMOperator::LLVM_FADDR) {
+                    if (ins.args.size() > 1 &&
+                        std::holds_alternative<std::string>(ins.args[1]) &&
+                        (std::get<std::string>(ins.args[1]) == "length" ||
+                         std::get<std::string>(ins.args[1]) == "raw_range")) {
+                        popType();
+                    }
+                    popType();
+                    stack.push_back(!ins.args.empty() &&
+                        std::holds_alternative<std::string>(ins.args[0])
+                        ? std::get<std::string>(ins.args[0]) : std::string());
+                    continue;
+                }
+                if (ins.op == VMOperator::LLVM_FSTORE) {
+                    const auto value = popType();
+                    annotateCopy(ins, value);
+                    if (ins.args.size() > 1 &&
+                        std::holds_alternative<std::string>(ins.args[1]) &&
+                        (std::get<std::string>(ins.args[1]) == "length" ||
+                         std::get<std::string>(ins.args[1]) == "raw_range")) {
+                        popType();
+                    }
+                    popType();
+                    continue;
+                }
+
                 if (ins.op == VMOperator::OBJ_BUILD ||
                     ins.op == VMOperator::OBJ_BUILD_SHARED ||
                     ins.op == VMOperator::NEW_OBJ) {
@@ -390,6 +662,15 @@ namespace IRStaticOperator {
                         continue;
                     }
                     std::string classType = popType();
+                    std::string genericClassName;
+                    std::vector<std::string> genericTypeArguments;
+                    std::string specializedClassName;
+                    if (ins.metadata.readClassInstantiation(
+                            genericClassName, genericTypeArguments,
+                            &specializedClassName) &&
+                        !specializedClassName.empty()) {
+                        classType = specializedClassName;
+                    }
                     if (ins.args.size() > 1 &&
                         std::holds_alternative<std::string>(ins.args[1])) {
                         const std::string& explicitType = std::get<std::string>(ins.args[1]);
@@ -401,8 +682,8 @@ namespace IRStaticOperator {
                     if (classType.rfind(classPrefix, 0) == 0) {
                         classType.erase(0, classPrefix.size());
                     }
-                    stack.push_back(classLayouts.find(classType) == classLayouts.end()
-                        ? std::string() : classType);
+                    stack.push_back(FlowType(classLayouts.find(classType) == classLayouts.end()
+                        ? std::string() : classType, false));
                     continue;
                 }
 
@@ -414,7 +695,14 @@ namespace IRStaticOperator {
                         stack.clear();
                         continue;
                     }
-                    if (!popValues(argumentCount)) continue;
+                    if (stack.size() < static_cast<size_t>(argumentCount + 1)) {
+                        stack.clear();
+                        continue;
+                    }
+                    std::vector<std::string> argumentTypes(static_cast<size_t>(argumentCount));
+                    for (int64_t i = argumentCount - 1; i >= 0; --i) {
+                        argumentTypes[static_cast<size_t>(i)] = popType();
+                    }
                     const std::string receiverType = popType();
                     const std::string classPrefix = "class:";
                     const bool staticMethod = receiverType.rfind(classPrefix, 0) == 0;
@@ -426,8 +714,58 @@ namespace IRStaticOperator {
                         static_cast<size_t>(argumentCount),
                         staticMethod
                     );
-                    stack.push_back(method == nullptr
-                        ? std::string() : method->returnType);
+                    std::string existingTarget;
+                    if (ins.metadata.readDirectCall(existingTarget)) {
+                        const auto existing = functions.find(existingTarget);
+                        if (existing != functions.end() &&
+                            existing->second.ownerType == ownerType &&
+                            existing->second.isStaticMethod == staticMethod) {
+                            method = &existing->second;
+                        }
+                    }
+                    if (method != nullptr) {
+                        // Preserve the fact that this call has a statically
+                        // resolved receiver for later backend analyses. The VM
+                        // ignores this metadata; LLVM still performs its usual
+                        // lowering from the runtime NativeValue.
+                        const auto argumentSources = ins.metadata.callArguments;
+                        const auto explicitTypeArguments =
+                            ins.metadata.explicitTypeArguments;
+                        const bool genericVmDispatch =
+                            ins.metadata.tag == "generic_vm_specialization";
+                        ins.metadata = IRType::IRMetadata::callTarget(
+                            method->name, method->returnType, 0, method->parameterTypes,
+                            method->parameterNames, method->parameterIsReference);
+                        ins.metadata.tag = genericVmDispatch
+                            ? "generic_vm_specialization"
+                            : "statically_resolved_method";
+                        ins.metadata.callArguments = argumentSources;
+                        ins.metadata.explicitTypeArguments = explicitTypeArguments;
+                        if (!staticMethod) argumentTypes.insert(argumentTypes.begin(), ownerType);
+                        ins.metadata.callArgumentTypes = std::move(argumentTypes);
+                    }
+                    const std::string methodReturnType = method == nullptr
+                        ? std::string() : method->returnType;
+                    stack.push_back(FlowType(
+                        methodReturnType,
+                        !methodReturnType.empty() && methodReturnType.front() == '&'));
+                    continue;
+                }
+
+                if (ins.op == VMOperator::LOAD_VALUE_SHARED) {
+                    std::string typeName;
+                    if (!ins.args.empty() &&
+                        std::holds_alternative<std::string>(ins.args[0])) {
+                        const std::string& name = std::get<std::string>(ins.args[0]);
+                        const auto sharedType = sharedBindingTypes.find(name);
+                        if (sharedType != sharedBindingTypes.end() &&
+                            ambiguousSharedBindingTypes.find(name) ==
+                                ambiguousSharedBindingTypes.end()) {
+                            typeName = sharedType->second;
+                            ins.metadata = IRType::IRMetadata::sharedBindingType(typeName);
+                        }
+                    }
+                    stack.push_back(typeName);
                     continue;
                 }
 
@@ -440,31 +778,73 @@ namespace IRStaticOperator {
 
                 int globalIndex = -1;
                 if (isGlobalLoad(ins, globalIndex)) {
-                    auto global = globalTypes.find(globalIndex);
-                    stack.push_back(global == globalTypes.end()
-                        ? std::string()
-                        : global->second);
+                    const auto localGlobal = isFunctionChunk
+                        ? functionGlobalTypes.find(globalIndex)
+                        : functionGlobalTypes.end();
+                    const auto global = globalTypes.find(globalIndex);
+                    if (localGlobal != functionGlobalTypes.end()) {
+                        if (!localGlobal->second.empty()) {
+                            stack.push_back(localGlobal->second);
+                        } else {
+                            stack.push_back(global == globalTypes.end()
+                                ? std::string() : global->second);
+                        }
+                    } else {
+                        stack.push_back(global == globalTypes.end()
+                            ? std::string()
+                            : global->second);
+                    }
                     continue;
                 }
 
                 if (ins.op == VMOperator::STORE_VALUE_LOCAL ||
                     ins.op == VMOperator::ASSIGN_VALUE_LOCAL) {
-                    std::string valueType = popType();
+                    const auto value = popType();
+                    annotateCopy(ins, value);
+                    std::string valueType = value;
                     if (!ins.args.empty() && std::holds_alternative<LexerType::Value>(ins.args[0]) &&
                         std::holds_alternative<ZeusType::BigInteger>(std::get<LexerType::Value>(ins.args[0]).data)) {
                         int64_t raw = 0;
                         const auto& indexValue = std::get<LexerType::Value>(ins.args[0]);
                         if (std::get<ZeusType::BigInteger>(indexValue.data).tryToInt64(raw)) {
-                            locals[static_cast<int>(raw)] = valueType;
+                            const int index = static_cast<int>(raw);
+                            if (!valueType.empty()) {
+                                locals[index] = valueType;
+                            } else {
+                                const auto declared = declaredLocalTypes.find(index);
+                                locals[index] = declared == declaredLocalTypes.end()
+                                    ? std::string() : declared->second;
+                            }
                         }
                     }
                     continue;
                 }
 
+                if (ins.op == VMOperator::STORE_VALUE_SHARED ||
+                    ins.op == VMOperator::ASSIGN_VALUE_SHARED) {
+                    const auto sharedValue = popType();
+                    if (ins.op == VMOperator::ASSIGN_VALUE_SHARED &&
+                        !ins.args.empty() &&
+                        std::holds_alternative<std::string>(ins.args[0])) {
+                        const std::string& name = std::get<std::string>(ins.args[0]);
+                        const auto sharedType = sharedBindingTypes.find(name);
+                        if (sharedType != sharedBindingTypes.end() &&
+                            ambiguousSharedBindingTypes.find(name) ==
+                                ambiguousSharedBindingTypes.end()) {
+                            ins.metadata = IRType::IRMetadata::sharedBindingType(
+                                sharedType->second);
+                        }
+                    }
+                    annotateCopy(ins, sharedValue);
+                    continue;
+                }
+
                 if (ins.op == VMOperator::STORE_VALUE_GLOBAL ||
                     ins.op == VMOperator::ASSIGN_VALUE_GLOBAL) {
-                    const std::string valueType = popType();
-                    if (!isFunctionChunk && readGlobalStoreIndex(ins, globalIndex)) {
+                    const auto value = popType();
+                    annotateCopy(ins, value);
+                    const std::string valueType = value;
+                    if (readGlobalStoreIndex(ins, globalIndex)) {
                         std::string storedClassType;
                         for (const auto& argument : ins.args) {
                             if (!std::holds_alternative<std::string>(argument)) continue;
@@ -473,8 +853,17 @@ namespace IRStaticOperator {
                                 storedClassType = "class:" + candidate;
                             }
                         }
-                        globalTypes[globalIndex] = storedClassType.empty()
+                        auto& types = isFunctionChunk
+                            ? functionGlobalTypes : globalTypes;
+                        std::string storedType = storedClassType.empty()
                             ? valueType : storedClassType;
+                        if (storedType.empty()) {
+                            const auto declared = globalBindingTypes.find(globalIndex);
+                            if (declared != globalBindingTypes.end()) {
+                                storedType = declared->second;
+                            }
+                        }
+                        types[globalIndex] = std::move(storedType);
                     }
                     continue;
                 }
@@ -490,20 +879,35 @@ namespace IRStaticOperator {
                 }
 
                 if (ins.op == VMOperator::OBJ_STORE_ATTR) {
-                    popType();
-                    popType();
+                    const auto value = popType();
+                    const auto object = popType();
+                    annotateCopy(ins, value);
+                    if (!ins.args.empty() && std::holds_alternative<std::string>(ins.args[0])) {
+                        const auto field = findFieldType(object, std::get<std::string>(ins.args[0]));
+                        if (!field.empty() && field.front() == '&') ins.metadata.classAssignmentCopy = false;
+                    }
                     continue;
                 }
 
                 if (ins.op == VMOperator::DICT_LOAD_VALUE) {
                     const std::string keyType = popType();
                     const std::string containerType = popType();
-                    const FunctionSignature* target = isFunctionChunk
-                        ? nullptr
-                        : findIndexOperator(containerType, { keyType }, "[]");
+                    if (containerType == "&bytes") {
+                        ins.metadata = IRType::IRMetadata::rawBytesRangeIndexLoad();
+                        stack.push_back("int");
+                        pendingDirectCall.clear();
+                        continue;
+                    }
+                    const bool nativeValueType =
+                        ZeusBuiltins::findNativeTypeABI(containerType) != nullptr;
+                    const FunctionSignature* target =
+                        (!isFunctionChunk || nativeValueType)
+                            ? findIndexOperator(
+                                containerType, { keyType }, "[]", nativeValueType)
+                            : nullptr;
                     if (target != nullptr) {
                         ins.metadata = IRType::IRMetadata::directCall(target->name);
-                        stack.push_back(target->returnType);
+                        stack.push_back(FlowType(valueResultType(target->returnType), false));
                     } else {
                         stack.push_back({});
                     }
@@ -515,12 +919,29 @@ namespace IRStaticOperator {
                     const std::string valueType = popType();
                     const std::string keyType = popType();
                     const std::string containerType = popType();
-                    const FunctionSignature* target = isFunctionChunk
-                        ? nullptr
-                        : findIndexOperator(
-                            containerType, { keyType, valueType }, "[]=");
+                    if (containerType == "&bytes") {
+                        ins.metadata = IRType::IRMetadata::rawBytesRangeIndexStore();
+                        pendingDirectCall.clear();
+                        continue;
+                    }
+                    const bool nativeValueType =
+                        ZeusBuiltins::findNativeTypeABI(containerType) != nullptr;
+                    const FunctionSignature* candidate = findIndexOperator(
+                        containerType, { keyType, valueType }, "[]=", nativeValueType);
+                    const bool isValueSetter = candidate != nullptr &&
+                        candidate->returnType == containerType &&
+                        classLayouts.find(containerType) == classLayouts.end();
+                    const FunctionSignature* target =
+                        (!isFunctionChunk || isValueSetter) ? candidate : nullptr;
                     if (target != nullptr) {
+                        const IRType::SymbolRef writebackTarget =
+                            ins.metadata.subscriptWritebackTarget;
                         ins.metadata = IRType::IRMetadata::directCall(target->name);
+                        if (isValueSetter && writebackTarget.isResolved()) {
+                            ins.metadata.subscriptWritebackTarget = writebackTarget;
+                            ins.metadata.isSubscriptValueWriteback = true;
+                            stack.push_back(FlowType(valueResultType(target->returnType), false));
+                        }
                     }
                     pendingDirectCall.clear();
                     continue;
@@ -549,9 +970,30 @@ namespace IRStaticOperator {
 
                     if (target != nullptr) {
                         ins.metadata = IRType::IRMetadata::directCall(target->name);
-                        stack.push_back(target->returnType);
+                        stack.push_back(FlowType(valueResultType(target->returnType), false));
                     } else {
-                        stack.push_back({});
+                        // Primitive operations need no operator function. Their
+                        // result types must still reach subsequent typed calls.
+                        const std::string symbol = operatorSymbol(ins.op);
+                        const bool comparison = symbol == "==" || symbol == "!=" ||
+                            symbol == "<" || symbol == ">" || symbol == "<=" || symbol == ">=";
+                        const bool leftNumeric = lhsType == "int" || lhsType == "bigint" ||
+                            lhsType == "float";
+                        const bool rightNumeric = rhsType == "int" || rhsType == "bigint" ||
+                            rhsType == "float";
+                        if (leftNumeric && rightNumeric) {
+                            stack.push_back(comparison ? "bool" :
+                                lhsType == "float" || rhsType == "float" ? "float" :
+                                lhsType == "bigint" || rhsType == "bigint" ? "bigint" : "int");
+                        } else if (lhsType == rhsType &&
+                                   (lhsType == "string" || lhsType == "bytes") &&
+                                   (comparison || symbol == "+")) {
+                            stack.push_back(comparison ? "bool" : lhsType);
+                        } else if (lhsType == "bool" && rhsType == "bool" && comparison) {
+                            stack.push_back("bool");
+                        } else {
+                            stack.push_back({});
+                        }
                     }
                     pendingDirectCall.clear();
                     continue;
@@ -566,16 +1008,81 @@ namespace IRStaticOperator {
                         }
                     }
 
-                    for (int64_t i = 0; i < argc; ++i) popType();
+                    std::vector<std::string> argumentTypes(
+                        static_cast<size_t>(std::max<int64_t>(0, argc)));
+                    for (int64_t i = argc - 1; i >= 0; --i) {
+                        argumentTypes[static_cast<size_t>(i)] = popType();
+                    }
                     popType();
 
+                    if (ins.metadata.kind == IRType::IRMetadataKind::CallTarget) {
+                        ins.metadata.callArgumentTypes = std::move(argumentTypes);
+                    }
+
                     auto target = functions.find(pendingDirectCall);
-                    stack.push_back(target == functions.end() ? std::string() : target->second.returnType);
+                    const std::string returnType = target == functions.end()
+                        ? std::string() : target->second.returnType;
+                    stack.push_back(FlowType(
+                        returnType,
+                        !returnType.empty() && returnType.front() == '&'));
                     pendingDirectCall.clear();
                     continue;
                 }
 
-                if (ins.op == VMOperator::POP || ins.op == VMOperator::RETURN) {
+                if (ins.op == VMOperator::CALL_NATIVE) {
+                    int64_t argc = 0;
+                    if (!readOperandCount(ins, 0, argc) ||
+                        static_cast<uint64_t>(argc) + 1 > stack.size()) {
+                        stack.clear();
+                        pendingDirectCall.clear();
+                        continue;
+                    }
+                    for (int64_t i = 0; i < argc; ++i) popType();
+                    const FlowType callee = popType();
+                    std::string returnType;
+                    if (!callee.nativeFunctionName.empty()) {
+                        const auto function = functions.find(
+                            callee.nativeFunctionName);
+                        if (function != functions.end()) {
+                            returnType = function->second.returnType;
+                        } else if (const auto* builtin =
+                                       ZeusBuiltins::findBuiltinFunctionType(
+                                           callee.nativeFunctionName)) {
+                            returnType = std::string(builtin->returnType);
+                        }
+                    }
+                    stack.push_back(returnType.empty()
+                        ? FlowType()
+                        : FlowType(valueResultType(returnType), false));
+                    pendingDirectCall.clear();
+                    continue;
+                }
+
+                if (ins.op == VMOperator::RETURN) {
+                    const auto value = popType();
+                    // Locals already own their result; returning them transfers it.
+                    // Receivers, parameters and field reads remain borrowed.
+                    bool transfersLocal = false;
+                    if (instructionIndex > 0) {
+                        int localIndex = -1;
+                        const bool returnsSharedValue =
+                            !value.empty() && value.front() == '&';
+                        transfersLocal = !returnsSharedValue &&
+                            isLocalLoad(chunk[instructionIndex - 1], localIndex) &&
+                            localIndex >= static_cast<int>(signature.parameterTypes.size());
+                    }
+                    if (!transfersLocal && !signature.returnType.empty() &&
+                        signature.returnType.front() != '&') {
+                        FlowType copySource = value;
+                        if (!copySource.empty() && copySource.front() == '&') {
+                            copySource = FlowType(valueResultType(copySource), true);
+                        }
+                        annotateCopy(ins, copySource);
+                        ins.metadata.classCopySkipHook = signature.operatorSymbol == "@=";
+                    }
+                    continue;
+                }
+                if (ins.op == VMOperator::POP) {
                     popType();
                 }
             }
@@ -584,7 +1091,8 @@ namespace IRStaticOperator {
     public:
         void annotate(std::vector<std::vector<IRType::IRInstr>>& program) {
             collectSignatures(program);
-            std::unordered_map<int, std::string> globalTypes;
+            collectSharedBindingTypes(program);
+            std::unordered_map<int, std::string> globalTypes = globalBindingTypes;
             for (auto& chunk : program) resolveChunk(chunk, globalTypes);
         }
     };

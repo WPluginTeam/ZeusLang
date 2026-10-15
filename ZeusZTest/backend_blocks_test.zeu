@@ -1,0 +1,58 @@
+func selectedLength(value: string) -> int {
+    using LLVM {
+        return @faddr(@reveal(value) - 8, 8) -> int;
+    }
+    using VM {
+        return value.length();
+    }
+}
+
+func llvmOnly() -> int {
+    using LLVM {
+        return 9;
+    }
+    return 8;
+}
+
+func pairedSequence(value: int) -> int {
+    let result = 0;
+    using LLVM {
+        result = value + 1;
+    }
+    using VM {
+        result = value + 2;
+    }
+    using LLVM {
+        result = result + 10;
+    }
+    using VM {
+        result = result + 20;
+    }
+    return result;
+}
+
+func joinText(left: string, right: string) -> string {
+    return left + right;
+}
+
+inline func plusOne(value: int) -> int {
+    return value + 1;
+}
+
+@no_safepoint
+func sumRange(end: int) -> int {
+    let total = 0;
+    for (0 .. end) [const &index] {
+        total = total + index;
+    }
+    return total;
+}
+
+print(selectedLength("zeus"));
+print(llvmOnly());
+print(pairedSequence(1));
+print(joinText("hel", "lo"));
+print(plusOne(1));
+print(sumRange(4));
+let byteValue = b"abc";
+print(byteValue.length());

@@ -1,0 +1,112 @@
+import zeus.thread [&];
+
+func namedQueuedTask() -> int {
+    return 42;
+}
+
+func makeQueuedTask() {
+    let queuedRuns = 0;
+    func queuedTask() [queuedRuns] -> int {
+        queuedRuns = queuedRuns + 1;
+        return queuedRuns;
+    }
+    return queuedTask;
+}
+
+func check(label, actual, expected) {
+    if (actual != expected) {
+        print("FAIL", label, "expected", expected, "got", actual);
+        throw "thread priority queue test failed";
+    }
+    print("PASS", label);
+}
+
+func main() {
+    print("THREAD_PRIORITY_QUEUE_TEST_START");
+
+    let queue = new thread.PriorityQueue();
+    check("empty", queue.isEmpty(), true);
+    check("empty pop", queue.pop(), nil);
+
+    queue.push("priority-2", 2);
+    queue.push("priority-5-first", 5);
+    queue.push("priority-1", 1);
+    queue.push("priority-5-second", 5);
+    queue.push("priority-0", 0);
+    queue.push("priority-7", 7);
+    queue.push("priority-3", 3);
+    queue.push("priority-5-third", 5);
+    queue.push("priority-negative", -3);
+
+    check("peek", queue.peek(), "priority-7");
+    check("size before pop", queue.size(), 9);
+    check("pop highest", queue.pop(), "priority-7");
+    check("stable tie first", queue.pop(), "priority-5-first");
+    check("stable tie second", queue.pop(), "priority-5-second");
+    check("stable tie third", queue.pop(), "priority-5-third");
+    check("pop priority 3", queue.pop(), "priority-3");
+    check("pop priority 2", queue.pop(), "priority-2");
+    check("pop priority 1", queue.pop(), "priority-1");
+    check("pop priority 0", queue.pop(), "priority-0");
+    check("pop negative priority", queue.pop(), "priority-negative");
+    check("empty after pop", queue.isEmpty(), true);
+    queue.push("stale", 1);
+    queue.init();
+    check("reinitialization clears queue", queue.isEmpty(), true);
+    queue.push("fresh", 1);
+    check("reinitialized queue has no stale entries", queue.pop(), "fresh");
+    delete queue;
+
+    let namedFunctionQueue = new thread.PriorityQueue();
+    namedFunctionQueue.push(namedQueuedTask, 12);
+    let namedCallback = namedFunctionQueue.pop();
+    check("top-level function reference remains callable", namedCallback(), 42);
+    delete namedFunctionQueue;
+
+    let queuedTask = makeQueuedTask();
+    check("closure direct call", queuedTask(), 1);
+
+    let closureQueue = new thread.PriorityQueue();
+    closureQueue.push(queuedTask, 11);
+    let queuedCallback = closureQueue.pop();
+    check("queue executes queued closure", queuedCallback(), 2);
+    delete closureQueue;
+
+    let pool = new thread.ThreadPool(1);
+    pool.submit(queuedTask, 11);
+    pool.submit("priority-0");
+    pool.submit("priority-5-first", 5);
+    pool.submit("priority-5-second", 5);
+    pool.submit("priority-9", 9);
+    pool.submit("priority-0-second", 0);
+    check("pool pending", pool.pendingTasks(), 6);
+    let highPriorityTask = pool._getTask();
+    check("pool executes queued closure", highPriorityTask(), 3);
+    check("pool next highest", pool._getTask(), "priority-9");
+    check("pool stable tie first", pool._getTask(), "priority-5-first");
+    check("pool stable tie second", pool._getTask(), "priority-5-second");
+    check("pool default priority", pool._getTask(), "priority-0");
+    check("pool stable default priority", pool._getTask(), "priority-0-second");
+    check("pool empty", pool.pendingTasks(), 0);
+    check("pool empty task", pool._getTask(), nil);
+    delete pool;
+
+    let drainingPool = new thread.ThreadPool(2);
+    let completions = [];
+    for (0..8) [const &i] {
+        let completion = new thread.Event();
+        completions.append(completion);
+        drainingPool.submit(completion.set, 8 - i);
+    }
+    check("worker pool starts", drainingPool.start(), true);
+    check("worker pool drains on shutdown", drainingPool.shutdown(true), true);
+    for (0..completions.length()) [const &i] {
+        check("queued task completed", completions[i].isSet(), true);
+    }
+    check("submit rejected after shutdown", drainingPool.submit(namedQueuedTask), false);
+    delete drainingPool;
+
+    print("THREAD_PRIORITY_QUEUE_TEST_PASS");
+}
+
+main();

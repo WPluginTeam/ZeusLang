@@ -1,4 +1,5 @@
+let a = "123";
+let addr: int = @reveal(a);
 
-import ZeusBuiltins.time [&];
-
-print("Current time:", time.asctime());
+print(@faddr(addr)->string); // 123
+print(@faddr(addr-8, 8)->int); // 3

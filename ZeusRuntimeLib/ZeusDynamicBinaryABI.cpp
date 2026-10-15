@@ -21,7 +21,7 @@ ZeusType::UniversalVariant nullVariant() {
 
 ZeusBox* makeBox(const ZeusType::UniversalVariant& value) {
     ZeusBox* box = new ZeusBox();
-    box->v = value;
+    box->assignVariant(value);
     return box;
 }
 
@@ -118,7 +118,9 @@ ZeusBox* applyBuiltin(
             zeus_less_than(opcode == ZEUS_BINARY_LESS_EQUAL ? rhs : lhs,
                            opcode == ZEUS_BINARY_LESS_EQUAL ? lhs : rhs),
             &zeus_box_release);
-        return makeValueBox(LexerType::Value(zeus_truthy(strict.get()) == 0 ? 1 : 0));
+        // Keep the result typed as bool. Dynamic conditions are unboxed using
+        // the inline-bool ZeusValue tag, so integer 0/1 breaks AOT callers.
+        return makeValueBox(LexerType::Value(zeus_truthy(strict.get()) == 0));
     }
 
     LexerType::Value leftValue(0);

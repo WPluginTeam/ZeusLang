@@ -1,0 +1,142 @@
+@native("zeus_bench_identity_i64")
+decl func __native_identity(value: int) -> int;
+
+func normalizeKey(key) -> string {
+    if (type(key) == "string") return key;
+    return __builtin_str(key);
+}
+
+class LegacyDict {
+    using &this;
+
+    let data = {};
+
+    func init() {
+        this.data = {};
+    }
+
+    func set(key, value) {
+        let normalized = normalizeKey(key);
+        this.data[normalized] = value;
+        return this;
+    }
+}
+
+func benchmarkNativeCall() {
+    let count = 10000000;
+    var index = 0;
+    var checksum = 0;
+    let started = __time_perf_counter_ns();
+    for (true) {
+        if (index >= count) break;
+        using LLVM {
+            checksum = checksum + __native_identity(index);
+        }
+        using VM {
+            checksum = checksum + index;
+        }
+        index = index + 1;
+    }
+    let elapsed = __time_perf_counter_ns() - started;
+    using LLVM {
+        print("ABI_IDENTITY_I64_10M_NS", elapsed, checksum);
+    }
+    using VM {
+        print("VM_INT_LOOP_10M_NS", elapsed, checksum);
+    }
+}
+
+func benchmarkPureLoop() {
+    let count = 10000000;
+    var index = 0;
+    var checksum = 0;
+    let started = __time_perf_counter_ns();
+    for (true) {
+        if (index >= count) break;
+        checksum = checksum + index;
+        index = index + 1;
+    }
+    let elapsed = __time_perf_counter_ns() - started;
+    using LLVM {
+        print("LLVM_INT_LOOP_10M_NS", elapsed, checksum);
+    }
+    using VM {
+        print("VM_INT_LOOP_10M_NS", elapsed, checksum);
+    }
+}
+
+func benchmarkDynamicInsert() {
+    let wrapper = new LegacyDict();
+    var index = 0;
+    let started = __time_perf_counter_ns();
+    for (true) {
+        if (index >= 20000) break;
+        wrapper.set(__builtin_str(index), index);
+        index = index + 1;
+    }
+    print("DICT_DYNAMIC_INSERT_20K_NS", __time_perf_counter_ns() - started, index);
+}
+
+func benchmarkCurrentInsert() {
+    let wrapper = new Dict();
+    var index = 0;
+    let started = __time_perf_counter_ns();
+    for (true) {
+        if (index >= 20000) break;
+        wrapper.set(__builtin_str(index), index);
+        index = index + 1;
+    }
+    print("DICT_CURRENT_INSERT_20K_NS", __time_perf_counter_ns() - started, index);
+}
+
+func benchmarkDynamicReplace() {
+    let wrapper = new LegacyDict();
+    wrapper.set("hot", 0);
+    var index = 0;
+    let started = __time_perf_counter_ns();
+    for (true) {
+        if (index >= 20000) break;
+        wrapper.set("hot", index);
+        index = index + 1;
+    }
+    print("DICT_DYNAMIC_REPLACE_20K_NS", __time_perf_counter_ns() - started, index);
+}
+
+func benchmarkCurrentReplace() {
+    let wrapper = new Dict();
+    wrapper.set("hot", 0);
+    var index = 0;
+    let started = __time_perf_counter_ns();
+    for (true) {
+        if (index >= 20000) break;
+        wrapper.set("hot", index);
+        index = index + 1;
+    }
+    print("DICT_CURRENT_REPLACE_20K_NS", __time_perf_counter_ns() - started, index);
+}
+
+func benchmarkCurrentDelete() {
+    let wrapper = new Dict();
+    var index = 0;
+    for (true) {
+        if (index >= 20000) break;
+        wrapper.set(__builtin_str(index), index);
+        index = index + 1;
+    }
+    index = 0;
+    let started = __time_perf_counter_ns();
+    for (true) {
+        if (index >= 20000) break;
+        wrapper.deleteKey(__builtin_str(index));
+        index = index + 1;
+    }
+    print("DICT_CURRENT_DELETE_20K_NS", __time_perf_counter_ns() - started, index);
+}
+
+benchmarkPureLoop();
+benchmarkNativeCall();
+benchmarkDynamicInsert();
+benchmarkCurrentInsert();
+benchmarkDynamicReplace();
+benchmarkCurrentReplace();
+benchmarkCurrentDelete();

@@ -53,13 +53,20 @@ namespace IRType {
         None,
         FunctionSignature,
         ExternalFunctionSignature,
+        NativeFunction,
         DirectCall,
         CallArguments,
         IntrinsicOperator,
         CallTarget,
         Symbol,
         ClassLayout,
-        ModuleImportInit
+        ModuleImportInit,
+        LocalBindingType,
+        GlobalBindingType,
+        SharedBindingType,
+        ClassInstantiation,
+        RawBytesRangeIndexLoad,
+        RawBytesRangeIndexStore
     };
 
     enum class ClassFieldDefaultKind {
@@ -99,16 +106,37 @@ namespace IRType {
         std::vector<std::string> parameterNames;
         std::vector<bool> parameterIsReference;
         std::vector<CallArgumentSource> callArguments;
+        // Static types inferred for positional CALL_CLOSURE arguments.
+        // Compiler-only metadata; backends rebuild it from the IR type flow.
+        std::vector<std::string> callArgumentTypes;
+        std::vector<std::string> explicitTypeArguments;
+        std::vector<std::string> classTypeParameters;
         std::vector<std::string> fieldNames;
+        // True only when the source declaration includes an explicit `: Type`.
+        // `typeNames` also contains types inferred from literal defaults.
+        std::vector<bool> fieldTypeExplicit;
         std::vector<bool> fieldConstness;
         std::vector<ClassFieldDefault> fieldDefaults;
+        // Optional ordinary-function initializer names, aligned with fieldNames.
+        // Empty entries mean the field uses its literal/zero default directly.
+        std::vector<std::string> fieldInitializerNames;
         std::string ownerType;
         std::string operatorSymbol;
         std::string nativeSymbol;
+        std::string nativeReferenceABI = "raw";
         std::string moduleName;
         int captureCount = 0;
         bool hasCaptureCount = false;
         bool isStaticMethod = false;
+        bool isInline = false;
+        bool isNoSafepoint = false;
+        SymbolRef subscriptWritebackTarget;
+        bool isSubscriptValueWriteback = false;
+        // Borrowed class values copy at binding boundaries; call/new results transfer.
+        bool classAssignmentCopy = false;
+        bool classCopySkipHook = false;
+        std::string classCopyType;
+        std::string classCopyHook;
 
         static IRMetadata functionSignature(
             const std::string& name,
@@ -119,7 +147,9 @@ namespace IRType {
             std::string op = {},
             bool staticMethod = false,
             std::vector<std::string> names = {},
-            std::vector<bool> byReference = {}
+            std::vector<bool> byReference = {},
+            bool inlineFunction = false,
+            bool noSafepoint = false
         ) {
             IRMetadata result;
             result.kind = IRMetadataKind::FunctionSignature;
@@ -134,6 +164,8 @@ namespace IRType {
             result.captureCount = captures;
             result.hasCaptureCount = true;
             result.isStaticMethod = staticMethod;
+            result.isInline = inlineFunction;
+            result.isNoSafepoint = noSafepoint;
             return result;
         }
 
@@ -143,7 +175,8 @@ namespace IRType {
             std::vector<std::string> parameterTypes,
             std::string nativeSymbol = {},
             std::vector<std::string> names = {},
-            std::vector<bool> byReference = {}
+            std::vector<bool> byReference = {},
+            std::string nativeReferenceABI = "raw"
         ) {
             IRMetadata result = functionSignature(
                 name, returnType, 0, std::move(parameterTypes), {}, {}, false,
@@ -152,6 +185,7 @@ namespace IRType {
             result.kind = IRMetadataKind::ExternalFunctionSignature;
             result.tag = "external_function_signature";
             result.nativeSymbol = std::move(nativeSymbol);
+            result.nativeReferenceABI = std::move(nativeReferenceABI);
             return result;
         }
 
@@ -160,6 +194,14 @@ namespace IRType {
             result.kind = IRMetadataKind::DirectCall;
             result.tag = "direct_call";
             result.symbol = SymbolRef::function(name);
+            return result;
+        }
+
+        static IRMetadata nativeFunction(const std::string& name) {
+            IRMetadata result;
+            result.kind = IRMetadataKind::NativeFunction;
+            result.tag = "native_function";
+            result.nativeSymbol = name;
             return result;
         }
 
@@ -191,11 +233,15 @@ namespace IRType {
             return result;
         }
 
-        static IRMetadata callArgumentSources(std::vector<CallArgumentSource> arguments) {
+        static IRMetadata callArgumentSources(
+            std::vector<CallArgumentSource> arguments,
+            std::vector<std::string> explicitTypes = {}
+        ) {
             IRMetadata result;
             result.kind = IRMetadataKind::CallArguments;
             result.tag = "call_arguments";
             result.callArguments = std::move(arguments);
+            result.explicitTypeArguments = std::move(explicitTypes);
             return result;
         }
 
@@ -204,7 +250,10 @@ namespace IRType {
             std::vector<std::string> names,
             std::vector<std::string> fieldTypes,
             std::vector<bool> constFields = {},
-            std::vector<ClassFieldDefault> defaults = {}
+            std::vector<ClassFieldDefault> defaults = {},
+            std::vector<std::string> typeParameters = {},
+            std::vector<bool> explicitFieldTypes = {},
+            std::vector<std::string> initializerNames = {}
         ) {
             IRMetadata result;
             result.kind = IRMetadataKind::ClassLayout;
@@ -213,8 +262,37 @@ namespace IRType {
             result.typeName = className;
             result.fieldNames = std::move(names);
             result.typeNames = std::move(fieldTypes);
+            result.fieldTypeExplicit = std::move(explicitFieldTypes);
             result.fieldConstness = std::move(constFields);
             result.fieldDefaults = std::move(defaults);
+            result.classTypeParameters = std::move(typeParameters);
+            result.fieldInitializerNames = std::move(initializerNames);
+            return result;
+        }
+
+        static IRMetadata classInstantiation(
+            const std::string& className,
+            std::vector<std::string> typeArguments
+        ) {
+            IRMetadata result;
+            result.kind = IRMetadataKind::ClassInstantiation;
+            result.tag = "class_instantiation";
+            result.symbol = SymbolRef::classType(className);
+            result.explicitTypeArguments = std::move(typeArguments);
+            return result;
+        }
+
+        static IRMetadata rawBytesRangeIndexLoad() {
+            IRMetadata result;
+            result.kind = IRMetadataKind::RawBytesRangeIndexLoad;
+            result.tag = "raw_bytes_range_index_load";
+            return result;
+        }
+
+        static IRMetadata rawBytesRangeIndexStore() {
+            IRMetadata result;
+            result.kind = IRMetadataKind::RawBytesRangeIndexStore;
+            result.tag = "raw_bytes_range_index_store";
             return result;
         }
 
@@ -223,6 +301,30 @@ namespace IRType {
             result.kind = IRMetadataKind::ModuleImportInit;
             result.tag = "module_import_init";
             result.moduleName = name;
+            return result;
+        }
+
+        static IRMetadata localBindingType(const std::string& name) {
+            IRMetadata result;
+            result.kind = IRMetadataKind::LocalBindingType;
+            result.tag = "local_binding_type";
+            result.typeName = name;
+            return result;
+        }
+
+        static IRMetadata globalBindingType(const std::string& name) {
+            IRMetadata result;
+            result.kind = IRMetadataKind::GlobalBindingType;
+            result.tag = "global_binding_type";
+            result.typeName = name;
+            return result;
+        }
+
+        static IRMetadata sharedBindingType(const std::string& name) {
+            IRMetadata result;
+            result.kind = IRMetadataKind::SharedBindingType;
+            result.tag = "shared_binding_type";
+            result.typeName = name;
             return result;
         }
 
@@ -243,7 +345,8 @@ namespace IRType {
             std::string* op = nullptr,
             std::string* native = nullptr,
             std::vector<std::string>* names = nullptr,
-            std::vector<bool>* byReference = nullptr
+            std::vector<bool>* byReference = nullptr,
+            std::string* nativeRefABI = nullptr
         ) const {
             if ((kind != IRMetadataKind::FunctionSignature &&
                  kind != IRMetadataKind::ExternalFunctionSignature) ||
@@ -262,6 +365,7 @@ namespace IRType {
             if (owner) *owner = ownerType;
             if (op) *op = operatorSymbol;
             if (native) *native = nativeSymbol;
+            if (nativeRefABI) *nativeRefABI = nativeReferenceABI;
             return true;
         }
 
@@ -302,14 +406,21 @@ namespace IRType {
             std::vector<std::string>& names,
             std::vector<std::string>& fieldTypes,
             std::vector<bool>* constFields = nullptr,
-            std::vector<ClassFieldDefault>* defaults = nullptr
+            std::vector<ClassFieldDefault>* defaults = nullptr,
+            std::vector<std::string>* typeParameters = nullptr,
+            std::vector<bool>* explicitFieldTypes = nullptr,
+            std::vector<std::string>* initializerNames = nullptr
         ) const {
             if (kind != IRMetadataKind::ClassLayout ||
                 symbol.kind != SymbolRefKind::Class ||
                 symbol.name.empty() ||
                 fieldNames.size() != typeNames.size() ||
+                (!fieldTypeExplicit.empty() &&
+                 fieldTypeExplicit.size() != fieldNames.size()) ||
                 (!fieldConstness.empty() && fieldConstness.size() != fieldNames.size()) ||
-                (!fieldDefaults.empty() && fieldDefaults.size() != fieldNames.size())) {
+                (!fieldDefaults.empty() && fieldDefaults.size() != fieldNames.size()) ||
+                (!fieldInitializerNames.empty() &&
+                 fieldInitializerNames.size() != fieldNames.size())) {
                 return false;
             }
 
@@ -318,6 +429,28 @@ namespace IRType {
             fieldTypes = typeNames;
             if (constFields != nullptr) *constFields = fieldConstness;
             if (defaults != nullptr) *defaults = fieldDefaults;
+            if (typeParameters != nullptr) *typeParameters = classTypeParameters;
+            if (explicitFieldTypes != nullptr) {
+                *explicitFieldTypes = fieldTypeExplicit;
+            }
+            if (initializerNames != nullptr) {
+                *initializerNames = fieldInitializerNames;
+            }
+            return true;
+        }
+
+        bool readClassInstantiation(
+            std::string& className,
+            std::vector<std::string>& typeArguments,
+            std::string* specializedName = nullptr
+        ) const {
+            if (kind != IRMetadataKind::ClassInstantiation ||
+                symbol.kind != SymbolRefKind::Class || symbol.name.empty()) {
+                return false;
+            }
+            className = symbol.name;
+            typeArguments = explicitTypeArguments;
+            if (specializedName != nullptr) *specializedName = typeName;
             return true;
         }
 

@@ -174,7 +174,12 @@ enum class VMOperator {
     LOGICAL_NOT,
 
     // Registers class-style methods for an existing runtime type.
-    TYPE_IMPL_BUILD
+    TYPE_IMPL_BUILD,
+    LLVM_ADDR,
+    LLVM_FADDR,
+    LLVM_FSTORE,
+    OBJ_REPLACE_STATE,
+    LLVM_SIZEOF
 };
 
 
@@ -267,6 +272,11 @@ std::string VMO_toString(VMOperator opr) {
         case VMOperator::JUMP_IF_PARAM_PROVIDED: return "JUMP_IF_PARAM_PROVIDED";
         case VMOperator::LOGICAL_NOT: return "LOGICAL_NOT";
         case VMOperator::TYPE_IMPL_BUILD: return "TYPE_IMPL_BUILD";
+        case VMOperator::LLVM_ADDR: return "LLVM_ADDR";
+        case VMOperator::LLVM_FADDR: return "LLVM_FADDR";
+        case VMOperator::OBJ_REPLACE_STATE: return "OBJ_REPLACE_STATE";
+        case VMOperator::LLVM_FSTORE: return "LLVM_FSTORE";
+        case VMOperator::LLVM_SIZEOF: return "LLVM_SIZEOF";
         default: return "UNKNOWN";
     }
 }

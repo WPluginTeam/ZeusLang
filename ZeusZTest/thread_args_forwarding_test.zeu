@@ -1,0 +1,16 @@
+import zeus.thread [&];
+
+class Worker {
+    using &this;
+
+    func run(left: int, right: int) {
+        print("thread-args", left, right);
+    }
+}
+
+let worker = new Worker();
+let workerThread = new thread.Thread(worker.run);
+workerThread.args = [19, 23];
+workerThread.start();
+workerThread.join();
+print("thread-count", thread.thread_count());

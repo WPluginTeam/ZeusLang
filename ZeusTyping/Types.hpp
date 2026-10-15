@@ -7,6 +7,7 @@ namespace ZeusTypeInfer {
 
     enum class InferredType {
         Unknown,
+        TypeParameter,
 
         Int,
         BigInt,
@@ -15,6 +16,7 @@ namespace ZeusTypeInfer {
         Char,
         String,
         Bytes,
+        RawBytesRange,
         Nil,
 
         List,
@@ -38,18 +40,21 @@ namespace ZeusTypeInfer {
             case InferredType::Char:     return "char";
             case InferredType::String:   return "string";
             case InferredType::Bytes:    return "bytes";
+            case InferredType::RawBytesRange: return "&bytes";
             case InferredType::Nil:      return "nil";
-            case InferredType::List:     return "list";
+            case InferredType::List:     return "Array";
             case InferredType::Dict:     return "dict";
             case InferredType::Object:   return "object";
             case InferredType::Function: return "function";
             case InferredType::Unknown:  return "unknown";
+            case InferredType::TypeParameter: return "type parameter";
         }
 
         return "unknown";
     }
 
     inline InferredType parseTypeName(const std::string& name) {
+        if (name == "&bytes") return InferredType::RawBytesRange;
         if (!name.empty() && name.front() == '&') {
             return parseTypeName(name.substr(1));
         }

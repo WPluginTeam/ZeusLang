@@ -57,16 +57,39 @@ void zeus_value_dict_build(
     int64_t pair_count,
     const ZeusValue* const* key_values
 );
+// Returns 1 only when value contains a dynamic array.
+int32_t zeus_value_is_array(const ZeusValue* value);
 void zeus_value_array_length(ZeusValue* out, const ZeusValue* array);
 void zeus_value_array_load(
     ZeusValue* out,
     const ZeusValue* array,
     const ZeusValue* index
 );
+void zeus_value_array_load_checked(
+    ZeusValue* out,
+    const ZeusValue* array,
+    const ZeusValue* index
+);
+void zeus_value_array_load_i64(
+    ZeusValue* out,
+    const ZeusValue* array,
+    int64_t index
+);
+void zeus_value_array_load_i64_checked(
+    ZeusValue* out,
+    const ZeusValue* array,
+    int64_t index
+);
 void zeus_value_array_store(
     ZeusValue* out,
     const ZeusValue* array,
     const ZeusValue* index,
+    const ZeusValue* value
+);
+void zeus_value_array_store_i64(
+    ZeusValue* out,
+    const ZeusValue* array,
+    int64_t index,
     const ZeusValue* value
 );
 void zeus_value_dict_keys(ZeusValue* out, const ZeusValue* dict);
@@ -81,6 +104,39 @@ void zeus_value_dict_store(
     const ZeusValue* key,
     const ZeusValue* value
 );
+
+// @native operations backing the language-level Array and Dict implementations.
+// Input values are borrowed; `out` receives an independently owned result.
+void zeus_value_array_push(
+    ZeusValue* out,
+    const ZeusValue* array,
+    const ZeusValue* value
+);
+void zeus_value_array_pop(ZeusValue* out, const ZeusValue* array);
+void zeus_value_array_get(
+    ZeusValue* out,
+    const ZeusValue* array,
+    const ZeusValue* index
+);
+void zeus_value_array_set(
+    ZeusValue* out,
+    const ZeusValue* array,
+    const ZeusValue* index,
+    const ZeusValue* value
+);
+void zeus_value_array_clear(ZeusValue* out, const ZeusValue* array);
+void zeus_value_array_slice(
+    ZeusValue* out,
+    const ZeusValue* array,
+    const ZeusValue* start,
+    const ZeusValue* end
+);
+void zeus_value_dict_delete(
+    ZeusValue* out,
+    const ZeusValue* dict,
+    const ZeusValue* key
+);
+void zeus_value_dict_clone(ZeusValue* out, const ZeusValue* dict);
 
 #ifdef __cplusplus
 }

@@ -1,0 +1,25 @@
+var shared_field_initializer_count = 0;
+
+func next_shared_field_initializer() {
+    shared_field_initializer_count = shared_field_initializer_count + 1;
+    return shared_field_initializer_count;
+}
+
+shared class SharedFieldInitializerProbe {
+    using &this;
+
+    var sequence = next_shared_field_initializer();
+    var observed = this.sequence + 10;
+}
+
+var shared first_shared_probe: SharedFieldInitializerProbe = new SharedFieldInitializerProbe();
+var shared second_shared_probe: SharedFieldInitializerProbe = new SharedFieldInitializerProbe();
+
+if (first_shared_probe.sequence != 1 or second_shared_probe.sequence != 2) {
+    throw new Exception("shared field defaults were not evaluated for each new");
+}
+if (first_shared_probe.observed != 11 or second_shared_probe.observed != 12) {
+    throw new Exception("shared field defaults did not observe this in declaration order");
+}
+
+print("SHARED_CLASS_FIELD_INITIALIZER_TEST_PASS");

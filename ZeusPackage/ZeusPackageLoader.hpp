@@ -11,7 +11,10 @@
 #include <sstream>
 #include "./ZeusParser/LexerParser.hpp"
 #include "./ZeusParser/TreeParser.hpp"
+#include "./ZeusParser/BackendBlockSelector.hpp"
 #include "./ZeusParser/SyntaxValidator.hpp"
+#include "./ZeusParser/InterfaceConformance.hpp"
+#include "./ZeusTyping/TypeChecker.hpp"
 #include "./ZeusIR/IRGenerator.hpp"
 #include "./ZeusIR/IRImport.hpp"
 #include "./ZeusIR/IRScope.hpp"
@@ -58,7 +61,10 @@ namespace ZeusPackage {
         std::string filePath;
         std::vector<std::vector<IRType::IRInstr>> chunks;
         std::vector<std::string> globalNames;
+        std::vector<ZeusDiagnostics::Diagnostic> warnings;
+        std::string sourceCode;
         std::set<std::string> functionNames;
+        ZeusParser::InterfaceContractRegistry interfaceContracts;
         std::map<int, std::string> namespaceAliasSentinels;
         std::map<int, int> importedGlobalSlotSentinels;
         int globalStartIndex;  // 包的全局变量起始索引
@@ -90,6 +96,72 @@ namespace ZeusPackage {
 
     inline std::string moduleNamespaceGlobalName(const std::string& ownerPackage, const std::string& alias) {
         return "__zeus_module_import__" + ownerPackage + "::" + alias;
+    }
+
+    inline std::map<std::string, std::string> packageFieldInitializerNameRemap(
+        const std::vector<std::vector<IRType::IRInstr>>& chunks,
+        const std::string& packageName
+    ) {
+        std::map<std::string, std::string> remap;
+        if (packageName.empty()) return remap;
+        const std::string packagePrefix = packageName + ".";
+        for (const auto& chunk : chunks) {
+            for (const auto& instruction : chunk) {
+                if (instruction.metadata.kind !=
+                    IRType::IRMetadataKind::ClassLayout) {
+                    continue;
+                }
+                std::string className;
+                std::vector<std::string> fieldNames;
+                std::vector<std::string> fieldTypes;
+                std::vector<std::string> initializerNames;
+                if (!instruction.metadata.readClassLayout(
+                        className, fieldNames, fieldTypes, nullptr, nullptr,
+                        nullptr, nullptr, &initializerNames)) {
+                    continue;
+                }
+                for (const auto& initializerName : initializerNames) {
+                    if (initializerName.empty() ||
+                        initializerName.compare(
+                            0, packagePrefix.size(), packagePrefix) == 0) {
+                        continue;
+                    }
+                    remap.emplace(initializerName,
+                                  packagePrefix + initializerName);
+                }
+            }
+        }
+        return remap;
+    }
+
+    inline void remapPackageFieldInitializerName(
+        IRType::IRInstr& instruction,
+        const std::map<std::string, std::string>& remap
+    ) {
+        if (remap.empty()) return;
+        if (instruction.metadata.kind == IRType::IRMetadataKind::ClassLayout) {
+            for (auto& initializerName :
+                 instruction.metadata.fieldInitializerNames) {
+                const auto replacement = remap.find(initializerName);
+                if (replacement != remap.end()) {
+                    initializerName = replacement->second;
+                }
+            }
+        }
+
+        const auto replacement = remap.find(instruction.metadata.symbol.name);
+        if (replacement == remap.end() ||
+            instruction.metadata.symbol.kind != IRType::SymbolRefKind::Function) {
+            return;
+        }
+        instruction.metadata.symbol.name = replacement->second;
+        if ((instruction.metadata.kind == IRType::IRMetadataKind::FunctionSignature ||
+             instruction.metadata.kind ==
+                 IRType::IRMetadataKind::ExternalFunctionSignature) &&
+            instruction.args.size() > 1 &&
+            std::holds_alternative<std::string>(instruction.args[1])) {
+            instruction.args[1] = replacement->second;
+        }
     }
 
     inline std::vector<ImportInfo> extractImportDeclarations(const std::string& source) {
@@ -145,18 +217,22 @@ namespace ZeusPackage {
                 }
             }
 
-            if (!info.packageName.empty()) imports.push_back(std::move(info));
+            if (!info.packageName.empty()) {
+                info.packageName = IRImport::canonicalPackageName(info.packageName);
+                imports.push_back(std::move(info));
+            }
         }
 
         return imports;
     }
 
     inline bool visitPackageDependencies(
-        const std::string& packageName,
+        std::string packageName,
         const std::string& importingSourcePath,
         PackageLoadGraph& graph,
         std::map<std::string, int>& visitState,
         std::vector<std::string>& visitStack) {
+        packageName = IRImport::canonicalPackageName(packageName);
         const auto state = visitState.find(packageName);
         if (state != visitState.end() && state->second == 2) return true;
         if (state != visitState.end() && state->second == 1) {
@@ -222,7 +298,16 @@ namespace ZeusPackage {
     static std::unordered_map<std::string, CompiledPackage> loadedPackages;
 
     // çźčŻĺćäť?
-    inline CompiledPackage compilePackage(const std::string& packageName, const std::string& sourceFilePath, bool strictDecl = false) {
+    inline CompiledPackage compilePackage(
+        const std::string& packageName,
+        const std::string& sourceFilePath,
+        bool strictDecl = false,
+        ZeusParser::BackendTarget target = ZeusParser::BackendTarget::VirtualMachine,
+        const std::unordered_map<TreeParser::NodeId, std::string>*
+            inferredFunctionReturnTypes = nullptr,
+        const std::unordered_map<TreeParser::NodeId, std::string>*
+            inferredBindingTypesByNode = nullptr
+    ) {
         
         ZEUS_DEBUG_PRINT("[PackageLoader] Compiling package: %s from %s", packageName.c_str(), sourceFilePath.c_str());
 
@@ -235,7 +320,7 @@ namespace ZeusPackage {
         // NOTE: IRScope::globals is NOT cleared - packages can reference previously loaded packages
         IRScope::funcStack.clear();
         IRScope::scopeStack.clear();
-        IRScope::refSymbols.clear();
+
         IRScope::localCount = 0;
         IRScope::useOriginalList = false;    // Reset to default (wrap as Array)
         IRScope::useOriginalBytes = false;   // Keep legacy original-mode state in sync.
@@ -276,6 +361,8 @@ namespace ZeusPackage {
         // čŻ­ćłĺć
         ZEUS_DEBUG_PRINT("[PackageLoader] Starting tree parser...");
         auto trees = TreeParser::parse(tokens, &syntaxDiagnostics);
+        std::vector<ZeusDiagnostics::Diagnostic> backendWarnings;
+        ZeusParser::selectBackendBlocks(trees, target, &backendWarnings);
         ZEUS_DEBUG_PRINT("[PackageLoader] Tree parser returned (%zu diagnostics)", syntaxDiagnostics.size());
         ZeusDiagnostics::append(
             syntaxDiagnostics,
@@ -292,12 +379,37 @@ namespace ZeusPackage {
                 syntaxDiagnostics.front(), sourceFilePath, source
             ));
         }
+        ZeusParser::InterfaceContractRegistry importedInterfaceContracts;
+        for (const auto& imported : extractImportDeclarations(source)) {
+            const auto dependency = loadedPackages.find(imported.packageName);
+            if (dependency == loadedPackages.end()) continue;
+            ZeusParser::bindImportedInterfaceContracts(
+                importedInterfaceContracts,
+                imported.packageName,
+                imported.alias,
+                imported.importMode == 1,
+                dependency->second.interfaceContracts
+            );
+        }
+        const auto interfaceDiagnostics = ZeusParser::validateInterfaceConformance(
+            trees, importedInterfaceContracts);
+        if (!interfaceDiagnostics.empty()) {
+            throw std::runtime_error(ZeusDiagnostics::render(
+                interfaceDiagnostics.front(), sourceFilePath, source
+            ));
+        }
         ZEUS_DEBUG_PRINT("[PackageLoader] Tree parser done (%zu trees)", trees.size());
 
         // IR生成
         ZEUS_DEBUG_PRINT("[PackageLoader] Starting IR generator...");
         auto irgen = IRGen::IRGenerator();
         irgen.strictDecl = strictDecl;
+        if (inferredFunctionReturnTypes != nullptr) {
+            irgen.inferredFunctionReturnTypes = *inferredFunctionReturnTypes;
+        }
+        if (inferredBindingTypesByNode != nullptr) {
+            irgen.inferredBindingTypesByNode = *inferredBindingTypesByNode;
+        }
         
         // 保存当前编译状态
         bool savedUseOriginalList = IRScope::useOriginalList;
@@ -340,6 +452,9 @@ namespace ZeusPackage {
         CompiledPackage pkg;
         pkg.packageName = packageName;
         pkg.filePath = sourceFilePath;
+        pkg.sourceCode = source;
+        pkg.interfaceContracts = ZeusParser::collectInterfaceContracts(trees);
+        pkg.warnings = std::move(backendWarnings);
         pkg.chunks = irgen.bytecodes;
         pkg.compileTimeGlobalsOffset = globalsBeforeCompile;  // Save for merge-time index adjustment
         pkg.sourceFileId = sourceFileId;
@@ -392,9 +507,11 @@ namespace ZeusPackage {
 
         // CRITICAL: Remove this package's own globals from IRScope::globals to prevent name collision
         // with subsequent packages. We keep the globals from PREVIOUS packages so they can be referenced.
-        // EXCEPTION: ZeusBuiltins.* packages are NOT cleaned up - their globals (like Array class) 
+        // EXCEPTION: compiler modules are NOT cleaned up - their globals (like Array class)
         // must remain available to all subsequent packages.
-        bool isBuiltinPackage = (packageName.find("ZeusBuiltins") == 0);
+        const bool isBuiltinPackage =
+            IRImport::hasPackagePrefix(packageName, "ZeusBuiltins") ||
+            IRImport::hasPackagePrefix(packageName, "zeus");
         
         if (!isBuiltinPackage && IRScope::globals.size() > globalsBeforeCompile) {
             // Find and remove globals that have indices >= globalsBeforeCompile
@@ -418,7 +535,8 @@ namespace ZeusPackage {
     }
 
     // ĺ č˝˝ĺ?ĺŚććŞĺ č˝˝ĺçźčŻ)
-    inline CompiledPackage* loadPackage(const std::string& packageName, const std::string& currentSourcePath, bool strictDecl = false) {
+    inline CompiledPackage* loadPackage(std::string packageName, const std::string& currentSourcePath, bool strictDecl = false) {
+        packageName = IRImport::canonicalPackageName(packageName);
         
         // ćŁćĽçźĺ­?
         auto it = loadedPackages.find(packageName);
@@ -440,7 +558,8 @@ namespace ZeusPackage {
         }
 
         // çźčŻĺ?
-        CompiledPackage pkg = compilePackage(packageName, packagePath, strictDecl);
+        CompiledPackage pkg = compilePackage(
+            packageName, packagePath, strictDecl, ZeusParser::BackendTarget::VirtualMachine);
 
         ZEUS_DEBUG_PRINT("[PackageLoader] Package globalNames:");
         for (size_t i = 0; i < pkg.globalNames.size(); ++i) {
@@ -468,7 +587,8 @@ namespace ZeusPackage {
                         
                         if (std::holds_alternative<std::string>(val.data)) {
                             ImportInfo info;
-                            info.packageName = std::get<std::string>(val.data);
+                            info.packageName = IRImport::canonicalPackageName(
+                                std::get<std::string>(val.data));
                             
                             // 获取别名 (args[1])
                             if (std::holds_alternative<LexerType::Value>(instr.args[1])) {
@@ -505,7 +625,8 @@ namespace ZeusPackage {
 
         const auto& packageValue = std::get<LexerType::Value>(instr.args[0]);
         if (!std::holds_alternative<std::string>(packageValue.data)) return false;
-        info.packageName = std::get<std::string>(packageValue.data);
+        info.packageName = IRImport::canonicalPackageName(
+            std::get<std::string>(packageValue.data));
         info.alias.clear();
         info.importMode = 0;
 
@@ -655,6 +776,8 @@ namespace ZeusPackage {
         
         for (auto* pkg : packages) {
             if (!pkg) continue;
+            const auto fieldInitializerNameRemap =
+                packageFieldInitializerNameRemap(pkg->chunks, pkg->packageName);
             
             ZEUS_DEBUG_PRINT("[PackageLoader] Inserting package chunks: %s (%zu chunks)", 
                 pkg->packageName.c_str(), pkg->chunks.size());
@@ -682,8 +805,15 @@ namespace ZeusPackage {
 
             for (size_t packageChunkIndex = 0; packageChunkIndex < pkg->chunks.size(); ++packageChunkIndex) {
                 const auto& pkgChunkSrc = pkg->chunks[packageChunkIndex];
+                ZEUS_DEBUG_PRINT("[PackageLoader] Inspecting pkg=%s chunk=%zu/%zu instructions=%zu",
+                    pkg->packageName.c_str(), packageChunkIndex, pkg->chunks.size(), pkgChunkSrc.size());
                 ImportInfo chunkImport;
-                if (!pkgChunkSrc.empty() && readImportInfo(pkgChunkSrc.front(), chunkImport)) {
+                const bool isPackageImport = !pkgChunkSrc.empty() &&
+                    readImportInfo(pkgChunkSrc.front(), chunkImport);
+                ZEUS_DEBUG_PRINT("[PackageLoader] pkg=%s chunk=%zu import=%d name=%s alias=%s mode=%d",
+                    pkg->packageName.c_str(), packageChunkIndex, isPackageImport ? 1 : 0,
+                    chunkImport.packageName.c_str(), chunkImport.alias.c_str(), chunkImport.importMode);
+                if (isPackageImport) {
                     if (chunkImport.importMode == 0) {
                         ZEUS_DEBUG_PRINT("[PackageLoader] Skipping package global IMPORT chunk: %s (owner=%s)",
                             chunkImport.packageName.c_str(), pkg->packageName.c_str());
@@ -714,6 +844,11 @@ namespace ZeusPackage {
                 auto pkgChunk = pkgChunkSrc;
                 for (size_t i = 0; i < pkgChunk.size(); ++i) {
                     auto& instr = pkgChunk[i];
+                    remapPackageFieldInitializerName(
+                        instr, fieldInitializerNameRemap);
+                    ZEUS_DEBUG_PRINT("[PackageLoader] Relocating pkg=%s chunk=%zu instr=%zu op=%d args=%zu",
+                        pkg->packageName.c_str(), packageChunkIndex, i,
+                        static_cast<int>(instr.op), instr.args.size());
                     relocateTypeImplPrototypes(instr, totalInsertedProtos);
                     
                     if (instr.op == VMOperator::MAKE_FUNCTION) {
@@ -832,7 +967,7 @@ namespace ZeusPackage {
                     
                     // 包的LOAD_VALUE global也需要调整
                     // BUT: only adjust indices for globals DEFINED IN THIS PACKAGE
-                    // Globals from other packages (e.g. Array from ZeusBuiltins.list) should not be adjusted
+                    // Globals from other packages (e.g. Array from zeus.list) should not be adjusted
                     if (instr.op == VMOperator::LOAD_VALUE &&
                         instr.args.size() >= 2 &&
                         std::holds_alternative<std::string>(instr.args[0]) &&
@@ -954,7 +1089,7 @@ namespace ZeusPackage {
                         alias = packageName;  // 如果没有别名,使用包名
                         
                         // 如果包名包含点号,只使用最后一段作为别名
-                        // 例如: "ZeusBuiltins.math" -> "math"
+                            // 例如: "zeus.math" -> "math"
                         size_t lastDot = alias.find_last_of('.');
                         if (lastDot != std::string::npos && lastDot + 1 < alias.size()) {
                             alias = alias.substr(lastDot + 1);
@@ -981,7 +1116,7 @@ namespace ZeusPackage {
                     std::vector<IRType::IRInstr> nsChunk;
                     
                     // 1. 加载 Namespace 类 (需要在所有包的全局变量中查找)
-                    // Namespace 类定义在 ZeusBuiltins.namespace 包中
+                    // Namespace 类定义在 zeus.namespace 包中
                     int namespaceClassIdx = -1;
                     
                     // 先在包的全局变量中查找

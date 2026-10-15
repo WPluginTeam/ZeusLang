@@ -246,6 +246,9 @@ namespace ZeusType {
 
         bool isSmallInt() const { return small; }
         int64_t smallIntValue() const { return smallVal; }
+        int64_t* nativeInt64Address() noexcept {
+            return small ? &smallVal : nullptr;
+        }
 
         bool isZero() const {
             if (small) return smallVal == 0;
@@ -981,6 +984,11 @@ namespace ZeusType {
         }
     };
 
+    struct RawBytesRange {
+        uintptr_t address = 0;
+        uint64_t length = 0;
+    };
+
     inline int bigIntegerToInt(const BigInteger& big) {
         if (!big.fitsInInt64()) {
             throw std::overflow_error("BigInteger too large for int");
@@ -1022,7 +1030,7 @@ namespace ZeusType {
     };  // 共享对象实例，删除并重建同名对象后旧句柄保持失效
     
     // Socket 句柄：网络套接字
-    struct SocketHandle { int id; };
+    struct SocketHandle { int64_t id; };
     
     // 可变参数传递结构（轻量级，仅用于有*args或**kwargs的函数）
     enum class ArgType { ARG, KWARG };
@@ -1033,10 +1041,10 @@ namespace ZeusType {
     };
     
     // 模块代理对象：用于引用映射包的全局变量，而非复制值
-    // 例如: __get_module("ZeusBuiltins.cppfunctions") 返回 ModuleProxy{"ZeusBuiltins.cppfunctions"}
-    // 访问 proxy.io 时，自动映射到全局变量 "ZeusBuiltins.cppfunctions.io"
+    // 例如: __get_module("zeus.cppfunctions") 返回 ModuleProxy{"zeus.cppfunctions"}
+    // 访问 proxy.io 时，自动映射到全局变量 "zeus.cppfunctions.io"
     struct ModuleProxy {
-        std::string modulePath;  // 模块路径，如 "ZeusBuiltins.cppfunctions"
+        std::string modulePath;  // 模块路径，如 "zeus.cppfunctions"
 
         bool operator==(const ModuleProxy& other) const {
             return modulePath == other.modulePath;

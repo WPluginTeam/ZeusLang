@@ -1,0 +1,16 @@
+func make_probe() {
+    let values = [10];
+    func read() [values] {
+        return values[0];
+    }
+
+    print("before", values[0], read());
+    values[0] = 15;
+    print("after item write", values[0], read());
+    values = [90];
+    print("after rebind", values[0], read());
+    return read;
+}
+
+let result = make_probe();
+print("after return", result());

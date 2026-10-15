@@ -1,0 +1,49 @@
+// Acyclic allocation/lifetime probe shared by the VM and LLVM paths.
+// Run in the VM with:
+//   Zeus.exe ZeusZTest/acyclic_memory_lifetime_test.zeu
+// Run through LLVM with:
+//   zeusc.bat ZeusZTest/acyclic_memory_lifetime_test.zeu -o <output.exe>
+
+var DESTROYED = 0;
+
+class Payload {
+    using &this;
+    var text = "";
+
+    func init(value) {
+        this.text = value;
+    }
+
+    func operator[~]() {
+        DESTROYED = DESTROYED + 1;
+    }
+}
+
+func make_temporary_values(i: int) {
+    let text = "payload-" + str(i);
+    let bytes_value = b"data" + b"tail";
+    let values = [text, bytes_value];
+    let mapping = {"payload": text, "index": i};
+    let object = new Payload(text);
+
+    // The values stay local to this call and are dropped when it returns.
+}
+
+func churn(n: int) {
+    let i = 0;
+    for (true) {
+        if (i >= n) {
+            break;
+        }
+        make_temporary_values(i);
+        i = i + 1;
+    }
+}
+
+func main() {
+    print("DESTROYED BEFORE =", DESTROYED);
+    churn(10000);
+    print("DESTROYED AFTER 10000 SCOPE CHURN =", DESTROYED);
+}
+
+main();

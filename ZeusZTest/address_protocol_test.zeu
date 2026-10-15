@@ -1,0 +1,55 @@
+func overwriteNativeString(value: string) -> string {
+    using LLVM {
+        let rawAddress = @addr(value);
+        @faddr(rawAddress) -> string = "456";
+        return value;
+    }
+    using VM {
+        return "456";
+    }
+}
+
+func nativeStringLength(value: string) -> int {
+    using LLVM {
+        let dataAddress = @reveal(value);
+        return @faddr(dataAddress - 8, 8) -> int;
+    }
+    using VM {
+        return len(value);
+    }
+}
+
+let dynamicText = "123";
+using LLVM {
+    let rawAddress = @addr(dynamicText);
+    @faddr(rawAddress) -> string = "456";
+    let dataAddress = @reveal(dynamicText);
+    if (@faddr(dataAddress, 1) -> int != 52) {
+        throw new Exception("string reveal did not point at the first character");
+    }
+}
+
+let dynamicBytes = b"abc";
+using LLVM {
+    let rawAddress = @addr(dynamicBytes);
+    @faddr(rawAddress) -> bytes = b"XYZ";
+    let dataAddress = @reveal(dynamicBytes);
+    @faddr(dataAddress) -> bytes = b"UVW";
+}
+
+if (dynamicText != "456") {
+    throw new Exception("dynamic string slot write failed");
+}
+if (dynamicBytes[0] != 85) {
+    throw new Exception("dynamic raw bytes address write failed");
+}
+if (dynamicBytes.length() != 3) {
+    throw new Exception("bytes reveal length header failed");
+}
+if (overwriteNativeString("123") != "456") {
+    throw new Exception("native raw string address write failed");
+}
+if (nativeStringLength("hello") != 5) {
+    throw new Exception("string reveal length header failed");
+}
+print("ADDRESS_PROTOCOL_PASS");

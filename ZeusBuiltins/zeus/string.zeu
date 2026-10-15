@@ -1,0 +1,605 @@
+using original;
+import zeus.mem;
+
+// Generic value conversion and list-producing split keep the dynamic ABI.
+@native("zeus_string_builtin_str")
+decl func __builtin_str(value);
+
+@native("zeus_string_builtin_type")
+decl func type(value);
+
+@native("zeus_string_builtin_len")
+decl func len(value);
+
+// Text-only operations cross the backend boundary as pointers to the native string buffer.
+@native("zeus_string_length")
+decl func __str_length(value: string) -> int;
+
+@native("zeus_string_data_address")
+decl func __str_data_address(value: string) -> int;
+
+@native("zeus_native_string_get")
+decl func __str_get(value: string, index: int) -> string;
+
+@native("zeus_native_string_slice")
+decl func __str_slice(value: string, start: int, end: int) -> string;
+
+@native("zeus_string_intern")
+decl func __str_intern_native(value: string) -> string;
+
+@native("zeus_string_from_address")
+decl func __str_from_address(data_address: int, length: int) -> string;
+
+@native("zeus_native_string_index")
+decl func __str_index(value: string, substring: string) -> int;
+
+@native("zeus_native_string_rindex")
+decl func __str_rindex(value: string, substring: string) -> int;
+
+@native("zeus_native_string_replace")
+decl func __str_replace(value: string, old: string, replacement: string) -> string;
+
+@native("zeus_string_split")
+decl func __str_split(value, separator);
+
+@native("zeus_native_string_startswith")
+decl func __str_startswith(value: string, prefix: string) -> bool;
+
+@native("zeus_native_string_endswith")
+decl func __str_endswith(value: string, suffix: string) -> bool;
+
+@native("zeus_native_string_lower")
+decl func __str_lower(value: string) -> string;
+
+@native("zeus_native_string_upper")
+decl func __str_upper(value: string) -> string;
+
+@native("zeus_native_string_count")
+decl func __str_count(value: string, substring: string) -> int;
+
+// String literals and all methods use the native `string` representation.
+impl string {
+    using &this;
+
+    // new string(value) is a value factory; it does not allocate a class object.
+    func operator[new](value = "") -> string {
+        if (type(value) == "string") {
+            return value;
+        }
+        return __builtin_str(value);
+    }
+
+    @no_safepoint inline func length() -> int {
+        using LLVM {
+            let dataAddress = @reveal(this);
+            return @faddr(dataAddress - 8, 8) -> int;
+        }
+        using VM {
+            return __str_length(this);
+        }
+    }
+
+    @no_safepoint inline func dataAddress() -> int {
+        using LLVM {
+            return __str_data_address(this);
+        }
+        using VM {
+            return @reveal(this);
+        }
+    }
+
+    func toString() -> string {
+        return this;
+    }
+
+    func nativeString() -> string {
+        return this;
+    }
+
+    @no_safepoint inline func isEmpty() -> bool {
+        using LLVM {
+            let dataAddress = @reveal(this);
+            return (@faddr(dataAddress - 8, 8) -> int) == 0;
+        }
+        using VM {
+            return __str_length(this) == 0;
+        }
+    }
+
+    func clone() -> string {
+        return this;
+    }
+
+    func get(index: int) -> string {
+        return __str_get(this, index);
+    }
+
+    func slice(start: int, end: int) -> string {
+        return __str_slice(this, start, end);
+    }
+
+    func operator[[]=](index: int, value: string) -> string {
+        var textLength = 0;
+        using LLVM {
+            let textDataAddress = @reveal(this);
+            textLength = @faddr(textDataAddress - 8, 8) -> int;
+        }
+        using VM {
+            textLength = __str_length(this);
+        }
+
+        var valueLength = 0;
+        using LLVM {
+            let valueDataAddress = @reveal(value);
+            valueLength = @faddr(valueDataAddress - 8, 8) -> int;
+        }
+        using VM {
+            valueLength = __str_length(value);
+        }
+
+        let writeIndex = index;
+        if (writeIndex < 0) writeIndex = writeIndex + textLength;
+        if (writeIndex < 0) {
+            throw new Exception("String index out of range");
+        }
+        if (writeIndex >= textLength) {
+            throw new Exception("String index out of range");
+        }
+        if (valueLength != 1) {
+            throw new Exception("String index assignment requires one byte");
+        }
+
+        using LLVM {
+            if (textLength > 9223372036854775791) {
+                throw new Exception("String index assignment result is too large");
+            }
+            let sourceAddress = this.dataAddress();
+            let replacementAddress = value.dataAddress();
+            let allocation = malloc(textLength + 9);
+            if (allocation == 0) {
+                throw new Exception("String index assignment allocation failed");
+            }
+            let outputAddress = allocation + 8;
+            @faddr(allocation, 8) -> int = textLength;
+
+            let offset = 0;
+            for (offset < writeIndex) {
+                @faddr(outputAddress + offset, 1) -> int =
+                    @faddr(sourceAddress + offset, 1) -> int;
+                offset = offset + 1;
+            }
+            @faddr(outputAddress + writeIndex, 1) -> int =
+                @faddr(replacementAddress, 1) -> int;
+            offset = writeIndex + 1;
+            for (offset < textLength) {
+                @faddr(outputAddress + offset, 1) -> int =
+                    @faddr(sourceAddress + offset, 1) -> int;
+                offset = offset + 1;
+            }
+            @faddr(outputAddress + textLength, 1) -> int = 0;
+
+            var result: string = "";
+            try {
+                result = __str_from_address(outputAddress, textLength);
+            } catch (&error) {
+                free(allocation);
+                throw error;
+            }
+            free(allocation);
+            return result;
+        }
+        using VM {
+            return __str_slice(this, 0, writeIndex) + value +
+                __str_slice(this, writeIndex + 1, textLength);
+        }
+    }
+
+    @no_safepoint inline func index(substring: string) -> int {
+        using LLVM {
+            let textData = @reveal(this);
+            let needleData = @reveal(substring);
+            let textAddress = textData;
+            let needleAddress = needleData;
+            let textLength = @faddr(textData - 8, 8) -> int;
+            let needleLength = @faddr(needleData - 8, 8) -> int;
+
+            if (needleLength == 0) return 0;
+            if (needleLength > textLength) return -1;
+
+            let firstByte = @faddr(needleAddress, 1) -> int;
+            let scan = 0;
+            for (scan <= textLength - needleLength) {
+                if (@faddr(textAddress + scan, 1) -> int == firstByte) {
+                    let matched = 1;
+                    let offset = 1;
+                    for (offset <= needleLength - 8) {
+                        if (@faddr(textAddress + scan + offset, 8) -> int !=
+                            @faddr(needleAddress + offset, 8) -> int) {
+                            matched = 0;
+                            break;
+                        }
+                        offset = offset + 8;
+                    }
+                    if (matched == 1) {
+                        for (offset < needleLength) {
+                            if (@faddr(textAddress + scan + offset, 1) -> int !=
+                                @faddr(needleAddress + offset, 1) -> int) {
+                                matched = 0;
+                                break;
+                            }
+                            offset = offset + 1;
+                        }
+                    }
+                    if (matched == 1) return scan;
+                }
+                scan = scan + 1;
+            }
+            return -1;
+        }
+        using VM {
+            return __str_index(this, substring);
+        }
+    }
+
+    @no_safepoint inline func rindex(substring: string) -> int {
+        using LLVM {
+            let textData = @reveal(this);
+            let needleData = @reveal(substring);
+            let textAddress = textData;
+            let needleAddress = needleData;
+            let textLength = @faddr(textData - 8, 8) -> int;
+            let needleLength = @faddr(needleData - 8, 8) -> int;
+
+            if (needleLength == 0) return textLength;
+            if (needleLength > textLength) return -1;
+
+            let firstByte = @faddr(needleAddress, 1) -> int;
+            let scan = textLength - needleLength;
+            for (scan >= 0) {
+                if (@faddr(textAddress + scan, 1) -> int == firstByte) {
+                    let matched = 1;
+                    let offset = 1;
+                    for (offset <= needleLength - 8) {
+                        if (@faddr(textAddress + scan + offset, 8) -> int !=
+                            @faddr(needleAddress + offset, 8) -> int) {
+                            matched = 0;
+                            break;
+                        }
+                        offset = offset + 8;
+                    }
+                    if (matched == 1) {
+                        for (offset < needleLength) {
+                            if (@faddr(textAddress + scan + offset, 1) -> int !=
+                                @faddr(needleAddress + offset, 1) -> int) {
+                                matched = 0;
+                                break;
+                            }
+                            offset = offset + 1;
+                        }
+                    }
+                    if (matched == 1) return scan;
+                }
+                scan = scan - 1;
+            }
+            return -1;
+        }
+        using VM {
+            return __str_rindex(this, substring);
+        }
+    }
+
+    @no_safepoint inline func replace(old: string, replacement: string) -> string {
+        using LLVM {
+            let textData = @reveal(this);
+            let oldData = @reveal(old);
+            let replacementData = @reveal(replacement);
+            let textAddress = textData;
+            let oldAddress = oldData;
+            let replacementAddress = replacementData;
+            let textLength = @faddr(textData - 8, 8) -> int;
+            let oldLength = @faddr(oldData - 8, 8) -> int;
+            let replacementLength = @faddr(replacementData - 8, 8) -> int;
+
+            if (oldLength == 0) {
+                throw new Exception("String replace pattern cannot be empty");
+            }
+
+            let replacementIsOld = oldLength == replacementLength;
+            let compareOffset = 0;
+            if (replacementIsOld) {
+                for (compareOffset < oldLength) {
+                    if (@faddr(oldAddress + compareOffset, 1) -> int !=
+                        @faddr(replacementAddress + compareOffset, 1) -> int) {
+                        replacementIsOld = false;
+                        break;
+                    }
+                    compareOffset = compareOffset + 1;
+                }
+            }
+            if (replacementIsOld) {
+                return this;
+            }
+
+            let outputLength = textLength;
+            let foundMatch = false;
+            let scan = 0;
+            for (scan <= textLength - oldLength) {
+                let matched = 0;
+                let isMatch = false;
+                let lastByteMatches =
+                    @faddr(textAddress + scan + oldLength - 1, 1) -> int ==
+                    @faddr(oldAddress + oldLength - 1, 1) -> int;
+                if (lastByteMatches) {
+                    for (matched < oldLength - 1) {
+                        if (@faddr(textAddress + scan + matched, 1) -> int !=
+                            @faddr(oldAddress + matched, 1) -> int) {
+                            break;
+                        }
+                        matched = matched + 1;
+                    }
+                    if (matched == oldLength - 1) {
+                        isMatch = true;
+                    }
+                }
+                if (isMatch) {
+                    foundMatch = true;
+                    if (replacementLength > oldLength) {
+                        let growth = replacementLength - oldLength;
+                        if (outputLength > 9223372036854775807 - growth) {
+                            throw new Exception("String replace result is too large");
+                        }
+                        outputLength = outputLength + growth;
+                    } else {
+                        outputLength = outputLength -
+                            (oldLength - replacementLength);
+                    }
+                    scan = scan + oldLength;
+                } else {
+                    scan = scan + 1;
+                }
+            }
+
+            if (foundMatch == false) {
+                return this;
+            }
+
+            if (outputLength > 9223372036854775791) {
+                throw new Exception("String replace result is too large");
+            }
+            let allocation = malloc(outputLength + 9);
+            if (allocation == 0) {
+                throw new Exception("String replace allocation failed");
+            }
+            let outputAddress = allocation + 8;
+            @faddr(allocation, 8) -> int = outputLength;
+
+            let source = 0;
+            let destination = 0;
+            for (source <= textLength - oldLength) {
+                let matched = 0;
+                let isMatch = false;
+                let lastByteMatches =
+                    @faddr(textAddress + source + oldLength - 1, 1) -> int ==
+                    @faddr(oldAddress + oldLength - 1, 1) -> int;
+                if (lastByteMatches) {
+                    for (matched < oldLength - 1) {
+                        if (@faddr(textAddress + source + matched, 1) -> int !=
+                            @faddr(oldAddress + matched, 1) -> int) {
+                            break;
+                        }
+                        matched = matched + 1;
+                    }
+                    if (matched == oldLength - 1) {
+                        isMatch = true;
+                    }
+                }
+                if (isMatch) {
+                    let replacementOffset = 0;
+                    for (replacementOffset < replacementLength) {
+                        @faddr(outputAddress + destination, 1) -> int =
+                            @faddr(replacementAddress + replacementOffset, 1) -> int;
+                        destination = destination + 1;
+                        replacementOffset = replacementOffset + 1;
+                    }
+                    source = source + oldLength;
+                } else {
+                    @faddr(outputAddress + destination, 1) -> int =
+                        @faddr(textAddress + source, 1) -> int;
+                    source = source + 1;
+                    destination = destination + 1;
+                }
+            }
+            for (source < textLength) {
+                @faddr(outputAddress + destination, 1) -> int =
+                    @faddr(textAddress + source, 1) -> int;
+                source = source + 1;
+                destination = destination + 1;
+            }
+            @faddr(outputAddress + outputLength, 1) -> int = 0;
+
+            var result: string = "";
+            try {
+                result = __str_from_address(outputAddress, outputLength);
+            } catch (&error) {
+                free(allocation);
+                throw error;
+            }
+            free(allocation);
+            return result;
+        }
+        using VM {
+            return __str_replace(this, old, replacement);
+        }
+    }
+
+    func split(separator: string) {
+        return __str_split(this, separator);
+    }
+
+    @no_safepoint inline func startswith(prefix: string) -> bool {
+        using LLVM {
+            let textData = @reveal(this);
+            let prefixData = @reveal(prefix);
+            let textAddress = textData;
+            let prefixAddress = prefixData;
+            let textLength = @faddr(textData - 8, 8) -> int;
+            let prefixLength = @faddr(prefixData - 8, 8) -> int;
+
+            if (prefixLength > textLength) return false;
+            let offset = 0;
+            for (offset <= prefixLength - 32) {
+                if (@faddr(textAddress + offset, 8) -> int !=
+                    @faddr(prefixAddress + offset, 8) -> int) {
+                    return false;
+                }
+                if (@faddr(textAddress + offset + 8, 8) -> int !=
+                    @faddr(prefixAddress + offset + 8, 8) -> int) {
+                    return false;
+                }
+                if (@faddr(textAddress + offset + 16, 8) -> int !=
+                    @faddr(prefixAddress + offset + 16, 8) -> int) {
+                    return false;
+                }
+                if (@faddr(textAddress + offset + 24, 8) -> int !=
+                    @faddr(prefixAddress + offset + 24, 8) -> int) {
+                    return false;
+                }
+                offset = offset + 32;
+            }
+            for (offset <= prefixLength - 8) {
+                if (@faddr(textAddress + offset, 8) -> int !=
+                    @faddr(prefixAddress + offset, 8) -> int) {
+                    return false;
+                }
+                offset = offset + 8;
+            }
+            for (offset < prefixLength) {
+                if (@faddr(textAddress + offset, 1) -> int !=
+                    @faddr(prefixAddress + offset, 1) -> int) {
+                    return false;
+                }
+                offset = offset + 1;
+            }
+            return true;
+        }
+        using VM {
+            return __str_startswith(this, prefix);
+        }
+    }
+
+    @no_safepoint inline func endswith(suffix: string) -> bool {
+        using LLVM {
+            let textData = @reveal(this);
+            let suffixData = @reveal(suffix);
+            let textAddress = textData;
+            let suffixAddress = suffixData;
+            let textLength = @faddr(textData - 8, 8) -> int;
+            let suffixLength = @faddr(suffixData - 8, 8) -> int;
+
+            if (suffixLength > textLength) return false;
+            let offset = 0;
+            let start = textLength - suffixLength;
+            for (offset <= suffixLength - 32) {
+                if (@faddr(textAddress + start + offset, 8) -> int !=
+                    @faddr(suffixAddress + offset, 8) -> int) {
+                    return false;
+                }
+                if (@faddr(textAddress + start + offset + 8, 8) -> int !=
+                    @faddr(suffixAddress + offset + 8, 8) -> int) {
+                    return false;
+                }
+                if (@faddr(textAddress + start + offset + 16, 8) -> int !=
+                    @faddr(suffixAddress + offset + 16, 8) -> int) {
+                    return false;
+                }
+                if (@faddr(textAddress + start + offset + 24, 8) -> int !=
+                    @faddr(suffixAddress + offset + 24, 8) -> int) {
+                    return false;
+                }
+                offset = offset + 32;
+            }
+            for (offset <= suffixLength - 8) {
+                if (@faddr(textAddress + start + offset, 8) -> int !=
+                    @faddr(suffixAddress + offset, 8) -> int) {
+                    return false;
+                }
+                offset = offset + 8;
+            }
+            for (offset < suffixLength) {
+                if (@faddr(textAddress + start + offset, 1) -> int !=
+                    @faddr(suffixAddress + offset, 1) -> int) {
+                    return false;
+                }
+                offset = offset + 1;
+            }
+            return true;
+        }
+        using VM {
+            return __str_endswith(this, suffix);
+        }
+    }
+
+    func lower() -> string {
+        return __str_lower(this);
+    }
+
+    func upper() -> string {
+        return __str_upper(this);
+    }
+
+    @no_safepoint inline func count(substring: string) -> int {
+        using LLVM {
+            let textData = @reveal(this);
+            let needleData = @reveal(substring);
+            let textAddress: int = textData;
+            let needleAddress: int = needleData;
+            let textLength: int = @faddr(textData - 8, 8) -> int;
+            let needleLength: int = @faddr(needleData - 8, 8) -> int;
+
+            if (needleLength == 0) return 0;
+            if (needleLength > textLength) return 0;
+
+            let result: int = 0;
+            let scan: int = 0;
+            for (scan <= textLength - needleLength) {
+                let matched: int = 0;
+                for (matched < needleLength) {
+                    if (@faddr(textAddress + scan + matched, 1) -> int !=
+                        @faddr(needleAddress + matched, 1) -> int) {
+                        break;
+                    }
+                    matched = matched + 1;
+                }
+                if (matched == needleLength) {
+                    result = result + 1;
+                    scan = scan + needleLength;
+                } else {
+                    scan = scan + 1;
+                }
+            }
+            return result;
+        }
+        using VM {
+            return __str_count(this, substring);
+        }
+    }
+}
+
+func str(obj) -> string {
+    if (type(obj) == "string") {
+        return obj;
+    }
+
+    // Class instances have their class name as type(obj), not "object".
+    // Try the user-visible conversion protocol for every non-string value;
+    // primitives without toString() keep the native conversion below.
+    try {
+        let converted = obj.toString();
+        if (type(converted) == "string") {
+            return converted;
+        }
+        return __builtin_str(converted);
+    } catch (e) {
+        return __builtin_str(obj);
+    }
+}

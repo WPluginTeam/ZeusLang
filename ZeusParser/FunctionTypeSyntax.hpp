@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "LexerType.hpp"
+#include "GenericCallSyntax.hpp"
 
 namespace ZeusParser {
 
@@ -18,12 +19,17 @@ namespace ZeusParser {
     struct FunctionDecoratorSyntax {
         std::string name;
         std::string argument;
+        std::string secondaryArgument;
+        std::vector<std::string> typeArguments;
         bool hasArgument = false;
+        bool hasSecondaryArgument = false;
+        bool argumentIsIdentifier = false;
     };
 
-    struct FunctionDecoratorPrefixSyntax {
+    struct FunctionPrefixSyntax {
         std::vector<FunctionDecoratorSyntax> decorators;
         size_t nextToken = 0;
+        bool isInline = false;
         bool valid = true;
     };
 
@@ -32,7 +38,14 @@ namespace ZeusParser {
         std::vector<FunctionParameterSyntax> parameters;
         std::string returnTypeName;
         std::vector<FunctionDecoratorSyntax> decorators;
+        bool isInline = false;
+        bool isStaticMethod = false;
+        bool hasVariadicArgs = false;
+        bool hasVariadicKwargs = false;
         std::string nativeSymbol;
+        // Scalar `&T` native parameters use raw pointers by default; "slot"
+        // keeps the legacy ZeusValue* reference ABI.
+        std::string nativeReferenceABI = "raw";
         bool valid = false;
     };
 
@@ -44,13 +57,24 @@ namespace ZeusParser {
                std::get<LexerType::Operator>(token).symbol == symbol;
     }
 
-    inline FunctionDecoratorPrefixSyntax parseFunctionDecoratorPrefix(
+    inline FunctionPrefixSyntax parseFunctionPrefix(
         const std::vector<LexerType::Token>& tokens
     ) {
-        FunctionDecoratorPrefixSyntax result;
+        FunctionPrefixSyntax result;
         size_t position = 0;
 
-        while (position < tokens.size() && isOperator(tokens[position], "@")) {
+        while (position < tokens.size()) {
+            if (std::holds_alternative<LexerType::Keyword>(tokens[position]) &&
+                std::get<LexerType::Keyword>(tokens[position]).name == "inline") {
+                if (result.isInline) {
+                    result.valid = false;
+                    return result;
+                }
+                result.isInline = true;
+                ++position;
+                continue;
+            }
+            if (!isOperator(tokens[position], "@")) break;
             ++position;
             if (position >= tokens.size() ||
                 !std::holds_alternative<LexerType::Keyword>(tokens[position])) {
@@ -62,18 +86,58 @@ namespace ZeusParser {
             decorator.name = std::get<LexerType::Keyword>(tokens[position++]).name;
             if (position < tokens.size() && isOperator(tokens[position], "(")) {
                 ++position;
-                if (position >= tokens.size() ||
-                    !std::holds_alternative<LexerType::Value>(tokens[position])) {
-                    result.valid = false;
-                    return result;
+                if (decorator.name == "type") {
+                    while (true) {
+                        if (position >= tokens.size() ||
+                            !std::holds_alternative<LexerType::Keyword>(tokens[position])) {
+                            result.valid = false;
+                            return result;
+                        }
+                        const std::string typeParameter =
+                            std::get<LexerType::Keyword>(tokens[position++]).name;
+                        if (typeParameter.empty()) {
+                            result.valid = false;
+                            return result;
+                        }
+                        decorator.typeArguments.push_back(typeParameter);
+                        if (position < tokens.size() && isOperator(tokens[position], ",")) {
+                            ++position;
+                            continue;
+                        }
+                        break;
+                    }
+                    decorator.argument = decorator.typeArguments.front();
+                    decorator.hasArgument = true;
+                    decorator.argumentIsIdentifier = true;
+                } else {
+                    if (position >= tokens.size() ||
+                        !std::holds_alternative<LexerType::Value>(tokens[position])) {
+                        result.valid = false;
+                        return result;
+                    }
+                    const auto& value = std::get<LexerType::Value>(tokens[position++]);
+                    if (!std::holds_alternative<std::string>(value.data)) {
+                        result.valid = false;
+                        return result;
+                    }
+                    decorator.argument = std::get<std::string>(value.data);
+                    decorator.hasArgument = true;
                 }
-                const auto& value = std::get<LexerType::Value>(tokens[position++]);
-                if (!std::holds_alternative<std::string>(value.data)) {
-                    result.valid = false;
-                    return result;
+                if (position < tokens.size() && isOperator(tokens[position], ",")) {
+                    ++position;
+                    if (position >= tokens.size() ||
+                        !std::holds_alternative<LexerType::Value>(tokens[position])) {
+                        result.valid = false;
+                        return result;
+                    }
+                    const auto& option = std::get<LexerType::Value>(tokens[position++]);
+                    if (!std::holds_alternative<std::string>(option.data)) {
+                        result.valid = false;
+                        return result;
+                    }
+                    decorator.secondaryArgument = std::get<std::string>(option.data);
+                    decorator.hasSecondaryArgument = true;
                 }
-                decorator.argument = std::get<std::string>(value.data);
-                decorator.hasArgument = true;
                 if (position >= tokens.size() || !isOperator(tokens[position], ")")) {
                     result.valid = false;
                     return result;
@@ -93,16 +157,13 @@ namespace ZeusParser {
         size_t end,
         std::string& typeName
     ) {
-        bool isReference = position < end && isOperator(tokens[position], "&");
-        if (isReference) ++position;
+        const size_t start = position;
         if (position >= end ||
-            !std::holds_alternative<LexerType::Keyword>(tokens[position])) {
-            if (isReference) --position;
+            !ZeusParser::parseGenericType(tokens, position, typeName) ||
+            position > end) {
+            position = start;
             return false;
         }
-
-        typeName = std::get<LexerType::Keyword>(tokens[position++]).name;
-        if (isReference) typeName.insert(typeName.begin(), '&');
         return true;
     }
 
@@ -118,16 +179,16 @@ namespace ZeusParser {
                 break;
             }
         }
-        if (functionKeyword == tokens.size() || functionKeyword + 1 >= tokens.size() ||
-            !std::holds_alternative<LexerType::Keyword>(tokens[functionKeyword + 1])) {
+        if (functionKeyword == tokens.size() || functionKeyword + 1 >= tokens.size()) {
             return signature;
         }
 
         const std::vector<LexerType::Token> prefixTokens(
             tokens.begin(), tokens.begin() + functionKeyword
         );
-        const auto prefix = parseFunctionDecoratorPrefix(prefixTokens);
+        const auto prefix = parseFunctionPrefix(prefixTokens);
         if (!prefix.valid) return signature;
+        signature.isInline = prefix.isInline;
         size_t prefixEnd = prefix.nextToken;
         if (prefixEnd < prefixTokens.size() &&
             std::holds_alternative<LexerType::Keyword>(prefixTokens[prefixEnd]) &&
@@ -139,18 +200,40 @@ namespace ZeusParser {
         for (const auto& decorator : signature.decorators) {
             if (decorator.name == "native") {
                 if (!decorator.hasArgument || decorator.argument.empty() ||
-                    !signature.nativeSymbol.empty()) {
+                    !signature.nativeSymbol.empty() ||
+                    (decorator.hasSecondaryArgument &&
+                     decorator.secondaryArgument != "raw" &&
+                     decorator.secondaryArgument != "slot")) {
                     return FunctionSignatureSyntax{};
                 }
                 signature.nativeSymbol = decorator.argument;
+                if (decorator.hasSecondaryArgument) {
+                    signature.nativeReferenceABI = decorator.secondaryArgument;
+                }
             } else {
                 return FunctionSignatureSyntax{};
             }
         }
 
-        signature.name = std::get<LexerType::Keyword>(tokens[functionKeyword + 1]).name;
-        size_t openParen = functionKeyword + 2;
-        while (openParen < tokens.size() && !isOperator(tokens[openParen], "(")) ++openParen;
+        size_t namePosition = functionKeyword + 1;
+        if (std::holds_alternative<LexerType::Keyword>(tokens[namePosition]) &&
+            std::get<LexerType::Keyword>(tokens[namePosition]).name == "static") {
+            signature.isStaticMethod = true;
+            ++namePosition;
+        }
+        if (namePosition >= tokens.size() ||
+            !std::holds_alternative<LexerType::Keyword>(tokens[namePosition])) {
+            return signature;
+        }
+        signature.name = std::get<LexerType::Keyword>(tokens[namePosition]).name;
+        size_t openParen = namePosition + 1;
+        while (openParen < tokens.size() && !isOperator(tokens[openParen], "(")) {
+            if (std::holds_alternative<LexerType::Keyword>(tokens[openParen]) &&
+                std::get<LexerType::Keyword>(tokens[openParen]).name == "static") {
+                signature.isStaticMethod = true;
+            }
+            ++openParen;
+        }
         if (openParen == tokens.size()) return signature;
 
         size_t closeParen = openParen + 1;
@@ -167,6 +250,9 @@ namespace ZeusParser {
             if (begin >= end) return;
 
             FunctionParameterSyntax parameter;
+            const bool isVariadicArgs = isOperator(tokens[begin], "*");
+            const bool isVariadicKwargs = isVariadicArgs && begin + 1 < end &&
+                isOperator(tokens[begin + 1], "*");
             parameter.isReference = isOperator(tokens[begin], "&");
             size_t colon = end;
             for (size_t i = begin; i < end; ++i) {
@@ -189,7 +275,19 @@ namespace ZeusParser {
                 parseTypeName(tokens, typePosition, end, parameter.typeName);
             }
             if (!parameter.name.empty() && parameter.name != "*") {
-                signature.parameters.push_back(std::move(parameter));
+                if (isVariadicKwargs) {
+                    signature.hasVariadicKwargs = true;
+                } else if (isVariadicArgs) {
+                    signature.hasVariadicArgs = true;
+                } else {
+                    if (!parameter.typeName.empty() &&
+                        parameter.typeName.front() == '&' &&
+                        parameter.typeName != "&bytes") {
+                        parameter.isReference = true;
+                        parameter.typeName.erase(parameter.typeName.begin());
+                    }
+                    signature.parameters.push_back(std::move(parameter));
+                }
             }
         };
 

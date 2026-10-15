@@ -1,0 +1,50 @@
+@type(K, V)
+class Pair {
+    using &this;
+    var key: K;
+    var value: V;
+
+    func init(k: K, v: V) {
+        this.key = k;
+        this.value = v;
+    }
+}
+
+@type(T)
+class Box {
+    using &this;
+    var item: T;
+
+    func init(value: T) {
+        this.item = value;
+    }
+}
+
+func nestedValue(box: Box<Pair<int, string>>) -> string {
+    return box.item.value;
+}
+
+@type(U)
+func preserveBox(value: Box<U>) -> Box<U> {
+    return value;
+}
+
+@type(U)
+func preserveNestedBox(value: Box<Box<U>>) -> Box<Box<U>> {
+    return value;
+}
+
+let pair = new Pair<int, string>(17, "nested-ok");
+let box = new Box<Pair<int, string>>(pair);
+let preservedBox = preserveBox(box);
+let nestedBox = new Box<Box<Pair<int, string>>>(box);
+let preservedNestedBox = preserveNestedBox(nestedBox);
+if (box.item.key != 17 or box.item.value != "nested-ok" or
+    nestedValue(box) != "nested-ok" or
+    preservedBox.item.value != "nested-ok" or
+    preservedNestedBox.item.item.key != 17) {
+    throw "nested generic class specialization failed";
+}
+
+print("GENERIC_NESTED_CLASS_PASS");
+delete pair, box, nestedBox;

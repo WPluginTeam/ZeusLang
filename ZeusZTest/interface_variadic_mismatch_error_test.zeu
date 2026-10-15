@@ -1,0 +1,9 @@
+interface VariadicInput {
+    decl func collect(*args) -> int;
+}
+
+class FixedInput [VariadicInput] {
+    func collect(args) -> int {
+        return 1;
+    }
+}

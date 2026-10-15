@@ -1,0 +1,21 @@
+
+import zeus.http;
+
+func integrationEcho(request) {
+    if (request.method == "POST") return request.text();
+    let s = "<h1>Hello, World!</h1>";
+    let res = new HTTPResponse("Hello", 200);
+    res.setHeader("Content-Type", "text/html");
+    res.setBody(s);
+    return res;
+}
+
+func main() {
+    let server = new HTTPServer("127.0.0.1", 18773);
+    server.get("/hello", integrationEcho);
+    server.post("/echo", integrationEcho);
+    print("HTTP_SERVER_READY");
+    server.serve(1);
+}
+
+main();

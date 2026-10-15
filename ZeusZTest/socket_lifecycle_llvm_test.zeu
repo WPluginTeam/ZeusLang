@@ -1,0 +1,28 @@
+// AOT probe for automatic Socket.operator[~] invocation.
+
+@native("zeus_runtime_debug_dump")
+decl func runtime_debug_dump() -> int;
+
+import zeus.socket [&];
+
+func create_temporary_listener() {
+    let listener = new socket.Socket();
+    listener.bind("127.0.0.1", 0);
+    listener.listen(1);
+}
+
+func main() {
+    let i = 0;
+    for (true) {
+        if (i >= 10000) {
+            break;
+        }
+        create_temporary_listener();
+        i = i + 1;
+    }
+
+    runtime_debug_dump();
+    print("SOCKET_LIFECYCLE_LLVM_TEST_PASS");
+}
+
+main();

@@ -1,0 +1,44 @@
+// Compare the raw pointer implementation against the existing C++ StringView ABI.
+func runRuntimeReplace(value: string, old: string, replacement: string, iterations: int) -> int {
+    let checksum = 0;
+    let index = 0;
+    for (true) {
+        if (index >= iterations) break;
+        checksum = checksum + __str_replace(value, old, replacement).length();
+        index = index + 1;
+    }
+    return checksum;
+}
+
+func runPointerReplace(value: string, old: string, replacement: string, iterations: int) -> int {
+    let checksum = 0;
+    let index = 0;
+    for (true) {
+        if (index >= iterations) break;
+        checksum = checksum + value.replace(old, replacement).length();
+        index = index + 1;
+    }
+    return checksum;
+}
+
+func benchmark(label: string, value: string, old: string, replacement: string) {
+    let iterations = 2000;
+    runRuntimeReplace(value, old, replacement, 100);
+    runPointerReplace(value, old, replacement, 100);
+
+    let runtimeStart = __time_perf_counter_ns();
+    let runtimeChecksum = runRuntimeReplace(value, old, replacement, iterations);
+    let runtimeElapsed = __time_perf_counter_ns() - runtimeStart;
+
+    let pointerStart = __time_perf_counter_ns();
+    let pointerChecksum = runPointerReplace(value, old, replacement, iterations);
+    let pointerElapsed = __time_perf_counter_ns() - pointerStart;
+
+    print(label, "CPP_VIEW_ABI_NS", runtimeElapsed, runtimeChecksum);
+    print(label, "LLVM_POINTER_NS", pointerElapsed, pointerChecksum);
+}
+
+benchmark("SHORT_EXPANDING", "ab::cd::ef::gh::", "::", "-long-");
+benchmark("SHORT_SHRINKING", "ab--cd--ef--gh--", "--", "x");
+benchmark("LONG_MANY_MATCHES", "0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::0123456789::", "::", "--");
+benchmark("LONG_NEAR_MISS", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", "!");

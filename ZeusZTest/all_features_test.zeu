@@ -4,7 +4,7 @@
 // Optional:
 //   Zeus.exe --strict-decl ZeusZTest/all_features_test.zeu
 
-import ZeusBuiltins.time [&tm];
+import zeus.time [&tm];
 
 var PASS = 0;
 var FAIL = 0;
@@ -237,6 +237,17 @@ func main() {
     let branch = 0;
     if (false) branch = 1; else if (true) branch = 2; else branch = 3;
     ok("else if chain", branch == 2);
+
+    let emptyElseIfBranch = 0;
+    if (false) {
+        emptyElseIfBranch = 1;
+    } else if (false) {
+    } else if (true) {
+        emptyElseIfBranch = 2;
+    } else {
+        emptyElseIfBranch = 3;
+    }
+    ok("else if after empty branch", emptyElseIfBranch == 2);
 
     section("list / dict / subscript");
     let arr = [1, 2, 3];

@@ -1,0 +1,61 @@
+func identity(value) { return value; }
+func incrementReference(&value: int) { value = value + 1; }
+
+var staticCount: int = 1;
+let staticCountAddress = @addr(staticCount);
+staticCount = 2;
+if (@faddr(staticCountAddress) -> int != 2) throw "native global assignment missed exposed slot";
+@faddr(staticCountAddress, 8) -> int = 3;
+if (staticCount != 3) throw "native global read missed raw slot write";
+
+var dynamicValue = identity(1);
+let dynamicValueAddress = @addr(dynamicValue);
+dynamicValue = 2;
+if (@faddr(dynamicValueAddress) -> int != 2) throw "dynamic global assignment missed exposed slot";
+
+var dynamicText = identity("old");
+let dynamicTextAddress = @addr(dynamicText);
+dynamicText = "new";
+if (@faddr(dynamicTextAddress) -> string != "new") throw "dynamic string assignment missed exposed slot";
+@faddr(dynamicTextAddress) -> string = "assigned";
+if (dynamicText != "assigned") throw "dynamic string raw slot write missed variable read";
+
+var dynamicBytes = identity(b"old");
+let dynamicBytesAddress = @addr(dynamicBytes);
+dynamicBytes = b"new";
+let exposedBytes = @faddr(dynamicBytesAddress) -> bytes;
+if (exposedBytes.length() != 3 or exposedBytes[0] != 110) {
+    throw "dynamic bytes assignment missed exposed slot";
+}
+@faddr(dynamicBytesAddress) -> bytes = b"assigned";
+if (dynamicBytes.length() != 8 or dynamicBytes[0] != 97) {
+    throw "dynamic bytes raw slot write missed variable read";
+}
+
+var referenceCount: int = 9;
+incrementReference(referenceCount);
+if (referenceCount != 10) throw "reference parameter missed global slot";
+
+var branchCount: int = 0;
+var branchAddress: int = 0;
+if (false) {
+    branchAddress = @addr(branchCount);
+    @faddr(branchAddress) -> int = 99;
+}
+branchCount = 4;
+if (branchCount != 4) throw "nonexecuted address branch left a stale cache";
+
+var loopCount: int = 0;
+var iteration: int = 0;
+var loopAddress: int = 0;
+for (iteration < 3) {
+    loopCount = loopCount + 1;
+    if (iteration == 1) {
+        loopAddress = @addr(loopCount);
+        @faddr(loopAddress) -> int = 7;
+    }
+    iteration = iteration + 1;
+}
+if (loopCount != 8) throw "loop address exposure lost global writes";
+
+print("GLOBAL_ADDRESS_COHERENCE_PASS");

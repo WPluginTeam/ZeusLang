@@ -1,0 +1,16 @@
+if ("zeus".length() != 4) {
+    throw new Exception("ASCII length failed");
+}
+if ("".length() != 0) {
+    throw new Exception("empty string length failed");
+}
+if ("".isEmpty() != true) {
+    throw new Exception("empty string isEmpty failed");
+}
+if ("zeus".isEmpty() != false) {
+    throw new Exception("non-empty string isEmpty failed");
+}
+if ("你好".length() != 6) {
+    throw new Exception("UTF-8 byte length failed");
+}
+print("STRING_NATIVE_LENGTH_PASS");

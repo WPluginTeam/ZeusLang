@@ -191,7 +191,7 @@ void threadEntry(std::shared_ptr<ThreadInfo> info) {
 
 3. **在 Thread.join() 中触发清理**
 ```cpp
-// ZeusBuiltins/thread.zeu
+// ZeusBuiltins/zeus/thread.zeu
 func join () {
     if (this._Thread_ID >= 0) {
         __thread_join(this._Thread_ID);  // 这里应该触发清理

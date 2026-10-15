@@ -1,0 +1,55 @@
+import zeus.socket [&];
+
+func create_and_drop_bound_socket() {
+    let item = new socket.Socket();
+    item.bind("127.0.0.1", 0);
+    item.listen(1);
+}
+
+func create_and_delete_unconnected_socket() {
+    let item = new socket.Socket();
+    delete item;
+}
+
+func main() {
+    print("=== SOCKET SLOTS BEFORE ===");
+    __vm_stats();
+
+    let i = 0;
+    for (true) {
+        if (i == 100) { break; }
+        create_and_drop_bound_socket();
+        i = i + 1;
+    }
+    print("=== AFTER 100 AUTOMATIC DESTRUCTIONS ===");
+    __vm_stats();
+
+    i = 0;
+    for (true) {
+        if (i == 100) { break; }
+        create_and_delete_unconnected_socket();
+        i = i + 1;
+    }
+
+    print("=== AFTER 100 CREATE/DELETE ===");
+    __vm_stats();
+
+    let item = new socket.Socket();
+    item.close();
+    print("CLOSED_GET_CONNECTED", item.getConnected());
+    item.close();
+    delete item;
+
+    let listener = new socket.Socket();
+    listener.bind("127.0.0.1", 0);
+    listener.listen(1);
+    listener.close();
+    listener.close();
+    delete listener;
+
+    print("=== AFTER IDEMPOTENT AND BOUND CLOSE ===");
+    __vm_stats();
+    print("SOCKET_LIFECYCLE_PROBE_COMPLETE");
+}
+
+main();

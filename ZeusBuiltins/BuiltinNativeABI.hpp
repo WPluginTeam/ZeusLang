@@ -8,21 +8,13 @@ namespace ZeusBuiltins {
 // These native callbacks are independent of a live VM instance and can be
 // invoked through the standalone ZeusValue ABI used by LLVM/AOT code.
 inline bool hasStandaloneValueCallABI(std::string_view name) noexcept {
-    static constexpr std::array<std::string_view, 47> names = {
+    static constexpr std::array<std::string_view, 53> names = {
         "__builtin_str",
         "type",
         "len",
         "int",
         "float",
-        "__array_push",
-        "__array_pop",
-        "__array_get",
-        "__array_set",
-        "__array_clear",
-        "__array_slice",
         "__bytes_slice",
-        "__dict_delete",
-        "__dict_clone",
         "__str_get",
         "__str_slice",
         "__str_index",
@@ -49,13 +41,27 @@ inline bool hasStandaloneValueCallABI(std::string_view name) noexcept {
         "__time_monotonic",
         "__time_monotonic_ns",
         "__time_sleep",
-        "__mutex_create",
-        "__mutex_lock",
-        "__mutex_trylock",
-        "__mutex_unlock",
-        "__mutex_destroy",
         "__thread_sleep",
-        "__thread_current_id"
+        "__thread_current_id",
+        "__socket_create",
+        "__socket_connect",
+        "__socket_bind",
+        "__socket_listen",
+        "__socket_accept",
+        "__socket_send",
+        "__socket_send_all",
+        "__socket_recv",
+        "__socket_recv_exact",
+        "__socket_close",
+        "__socket_is_connected",
+        "bytes",
+        "__bytes_create",
+        "__bytes_get",
+        "__bytes_set",
+        "__bytes_len",
+        "__bytes_concat",
+        "__bytes_decode",
+        "__bytes_to_list"
     };
 
 

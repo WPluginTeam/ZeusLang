@@ -26,6 +26,31 @@ project/
     └── string.zeu        # 字符串包
 ```
 
+## 模块文件寻址
+
+点号分隔的模块名对应目录层级，文件后缀为 `.zeu`。编译器内置模块的根目录固定为编译器可执行文件所在目录下的 `ZeusBuiltins/`：
+
+```text
+import zeus.mem;          -> <compiler-dir>/ZeusBuiltins/zeus/mem.zeu
+import zeus.net.http;     -> <compiler-dir>/ZeusBuiltins/zeus/net/http.zeu
+import ZeusBuiltins.mem;  -> 旧名，规范化为 zeus.mem
+```
+
+所有内置 `.zeu` 模块都放在 `ZeusBuiltins/zeus/` 下。`zeus.*` 是内置模块命名空间，未找到时会直接报模块不存在，不会改从项目目录加载同名文件。旧的 `ZeusBuiltins.*` 名称会规范化为对应的 `zeus.*` 名称，并加载同一个模块。其他项目模块先相对于导入它的源文件目录解析，再相对于进程当前目录解析。
+
+例如，项目文件仍可这样组织：
+
+```text
+project/
+├── main.zeu
+└── package/
+    └── math.zeu
+```
+
+```zeus
+import package.math;
+```
+
 ## 实现架构
 
 ### 1. 四阶段编译流程
@@ -71,8 +96,10 @@ project/
 
 #### IRImport.hpp
 - `resolvePackagePath()`: 解析包路径
-  - 将 `package.math` 转换为 `package/math.zeu`
-  - 相对于主文件路径解析
+  - 将模块点号转换为目录分隔符，并返回绝对路径
+  - `zeus.*` 从编译器目录下的 `ZeusBuiltins/zeus/` 解析
+  - `ZeusBuiltins.*` 作为兼容名称规范化为 `zeus.*`
+  - 项目模块相对于导入源文件目录和进程当前目录解析
 
 #### Zeus.cpp
 - 实现四阶段编译流程

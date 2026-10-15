@@ -1,0 +1,113 @@
+func apply(callback, value) {
+    return callback(value);
+}
+
+class DirectCounter {
+    using &this;
+
+    func add(value) {
+        return value + 1;
+    }
+
+    func callSelf(value) {
+        return this.add(value);
+    }
+}
+
+class BoundCounter {
+    using &this;
+
+    let value = 0;
+
+    func increment(delta) {
+        this.value = this.value + delta;
+        return this.value;
+    }
+
+    func extractAndCall(delta) {
+        let callback = this.increment;
+        return callback(delta);
+    }
+
+    func passAsArgument(delta) {
+        return apply(this.increment, delta);
+    }
+}
+
+class ChainLeaf {
+    using &this;
+
+    func method(value) {
+        return value + 40;
+    }
+}
+
+class ChainLevel4 {
+    using &this;
+
+    let obj4: ChainLeaf;
+
+    func init(value: ChainLeaf) {
+        this.obj4 = value;
+    }
+}
+
+class ChainLevel3 {
+    using &this;
+
+    let obj3: ChainLevel4;
+
+    func init(value: ChainLevel4) {
+        this.obj3 = value;
+    }
+}
+
+class ChainLevel2 {
+    using &this;
+
+    let obj2: ChainLevel3;
+
+    func init(value: ChainLevel3) {
+        this.obj2 = value;
+    }
+}
+
+class ChainRoot {
+    using &this;
+
+    let obj1: ChainLevel2;
+
+    func init(value: ChainLevel2) {
+        this.obj1 = value;
+    }
+}
+
+func makeBoundMethod() {
+    let counter = new BoundCounter();
+    return counter.increment;
+}
+
+let direct = new DirectCounter();
+print(direct.callSelf(2));
+
+let local = new BoundCounter();
+print(local.extractAndCall(3));
+
+let argument = new BoundCounter();
+print(argument.passAsArgument(4));
+
+let topLevel = new BoundCounter();
+let topLevelCallback = topLevel.increment;
+print(topLevelCallback(5));
+
+let detachedCallback = makeBoundMethod();
+print(detachedCallback(6));
+
+let chainLeaf = new ChainLeaf();
+let chainLevel4 = new ChainLevel4(chainLeaf);
+let chainLevel3 = new ChainLevel3(chainLevel4);
+let chainLevel2 = new ChainLevel2(chainLevel3);
+let chainRoot = new ChainRoot(chainLevel2);
+print(chainRoot.obj1.obj2.obj3.obj4.method(7));
+let chainCallback = chainRoot.obj1.obj2.obj3.obj4.method;
+print(chainCallback(7));

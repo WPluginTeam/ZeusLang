@@ -4,6 +4,7 @@
 // 使用 --debug-channels=MEM 开启 Cell/GC 相关调试输出
 
 #include "ZeusVariant.hpp"
+#include "ZeusValueSlot.hpp"
 #include "../ZeusDebug/Utils.hpp"
 #include <cstdint>
 #include <iostream>
@@ -16,6 +17,7 @@
 #include <vector>
 #include <chrono>
 #include <algorithm>
+#include <utility>
 
 // 前向声明 Cell 以供 HeapStats 使用
 struct Cell;
@@ -68,10 +70,11 @@ namespace HeapStats {
 
 
 // 统一的运行期变量单元：
-//  - value: 实际值（UniversalVariant）
+//  - value: 16-byte ZeusValue slot; nil/scalars are inline, strings/bytes own
+//    direct buffers, and other managed values currently own a ZeusBox
 //  - flags: 位标记 (bit0 = const)
 struct Cell {
-    ZeusType::UniversalVariant value;
+    ZeusValueSlot value;
     uint8_t flags; // 0 = var, 1 = const
     uint32_t debugId; // 唯一调试ID
     int refCount = 1; // 引用计数：持有者数量（局部槽、全局槽、upvalue 等）
@@ -80,6 +83,22 @@ struct Cell {
     uint64_t createdAtMs = 0;
     // 调试信息：创建来源（如 "STORE_LOCAL", "MAKE_CLOSURE" 等）
     const char* createdBy = "unknown";
+    Cell(const ZeusType::UniversalVariant& initialValue,
+         uint8_t initialFlags, uint32_t initialDebugId)
+        : value(initialValue), flags(initialFlags), debugId(initialDebugId) {}
+
+    ZeusType::UniversalVariant readValue() const { return value.read(); }
+    void writeValue(const ZeusType::UniversalVariant& nextValue) { value.write(nextValue); }
+
+    template <typename Function>
+    void withValue(Function&& function) {
+        value.withVariant(std::forward<Function>(function));
+    }
+
+    template <typename Function>
+    void withValue(Function&& function) const {
+        value.withVariant(std::forward<Function>(function));
+    }
 
     void retain() { 
         ++refCount; 
@@ -96,8 +115,9 @@ struct Cell {
             HeapStats::recordDelete();
 
             // 追踪ObjectHandle Cell的释放（调试通道）
-            if (std::holds_alternative<ZeusType::ObjectHandle>(value)) {
-                auto& oh = std::get<ZeusType::ObjectHandle>(value);
+            const auto currentValue = readValue();
+            if (std::holds_alternative<ZeusType::ObjectHandle>(currentValue)) {
+                const auto& oh = std::get<ZeusType::ObjectHandle>(currentValue);
                 ZEUS_DEBUG_EXEC({
                     std::cout << "[CELL-TRACK] Released ObjectHandle Cell #" << debugId 
                               << " for obj#" << oh.id << std::endl;
@@ -123,7 +143,7 @@ struct Cell {
                     }, v);
                 };
                 std::cout << "[MEMORY   ] Clear cell: #" << debugId
-                          << " type: " << typeName(value) << std::endl;
+                          << " type: " << typeName(currentValue) << std::endl;
             });
             delete this;
         }
@@ -131,6 +151,7 @@ struct Cell {
     
     // 获取Cell存储的值类型字符串
     std::string getTypeString() const {
+        const auto currentValue = readValue();
         return std::visit([](auto&& arg) -> std::string {
             using T = std::decay_t<decltype(arg)>;
             if constexpr (std::is_same_v<T, ZeusType::BigInteger>) return "int";
@@ -171,7 +192,7 @@ struct Cell {
                 }, arg);
             }
             else return "unknown";
-        }, value);
+        }, currentValue);
     }
 };
 
@@ -202,6 +223,7 @@ namespace ZeusCellUtil {
 namespace HeapStats {
     // 打印所有存活Cell的统计信息
     inline void dumpLiveCells() {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         std::lock_guard<std::mutex> lock(cellRegistryMutex);
         
         std::map<std::string, int> typeCounts;
@@ -220,6 +242,7 @@ namespace HeapStats {
     
     // 获取存活Cell的详细信息（用于Builtin）
     inline std::string getLiveCellsInfo() {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         std::lock_guard<std::mutex> lock(cellRegistryMutex);
         
         std::map<std::string, std::vector<Cell*>> typeGroups;
@@ -246,8 +269,9 @@ namespace HeapStats {
                 oss << "  #" << c->debugId << " refCount=" << c->refCount;
                 
                 // 如果是ObjectHandle，显示objId
-                if (std::holds_alternative<ZeusType::ObjectHandle>(c->value)) {
-                    auto& oh = std::get<ZeusType::ObjectHandle>(c->value);
+                const auto value = c->readValue();
+                if (std::holds_alternative<ZeusType::ObjectHandle>(value)) {
+                    const auto& oh = std::get<ZeusType::ObjectHandle>(value);
                     oss << " objId=" << oh.id << " gen=" << oh.generation;
                 }
                 
@@ -260,12 +284,13 @@ namespace HeapStats {
     
     // 获取存活时间最长的 object Cell（用于追踪泄漏）
     inline std::string getOldestObjectCells(int maxCount = 10) {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         std::lock_guard<std::mutex> lock(cellRegistryMutex);
         
         // 收集所有 object 类型的 Cell
         std::vector<Cell*> objectCells;
         for (Cell* c : liveCells) {
-            if (c && std::holds_alternative<ZeusType::ObjectHandle>(c->value)) {
+            if (c && std::holds_alternative<ZeusType::ObjectHandle>(c->readValue())) {
                 objectCells.push_back(c);
             }
         }
@@ -286,7 +311,8 @@ namespace HeapStats {
         for (Cell* c : objectCells) {
             if (shown >= maxCount) break;
             
-            auto& oh = std::get<ZeusType::ObjectHandle>(c->value);
+            const auto value = c->readValue();
+            const auto& oh = std::get<ZeusType::ObjectHandle>(value);
             uint64_t ageMs = now - c->createdAtMs;
             
             oss << "#" << c->debugId 
@@ -304,12 +330,15 @@ namespace HeapStats {
     
     // 获取泄漏的object Cell的ObjectHandle ID列表（用于深入分析）
     inline std::vector<std::pair<uint32_t, int>> getLeakedObjectCellIds() {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         std::lock_guard<std::mutex> lock(cellRegistryMutex);
         std::vector<std::pair<uint32_t, int>> result;
         
         for (Cell* c : liveCells) {
-            if (c && std::holds_alternative<ZeusType::ObjectHandle>(c->value)) {
-                auto& oh = std::get<ZeusType::ObjectHandle>(c->value);
+            if (!c) continue;
+            const auto value = c->readValue();
+            if (std::holds_alternative<ZeusType::ObjectHandle>(value)) {
+                const auto& oh = std::get<ZeusType::ObjectHandle>(value);
                 result.push_back({c->debugId, oh.id});
             }
         }

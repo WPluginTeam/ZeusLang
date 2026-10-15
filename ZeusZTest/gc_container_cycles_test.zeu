@@ -1,0 +1,137 @@
+var failures = 0;
+
+class GCNode {
+    using &this;
+    let next: GCNode;
+    let payload = nil;
+}
+
+func fail(message: string) {
+    failures = failures + 1;
+    print("[FAIL]", message);
+}
+
+func make_self_array_cycle() {
+    let value = [0];
+    value[0] = value;
+}
+
+func make_self_dict_cycle() {
+    let value = {};
+    value["self"] = value;
+}
+
+func make_self_dict_wrapper_cycle() {
+    let value = new Dict();
+    value["self"] = value;
+}
+
+func make_mixed_cycle() {
+    let array = [0];
+    let dict = {};
+    array[0] = dict;
+    dict["array"] = array;
+}
+
+func make_native_class_cycle() {
+    let first = new GCNode();
+    let second = new GCNode();
+    first.next = second;
+    second.next = first;
+}
+
+func make_native_class_dict_cycle() {
+    let node = new GCNode();
+    let values = {};
+    node.payload = values;
+    values["node"] = node;
+}
+
+func test_rooted_array_cycle() {
+    let value = [0];
+    value[0] = value;
+    let before = __gc_native_nodes();
+    let after = __gc_collect();
+    if (after < before) fail("rooted array cycle was reclaimed");
+    __array_clear(value);
+}
+
+func test_rooted_dict_cycle() {
+    let value = {};
+    value["self"] = value;
+    let before = __gc_native_nodes();
+    let after = __gc_collect();
+    if (after < before) fail("rooted dictionary cycle was reclaimed");
+    value["self"] = 0;
+}
+
+func test_rooted_dict_wrapper_cycle() {
+    let value = new Dict();
+    value["self"] = value;
+    let before = __gc_native_nodes();
+    let after = __gc_collect();
+    if (after < before) fail("rooted Dict wrapper cycle was reclaimed");
+    value.clear();
+}
+
+func test_rooted_native_class_cycle() {
+    __gc_collect();
+    let first = new GCNode();
+    let second = new GCNode();
+    first.next = second;
+    second.next = first;
+    let before = __gc_native_nodes();
+    let after = __gc_collect();
+    if (after < before) fail("rooted native class cycle was reclaimed");
+}
+
+func test_rooted_native_class_dict_cycle() {
+    __gc_collect();
+    let node = new GCNode();
+    let values = {};
+    node.payload = values;
+    values["node"] = node;
+    let expected = __gc_native_nodes();
+    let after = __gc_collect();
+    print("ROOTED_CLASS_DICT_CYCLE", expected, after);
+    if (after < expected) fail("rooted class-dictionary cycle was reclaimed");
+}
+
+func main() {
+    let before = __gc_native_nodes();
+    make_self_array_cycle();
+    let afterArray = __gc_collect();
+    print("SELF_ARRAY_CYCLE", before, afterArray);
+    make_self_dict_cycle();
+    let afterDict = __gc_collect();
+    print("SELF_DICT_CYCLE", afterArray, afterDict);
+    make_self_dict_wrapper_cycle();
+    let afterDictWrapper = __gc_collect();
+    print("SELF_DICT_WRAPPER_CYCLE", afterDict, afterDictWrapper);
+    make_mixed_cycle();
+    let after = __gc_collect();
+    print("MIXED_CYCLE", afterDictWrapper, after);
+    if (after > before) fail("unrooted container cycles remain registered");
+    make_native_class_cycle();
+    let afterNativeClass = __gc_collect();
+    print("UNROOTED_NATIVE_CLASS_CYCLE", after, afterNativeClass);
+    if (afterNativeClass > before) fail("unrooted class/container cycles remain registered");
+    make_native_class_dict_cycle();
+    let afterClassDict = __gc_collect();
+    print("UNROOTED_CLASS_DICT_CYCLE", afterNativeClass, afterClassDict);
+    print("UNROOTED_CYCLES", before, afterClassDict);
+    if (afterClassDict > before) fail("unrooted class-dictionary cycles remain registered");
+
+    test_rooted_array_cycle();
+    test_rooted_dict_cycle();
+    test_rooted_dict_wrapper_cycle();
+    test_rooted_native_class_cycle();
+    test_rooted_native_class_dict_cycle();
+    let final = __gc_collect();
+    print("AFTER_ROOTED_CYCLES", before, final);
+    if (final > before) fail("rooted-cycle cleanup left unbounded nodes");
+    if (failures == 0) print("GC_CONTAINER_CYCLES_PASS", before, after, final);
+    else print("GC_CONTAINER_CYCLES_FAIL", failures);
+}
+
+main();

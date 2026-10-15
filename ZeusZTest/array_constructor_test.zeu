@@ -1,0 +1,36 @@
+import zeus.list;
+import zeus.exception;
+
+func assertArray(condition, message) {
+    if (!condition) throw new Exception("Array impl test failed: " + message);
+}
+
+let literal = [4, 5, 6];
+assertArray(type(literal) == "Array", "array literal has the public Array type");
+assertArray(literal.length() == 3, "literal methods work without a wrapper object");
+
+let constructed = literal;
+assertArray(type(constructed) == "Array", "Array assignment preserves the public Array type");
+constructed[1] = 8;
+assertArray(literal[1] == 8, "Array aliases share the original storage");
+
+let empty = [];
+assertArray(type(empty) == "Array", "empty Array literal has the public type");
+assertArray(empty.length() == 0, "empty literal creates an empty value");
+
+let copied = literal.copy();
+copied[0] = 9;
+assertArray(literal[0] == 4, "copy creates independent array storage");
+assertArray(copied.length() == literal.length(), "copy preserves elements");
+
+let factoryAlias = new Array(literal);
+assertArray(factoryAlias.length() == 3, "Array factory accepts an existing Array");
+factoryAlias[2] = 12;
+assertArray(literal[2] == 12, "Array factory preserves the original Array storage");
+
+let factoryEmpty = new Array();
+assertArray(factoryEmpty.length() == 0, "Array factory supports its default nil argument");
+let factoryEmptyFromNil = new Array(nil);
+assertArray(factoryEmptyFromNil.length() == 0, "Array factory accepts explicit nil");
+
+print("ARRAY_IMPL_TEST_PASS");

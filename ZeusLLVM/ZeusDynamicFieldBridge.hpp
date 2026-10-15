@@ -15,8 +15,14 @@ struct FieldBinding {
     std::string fieldName;
     std::string fieldTypeName;
     size_t fieldIndex = 0;
+    bool typeIsExplicit = false;
     bool hasInitializationFlag = false;
     size_t initializationFlagIndex = 0;
+    bool registerDynamic = true;
+    bool registerForTracing = false;
+    bool hasSetter = false;
+    bool hasNativeSetter = false;
+    bool writable = true;
 };
 
 struct TypeRules {
@@ -78,7 +84,13 @@ inline GeneratedIR generate(
             addString(adapterIndex, "type", field.typeName);
         const std::string fieldString =
             addString(adapterIndex, "name", field.fieldName);
+        const std::string fieldTypeString =
+            addString(adapterIndex, "field_type_name", field.fieldTypeName);
+        const std::string fieldLabel =
+            addString(adapterIndex, "label", field.typeName + "." + field.fieldName);
         const std::string thunkName = "@__zeus_dynamic_field_" +
+            std::to_string(adapterIndex);
+        const std::string setterName = "@__zeus_dynamic_field_set_" +
             std::to_string(adapterIndex);
 
         generated.adapters += "define internal void " + thunkName +
@@ -118,9 +130,9 @@ inline GeneratedIR generate(
                 generated.adapters += "  call void @zeus_value_from_class_ptr(ptr %out, ptr %native.address, ptr " +
                     targetClass + ")\n";
             } else if (const auto* abi = ZeusBuiltins::findNativeTypeABI(targetType);
-                       ZeusBuiltins::isNativeViewABI(abi)) {
+                       ZeusBuiltins::isNativePointerABI(abi)) {
                 generated.adapters += "  call void @" +
-                    std::string(ZeusBuiltins::nativeViewToDynamicHelper(abi)) +
+                    std::string(ZeusBuiltins::nativePointerToDynamicHelper(abi)) +
                     "(ptr %out, ptr %native.address)\n";
             } else {
                 generated.error = "dynamic field '" + field.typeName + "." +
@@ -142,10 +154,10 @@ inline GeneratedIR generate(
             generated.adapters += "  call void @zeus_value_init_bool(ptr %out, i32 %native.value.i32)\n";
         } else if (const auto* viewABI =
                        ZeusBuiltins::findNativeTypeABI(fieldTypeName);
-                   ZeusBuiltins::isNativeViewABI(viewABI)) {
+                   ZeusBuiltins::isNativePointerABI(viewABI)) {
             generated.adapters += "  %native.value = load ptr, ptr %field.address\n";
             generated.adapters += "  call void @" +
-                std::string(ZeusBuiltins::nativeViewToDynamicHelper(viewABI)) +
+                std::string(ZeusBuiltins::nativePointerToDynamicHelper(viewABI)) +
                 "(ptr %out, ptr %native.value)\n";
         } else if (rules.isClassType(fieldTypeName)) {
             const std::string targetClass =
@@ -160,8 +172,91 @@ inline GeneratedIR generate(
         }
 
         generated.adapters += "  ret void\n}\n\n";
-        generated.initializer += "  call void @zeus_dynamic_field_register(ptr " +
-            classString + ", ptr " + fieldString + ", ptr " + thunkName + ")\n";
+
+        if (field.hasNativeSetter) {
+            generated.adapters += "define internal void " + setterName +
+                "(ptr %object, ptr %value, i32 %line) {\nentry:\n";
+            generated.adapters += "  %field.address = getelementptr inbounds " +
+                structType + ", ptr %object, i32 0, i32 " +
+                std::to_string(field.fieldIndex) + "\n";
+
+            if (rules.usesZeusValueABI(fieldTypeName)) {
+                generated.adapters += "  call void @zeus_value_release(ptr %field.address)\n";
+                generated.adapters += "  call void @zeus_value_clone(ptr %field.address, ptr %value)\n";
+            } else if (!fieldTypeName.empty() && fieldTypeName.front() == '&') {
+                const std::string targetType = fieldTypeName.substr(1);
+                const auto* targetABI = ZeusBuiltins::findNativeTypeABI(targetType);
+                if (targetABI && targetABI->valueABI == ZeusBuiltins::NativeValueABI::Int64) {
+                    generated.adapters += "  %native.value = call ptr @zeus_value_require_i64_ptr(ptr %value)\n";
+                    generated.adapters += "  store ptr %native.value, ptr %field.address\n";
+                } else if (targetABI && targetABI->valueABI == ZeusBuiltins::NativeValueABI::Bool1) {
+                    generated.adapters += "  %native.value = call ptr @zeus_value_require_bool_ptr(ptr %value)\n";
+                    generated.adapters += "  store ptr %native.value, ptr %field.address\n";
+                }
+            } else if (const auto* integerABI =
+                           ZeusBuiltins::findNativeTypeABI(fieldTypeName);
+                       integerABI && integerABI->valueABI ==
+                           ZeusBuiltins::NativeValueABI::Int64) {
+                generated.adapters += "  %native.value = call i64 @zeus_value_require_i64(ptr %value)\n";
+                generated.adapters += "  store i64 %native.value, ptr %field.address\n";
+            } else if (const auto* booleanABI =
+                           ZeusBuiltins::findNativeTypeABI(fieldTypeName);
+                       booleanABI && booleanABI->valueABI ==
+                           ZeusBuiltins::NativeValueABI::Bool1) {
+                generated.adapters += "  %native.value.i32 = call i32 @zeus_value_require_bool(ptr %value)\n";
+                generated.adapters += "  %native.value = trunc i32 %native.value.i32 to i1\n";
+                generated.adapters += "  store i1 %native.value, ptr %field.address\n";
+            } else if (const auto* viewABI =
+                           ZeusBuiltins::findNativeTypeABI(fieldTypeName);
+                       ZeusBuiltins::isNativePointerABI(viewABI)) {
+                generated.adapters += "  %native.value = call ptr @" +
+                    std::string(ZeusBuiltins::nativePointerFromDynamicHelper(viewABI)) +
+                    "(ptr %value)\n";
+                generated.adapters += "  store ptr %native.value, ptr %field.address\n";
+            } else if (rules.isClassType(fieldTypeName)) {
+                generated.adapters += "  %native.value = call ptr @zeus_value_require_class_ptr(ptr %value, ptr " +
+                    fieldTypeString + ")\n";
+                generated.adapters += "  call void @zeus_class_ref_retain_edge(ptr %native.value)\n";
+                generated.adapters += "  %previous.value = load ptr, ptr %field.address\n";
+                generated.adapters += "  call void @zeus_class_ref_release_edge(ptr %previous.value)\n";
+                generated.adapters += "  store ptr %native.value, ptr %field.address\n";
+            }
+            generated.adapters += "  ret void\n}\n\n";
+        }
+
+        if (field.registerDynamic) {
+            generated.initializer += "  call void @zeus_dynamic_field_register(ptr " +
+                classString + ", ptr " + fieldString + ", ptr " + thunkName + ")\n";
+        }
+        if (field.registerForTracing) {
+            std::string preparerName = "ptr null";
+            if (rules.usesZeusValueABI(field.fieldTypeName)) {
+                const std::string preparer = "@__zeus_dynamic_field_prepare_" +
+                    std::to_string(adapterIndex);
+                generated.adapters += "define internal void " + preparer +
+                    "(ptr %object) {\nentry:\n";
+                generated.adapters += "  %field.address = getelementptr inbounds " +
+                    rules.llvmStructType(field.typeName) +
+                    ", ptr %object, i32 0, i32 " +
+                    std::to_string(field.fieldIndex) + "\n";
+                generated.adapters += "  call void @zeus_value_slot_register_gc_edge(ptr %field.address)\n";
+                generated.adapters += "  ret void\n}\n\n";
+                preparerName = "ptr " + preparer;
+            }
+            generated.initializer += "  call void @zeus_dynamic_field_trace_register(ptr " +
+                classString + ", ptr " + fieldString + ", ptr " + thunkName +
+                ", " + preparerName + ")\n";
+        }
+
+        if (field.hasSetter) {
+            generated.initializer += "  call void @zeus_dynamic_field_setter_register(ptr " +
+                classString + ", ptr " + fieldString + ", i32 " +
+                (field.writable ? "1" : "0") + ", " +
+                (field.typeIsExplicit ? "ptr " + fieldTypeString : "ptr null") +
+                ", " +
+                (field.hasNativeSetter ? "ptr " + setterName : "ptr null") +
+                ")\n";
+        }
         ++adapterIndex;
     }
 

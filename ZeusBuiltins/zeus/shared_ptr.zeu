@@ -1,0 +1,46 @@
+// SharedPtr owns one raw process allocation. Class aliases share this owner;
+// the allocation is released when the last SharedPtr alias is destroyed.
+import zeus.mem;
+
+class SharedPtr {
+    using &this;
+
+    var addressValue: int = 0;
+
+    func init(capacity: int) {
+        if (capacity <= 0) {
+            throw "SharedPtr capacity must be positive";
+        }
+
+        let allocation: int = malloc(capacity);
+        this.addressValue = allocation;
+        if (this.addressValue == 0) {
+            throw "SharedPtr allocation failed";
+        }
+    }
+
+    @type(T)
+    @no_safepoint
+    inline func save(value: T) {
+        @faddr(this.addressValue) -> T = value;
+    }
+
+    @type(T)
+    @no_safepoint
+    inline func read(exemplar: T) -> T {
+        return @faddr(this.addressValue) -> T;
+    }
+
+    @no_safepoint
+    inline func address() -> int {
+        return this.addressValue;
+    }
+
+    @no_safepoint
+    func operator[~]() {
+        if (this.addressValue != 0) {
+            free(this.addressValue);
+            this.addressValue = 0;
+        }
+    }
+}

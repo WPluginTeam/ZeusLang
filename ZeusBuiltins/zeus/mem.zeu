@@ -1,0 +1,23 @@
+// Raw process allocation for LLVM/AOT code; failure returns address 0.
+@native("__zeus_malloc")
+decl func __zeus_malloc(size: int) -> int;
+
+@native("__zeus_free")
+decl func __zeus_free(address: int) -> int;
+
+@no_safepoint
+inline func malloc(size: int) -> int {
+    return __zeus_malloc(size);
+}
+
+@no_safepoint
+inline func free(address: int) {
+    __zeus_free(address);
+}
+
+// Copies len bytes from addr to dest_addr. The ranges must not overlap.
+func memcpy(addr: int, len: int, dest_addr: int) -> int {
+    let source = @faddr(addr, len) -> &bytes;
+    @faddr(dest_addr, len) -> &bytes = source;
+    return dest_addr;
+}

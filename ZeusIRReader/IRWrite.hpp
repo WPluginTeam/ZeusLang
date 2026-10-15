@@ -14,12 +14,13 @@
 #include <cstdlib>
 
 #include "../ZeusIR/IRType.hpp"
+#include "IRMetadataCodec.hpp"
 
 namespace IRBinary {
 
     // Magic + version
     static const unsigned char MAGIC[4] = { 'Z', 'I', 'R', '1' };
-    static const uint16_t VERSION = 3;
+    static const uint16_t VERSION = 9;
 
     // Arg type tags（尾部追加：老 .zir 里不可能出现新 tag，前向兼容）
     enum ArgTag : uint8_t {
@@ -38,6 +39,7 @@ namespace IRBinary {
     enum SectionType : uint16_t {
         SECTION_SYMBOLS = 1,
         SECTION_GLOBAL_NAMES = 2,
+        SECTION_INSTRUCTION_METADATA = 3,
     };
 
     struct SectionEntry {
@@ -97,7 +99,7 @@ namespace IRBinary {
         std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv);
         meta.buildTime = buf;
 
-        meta.buildVersion = "ZeusIR v3";
+        meta.buildVersion = "ZeusIR v4";
         return meta;
     }
 
@@ -212,6 +214,15 @@ namespace IRBinary {
         writeStringListSection(SECTION_SYMBOLS, symbols);
         if (globalNames) {
             writeStringListSection(SECTION_GLOBAL_NAMES, *globalNames);
+        }
+        {
+            SectionEntry ent;
+            ent.type = SECTION_INSTRUCTION_METADATA;
+            if (!IRMetadataCodec::writeSection(ofs, program, ent.offset, ent.size)) {
+                if (errorMsg) *errorMsg = "Failed to write IR instruction metadata";
+                return false;
+            }
+            sections.push_back(ent);
         }
 
         uint32_t sectionTableOffset = static_cast<uint32_t>(ofs.tellp());

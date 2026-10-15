@@ -1,0 +1,13 @@
+import zeus.http [&];
+
+func routeDebugHandler(request) {
+    return "ok";
+}
+
+let parsed = __http_parse_request(bytes("GET /echo HTTP/1.1\r\nHost: localhost\r\n\r\n"), 16384, 1024);
+print("parsed", parsed.status, parsed.request.path);
+let router = new HTTPRouter();
+router.get("/echo", routeDebugHandler);
+print("route added");
+let response = router.dispatch(parsed.request);
+print("response", response.status, response.body.decode());

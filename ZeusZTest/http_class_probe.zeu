@@ -1,0 +1,8 @@
+import zeus.exception [&];
+
+func main() {
+    let error = new Exception("probe");
+    print(error.getMessage());
+}
+
+main();

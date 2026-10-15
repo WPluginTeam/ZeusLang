@@ -1,0 +1,98 @@
+import zeus.http;
+import zeus.exception;
+
+func assertHttp(condition, message) {
+    if (!condition) throw new Exception("HTTP test failed: " + message);
+}
+
+func httpEcho(request) {
+    return request.text();
+}
+
+func main() {
+    let wire = bytes("POST /echo?source=test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nabcGET /next HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let first = __http_parse_request(wire, 16384, 1024);
+    assertHttp(first.status == 0 and !first.incomplete, "valid POST parses");
+    assertHttp(first.request.method == "POST", "method is normalized");
+    assertHttp(first.request.path == "/echo", "query is separated from path");
+    assertHttp(first.request.query == "source=test", "query is retained");
+    assertHttp(first.request.getHeader("HOST") == "localhost", "headers are case-insensitive");
+    assertHttp(first.request.text() == "abc", "Content-Length body is read");
+    assertHttp(first.request.persistent, "HTTP/1.1 defaults to keep-alive");
+
+    let nextWire = wire.slice(first.consumed, wire.length());
+    let second = __http_parse_request(nextWire, 16384, 1024);
+    assertHttp(second.status == 0 and !second.incomplete, "pipelined next request remains buffered");
+    assertHttp(second.request.path == "/next", "next request parses from retained bytes");
+
+    let missingHost = __http_parse_request(bytes("GET / HTTP/1.1\r\n\r\n"), 16384, 1024);
+    assertHttp(missingHost.status == 400, "HTTP/1.1 requires Host");
+
+    let invalidHeaderName = __http_parse_request(bytes("GET / HTTP/1.1\r\nHost: localhost\r\nBad Header: x\r\n\r\n"), 16384, 1024);
+    assertHttp(invalidHeaderName.status == 400, "header field names reject whitespace");
+
+    let invalidHeaderToken = __http_parse_request(bytes("GET / HTTP/1.1\r\nHost: localhost\r\nBad@Name: x\r\n\r\n"), 16384, 1024);
+    assertHttp(invalidHeaderToken.status == 400, "header field names must use HTTP token characters");
+
+    let invalidMethodToken = __http_parse_request(bytes("G@T / HTTP/1.1\r\nHost: localhost\r\n\r\n"), 16384, 1024);
+    assertHttp(invalidMethodToken.status == 400, "method must use HTTP token characters");
+
+    let lowerCaseMethod = __http_parse_request(bytes("get /echo HTTP/1.1\r\nHost: localhost\r\n\r\n"), 16384, 1024);
+    assertHttp(lowerCaseMethod.status == 0 and lowerCaseMethod.request.method == "get", "method tokens remain case-sensitive");
+
+    let duplicateLength = __http_parse_request(bytes("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx"), 16384, 1024);
+    assertHttp(duplicateLength.status == 400, "duplicate Content-Length is rejected");
+
+    let invalidLength = __http_parse_request(bytes("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 12x\r\n\r\n"), 16384, 1024);
+    assertHttp(invalidLength.status == 400, "non-decimal Content-Length is rejected");
+
+    let tooLargeBody = __http_parse_request(bytes("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\n"), 16384, 4);
+    assertHttp(tooLargeBody.status == 413, "body byte limit is enforced");
+
+    let chunked = __http_parse_request(bytes("POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n"), 16384, 1024);
+    assertHttp(chunked.status == 501, "chunked input is explicitly unsupported");
+
+    let tooLarge = __http_parse_request(bytes("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"), 8, 1024);
+    assertHttp(tooLarge.status == 431, "header byte limit is enforced");
+
+    let router = new HTTPRouter();
+    router.post("/echo", httpEcho);
+    router.get("/echo", httpEcho);
+    let echoResponse = router.dispatch(first.request);
+    assertHttp(echoResponse.status == 200 and echoResponse.body.decode() == "abc", "route receives parsed request");
+    assertHttp(router.dispatch(lowerCaseMethod.request).status == 501, "unknown lowercase method is not treated as GET");
+
+    let unsupportedKnownMethod = __http_parse_request(
+        bytes("PUT /echo HTTP/1.1\r\nHost: localhost\r\n\r\n"), 16384, 1024);
+    let methodError = router.dispatch(unsupportedKnownMethod.request);
+    assertHttp(methodError.status == 405 and
+        methodError.headerLines.index("allow: POST, GET, HEAD") >= 0,
+        "known method mismatch returns the methods registered for the path");
+
+    let unsupportedRouteRejected = false;
+    try {
+        router.add("PUT", "/echo", httpEcho);
+    } catch (&error) {
+        unsupportedRouteRejected = true;
+    }
+    assertHttp(unsupportedRouteRejected, "router does not register methods the server cannot parse");
+
+    let response = new HTTPResponse("ok", 201);
+    response.setHeader("X-Trace", "unit");
+    let invalidResponseHeaderRejected = false;
+    try {
+        response.setHeader("Bad@Name", "unit");
+    } catch (&error) {
+        invalidResponseHeaderRejected = true;
+    }
+    assertHttp(invalidResponseHeaderRejected, "response header names must use HTTP token characters");
+    let responseText = __http_response_bytes(response, true).decode();
+    assertHttp(responseText.startswith("HTTP/1.1 201 Created\r\n"), "response status line is rendered");
+    assertHttp(responseText.index("content-length: 2") >= 0 or responseText.index("Content-Length: 2") >= 0, "response Content-Length is rendered");
+    assertHttp(responseText.index("Connection: keep-alive") >= 0, "persistent response header is rendered");
+    assertHttp(responseText.endswith("\r\n\r\nok"), "response body follows header terminator");
+
+    print("PASS HTTP/1.1 server unit");
+}
+
+main();
