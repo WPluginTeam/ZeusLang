@@ -1,0 +1,182 @@
+using original;
+import zeus.exception;
+import zeus.list;
+import zeus.string;
+
+let IGNORECASE = 2;
+let I = 2;
+let DOTALL = 16;
+let S = 16;
+
+@native("zeus_re_compile")
+decl func __re_compile(pattern, flags);
+@native("zeus_re_matches")
+decl func __re_matches(pattern, flags, text, mode);
+@native("zeus_re_match_at")
+decl func __re_match_at(records, index);
+@native("zeus_re_findall")
+decl func __re_findall(pattern, flags, text);
+@native("zeus_re_split")
+decl func __re_split(pattern, flags, text, maxsplit);
+@native("zeus_re_sub")
+decl func __re_sub(pattern, flags, repl, text, count);
+@native("zeus_re_subn")
+decl func __re_subn(pattern, flags, repl, text, count);
+@native("zeus_re_escape")
+decl func __re_escape(pattern);
+
+class Match {
+    using &this;
+
+    let data: Array = [];
+    let string: string = "";
+    let re = nil;
+
+    func init(data: Array, string: string, re) {
+        this.data = data;
+        this.string = string;
+        this.re = re;
+    }
+
+    func group(index: int = 0) {
+        let groups = this.data[2];
+        if (index < 0 or index >= groups.length()) {
+            throw new Exception("Match group index is out of range");
+        }
+        return groups[index][0];
+    }
+
+    func groups(defaultValue = nil) -> Array {
+        let source = this.data[2];
+        let result = [];
+        let index = 1;
+        for (index < source.length()) {
+            let value = source[index][0];
+            if (value == nil) value = defaultValue;
+            result.append(value);
+            index = index + 1;
+        }
+        return result;
+    }
+
+    func start(index: int = 0) -> int {
+        let groups = this.data[2];
+        if (index < 0 or index >= groups.length()) {
+            throw new Exception("Match group index is out of range");
+        }
+        return groups[index][1];
+    }
+
+    func end(index: int = 0) -> int {
+        let groups = this.data[2];
+        if (index < 0 or index >= groups.length()) {
+            throw new Exception("Match group index is out of range");
+        }
+        return groups[index][2];
+    }
+
+    func span(index: int = 0) -> Array {
+        return [this.start(index), this.end(index)];
+    }
+}
+
+class Pattern {
+    using &this;
+
+    let pattern: string = "";
+    let flags: int = 0;
+    let groups: int = 0;
+
+    func init(pattern: string, flags: int = 0) {
+        this.pattern = pattern;
+        this.flags = flags;
+        this.groups = __re_compile(pattern, flags);
+    }
+
+    func search(text: string) {
+        let data = __re_matches(this.pattern, this.flags, text, 0);
+        if (data == nil) return nil;
+        return new Match(data, text, this);
+    }
+
+    func match(text: string) {
+        let data = __re_matches(this.pattern, this.flags, text, 1);
+        if (data == nil) return nil;
+        return new Match(data, text, this);
+    }
+
+    func fullmatch(text: string) {
+        let data = __re_matches(this.pattern, this.flags, text, 2);
+        if (data == nil) return nil;
+        return new Match(data, text, this);
+    }
+
+    func findall(text: string) -> Array {
+        return __re_findall(this.pattern, this.flags, text);
+    }
+
+    func finditer(text: string) -> Array {
+        let records: Array = __re_matches(this.pattern, this.flags, text, 3);
+        let result: Array = [];
+        let index = 0;
+        for (index < records.length()) {
+            let record: Array = __re_match_at(records, index);
+            result.append(new Match(record, text, this));
+            index = index + 1;
+        }
+        return result;
+    }
+
+    func split(text: string, maxsplit: int = 0) -> Array {
+        return __re_split(this.pattern, this.flags, text, maxsplit);
+    }
+
+    func subn(repl: string, text: string, count: int = 0) -> Array {
+        return __re_subn(this.pattern, this.flags, repl, text, count);
+    }
+
+    func sub(repl: string, text: string, count: int = 0) -> string {
+        return this.subn(repl, text, count)[0];
+    }
+}
+
+func compile(pattern: string, flags: int = 0) -> Pattern {
+    return new Pattern(pattern, flags);
+}
+
+func search(pattern: string, text: string, flags: int = 0) {
+    return compile(pattern, flags).search(text);
+}
+
+func match(pattern: string, text: string, flags: int = 0) {
+    return compile(pattern, flags).match(text);
+}
+
+func fullmatch(pattern: string, text: string, flags: int = 0) {
+    return compile(pattern, flags).fullmatch(text);
+}
+
+func findall(pattern: string, text: string, flags: int = 0) -> Array {
+    return __re_findall(pattern, flags, text);
+}
+
+func finditer(pattern: string, text: string, flags: int = 0) -> Array {
+    let expression: Pattern = compile(pattern, flags);
+    return expression.finditer(text);
+}
+
+func split(pattern: string, text: string, maxsplit: int = 0, flags: int = 0) -> Array {
+    return __re_split(pattern, flags, text, maxsplit);
+}
+
+func sub(pattern: string, repl: string, text: string, count: int = 0, flags: int = 0) -> string {
+    return __re_sub(pattern, flags, repl, text, count);
+}
+
+func subn(pattern: string, repl: string, text: string, count: int = 0, flags: int = 0) -> Array {
+    return __re_subn(pattern, flags, repl, text, count);
+}
+
+func escape(pattern: string) -> string {
+    return __re_escape(pattern);
+}

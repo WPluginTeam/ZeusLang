@@ -3,6 +3,7 @@
 #include "ZeusABIInternal.hpp"
 #include "ZeusProtocolABI.hpp"
 #include "../ZeusBuiltins/BuiltinNativeABI.hpp"
+#include "../ZeusRunner/ZeusBuiltins/regex.hpp"
 #include "../ZeusRunner/ZeusBuiltins/bytes.hpp"
 #include "../ZeusRunner/ZeusBuiltins/gc.hpp"
 #include "../ZeusRunner/ZeusBuiltins/ThreadNativeBuiltins.hpp"
@@ -16,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -46,6 +48,47 @@ ZeusNativeString nativeStringTextOf(const ZeusValue* value,
         return nullptr;
     }
     return zeus_value_intern_string(value);
+}
+
+using RegexNativeCallback = ZeusType::UniversalVariant (*)(
+    const std::vector<ZeusType::UniversalVariant>&);
+
+void invokeRegexNativeValue(
+    ZeusValue* out,
+    const char* symbol,
+    std::initializer_list<const ZeusValue*> values,
+    RegexNativeCallback callback
+) {
+    if (!out) nativeCallPanic(symbol, "null result pointer");
+    zeus_value_init_nil(out);
+
+    try {
+        std::vector<ZeusType::UniversalVariant> arguments;
+        arguments.reserve(values.size());
+        for (const ZeusValue* value : values) {
+            std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> box(
+                zeus_value_to_box(value), &zeus_box_release);
+            const ZeusNativeString text = nativeStringTextOf(value, box->v);
+            if (text) {
+                uint64_t length = 0;
+                std::memcpy(&length, text - sizeof(uint64_t), sizeof(length));
+                if (length > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+                    throw std::length_error("String argument is too large");
+                }
+                arguments.emplace_back(std::string(text, static_cast<size_t>(length)));
+            } else {
+                arguments.push_back(box->v);
+            }
+        }
+
+        ZeusBox result;
+        result.assignVariant(callback(arguments));
+        zeus_value_from_box(out, &result);
+    } catch (const std::exception& error) {
+        nativeCallPanic(symbol, error.what());
+    } catch (...) {
+        nativeCallPanic(symbol, "callback threw a non-standard exception");
+    }
 }
 
 void initializeStandaloneBuiltins() {
@@ -129,6 +172,91 @@ void zeus_value_native_call(
         nativeCallPanic(builtin_name, "callback threw a non-standard exception");
     }
 }
+
+extern "C" {
+
+void zeus_re_compile(
+    ZeusValue* out,
+    const ZeusValue* pattern,
+    const ZeusValue* flags
+) {
+    invokeRegexNativeValue(out, "zeus_re_compile", {pattern, flags},
+        ZeusBuiltins::RegexBuiltinDetail::builtinCompile);
+}
+
+void zeus_re_matches(
+    ZeusValue* out,
+    const ZeusValue* pattern,
+    const ZeusValue* flags,
+    const ZeusValue* text,
+    const ZeusValue* mode
+) {
+    invokeRegexNativeValue(out, "zeus_re_matches", {pattern, flags, text, mode},
+        ZeusBuiltins::RegexBuiltinDetail::builtinMatches);
+}
+
+void zeus_re_match_at(
+    ZeusValue* out,
+    const ZeusValue* records,
+    const ZeusValue* index
+) {
+    invokeRegexNativeValue(out, "zeus_re_match_at", {records, index},
+        ZeusBuiltins::RegexBuiltinDetail::builtinMatchAt);
+}
+
+void zeus_re_findall(
+    ZeusValue* out,
+    const ZeusValue* pattern,
+    const ZeusValue* flags,
+    const ZeusValue* text
+) {
+    invokeRegexNativeValue(out, "zeus_re_findall", {pattern, flags, text},
+        ZeusBuiltins::RegexBuiltinDetail::builtinFindall);
+}
+
+void zeus_re_split(
+    ZeusValue* out,
+    const ZeusValue* pattern,
+    const ZeusValue* flags,
+    const ZeusValue* text,
+    const ZeusValue* maxsplit
+) {
+    invokeRegexNativeValue(out, "zeus_re_split", {pattern, flags, text, maxsplit},
+        ZeusBuiltins::RegexBuiltinDetail::builtinSplit);
+}
+
+void zeus_re_sub(
+    ZeusValue* out,
+    const ZeusValue* pattern,
+    const ZeusValue* flags,
+    const ZeusValue* replacement,
+    const ZeusValue* text,
+    const ZeusValue* count
+) {
+    invokeRegexNativeValue(out, "zeus_re_sub",
+        {pattern, flags, replacement, text, count},
+        ZeusBuiltins::RegexBuiltinDetail::builtinSub);
+}
+
+void zeus_re_subn(
+    ZeusValue* out,
+    const ZeusValue* pattern,
+    const ZeusValue* flags,
+    const ZeusValue* replacement,
+    const ZeusValue* text,
+    const ZeusValue* count
+) {
+    invokeRegexNativeValue(out, "zeus_re_subn",
+        {pattern, flags, replacement, text, count},
+        ZeusBuiltins::RegexBuiltinDetail::builtinSubn);
+}
+
+void zeus_re_escape(ZeusValue* out, const ZeusValue* pattern) {
+    invokeRegexNativeValue(out, "zeus_re_escape", {pattern},
+        ZeusBuiltins::RegexBuiltinDetail::builtinEscape);
+}
+
+} // extern "C"
 
 namespace {
 

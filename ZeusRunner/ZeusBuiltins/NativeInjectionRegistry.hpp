@@ -2,6 +2,7 @@
 
 #include "crypto.hpp"
 #include "websocket.hpp"
+#include "regex.hpp"
 #include "ThreadNativeBuiltins.hpp"
 
 #include <string_view>
@@ -45,7 +46,23 @@ inline const std::vector<NativeInjectionDescriptor>& nativeInjections() {
         {"__mutex_lock", "zeus_mutex_lock", builtin_mutex_lock, 1, 1},
         {"__mutex_trylock", "zeus_mutex_trylock", builtin_mutex_trylock, 1, 1},
         {"__mutex_unlock", "zeus_mutex_unlock", builtin_mutex_unlock, 1, 1},
-        {"__mutex_destroy", "zeus_mutex_destroy", builtin_mutex_destroy, 1, 1}
+        {"__mutex_destroy", "zeus_mutex_destroy", builtin_mutex_destroy, 1, 1},
+        {"__re_compile", "zeus_re_compile",
+         RegexBuiltinDetail::builtinCompile, 2, 2},
+        {"__re_matches", "zeus_re_matches",
+         RegexBuiltinDetail::builtinMatches, 4, 4},
+        {"__re_match_at", "zeus_re_match_at",
+         RegexBuiltinDetail::builtinMatchAt, 2, 2},
+        {"__re_findall", "zeus_re_findall",
+         RegexBuiltinDetail::builtinFindall, 3, 3},
+        {"__re_split", "zeus_re_split",
+         RegexBuiltinDetail::builtinSplit, 4, 4},
+        {"__re_sub", "zeus_re_sub",
+         RegexBuiltinDetail::builtinSub, 5, 5},
+        {"__re_subn", "zeus_re_subn",
+         RegexBuiltinDetail::builtinSubn, 5, 5},
+        {"__re_escape", "zeus_re_escape",
+         RegexBuiltinDetail::builtinEscape, 1, 1}
     };
     return injections;
 }
