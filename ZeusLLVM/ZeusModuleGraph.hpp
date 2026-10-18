@@ -7,6 +7,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include "../ZeusParser/NativeTypeDeclarationResolver.hpp"
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -126,7 +127,7 @@ inline std::vector<ModuleFunctionInterface> readInterfaces(
     const std::string& sourcePath = {}
 ) {
     std::vector<ZeusDiagnostics::Diagnostic> diagnostics;
-    const auto tokens = LexerParser::parse(source, &diagnostics);
+    auto tokens = ZeusParser::parseNativeTypeSource(source, sourcePath, diagnostics);
     ZeusDiagnostics::append(diagnostics, ZeusParser::validateSyntax(tokens));
     if (!diagnostics.empty()) {
         throw std::runtime_error(ZeusDiagnostics::render(diagnostics.front(), sourcePath, source));
@@ -173,7 +174,7 @@ inline std::vector<ModuleClassInterface> readClassInterfaces(
     const std::string& sourcePath = {}
 ) {
     std::vector<ZeusDiagnostics::Diagnostic> diagnostics;
-    const auto tokens = LexerParser::parse(source, &diagnostics);
+    auto tokens = ZeusParser::parseNativeTypeSource(source, sourcePath, diagnostics);
     ZeusDiagnostics::append(diagnostics, ZeusParser::validateSyntax(tokens));
     if (!diagnostics.empty()) {
         throw std::runtime_error(ZeusDiagnostics::render(diagnostics.front(), sourcePath, source));
@@ -243,7 +244,7 @@ inline ZeusParser::InterfaceContractRegistry readInterfaceContracts(
     const std::string& sourcePath = {}
 ) {
     std::vector<ZeusDiagnostics::Diagnostic> diagnostics;
-    const auto tokens = LexerParser::parse(source, &diagnostics);
+    auto tokens = ZeusParser::parseNativeTypeSource(source, sourcePath, diagnostics);
     ZeusDiagnostics::append(diagnostics, ZeusParser::validateSyntax(tokens));
     if (!diagnostics.empty()) {
         throw std::runtime_error(ZeusDiagnostics::render(
@@ -370,7 +371,7 @@ public:
         importStack.clear();
 
         std::vector<ZeusDiagnostics::Diagnostic> rootDiagnostics;
-        const auto rootTokens = LexerParser::parse(rootSource, &rootDiagnostics);
+        const auto rootTokens = ZeusParser::parseNativeTypeSource(rootSource, rootPath, rootDiagnostics);
         ZeusDiagnostics::append(rootDiagnostics, ZeusParser::validateSyntax(rootTokens));
         if (!rootDiagnostics.empty()) {
             result.error = ZeusDiagnostics::render(rootDiagnostics.front(), rootPath, rootSource);

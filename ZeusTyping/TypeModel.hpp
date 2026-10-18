@@ -107,8 +107,15 @@ namespace ZeusTypeInfer {
 
     inline TypeRef parseTypeRef(const std::string& name) {
         TypeRef result(parseTypeName(name));
+        if (ZeusBuiltins::findNativeIntegerABI(name) ||
+            ZeusBuiltins::isNativeFloatingPointType(name)) result.namedType = name;
         result.isReference = !name.empty() && name.front() == '&' &&
             result.kind != InferredType::RawBytesRange;
+        if (result.isReference) {
+            const std::string targetType = name.substr(1);
+            if (ZeusBuiltins::findNativeIntegerABI(targetType) ||
+                ZeusBuiltins::isNativeFloatingPointType(targetType)) result.namedType = targetType;
+        }
         return result;
     }
 

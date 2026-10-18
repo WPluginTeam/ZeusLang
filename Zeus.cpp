@@ -252,7 +252,7 @@ int main(int argc, char* argv[]) {
         VMException::setSourceCode(code);
 
         std::vector<ZeusDiagnostics::Diagnostic> sourceDiagnostics;
-        const auto prescanTokens = LexerParser::parse(code, &sourceDiagnostics);
+        const auto prescanTokens = ZeusParser::parseNativeTypeSource(code, srcPath, sourceDiagnostics);
         ZeusDiagnostics::append(
             sourceDiagnostics,
             ZeusParser::validateSyntax(prescanTokens)
@@ -367,7 +367,7 @@ int main(int argc, char* argv[]) {
 
             for (const auto& module : llvmModuleGraph.dependencyOrder) {
                 std::vector<ZeusDiagnostics::Diagnostic> moduleDiagnostics;
-                auto moduleTokens = LexerParser::parse(module.source, &moduleDiagnostics);
+                auto moduleTokens = ZeusParser::parseNativeTypeSource(module.source, module.path, moduleDiagnostics);
                 ZeusDiagnostics::append(
                     moduleDiagnostics,
                     ZeusParser::validateSyntax(moduleTokens)
@@ -428,7 +428,7 @@ int main(int argc, char* argv[]) {
             }
 
             std::vector<ZeusDiagnostics::Diagnostic> parseDiagnostics;
-            auto typingTokens = LexerParser::parse(code, &parseDiagnostics);
+            auto typingTokens = ZeusParser::parseNativeTypeSource(code, srcPath, parseDiagnostics);
             ZeusDiagnostics::append(
                 parseDiagnostics,
                 ZeusParser::validateSyntax(typingTokens)

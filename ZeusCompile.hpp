@@ -2,6 +2,7 @@
 #define ZEUS_COMPILE_HPP
 
 #include <string>
+#include "./ZeusParser/NativeTypeDeclarationResolver.hpp"
 #include <vector>
 #include <fstream>
 #include <chrono>
@@ -150,7 +151,7 @@ namespace ZeusCompile {
         ZeusDiagnostics::setSourceContext(sourceFilePath, src);
 
         auto t0 = std::chrono::steady_clock::now();
-        std::vector<LexerType::Token> tokens = LexerParser::parse(src, &r.diagnostics);
+        std::vector<LexerType::Token> tokens = ZeusParser::parseNativeTypeSource(src, sourceFilePath, r.diagnostics);
         auto t1 = std::chrono::steady_clock::now();
         ZeusDiagnostics::append(r.diagnostics, ZeusParser::validateSyntax(tokens));
         if (!r.diagnostics.empty()) {

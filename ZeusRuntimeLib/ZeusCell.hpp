@@ -5,6 +5,10 @@
 
 #include "ZeusVariant.hpp"
 #include "ZeusValueSlot.hpp"
+#include "ZeusSignedInteger.hpp"
+#include "ZeusUnsignedInteger.hpp"
+#include "ZeusNativeDouble.hpp"
+#include "ZeusNativeFloat.hpp"
 #include "../ZeusDebug/Utils.hpp"
 #include <cstdint>
 #include <iostream>
@@ -76,6 +80,9 @@ namespace HeapStats {
 struct Cell {
     ZeusValueSlot value;
     uint8_t flags; // 0 = var, 1 = const
+    int32_t signedIntegerBits = 0;
+    int32_t unsignedIntegerBits = 0;
+    uint32_t nativeFloatingPointBits = 0;
     uint32_t debugId; // 唯一调试ID
     int refCount = 1; // 引用计数：持有者数量（局部槽、全局槽、upvalue 等）
     
@@ -88,7 +95,25 @@ struct Cell {
         : value(initialValue), flags(initialFlags), debugId(initialDebugId) {}
 
     ZeusType::UniversalVariant readValue() const { return value.read(); }
-    void writeValue(const ZeusType::UniversalVariant& nextValue) { value.write(nextValue); }
+    void validateValue(const ZeusType::UniversalVariant& nextValue) const {
+        if (signedIntegerBits) ZeusSignedInteger::require(nextValue, signedIntegerBits);
+        if (unsignedIntegerBits) ZeusUnsignedInteger::require(nextValue, unsignedIntegerBits);
+        if (nativeFloatingPointBits == 32) static_cast<void>(ZeusNativeFloat::require(nextValue));
+        else if (nativeFloatingPointBits == 64) static_cast<void>(ZeusNativeDouble::require(nextValue));
+    }
+    void writeValue(const ZeusType::UniversalVariant& nextValue) {
+        if (signedIntegerBits) {
+            value.write(ZeusSignedInteger::normalize(nextValue, signedIntegerBits));
+        } else if (unsignedIntegerBits) {
+            value.write(ZeusUnsignedInteger::normalize(nextValue, unsignedIntegerBits));
+        } else if (nativeFloatingPointBits == 32) {
+            value.write(ZeusNativeFloat::normalize(nextValue));
+        } else if (nativeFloatingPointBits == 64) {
+            value.write(ZeusNativeDouble::normalize(nextValue));
+        } else {
+            value.write(nextValue);
+        }
+    }
 
     template <typename Function>
     void withValue(Function&& function) {

@@ -245,6 +245,64 @@ class VM {
         closures.clear();
     }
 
+    int signedIntegerBitsFor(const std::string& typeName) const {
+        const auto* abi = ZeusBuiltins::findNativeSignedIntegerABI(typeName);
+        return abi ? static_cast<int>(abi->integerBits) : 0;
+    }
+
+    int unsignedIntegerBitsFor(const std::string& typeName) const {
+        const auto* abi = ZeusBuiltins::findNativeUnsignedIntegerABI(typeName);
+        return abi ? static_cast<int>(abi->integerBits) : 0;
+    }
+
+    uint32_t nativeFloatingPointBitsFor(const std::string& typeName) const {
+        return ZeusBuiltins::nativeFloatingPointBits(typeName);
+    }
+
+    ZeusType::UniversalVariant normalizeNativeScalarValue(
+        const std::string& typeName,
+        const ZeusType::UniversalVariant& value
+    ) const {
+        if (const int bits = signedIntegerBitsFor(typeName)) {
+            return ZeusSignedInteger::normalize(value, bits);
+        }
+        if (const int bits = unsignedIntegerBitsFor(typeName)) {
+            return ZeusUnsignedInteger::normalize(value, bits);
+        }
+        if (nativeFloatingPointBitsFor(typeName) == 32) {
+            return ZeusNativeFloat::normalize(value);
+        }
+        if (nativeFloatingPointBitsFor(typeName) == 64) {
+            return ZeusNativeDouble::normalize(value);
+        }
+        return value;
+    }
+
+    void configureNativeScalarCell(Cell* cell, const std::string& typeName) const {
+        if (!cell) return;
+        cell->signedIntegerBits = signedIntegerBitsFor(typeName);
+        cell->unsignedIntegerBits = unsignedIntegerBitsFor(typeName);
+        cell->nativeFloatingPointBits = nativeFloatingPointBitsFor(typeName);
+    }
+
+    bool validateNativeScalarReturn(const std::string& returnType,
+                                    const IRType::IRInstr& instruction) {
+        if (!ZeusBuiltins::findNativeScalarCanonical(returnType)) return true;
+        try {
+            if (stack.empty()) {
+                throw std::runtime_error("Native scalar function returned no value");
+            }
+            stack.back() = normalizeNativeScalarValue(returnType, stack.back());
+        } catch (const std::bad_alloc&) {
+            throw;
+        } catch (const std::exception& error) {
+            VMException::VMException(error.what(), __line, instruction)
+                ._throw(vmstat, currentChunk);
+            return false;
+        }
+        return true;
+    }
+
     Cell* newCell(const ZeusType::UniversalVariant& v, uint8_t flags = 0, const char* createdBy = "unknown") {
         Cell* c = new Cell{v, flags, __nextCellId()};
         c->createdAtMs = __getCurrentTimeMs();
@@ -267,6 +325,9 @@ class VM {
         }
 
         Cell* c = new Cell{loadCellValue(src), src->flags, __nextCellId()};
+        c->signedIntegerBits = src->signedIntegerBits;
+        c->unsignedIntegerBits = src->unsignedIntegerBits;
+        c->nativeFloatingPointBits = src->nativeFloatingPointBits;
         c->createdAtMs = __getCurrentTimeMs();
         c->createdBy = createdBy;
         HeapStats::recordCreate();  // 修复：cloneCell 也需要记录创建
@@ -1110,6 +1171,7 @@ class VM {
         std::vector<CaptureDesc> captures; 
         std::string functionName;
         std::string ownerType;
+        std::string returnType;
         std::vector<std::string> paramTypes;
         std::vector<std::string> typeParameters;
         std::vector<bool> paramIsReference;
@@ -1160,7 +1222,8 @@ class VM {
         std::vector<Cell*>                  savedLocal;               // 保存的局部变量
         std::vector<Cell*>                  savedUpvalue;             // 保存的upvalue
         size_t                              stackBase;                // 栈基址（用于返回时恢复）
-        int                                 savedLine;                // 保存的行号
+        int                                 savedLine;
+        std::string                         returnType;                // 保存的行号
         int                                 calleeAutoReleaseId = -1; // 如果为函数调用传递的临时闭包, 返回时自动 release id
         std::vector<bool>                   paramProvided;           // supplied positional/named arguments for default prologue
         std::vector<bool>                   referenceParameterSlots;
@@ -1367,6 +1430,13 @@ class VM {
     ) {
         const auto* classInfo = getClass(object.classId);
         if (classInfo) {
+            const auto fieldType = classInfo->explicitFieldTypes.find(name);
+            if (fieldType != classInfo->explicitFieldTypes.end() &&
+                ZeusBuiltins::findNativeScalarCanonical(fieldType->second)) {
+                ZeusType::writeObjectField(object, *classInfo, name,
+                    normalizeNativeScalarValue(fieldType->second, value));
+                return;
+            }
             ZeusType::writeObjectField(object, *classInfo, name, value);
             return;
         }
@@ -2607,6 +2677,7 @@ class VM {
                             nullptr,
                             &proto.paramIsReference
                         );
+                        proto.returnType = std::move(returnType);
                         proto.isStaticMethod = bodyInstr.metadata.isStaticMethod;
                     }
                     if (bodyInstr.op == VMOperator::JUMP_IF_PARAM_PROVIDED) {
@@ -2837,6 +2908,7 @@ class VM {
     void assignCellValue(Cell* cell, const ZeusType::UniversalVariant& newVal) {
         if (!cell) return;
 
+        cell->validateValue(newVal);
         const auto oldVal = cell->readValue();
         ZeusGC::releaseVariantDeep(*this, oldVal);
         ZeusGC::retainVariantDeep(*this, newVal);
@@ -3241,6 +3313,7 @@ class VM {
             }
 
             if (ins.op == VMOperator::RETURN) {
+                if (!validateNativeScalarReturn(frame.returnType, ins)) continue;
                 if (!applyClassAssignmentCopy(ins)) continue;
                 StackItem retItem;
                 CallFrame returningFrame = std::move(callFrames.back());
@@ -3459,7 +3532,17 @@ class VM {
             }
 
             justPushedFrame = false;
-            execute(ins);
+            try {
+                execute(ins);
+            } catch (const std::bad_alloc&) {
+                throw;
+            } catch (const std::exception& error) {
+                if (vmstat == ZeusType::VMStatus::Running) {
+                    VMException::VMException(error.what(), __line, ins)
+                        ._throw(vmstat, currentChunk);
+                }
+                continue;
+            }
 
             if (justPushedFrame) {
                 justPushedFrame = false;
@@ -3548,6 +3631,10 @@ class VM {
         local.resize(localSize);
         for (int i = 0; i < localSize; ++i) {
             local[i] = newCell(LexerType::Value(0), 0, "CLOSURE_SYNC_local");
+            if (i < static_cast<int>(proto.paramTypes.size()) &&
+                (i >= static_cast<int>(proto.paramIsReference.size()) || !proto.paramIsReference[i])) {
+                configureNativeScalarCell(local[i], proto.paramTypes[i]);
+            }
         }
         
         // 设置 upvalue
@@ -3593,6 +3680,7 @@ class VM {
         syncFrame.pc = 0;
         syncFrame.stackBase = stack.size();
         syncFrame.savedLine = __line;
+        syncFrame.returnType = proto.returnType;
         syncFrame.savedLocal = oldLocal;
         syncFrame.savedUpvalue = oldUpvalue;
         syncFrame.paramProvided.assign(proto.paramCount, false);
@@ -5442,6 +5530,10 @@ class VM {
                         upvalue.clear();
                         for (int i = 0; i < regularParamCount; ++i) {
                             local[i] = newCell(LexerType::Value(0), 0, "CONSTRUCTOR_local");
+                            if (i < static_cast<int>(proto.paramTypes.size()) &&
+                                (i >= static_cast<int>(proto.paramIsReference.size()) || !proto.paramIsReference[i])) {
+                                configureNativeScalarCell(local[i], proto.paramTypes[i]);
+                            }
                         }
                         
                         // 扩展 local 以容纳 *args 和 **kwargs
@@ -5561,6 +5653,7 @@ class VM {
                         constructorFrame.savedUpvalue = oldUpvalue;
                         constructorFrame.stackBase = calleeIndex;
                         constructorFrame.savedLine = __line;
+                        constructorFrame.returnType = proto.returnType;
                         constructorFrame.paramProvided = std::move(paramProvided);
                         constructorFrame.referenceParameterSlots = proto.paramIsReference;
                         constructorFrame.constructorResult = objHandle;
@@ -8588,6 +8681,10 @@ class VM {
                 local.resize(proto.paramCount);
                 for (int i = 0; i < proto.paramCount; ++i) {
                     local[i] = newCell(LexerType::Value(0), 0, "CALL_CLOSURE_local");
+                    if (i < static_cast<int>(proto.paramTypes.size()) &&
+                        (i >= static_cast<int>(proto.paramIsReference.size()) || !proto.paramIsReference[i])) {
+                        configureNativeScalarCell(local[i], proto.paramTypes[i]);
+                    }
                 }
                 // upvalue 指向 closure 的 upvalues（Cell 指针集合）
                 // The closure owns the capture cells. Reference captures share
@@ -8893,6 +8990,7 @@ class VM {
                 newFrame.savedUpvalue = oldUpvalue;
                 newFrame.stackBase = callFrameBase;
                 newFrame.savedLine = __line;
+                newFrame.returnType = proto.returnType;
                 newFrame.paramProvided = std::move(paramProvided);
                 newFrame.referenceParameterSlots = proto.paramIsReference;
                 
@@ -9105,6 +9203,10 @@ class VM {
                     local.resize(__varIndexInt + 1, nullptr);
                 }
 
+                const std::string& nativeType = instr.metadata.typeName;
+                if (ZeusBuiltins::findNativeScalarCanonical(nativeType)) {
+                    stack.back() = normalizeNativeScalarValue(nativeType, stack.back());
+                }
                 StackItem newItem = popStackItem();
                 ZeusType::UniversalVariant newVal = newItem.value;
                 
@@ -9133,6 +9235,7 @@ class VM {
                 }
 
                 // 丢弃栈持有的那一份引用（local cell 已 retain 一份）
+                configureNativeScalarCell(local[__varIndexInt], nativeType);
                 dropStackItem(newItem);
 
                 printLocals();
@@ -9160,6 +9263,10 @@ class VM {
                 }
                 
                 ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_GLOBAL: Getting stack.back()...");
+                const std::string& nativeType = instr.metadata.typeName;
+                if (ZeusBuiltins::findNativeScalarCanonical(nativeType)) {
+                    stack.back() = normalizeNativeScalarValue(nativeType, stack.back());
+                }
                 StackItem newItem = popStackItem();
                 ZeusType::UniversalVariant newVal = newItem.value; // 将栈顶值视为要存储的新值（可能包含 closure）
                 
@@ -9197,6 +9304,7 @@ class VM {
                     }
                 }
 
+                configureNativeScalarCell(global[__varIndexInt], nativeType);
                 ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_GLOBAL: Popping stack...");
                 // 释放栈临时持有的对象引用（global cell 已 retain 一份）
                 dropStackItem(newItem);
@@ -9262,6 +9370,7 @@ class VM {
                     break;
                 }
 
+                global[idx]->validateValue(stack.back());
                 StackItem newItem = popStackItem();
                 ZeusType::UniversalVariant newVal = newItem.value;
 
@@ -9321,6 +9430,7 @@ class VM {
                     break;
                 }
 
+                local[idx]->validateValue(stack.back());
                 StackItem newItem = popStackItem();
                 ZeusType::UniversalVariant newVal = newItem.value;
 
@@ -9375,6 +9485,7 @@ class VM {
                     break;
                 }
 
+                upvalue[idx]->validateValue(stack.back());
                 StackItem newItem = popStackItem();
                 ZeusType::UniversalVariant newVal = newItem.value;
 

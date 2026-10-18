@@ -2,25 +2,16 @@
 
 #include <string_view>
 #include <vector>
+#include "NativeTypeIDs.hpp"
 
 namespace ZeusBuiltins {
-
-// A source type has one backend representation policy. Dynamic-only types stay
-// in ZeusValue; scalar and native data pointers cross native calls without boxing.
-enum class NativeValueABI {
-    ZeusValue,
-    Int64,
-    Bool1,
-    NativeString,
-    NativeBytes,
-    RawBytesRange
-};
 
 struct NativeTypeABI {
     std::string_view canonicalName;
     std::vector<std::string_view> aliases;
     std::string_view llvmType;
     NativeValueABI valueABI;
+    unsigned integerBits = 0;
 };
 
 inline bool isNativePointerABI(const NativeTypeABI* abi) noexcept {
@@ -54,20 +45,26 @@ inline std::string_view nativePointerFromDataHelper(const NativeTypeABI* abi) no
 }
 
 inline const std::vector<NativeTypeABI>& nativeTypeABIs() {
-    static const std::vector<NativeTypeABI> types = {
-        {"int", {"int32", "int64"}, "i64", NativeValueABI::Int64},
-        {"bool", {}, "i1", NativeValueABI::Bool1},
-        {"string", {"str", "String"}, "ptr", NativeValueABI::NativeString},
-        {"bigint", {}, "ptr", NativeValueABI::ZeusValue},
-        {"float", {"float32", "float64"}, "ptr", NativeValueABI::ZeusValue},
-        {"nil", {}, "ptr", NativeValueABI::ZeusValue},
-        {"Array", {"list", "array"}, "ptr", NativeValueABI::ZeusValue},
-        {"dict", {"map"}, "ptr", NativeValueABI::ZeusValue},
-        {"bytes", {}, "ptr", NativeValueABI::NativeBytes},
-        {"&bytes", {}, "%ZeusRawBytesRange", NativeValueABI::RawBytesRange},
-        {"object", {}, "ptr", NativeValueABI::ZeusValue},
-        {"func", {"function"}, "ptr", NativeValueABI::ZeusValue}
-    };
+    static const std::vector<NativeTypeABI> types = [] {
+        std::vector<NativeTypeABI> result;
+        for (const auto& type : nativeTypeIDs()) {
+            if (type.valueABI == NativeValueABI::NativePointer) continue;
+            result.push_back({type.canonicalName,
+                std::vector<std::string_view>(type.aliases.begin(),
+                    type.aliases.begin() + type.aliasCount),
+                type.llvmType, type.valueABI, type.bits});
+        }
+        // These are compiler/runtime type policies, not C++ native type IDs.
+        // Keep them available to existing dynamic-value lowering paths.
+        result.push_back({"bigint", {}, "ptr", NativeValueABI::ZeusValue});
+        result.push_back({"float", {"float32", "float64"}, "ptr", NativeValueABI::ZeusValue});
+        result.push_back({"nil", {}, "ptr", NativeValueABI::ZeusValue});
+        result.push_back({"Array", {"list", "array"}, "ptr", NativeValueABI::ZeusValue});
+        result.push_back({"dict", {"map"}, "ptr", NativeValueABI::ZeusValue});
+        result.push_back({"object", {}, "ptr", NativeValueABI::ZeusValue});
+        result.push_back({"func", {"function"}, "ptr", NativeValueABI::ZeusValue});
+        return result;
+    }();
     return types;
 }
 
@@ -79,6 +76,32 @@ inline const NativeTypeABI* findNativeTypeABI(std::string_view name) {
         }
     }
     return nullptr;
+}
+
+inline const NativeTypeABI* findNativeSignedIntegerABI(std::string_view name) {
+    const auto* abi = findNativeTypeABI(name);
+    return abi && abi->valueABI == NativeValueABI::SignedInteger ? abi : nullptr;
+}
+
+inline const NativeTypeABI* findNativeUnsignedIntegerABI(std::string_view name) {
+    const auto* abi = findNativeTypeABI(name);
+    return abi && abi->valueABI == NativeValueABI::UnsignedInteger ? abi : nullptr;
+}
+
+inline const NativeTypeABI* findNativeIntegerABI(std::string_view name) {
+    const auto* abi = findNativeTypeABI(name);
+    return abi && (abi->valueABI == NativeValueABI::SignedInteger ||
+                   abi->valueABI == NativeValueABI::UnsignedInteger)
+        ? abi : nullptr;
+}
+
+inline unsigned nativeFloatingPointBits(std::string_view name) {
+    const auto* abi = findNativeTypeABI(name);
+    return abi && abi->valueABI == NativeValueABI::FloatingPoint ? abi->integerBits : 0;
+}
+
+inline bool isNativeFloatingPointType(std::string_view name) {
+    return nativeFloatingPointBits(name) != 0;
 }
 
 } // namespace ZeusBuiltins

@@ -1,0 +1,17 @@
+// Stable native type IDs consumed by @native decl.
+var const DOUBLE = 1;
+var const LONGLONG = 2;
+var const INT32 = 3;
+var const INT8 = 4;
+var const INTEGER = 5;
+var const BOOL = 6;
+var const PTR = 7;
+var const STRING = 8;
+var const BYTES = 9;
+var const RAW_BYTES_RANGE = 10;
+var const FLOAT = 11;
+var const INT16 = 12;
+var const UINT8 = 13;
+var const UINT16 = 14;
+var const UINT32 = 15;
+var const UINT64 = 16;

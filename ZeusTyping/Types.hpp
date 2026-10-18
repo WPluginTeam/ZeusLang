@@ -2,6 +2,7 @@
 
 #include <string>
 #include "../ZeusBuiltins/BuiltinRegistry.hpp"
+#include "../ZeusBuiltins/NativeTypeABI.hpp"
 
 namespace ZeusTypeInfer {
 
@@ -54,6 +55,8 @@ namespace ZeusTypeInfer {
     }
 
     inline InferredType parseTypeName(const std::string& name) {
+        if (ZeusBuiltins::findNativeIntegerABI(name)) return InferredType::Int;
+        if (ZeusBuiltins::isNativeFloatingPointType(name)) return InferredType::Float;
         if (name == "&bytes") return InferredType::RawBytesRange;
         if (!name.empty() && name.front() == '&') {
             return parseTypeName(name.substr(1));

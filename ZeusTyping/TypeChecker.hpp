@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -1038,6 +1040,11 @@ namespace ZeusTypeInfer {
                         symbol == ">" || symbol == "<=" || symbol == ">=") {
                         return TypeInfo::fromType(TypeRef(InferredType::Bool));
                     }
+                    const std::string nativeDouble = ZeusBuiltins::isNativeFloatingPointType(leftInfo.type.namedType)
+                        ? leftInfo.type.namedType : rightInfo.type.namedType;
+                    if (ZeusBuiltins::isNativeFloatingPointType(nativeDouble)) {
+                        return TypeInfo::fromType(parseDeclaredTypeRef(nativeDouble));
+                    }
                     return TypeInfo::fromType(TypeRef(
                         leftInfo.type.kind == InferredType::Float ||
                         rightInfo.type.kind == InferredType::Float
@@ -1097,11 +1104,16 @@ namespace ZeusTypeInfer {
             InferredType expected,
             const TypeInfo& actualInfo,
             const std::string& valueDescription,
-            const TypeCheckOptions& options
+            const TypeCheckOptions& options,
+            const std::string& expectedNativeType = {}
         ) {
             const InferredType actual = actualInfo.type.kind;
 
             if (expected == InferredType::Unknown) return;
+            if (ZeusBuiltins::findNativeIntegerABI(expectedNativeType) &&
+                (actual == InferredType::BigInt || actual == InferredType::Float)) return;
+            if (ZeusBuiltins::isNativeFloatingPointType(expectedNativeType) &&
+                (actual == InferredType::Int || actual == InferredType::BigInt)) return;
 
             if (actual == InferredType::Unknown) {
                 if (options.rejectUnknownExpressions) {
@@ -1134,6 +1146,14 @@ namespace ZeusTypeInfer {
                 expected.type.kind != InferredType::Bool) {
                 return false;
             }
+            if (ZeusBuiltins::isNativeFloatingPointType(expected.type.namedType) &&
+                !expected.type.isReference && !actual.type.isReference &&
+                (actual.type.kind == InferredType::Int ||
+                 actual.type.kind == InferredType::BigInt)) return true;
+            if (ZeusBuiltins::findNativeIntegerABI(expected.type.namedType) &&
+                !expected.type.isReference && !actual.type.isReference &&
+                (actual.type.kind == InferredType::BigInt ||
+                 actual.type.kind == InferredType::Float)) return true;
             if (expected.type.kind != actual.type.kind) return false;
             if ((expected.type.kind == InferredType::Object ||
                  expected.type.kind == InferredType::TypeParameter) &&
@@ -1688,6 +1708,33 @@ namespace ZeusTypeInfer {
                 );
             }
 
+            if (const auto* integerABI = ZeusBuiltins::findNativeIntegerABI(declaredTypeName)) {
+                if (expression.size() == 1 &&
+                    std::holds_alternative<LexerType::Value>(expression.front())) {
+                    const auto& literal = std::get<LexerType::Value>(expression.front());
+                    if (const auto* integer = std::get_if<ZeusType::BigInteger>(&literal.data)) {
+                        const bool isUnsigned = integerABI->valueABI ==
+                            ZeusBuiltins::NativeValueABI::UnsignedInteger;
+                        const ZeusType::BigInteger minimum = isUnsigned
+                            ? ZeusType::BigInteger(0)
+                            : ZeusType::BigInteger(integerABI->integerBits == 64
+                                ? (std::numeric_limits<int64_t>::min)()
+                                : -(int64_t{1} << (integerABI->integerBits - 1)));
+                        const ZeusType::BigInteger maximum = isUnsigned
+                            ? ZeusType::BigInteger(integerABI->integerBits == 64
+                                ? "18446744073709551615"
+                                : std::to_string((uint64_t{1} << integerABI->integerBits) - 1))
+                            : ZeusType::BigInteger(integerABI->integerBits == 64
+                                ? (std::numeric_limits<int64_t>::max)()
+                                : (int64_t{1} << (integerABI->integerBits - 1)) - 1);
+                        if (*integer < minimum || *integer > maximum) {
+                            addDiagnostic(nodeIndex, TypeCheckSeverity::Error,
+                                "Integer literal is out of range for " + declaredTypeName);
+                        }
+                    }
+                }
+            }
+
             TypeInfo actualInfo = expression.empty()
                 ? TypeInfo::unresolved()
                 : inferExpressionInfo(expression, environment);
@@ -1718,7 +1765,7 @@ namespace ZeusTypeInfer {
                     declaredType,
                     actualInfo,
                     "变量 " + name,
-                    options
+                    options, declaredTypeName
                 );
                 environment[name] = TypeInfo::fromType(
                     hasDeclaredType
@@ -1787,7 +1834,7 @@ namespace ZeusTypeInfer {
                     return;
                 }
                 checkValueType(nodeIndex, targetInfo.type.kind, actualInfo,
-                               "@faddr 写入值", options);
+                               "@faddr 写入值", options, targetInfo.type.namedType);
                 return;
             }
             if (isSubscriptAssignmentTarget(statement.tokens, equalIndex)) {
@@ -1868,7 +1915,7 @@ namespace ZeusTypeInfer {
                     targetInfo.type.kind,
                     actualInfo,
                     "类字段赋值",
-                    options
+                    options, targetInfo.type.namedType
                 );
                 return;
             }
@@ -1946,7 +1993,7 @@ namespace ZeusTypeInfer {
                 variable->second.type.kind,
                 actualInfo,
                 "变量 " + name,
-                options
+                options, variable->second.type.namedType
             );
         }
 
@@ -2081,7 +2128,7 @@ namespace ZeusTypeInfer {
                     function->expectedReturn,
                     actualInfo,
                     "函数 " + function->name + " 的返回值",
-                    options
+                    options, function->expectedReturnTypeName
                 );
                 return;
             }

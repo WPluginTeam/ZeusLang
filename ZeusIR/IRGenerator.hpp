@@ -3307,6 +3307,9 @@ void parseVarDecl(
                 if (bindingTypesByNode != nullptr) {
                     const auto bindingType = bindingTypesByNode->find(node.id);
                     if (bindingType != bindingTypesByNode->end()) {
+                        if (ZeusBuiltins::findNativeSignedIntegerABI(bindingType->second)) {
+                            throw std::runtime_error("Native integer types are not supported for shared bindings");
+                        }
                         st.metadata = IRType::IRMetadata::sharedBindingType(
                             bindingType->second);
                     }

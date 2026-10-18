@@ -2,6 +2,7 @@
 #define ZeusPackageLoader_hpp
 
 #include <string>
+#include "./ZeusParser/NativeTypeDeclarationResolver.hpp"
 #include <vector>
 #include <algorithm>
 #include <unordered_map>
@@ -348,7 +349,7 @@ namespace ZeusPackage {
         // čŻćłĺć
         ZEUS_DEBUG_PRINT("[PackageLoader] Starting lexer...");
         std::vector<ZeusDiagnostics::Diagnostic> syntaxDiagnostics;
-        auto tokens = LexerParser::parse(source, &syntaxDiagnostics);
+        auto tokens = ZeusParser::parseNativeTypeSource(source, sourceFilePath, syntaxDiagnostics);
         ZeusDiagnostics::append(syntaxDiagnostics, ZeusParser::validateSyntax(tokens));
         ZEUS_DEBUG_PRINT("[PackageLoader] Syntax checks done (%zu diagnostics)", syntaxDiagnostics.size());
         ZEUS_DEBUG_PRINT("[PackageLoader] Lexer done (%zu tokens)", tokens.size());
@@ -401,6 +402,50 @@ namespace ZeusPackage {
         ZEUS_DEBUG_PRINT("[PackageLoader] Tree parser done (%zu trees)", trees.size());
 
         // IR生成
+        std::vector<std::string> packageFunctionNames;
+        const auto collectPackageFunctions = [&](auto&& self,
+            const std::vector<TreeParser::NodeAndBlock>& scope) -> void {
+            for (const auto& node : scope) {
+                if (!std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(node)) {
+                    continue;
+                }
+                const auto* block = std::get<std::unique_ptr<TreeParser::CodeBlock>>(node).get();
+                if (block == nullptr) continue;
+                if (block->type == CodeBlockType::FUNC) {
+                    if (!block->isClassMethod && !block->funcName.empty()) {
+                        packageFunctionNames.push_back(block->funcName);
+                    }
+                    continue;
+                }
+                if (block->type == CodeBlockType::CLASS ||
+                    block->type == CodeBlockType::INTERFACE ||
+                    block->type == CodeBlockType::IMPL) {
+                    continue;
+                }
+                self(self, block->nodes);
+            }
+        };
+        collectPackageFunctions(collectPackageFunctions, trees);
+        for (const auto& functionName : packageFunctionNames) {
+            auto existing = IRScope::globals.find(functionName);
+            if (existing == IRScope::globals.end()) continue;
+
+            const int previousIndex = existing->second;
+            IRScope::globals.erase(existing);
+            std::string previousName = packageName + ".__previous__" + functionName;
+            while (IRScope::globals.find(previousName) != IRScope::globals.end()) {
+                previousName += "_";
+            }
+            IRScope::globals.emplace(previousName, previousIndex);
+
+            const auto rawRange = IRScope::globalRawBytesRange.find(functionName);
+            if (rawRange != IRScope::globalRawBytesRange.end()) {
+                const bool isRawBytesRange = rawRange->second;
+                IRScope::globalRawBytesRange.erase(rawRange);
+                IRScope::globalRawBytesRange[previousName] = isRawBytesRange;
+            }
+        }
+
         ZEUS_DEBUG_PRINT("[PackageLoader] Starting IR generator...");
         auto irgen = IRGen::IRGenerator();
         irgen.strictDecl = strictDecl;

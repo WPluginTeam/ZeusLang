@@ -385,6 +385,13 @@ namespace IRStaticOperator {
                 }
             }
             std::unordered_map<int, std::string> declaredLocalTypes;
+            for (size_t i = 0; i < signature.parameterTypes.size(); ++i) {
+                const auto& type = signature.parameterTypes[i];
+                if (ZeusBuiltins::isNativeFloatingPointType(type) ||
+                    ZeusBuiltins::findNativeSignedIntegerABI(type)) {
+                    declaredLocalTypes[static_cast<int>(i)] = type;
+                }
+            }
             for (const auto& ins : chunk) {
                 if (ins.op != VMOperator::STORE_VALUE_LOCAL ||
                     ins.metadata.kind != IRType::IRMetadataKind::LocalBindingType ||
@@ -808,10 +815,14 @@ namespace IRStaticOperator {
                         const auto& indexValue = std::get<LexerType::Value>(ins.args[0]);
                         if (std::get<ZeusType::BigInteger>(indexValue.data).tryToInt64(raw)) {
                             const int index = static_cast<int>(raw);
-                            if (!valueType.empty()) {
+                            const auto declared = declaredLocalTypes.find(index);
+                            if (declared != declaredLocalTypes.end() &&
+                                (ZeusBuiltins::isNativeFloatingPointType(declared->second) ||
+                                 ZeusBuiltins::findNativeSignedIntegerABI(declared->second))) {
+                                locals[index] = declared->second;
+                            } else if (!valueType.empty()) {
                                 locals[index] = valueType;
                             } else {
-                                const auto declared = declaredLocalTypes.find(index);
                                 locals[index] = declared == declaredLocalTypes.end()
                                     ? std::string() : declared->second;
                             }
@@ -857,9 +868,11 @@ namespace IRStaticOperator {
                             ? functionGlobalTypes : globalTypes;
                         std::string storedType = storedClassType.empty()
                             ? valueType : storedClassType;
-                        if (storedType.empty()) {
-                            const auto declared = globalBindingTypes.find(globalIndex);
-                            if (declared != globalBindingTypes.end()) {
+                        const auto declared = globalBindingTypes.find(globalIndex);
+                        if (declared != globalBindingTypes.end()) {
+                            if (storedType.empty() ||
+                                ZeusBuiltins::isNativeFloatingPointType(declared->second) ||
+                                ZeusBuiltins::findNativeSignedIntegerABI(declared->second)) {
                                 storedType = declared->second;
                             }
                         }
@@ -950,6 +963,26 @@ namespace IRStaticOperator {
                 if (isBinaryOperator(ins.op)) {
                     const std::string rhsType = popType();
                     const std::string lhsType = popType();
+
+                    const bool leftDouble = ZeusBuiltins::isNativeFloatingPointType(lhsType);
+                    const bool rightDouble = ZeusBuiltins::isNativeFloatingPointType(rhsType);
+                    const auto isNumeric = [](const std::string& type) {
+                        return type == "int" || type == "bigint" || type == "float" ||
+                            ZeusBuiltins::isNativeFloatingPointType(type) ||
+                            ZeusBuiltins::findNativeSignedIntegerABI(type) != nullptr;
+                    };
+                    if ((leftDouble && isNumeric(rhsType)) ||
+                        (rightDouble && isNumeric(lhsType))) {
+                        const auto* nativeType = ZeusBuiltins::findNativeTypeABI(
+                            leftDouble ? lhsType : rhsType);
+                        ins.metadata.typeName = std::string(nativeType->canonicalName);
+                        const std::string symbol = operatorSymbol(ins.op);
+                        const bool comparison = symbol == "==" || symbol == "!=" ||
+                            symbol == "<" || symbol == ">" || symbol == "<=" || symbol == ">=";
+                        stack.push_back(comparison ? "bool" : ins.metadata.typeName);
+                        pendingDirectCall.clear();
+                        continue;
+                    }
 
                     if (ins.metadata.kind ==
                         IRType::IRMetadataKind::IntrinsicOperator) {
