@@ -1,0 +1,28 @@
+import zeus.json;
+import zeus.exception;
+
+func main() {
+    let plain = JSON.parse("\"plain 中 € text\"");
+    if (plain != "plain 中 € text") {
+        throw new Exception("JSON plain UTF-8 string parse mismatch");
+    }
+
+    let escaped = JSON.parse("\"line\\nquote: \\\"\\u03bb\"");
+    if (escaped != "line\nquote: \"λ") {
+        throw new Exception("JSON escaped string parse mismatch");
+    }
+
+    let object = JSON.parse("{\"plain\":\"fast path\",\"escaped\":\"a\\tb\"}");
+    if (object["plain"] != "fast path" or object["escaped"] != "a\tb") {
+        throw new Exception("JSON object string parse mismatch");
+    }
+
+    let legacy = new JSON({"legacy": 7});
+    if (legacy["legacy"] != 7) {
+        throw new Exception("JSON legacy wrapper API changed");
+    }
+
+    print("PASS JSON parser");
+}
+
+main();
