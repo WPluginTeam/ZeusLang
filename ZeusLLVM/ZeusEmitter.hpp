@@ -1254,6 +1254,99 @@ public:
             findNativeBuiltinDeclaration(name) != nullptr;
     }
 
+    // A bytes value that reaches a native function has to stay alive for the
+    // duration of the call, so the emitter hands over an owned copy of the
+    // buffer. The read only builtins never retain the pointer, so for them
+    // the copy is unnecessary and the buffer can be borrowed instead.
+    //
+    // The whitelist is on the native symbol rather than on the Zeus name,
+    // because a program may bind its own declaration to a symbol.
+    static bool isReadOnlyBytesNativeSymbol(const std::string& symbol) {
+        return symbol == "zeus_bytes_get" || symbol == "zeus_bytes_len";
+    }
+
+    // Only an instruction that pushes exactly one value may separate the
+    // load from the call. Anything else could consume the loaded value.
+    static bool isSingleValuePush(VMOperator op) {
+        return op == VMOperator::PUSH || op == VMOperator::PUSH_NAMED ||
+            op == VMOperator::LOAD_VALUE || op == VMOperator::OBJ_LOAD_ATTR;
+    }
+
+    // Reports whether the bytes value loaded at pc is the first argument of a
+    // call to a read only bytes builtin. The scan only accepts simple value
+    // pushes between the load and the call and checks the argument count, so
+    // the loaded value cannot be consumed by anything else.
+    bool isBorrowedBytesArgument(
+        const std::vector<IRType::IRInstr>& chunk,
+        size_t pc
+    ) const {
+        size_t pushes = 0;
+        size_t callPc = 0;
+        bool found = false;
+        // The value is often stored into a temporary local first and read
+        // back from there, so the scan follows that detour. The detour does
+        // not change how many values sit on the stack at the call.
+        int64_t temporaryLocal = -1;
+        for (size_t next = pc + 1; next < chunk.size(); ++next) {
+            const auto& instruction = chunk[next];
+            if (instruction.op == VMOperator::IR_ANNOTATION) continue;
+            if (instruction.op == VMOperator::STORE_VALUE_LOCAL &&
+                temporaryLocal < 0) {
+                int64_t index = -1;
+                if (!tryArgInt(instruction, 1, index) || index < 0) return false;
+                temporaryLocal = index;
+                continue;
+            }
+            if (instruction.op == VMOperator::LOAD_VALUE && temporaryLocal >= 0) {
+                int64_t index = -1;
+                if (!tryArgInt(instruction, 1, index) || index != temporaryLocal) {
+                    return false;
+                }
+                temporaryLocal = -1;
+                continue;
+            }
+            if (isSingleValuePush(instruction.op)) {
+                if (++pushes > 16) return false;
+                continue;
+            }
+            if (instruction.op != VMOperator::CALL_NATIVE) return false;
+            callPc = next;
+            found = true;
+            break;
+        }
+        if (!found) return false;
+
+        int64_t argc = 0;
+        if (!tryArgInt(chunk[callPc], 0, argc) || argc < 1) return false;
+        // The loaded value is the first argument, so the call pops one more
+        // value than the number of pushes between the load and the call.
+        if (static_cast<size_t>(argc) != pushes + 1) return false;
+
+        // The callee is pushed before the arguments, so the native load sits
+        // right before the argument expressions. Walking back from the load
+        // therefore finds the callee, and only simple instructions may
+        // separate the two.
+        for (size_t back = pc; back > 0; --back) {
+            const auto& instruction = chunk[back - 1];
+            if (instruction.op == VMOperator::IR_ANNOTATION) continue;
+            if (isSingleValuePush(instruction.op)) continue;
+            if (instruction.op != VMOperator::LOAD_NATIVE) return false;
+            int64_t handle = 0;
+            std::string nativeName;
+            if (!tryArgInt(instruction, 0, handle)) return false;
+            if (!resolveNativeHandle(handle, nativeName)) return false;
+            const auto* declaration = findNativeBuiltinDeclaration(nativeName);
+            if (declaration == nullptr) return false;
+            if (!isReadOnlyBytesNativeSymbol(declaration->nativeSymbol)) return false;
+            if (declaration->parameterTypes.empty() ||
+                declaration->parameterTypes.front() != "bytes") {
+                return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
     const FunctionSignature* resolveFunctionSignature(
         const std::string& name
     ) const {
@@ -9431,7 +9524,8 @@ public:
                             if (slotABI != nullptr && slotABI->valueABI ==
                                     ZeusBuiltins::NativeValueABI::NativeBytes) {
                                 if (detail::isNativeBytesDataAddressReceiver(chunk, pc) ||
-                                    borrowedReadOnlyBytesThis) {
+                                    borrowedReadOnlyBytesThis ||
+                                    isBorrowedBytesArgument(chunk, pc)) {
                                     valueStack.push_back(NativeValue{
                                         loaded, "ptr", false, false, slot.sourceType
                                     });
@@ -11163,7 +11257,8 @@ public:
                         ZeusBuiltins::findNativeTypeABI(fieldTypeName);
                     if (loadedFieldABI != nullptr && loadedFieldABI->valueABI ==
                             ZeusBuiltins::NativeValueABI::NativeBytes) {
-                        if (detail::isNativeBytesDataAddressReceiver(chunk, pc)) {
+                        if (detail::isNativeBytesDataAddressReceiver(chunk, pc) ||
+                            isBorrowedBytesArgument(chunk, pc)) {
                             loaded.ownsNativeBytes = false;
                         } else {
                             const std::string copy = freshNativeTmp();
