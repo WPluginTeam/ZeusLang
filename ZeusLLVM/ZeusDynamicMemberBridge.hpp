@@ -206,7 +206,21 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
             }
 
             std::string convertedValue = boxed;
-            if (!passedBoxed && (conversionType == "int" || conversionType == "int32" ||
+            if (nativeType == "%ZeusRawBytesRange") {
+                // A raw bytes range is a two word value, not a pointer, so it
+                // needs its own conversion. Reading it out of the boxed slot
+                // keeps the view copy free: the range still points at the
+                // buffer the caller owns.
+                const std::string storage = "%argument.range.slot." + suffix;
+                const std::string range = "%argument.range." + suffix;
+                generated.adapters += "  " + storage +
+                    " = alloca %ZeusRawBytesRange, align 8\n";
+                generated.adapters += "  call void @zeus_value_require_raw_bytes_range(ptr " +
+                    storage + ", ptr " + boxed + ")\n";
+                generated.adapters += "  " + range + " = load %ZeusRawBytesRange, ptr " +
+                    storage + ", align 8\n";
+                convertedValue = range;
+            } else if (!passedBoxed && (conversionType == "int" || conversionType == "int32" ||
                 conversionType == "int64")) {
                 if (isReferenceType(parameterType)) {
                     generated.adapters += "  " + converted +
@@ -271,7 +285,9 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
                     generated.adapters += "  br label %" + doneLabel + "\n";
                     placeholder = nativeType == "ptr"
                         ? "null"
-                        : (nativeType == "i1" ? "false" : "0");
+                        : (!nativeType.empty() && nativeType.front() == '%'
+                            ? "zeroinitializer"
+                            : (nativeType == "i1" ? "false" : "0"));
                 }
                 generated.adapters += doneLabel + ":\n";
                 nativeValue = "%argument.optional.native." + suffix;
