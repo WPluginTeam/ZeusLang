@@ -1,0 +1,87 @@
+// JSON parse and stringify throughput.
+//
+// The parser scans the input byte by byte, so the report separates the cost
+// per input byte from the cost per token: a shape that produces many small
+// strings and a shape that produces many numbers exercise different parts of
+// the scanner.
+//
+// Run it under both backends, the numbers are not comparable across them:
+//   Zeus.exe ZeusZTest\json_parse_benchmark.zeu
+//   zeusc.bat ZeusZTest\json_parse_benchmark.zeu --opt-level 2
+import zeus.json;
+
+func buildArray(count: int, item: string) -> string {
+    let text = "[";
+    for (0..count) [const &i] {
+        if (i > 0) text = text + ",";
+        text = text + item;
+    }
+    return text + "]";
+}
+
+func buildStrings(count: int) -> string {
+    return buildArray(count, "\"a moderately long plain ascii value\"");
+}
+
+func buildNumbers(count: int) -> string {
+    return buildArray(count, "1234567");
+}
+
+func buildObjects(count: int) -> string {
+    return buildArray(count, "{\"key\":\"value\",\"number\":1234,\"flag\":true}");
+}
+
+func buildEscaped(count: int) -> string {
+    return buildArray(count, "\"line\\nfeed\\ttab\\\\slash\\\"quote\"");
+}
+
+func measure(label: string, text: string, iterations: int) {
+    let warm = JSON.parse(text);
+    if (warm == nil) throw new Exception("benchmark parse produced nil");
+    let started = __time_perf_counter_ns();
+    for (0..iterations) [const &i] {
+        let value = JSON.parse(text);
+        if (value == nil) throw new Exception("benchmark parse produced nil");
+    }
+    let elapsed = __time_perf_counter_ns() - started;
+    let size = text.length();
+    print("JSON_PARSE_NS", label, "bytes", size,
+          "ns_per_parse", elapsed / iterations,
+          "ns_per_byte", (elapsed / iterations) / size);
+}
+
+func measureStringify(label: string, text: string, iterations: int) {
+    let value = JSON.parse(text);
+    let started = __time_perf_counter_ns();
+    for (0..iterations) [const &i] {
+        let encoded = JSON.stringify(value);
+        if (encoded.length() == 0) throw new Exception("benchmark stringify produced empty output");
+    }
+    let elapsed = __time_perf_counter_ns() - started;
+    print("JSON_STRINGIFY_NS", label, "ns_per_parse", elapsed / iterations);
+}
+
+func main() {
+    let strings = buildStrings(200);
+    let numbers = buildNumbers(200);
+    let objects = buildObjects(200);
+    let escaped = buildEscaped(200);
+
+    measure("strings", strings, 20);
+    measure("numbers", numbers, 20);
+    measure("objects", objects, 20);
+    measure("escaped", escaped, 20);
+
+    // Scaling series: the time per input byte must stay flat. A growing
+    // per-byte cost means the parser copies the source more than once.
+    measure("scale_50", buildNumbers(50), 20);
+    measure("scale_100", buildNumbers(100), 20);
+    measure("scale_200", buildNumbers(200), 20);
+    measure("scale_400", buildNumbers(400), 20);
+    measure("scale_800", buildNumbers(800), 20);
+
+    measureStringify("objects", objects, 20);
+    print("JSON_PARSE_BENCH_PASS");
+}
+
+main();

@@ -126,14 +126,19 @@ class JSONParser {
             "JSON parse error at byte " + __builtin_str(this.index) + ": " + message);
     }
 
+    // The scanner reads the cursor once per input byte. A field read costs a
+    // map lookup, a copy of the value and a liveness check, so the hot loops
+    // keep the cursor in a local and write it back when they return.
     func skipWhitespace() {
-        for (this.index < this.byteLength) {
-            let current = __bytes_get(this.sourceBytes, this.index);
+        let index = this.index;
+        for (index < this.byteLength) {
+            let current = __bytes_get(this.sourceBytes, index);
             if (current != 32 and current != 9 and current != 10 and current != 13) {
                 break;
             }
-            this.index = this.index + 1;
+            index = index + 1;
         }
+        this.index = index;
     }
 
     func readHex4() -> int {
@@ -151,34 +156,46 @@ class JSONParser {
     }
 
     func parseString() -> string {
-        if (this.index >= this.byteLength or
-            __bytes_get(this.sourceBytes, this.index) != 34) {
+        let index = this.index;
+        let source = this.source;
+        if (index >= this.byteLength or __bytes_get(this.sourceBytes, index) != 34) {
+            this.index = index;
             this.fail("expected a string");
         }
-        this.index = this.index + 1;
+        index = index + 1;
 
         let result: string = "";
-        let segmentStart: int = this.index;
+        let segmentStart: int = index;
         let hasEscapes: bool = false;
         for (true) {
-            if (this.index >= this.byteLength) this.fail("unterminated string");
-            let current: int = __bytes_get(this.sourceBytes, this.index);
+            if (index >= this.byteLength) {
+                this.index = index;
+                this.fail("unterminated string");
+            }
+            let current: int = __bytes_get(this.sourceBytes, index);
             if (current == 34) {
-                let tail: string = __str_slice(this.source, segmentStart, this.index);
-                this.index = this.index + 1;
+                let tail: string = __str_slice(source, segmentStart, index);
+                index = index + 1;
+                this.index = index;
                 if (!hasEscapes) return tail;
                 return result + tail;
             }
-            if (current < 32) this.fail("unescaped control character in string");
+            if (current < 32) {
+                this.index = index;
+                this.fail("unescaped control character in string");
+            }
 
             if (current == 92) {
                 hasEscapes = true;
-                result = result + __str_slice(this.source, segmentStart, this.index);
-                this.index = this.index + 1;
-                if (this.index >= this.byteLength) this.fail("incomplete escape sequence");
+                result = result + __str_slice(source, segmentStart, index);
+                index = index + 1;
+                if (index >= this.byteLength) {
+                    this.index = index;
+                    this.fail("incomplete escape sequence");
+                }
 
-                let escape: int = __bytes_get(this.sourceBytes, this.index);
-                this.index = this.index + 1;
+                let escape: int = __bytes_get(this.sourceBytes, index);
+                index = index + 1;
                 if (escape == 34) {
                     result = result + "\"";
                 } else if (escape == 92) {
@@ -196,35 +213,48 @@ class JSONParser {
                 } else if (escape == 116) {
                     result = result + __json_codepoint_string(9);
                 } else if (escape == 117) {
+                    // A Unicode escape is rare, so that path keeps using the
+                    // field cursor and the caller picks the cursor back up.
+                    this.index = index;
                     let codepoint: int = this.readHex4();
+                    index = this.index;
                     if (codepoint >= 55296 and codepoint <= 56319) {
-                        if (this.index + 6 > this.byteLength or
-                            __bytes_get(this.sourceBytes, this.index) != 92 or
-                            __bytes_get(this.sourceBytes, this.index + 1) != 117) {
+                        if (index + 6 > this.byteLength or
+                            __bytes_get(this.sourceBytes, index) != 92 or
+                            __bytes_get(this.sourceBytes, index + 1) != 117) {
+                            this.index = index;
                             this.fail("high surrogate must be followed by a low surrogate");
                         }
-                        this.index = this.index + 2;
+                        index = index + 2;
+                        this.index = index;
                         let lowSurrogate: int = this.readHex4();
+                        index = this.index;
                         if (lowSurrogate < 56320 or lowSurrogate > 57343) {
+                            this.index = index;
                             this.fail("invalid low surrogate");
                         }
                         codepoint = 65536 + (codepoint - 55296) * 1024 +
                             (lowSurrogate - 56320);
                     } else if (codepoint >= 56320 and codepoint <= 57343) {
+                        this.index = index;
                         this.fail("unexpected low surrogate");
                     }
                     result = result + __json_codepoint_string(codepoint);
                 } else {
+                    this.index = index;
                     this.fail("invalid escape sequence");
                 }
-                segmentStart = this.index;
+                segmentStart = index;
             } else if (current >= 128) {
                 let width: int = __json_utf8_sequence_length(
-                    this.sourceBytes, this.index, this.byteLength);
-                if (width == 0) this.fail("invalid UTF-8 in string");
-                this.index = this.index + width;
+                    this.sourceBytes, index, this.byteLength);
+                if (width == 0) {
+                    this.index = index;
+                    this.fail("invalid UTF-8 in string");
+                }
+                index = index + width;
             } else {
-                this.index = this.index + 1;
+                index = index + 1;
             }
         }
         return "";
@@ -234,29 +264,29 @@ class JSONParser {
         let tokenBytes = bytes(token);
         let tokenLength = __bytes_len(tokenBytes);
         let exponentMarker = -1;
+        let decimalPoint = -1;
         for (0..tokenLength) [const &i] {
             let current = __bytes_get(tokenBytes, i);
             if (current == 69 or current == 101) {
                 exponentMarker = i;
                 break;
             }
+            if (current == 46) decimalPoint = i;
         }
         if (exponentMarker < 0) return token;
 
         let negative = __bytes_get(tokenBytes, 0) == 45;
         let mantissaStart = 0;
         if (negative) mantissaStart = 1;
-        let digits = "";
-        let integerDigits = 0;
-        let afterDecimalPoint = false;
-        for (mantissaStart..exponentMarker) [const &i] {
-            let current = __bytes_get(tokenBytes, i);
-            if (current == 46) {
-                afterDecimalPoint = true;
-            } else {
-                digits = digits + __str_slice(token, i, i + 1);
-                if (!afterDecimalPoint) integerDigits = integerDigits + 1;
-            }
+
+        // The mantissa is taken in one slice. Collecting it digit by digit
+        // copied the accumulator once per digit.
+        let mantissa = __str_slice(token, mantissaStart, exponentMarker);
+        let digits = mantissa;
+        let integerDigits = exponentMarker - mantissaStart;
+        if (decimalPoint >= 0) {
+            digits = __str_replace(mantissa, ".", "");
+            integerDigits = decimalPoint - mantissaStart;
         }
 
         let exponentIndex = exponentMarker + 1;
@@ -298,67 +328,76 @@ class JSONParser {
     }
 
     func parseNumber() {
-        let start = this.index;
+        let index = this.index;
+        let source = this.source;
+        let start = index;
         let hasFraction = false;
         let hasExponent = false;
 
-        if (__bytes_get(this.sourceBytes, this.index) == 45) {
-            this.index = this.index + 1;
-            if (this.index >= this.byteLength) this.fail("incomplete number");
+        if (__bytes_get(this.sourceBytes, index) == 45) {
+            index = index + 1;
+            if (index >= this.byteLength) {
+                this.index = index;
+                this.fail("incomplete number");
+            }
         }
 
-        let current = __bytes_get(this.sourceBytes, this.index);
+        let current = __bytes_get(this.sourceBytes, index);
         if (current == 48) {
-            this.index = this.index + 1;
-            if (this.index < this.byteLength and
-                __json_is_digit(__bytes_get(this.sourceBytes, this.index))) {
+            index = index + 1;
+            if (index < this.byteLength and
+                __json_is_digit(__bytes_get(this.sourceBytes, index))) {
+                this.index = index;
                 this.fail("leading zero in number");
             }
         } else if (current >= 49 and current <= 57) {
-            for (this.index < this.byteLength and
-                __json_is_digit(__bytes_get(this.sourceBytes, this.index))) {
-                this.index = this.index + 1;
+            for (index < this.byteLength and
+                __json_is_digit(__bytes_get(this.sourceBytes, index))) {
+                index = index + 1;
             }
         } else {
+            this.index = index;
             this.fail("expected a digit");
         }
 
-        if (this.index < this.byteLength and
-            __bytes_get(this.sourceBytes, this.index) == 46) {
+        if (index < this.byteLength and __bytes_get(this.sourceBytes, index) == 46) {
             hasFraction = true;
-            this.index = this.index + 1;
-            if (this.index >= this.byteLength or
-                !__json_is_digit(__bytes_get(this.sourceBytes, this.index))) {
+            index = index + 1;
+            if (index >= this.byteLength or
+                !__json_is_digit(__bytes_get(this.sourceBytes, index))) {
+                this.index = index;
                 this.fail("fraction requires at least one digit");
             }
-            for (this.index < this.byteLength and
-                __json_is_digit(__bytes_get(this.sourceBytes, this.index))) {
-                this.index = this.index + 1;
+            for (index < this.byteLength and
+                __json_is_digit(__bytes_get(this.sourceBytes, index))) {
+                index = index + 1;
             }
         }
 
-        if (this.index < this.byteLength) {
-            current = __bytes_get(this.sourceBytes, this.index);
+        if (index < this.byteLength) {
+            current = __bytes_get(this.sourceBytes, index);
             if (current == 69 or current == 101) {
                 hasExponent = true;
-                this.index = this.index + 1;
-                if (this.index < this.byteLength and
-                    (__bytes_get(this.sourceBytes, this.index) == 43 or
-                     __bytes_get(this.sourceBytes, this.index) == 45)) {
-                    this.index = this.index + 1;
+                index = index + 1;
+                if (index < this.byteLength and
+                    (__bytes_get(this.sourceBytes, index) == 43 or
+                     __bytes_get(this.sourceBytes, index) == 45)) {
+                    index = index + 1;
                 }
-                if (this.index >= this.byteLength or
-                    !__json_is_digit(__bytes_get(this.sourceBytes, this.index))) {
+                if (index >= this.byteLength or
+                    !__json_is_digit(__bytes_get(this.sourceBytes, index))) {
+                    this.index = index;
                     this.fail("exponent requires at least one digit");
                 }
-                for (this.index < this.byteLength and
-                    __json_is_digit(__bytes_get(this.sourceBytes, this.index))) {
-                    this.index = this.index + 1;
+                for (index < this.byteLength and
+                    __json_is_digit(__bytes_get(this.sourceBytes, index))) {
+                    index = index + 1;
                 }
             }
         }
 
-        let token = __str_slice(this.source, start, this.index);
+        this.index = index;
+        let token = __str_slice(source, start, index);
         if (hasExponent) return float(this.expandExponent(token));
         if (hasFraction) return float(token);
         return int(token);
