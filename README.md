@@ -75,4 +75,4 @@ let c = a + b; // will call operator[+]
 
 ## Windows command entry
 
-`Zeus.exe run app.zeu` executes Zeus source, and `Zeus.exe build app.zeu -o app.exe --onefile` builds a standalone Windows executable. The command frontend is written in Zeus; `zeusc.bat` remains the AOT build driver. See [docs/ZeusCLI.md](docs/ZeusCLI.md) for setup and details.
+`Zeus.exe run app.zeu` executes Zeus source, and `Zeus.exe build app.zeu -o app.exe --onefile` builds a standalone Windows executable. The command frontend is written in Zeus; `zeusc.bat` remains the AOT build driver.
