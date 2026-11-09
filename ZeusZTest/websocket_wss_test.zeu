@@ -1,0 +1,59 @@
+import zeus.websocket;
+import zeus.ssl;
+import zeus.exception;
+
+func assertWebSocketWss(condition, message: string) {
+    if (!condition) throw new Exception("WebSocket WSS test failed: " + message);
+}
+
+let url = "wss://127.0.0.1:__PORT__/echo";
+let refusedUrl = "wss://127.0.0.1:__REFUSED_PORT__/echo";
+let rejected = false;
+try {
+    let unverified = WebSocketClient.connect(url);
+    unverified.close();
+} catch (&wssFailure) {
+    print("WSS_DEFAULT_CONTEXT_FAILURE_TYPE", type(wssFailure));
+    rejected = true;
+}
+assertWebSocketWss(rejected, "default context rejects an untrusted certificate");
+
+func insecureConnectFailureAndRethrow(url: string) {
+    try {
+        let failed = WebSocketClient.connect(url, 1048576, createInsecureContext());
+        failed.close();
+    } catch (&failure) {
+        print("WSS_INSECURE_CONNECT_FAILURE_TYPE", type(failure));
+        throw failure;
+    }
+}
+
+var insecureFailureType = "";
+try {
+    insecureConnectFailureAndRethrow(refusedUrl);
+} catch (&failure) {
+    insecureFailureType = type(failure);
+    print("WSS_INSECURE_CONNECT_RETHROW_TYPE", insecureFailureType);
+}
+assertWebSocketWss(insecureFailureType == "Exception",
+    "constructor connection failures keep their exception value through rethrow");
+
+func connectInsecureWithDiagnostic() -> WebSocketConnection {
+    try {
+        return WebSocketClient.connect(url, 1048576, createInsecureContext());
+    } catch (&failure) {
+        print("WSS_INSECURE_CONNECT_FAILURE_TYPE", type(failure));
+            throw failure;
+    }
+}
+
+let client = connectInsecureWithDiagnostic();
+client.sendText("Zeus over WSS");
+let response = client.receive();
+assertWebSocketWss(response != nil and response.isText(), "text response is returned");
+assertWebSocketWss(response.text == "Zeus over WSS", "TLS stream carries WebSocket data");
+
+client.close(1000, "done");
+assertWebSocketWss(client.receive() == nil, "close handshake completes over TLS");
+delete client;
+print("RUN_WEBSOCKET_WSS_TEST_PASS");

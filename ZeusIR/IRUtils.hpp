@@ -101,6 +101,15 @@ namespace IRUtils {
 		return ins;
 	}
 
+	// 创建 continue 占位符指令（使用 LOOP_CONTINUE）
+	// offset 将在循环 IR 生成完成后回填到步进/条件处
+	inline IRType::IRInstr makeLoopContinuePlaceholder() {
+		IRType::IRInstr ins;
+		ins.op = VMOperator::LOOP_CONTINUE;
+		ins.args.push_back(LexerType::Value(0));  // 占位符
+		return ins;
+	}
+
 	inline IRType::IRInstr makeListBuild(int count) {
 		IRType::IRInstr ins;
 		ins.op = VMOperator::LIST_BUILD;

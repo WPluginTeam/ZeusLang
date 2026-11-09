@@ -1,0 +1,1439 @@
+// zeus.process - child processes through the Windows process API.
+//
+// A child is described by hand-built native structures: CreateProcessW writes a
+// PROCESS_INFORMATION we read back, and optional output redirection reuses one
+// file handle for both standard output and standard error, so a chatty child can
+// never block on a full pipe.
+//
+// Field offsets follow the operating system rather than hand arithmetic.
+// GetStartupInfoW reports cb = 104 on this platform with the three standard
+// handles at 80, 88 and 96.
+
+import zeus.ctypes;
+import zeus.dict;
+import zeus.string;
+
+// ---------------------------------------------------------------- system API
+
+
+using windows {
+@native("CreateProcessW", from="kernel32")
+decl func createProcessW(
+    applicationName: ptr, commandLine: ptr,
+    processAttributes: ptr, threadAttributes: ptr,
+    inheritHandles: int32, creationFlags: u32,
+    environment: ptr, currentDirectory: ptr,
+    startupInfo: ptr, processInfo: ptr) -> int32;
+
+@native("GetModuleFileNameW", from="kernel32")
+decl func getModuleFileNameW(module: ptr, fileName: ptr, size: u32) -> u32;
+
+@native("zeus_native_process_arguments_size", from="ZeusNativeRuntime")
+decl func __process_arguments_size() -> int32;
+
+@native("zeus_native_process_arguments_write", from="ZeusNativeRuntime")
+decl func __process_arguments_write(destination: ptr, capacity: int32) -> int32;
+
+@native("GetStdHandle", from="kernel32")
+decl func processGetStdHandle(handleId: int32) -> int;
+
+@native("GetCurrentProcess", from="kernel32")
+decl func processGetCurrentProcess() -> int;
+
+@native("DuplicateHandle", from="kernel32")
+decl func processDuplicateHandle(
+    sourceProcess: ptr, sourceHandle: ptr,
+    targetProcess: ptr, targetHandle: ptr,
+    desiredAccess: u32, inheritHandle: int32, options: u32) -> int32;
+
+@native("WideCharToMultiByte", from="kernel32")
+decl func processWideCharToMultiByte(
+    codePage: u32, flags: u32, source: ptr, sourceLength: int32,
+    target: ptr, targetLength: int32, defaultChar: ptr, usedDefault: ptr) -> int32;
+
+// Stays int32 on purpose: wait(-1) means INFINITE and a failed wait answers
+// WAIT_FAILED (-1), so the module's own -1 convention needs signed plumbing.
+@native("WaitForSingleObject", from="kernel32")
+decl func waitForSingleObject(handle: ptr, milliseconds: int32) -> int32;
+
+@native("GetExitCodeProcess", from="kernel32")
+decl func getExitCodeProcess(handle: ptr, exitCode: ptr) -> int32;
+
+@native("TerminateProcess", from="kernel32")
+decl func terminateProcess(handle: ptr, exitCode: int32) -> int32;
+
+@native("CloseHandle", from="kernel32")
+decl func closeHandle(handle: ptr) -> int32;
+
+@native("GetLastError", from="kernel32")
+decl func getLastError() -> u32;
+
+// GetTempPathW takes the buffer length before the buffer, and that length is a
+// character count: the W-suffixed entry points size their buffers in UTF-16
+// code units, not bytes. Passing the byte size would let Windows write twice as
+// far as the allocation can hold.
+@native("GetTempPathW", from="kernel32")
+decl func getTempPathW(characterCount: int32, buffer: ptr) -> int32;
+
+@native("GetTempFileNameW", from="kernel32")
+decl func getTempFileNameW(directory: ptr, prefix: ptr, unique: int32, name: ptr) -> int32;
+
+@native("CreateFileW", from="kernel32")
+decl func createFileW(
+    name: ptr, desiredAccess: u32, shareMode: u32,
+    securityAttributes: ptr, creationDisposition: u32,
+    flagsAndAttributes: u32, templateFile: ptr) -> ptr;
+
+@native("SetFilePointerEx", from="kernel32")
+decl func setFilePointerEx(file: ptr, distance: int, result: ptr, method: int32) -> int32;
+
+@native("GetFileSizeEx", from="kernel32")
+decl func getFileSizeEx(file: ptr, size: ptr) -> int32;
+
+@native("ReadFile", from="kernel32")
+decl func readFile(file: ptr, buffer: ptr, byteCount: int32, bytesRead: ptr, overlapped: ptr) -> int32;
+
+@native("DeleteFileW", from="kernel32")
+decl func deleteFile(name: ptr) -> int32;
+
+@native("CreatePipe", from="kernel32")
+decl func createPipe(readHandle: ptr, writeHandle: ptr,
+        attributes: ptr, bufferSize: u32) -> int32;
+
+@native("SetHandleInformation", from="kernel32")
+decl func setHandleInformation(handle: ptr, mask: u32, flags: u32) -> int32;
+
+@native("InitializeProcThreadAttributeList", from="kernel32")
+decl func initializeProcThreadAttributeList(
+        attributeList: ptr, attributeCount: u32, flags: u32,
+        requiredSize: ptr) -> int32;
+
+@native("UpdateProcThreadAttribute", from="kernel32")
+decl func updateProcThreadAttribute(
+        attributeList: ptr, flags: u32, attribute: int,
+        value: ptr, valueSize: int,
+        previousValue: ptr, returnSize: ptr) -> int32;
+
+@native("DeleteProcThreadAttributeList", from="kernel32")
+decl func deleteProcThreadAttributeList(attributeList: ptr);
+
+@native("zeus_process_capture_start")
+decl func __process_capture_start(pipeReadHandle: int,
+        capacityBytes: int, errorCode: ptr) -> int;
+
+@native("zeus_process_capture_read")
+decl func __process_capture_read(captureId: int, requestedOffset: int,
+        maxBytes: int, destination: ptr, readStart: ptr, baseOffset: ptr,
+        totalWritten: ptr, copied: ptr, done: ptr, errorCode: ptr) -> int;
+
+@native("zeus_process_capture_release")
+decl func __process_capture_release(captureId: int) -> int;
+
+// Bytes helpers come from zeus.byte so raw memory can be decoded without a
+// second decoder living here.
+
+// ---------------------------------------------------------------- constants
+
+let STILL_ACTIVE = 259;
+let WAIT_OBJECT_0 = 0;
+let WAIT_TIMEOUT = 258;
+let WAIT_FAILED = -1;
+
+let GENERIC_READ = 2147483648;      // 0x80000000: a DWORD, passed as u32
+let GENERIC_WRITE = 1073741824;     // 0x40000000
+let FILE_SHARE_READ = 1;
+let FILE_SHARE_WRITE = 2;
+let FILE_SHARE_DELETE = 4;
+let CREATE_ALWAYS = 2;
+let OPEN_EXISTING = 3;
+let FILE_ATTRIBUTE_NORMAL = 128;
+
+let STARTF_USESTDHANDLES = 256;
+let CREATE_NO_WINDOW = 134217728;
+let CREATE_NEW_PROCESS_GROUP = 512;
+let EXTENDED_STARTUPINFO_PRESENT = 524288;
+let HANDLE_FLAG_INHERIT = 1;
+let PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 131074;
+let DUPLICATE_SAME_ACCESS = 2;
+let STD_INPUT_HANDLE = -10;
+let STD_OUTPUT_HANDLE = -11;
+let STD_ERROR_HANDLE = -12;
+
+let INVALID_HANDLE_VALUE = -1;
+let SW_HIDE = 0;
+let STILL_OPEN = -1;
+let MAX_CAPTURE = 16777216;
+
+// SECURITY_ATTRIBUTES is what makes a handle inheritable. Passing null would
+// leave the child with no standard handles at all, which shows up as a child
+// that starts fine but fails the moment it writes.
+let securityAttributesLayout = new Layout();
+securityAttributesLayout.field("nLength", 0, 4);
+securityAttributesLayout.field("lpSecurityDescriptor", 8, 8);
+securityAttributesLayout.field("bInheritHandle", 16, 4);
+securityAttributesLayout.field("padding", 20, 4);
+
+// The structure a child is handed at startup.
+let startupLayout = new Layout();
+startupLayout.field("cb", 0, 4);
+startupLayout.field("dwFlags", 60, 4);
+startupLayout.field("wShowWindow", 64, 2);
+startupLayout.field("hStdInput", 80, 8);
+startupLayout.field("hStdOutput", 88, 8);
+startupLayout.field("hStdError", 96, 8);
+
+let startupExLayout = new Layout();
+startupExLayout.field("cb", 0, 4);
+startupExLayout.field("dwFlags", 60, 4);
+startupExLayout.field("wShowWindow", 64, 2);
+startupExLayout.field("hStdInput", 80, 8);
+startupExLayout.field("hStdOutput", 88, 8);
+startupExLayout.field("hStdError", 96, 8);
+startupExLayout.field("lpAttributeList", 104, 8);
+
+// What CreateProcessW gives back.
+let processInfoLayout = new Layout();
+processInfoLayout.field("hProcess", 0, 8);
+processInfoLayout.field("hThread", 8, 8);
+processInfoLayout.field("dwProcessId", 16, 4);
+processInfoLayout.field("dwThreadId", 20, 4);
+
+// ---------------------------------------------------------------- helpers
+
+// Builds the attributes that mark a handle as inheritable by a child.
+//
+// The block is handed back as a raw address rather than as a Buffer: returning
+// a Buffer would leave the caller holding memory that this function's own
+// destructor has already freed, and the caller has to free the address anyway.
+func inheritableAttributes() -> int {
+    let attributes = new Buffer(securityAttributesLayout.size);
+    attributes.setI32(
+        securityAttributesLayout.offsetOf("nLength"), securityAttributesLayout.size);
+    attributes.setI64(securityAttributesLayout.offsetOf("lpSecurityDescriptor"), 0);
+    attributes.setI32(securityAttributesLayout.offsetOf("bInheritHandle"), 1);
+    return attributes.detach();
+}
+
+// Creates an empty file under the temp directory. The name stays in wide form
+// so it can be handed straight to DeleteFileW without a conversion back.
+func createCaptureFile() -> list {
+    let attributes = inheritableAttributes();
+
+    let directory = new Buffer(1024);
+    let pathLength = getTempPathW(512, directory.address);
+    if (pathLength == 0 || pathLength >= 512) {
+        free(attributes);
+        directory.release();
+        throw new Exception("process: GetTempPathW failed or the path exceeded 511 characters");
+    }
+
+    let prefix = new Buffer(16);
+    prefix.utf16(0, "zpr");
+
+    let name = new Buffer(1024);
+    let created = getTempFileNameW(
+        directory.address, prefix.address, 0, name.address);
+    let createError = 0;
+    if (created == 0) createError = getLastError();
+
+    prefix.release();
+    directory.release();
+
+    if (created == 0) {
+        free(attributes);
+        name.release();
+        throw new Exception("process: GetTempFileNameW failed with error " +
+            str(createError) + " (temp path length=" + str(pathLength) + ")");
+    }
+
+    // The child writes through this inherited handle. The parent opens an
+    // independent reader so its reads do not move the child's file position.
+    let handle = createFileW(
+        name.address, GENERIC_READ + GENERIC_WRITE,
+        FILE_SHARE_READ + FILE_SHARE_WRITE + FILE_SHARE_DELETE,
+        attributes, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (handle == INVALID_HANDLE_VALUE or handle == 0) {
+        deleteFile(name.address);
+        free(attributes);
+        name.release();
+        throw new Exception("process: CreateFileW failed for the capture file");
+    }
+
+    let pair = [];
+    pair.append(handle);
+    // The name has to outlive this function, so ownership moves to the caller as
+    // a raw address instead of travelling as a Buffer the local would free.
+    pair.append(name.detach());
+    free(attributes);
+    return pair;
+}
+
+// The child and the parent reader must have independent file pointers. Handles
+// inherited by the child share one file object, so reading through that handle
+// would move the cursor used by the child's stdout writes.
+func openCaptureReader(name: int) -> int {
+    let handle = createFileW(
+        name, GENERIC_READ,
+        FILE_SHARE_READ + FILE_SHARE_WRITE + FILE_SHARE_DELETE,
+        0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if (handle == INVALID_HANDLE_VALUE or handle == 0) {
+        throw new Exception("process: could not open the capture file for reading");
+    }
+    return handle;
+}
+
+// Opens the null device, which is what a child that must not read from the
+// parent's console needs on its standard input.
+func openNullDevice() -> int {
+    let attributes = inheritableAttributes();
+    let name = new Buffer(16);
+    name.utf16(0, "NUL");
+    let handle = createFileW(
+        name.address, GENERIC_READ,
+        FILE_SHARE_READ + FILE_SHARE_WRITE + FILE_SHARE_DELETE,
+        attributes, 3 /* OPEN_EXISTING */, FILE_ATTRIBUTE_NORMAL, 0);
+    name.release();
+    free(attributes);
+    if (handle == INVALID_HANDLE_VALUE or handle == 0) {
+        throw new Exception("process: could not open NUL for the child");
+    }
+    return handle;
+}
+
+func createCapturePipe() -> list {
+    let attributes = inheritableAttributes();
+    let readOut = new Buffer(8);
+    let writeOut = new Buffer(8);
+    readOut.setI64(0, 0);
+    writeOut.setI64(0, 0);
+    let created = createPipe(readOut.address, writeOut.address, attributes, 0);
+    free(attributes);
+    let readHandle = readOut.i64(0);
+    let writeHandle = writeOut.i64(0);
+    readOut.release();
+    writeOut.release();
+
+    if (!created) {
+        if (readHandle != 0) closeHandle(readHandle);
+        if (writeHandle != 0) closeHandle(writeHandle);
+        throw new Exception("process: CreatePipe failed with " + str(getLastError()));
+    }
+    if (!setHandleInformation(readHandle, HANDLE_FLAG_INHERIT, 0)) {
+        let failure = getLastError();
+        closeHandle(readHandle);
+        closeHandle(writeHandle);
+        throw new Exception(
+            "process: SetHandleInformation failed with " + str(failure));
+    }
+
+    return [readHandle, writeHandle];
+}
+
+func createProcessHandleAttributeList(handles: list) -> list {
+    let handleCount = handles.length();
+    if (handleCount <= 0) {
+        throw new Exception("process: an inherited handle list cannot be empty");
+    }
+    let requiredSize = new Buffer(8);
+    requiredSize.setI64(0, 0);
+    initializeProcThreadAttributeList(0, 1, 0, requiredSize.address);
+    let attributeBytes = requiredSize.i64(0);
+    if (attributeBytes <= 0 or attributeBytes > 1048576) {
+        let failure = getLastError();
+        requiredSize.release();
+        throw new Exception(
+            "process: InitializeProcThreadAttributeList size query failed with " +
+            str(failure));
+    }
+
+    let attributeList = new Buffer(attributeBytes);
+    let handleBytes = handleCount * 8;
+    let handleList = new Buffer(handleBytes);
+    let initialized = false;
+    try {
+        for (0..handleCount) [const &index] {
+            handleList.setI64(index * 8, handles.get(index));
+        }
+        if (!initializeProcThreadAttributeList(
+                attributeList.address, 1, 0, requiredSize.address)) {
+            throw new Exception(
+                "process: InitializeProcThreadAttributeList failed with " +
+                str(getLastError()));
+        }
+        initialized = true;
+        if (!updateProcThreadAttribute(
+                attributeList.address, 0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                handleList.address, handleBytes, 0, 0)) {
+            throw new Exception(
+                "process: UpdateProcThreadAttribute failed with " +
+                str(getLastError()));
+        }
+    } catch (&error) {
+        if (initialized) deleteProcThreadAttributeList(attributeList.address);
+        handleList.release();
+        attributeList.release();
+        requiredSize.release();
+        throw error;
+    }
+    requiredSize.release();
+    let handleListAddress = handleList.detach();
+    let attributeListAddress = attributeList.detach();
+    return [attributeListAddress, handleListAddress];
+}
+
+func duplicateConsoleHandle(handleId: int) -> int {
+    let sourceHandle = processGetStdHandle(handleId);
+    if (sourceHandle == 0 or sourceHandle == INVALID_HANDLE_VALUE) {
+        throw new Exception(
+            "process: the parent has no standard handle " + str(handleId));
+    }
+    let duplicatedHandle = new Buffer(8);
+    let currentProcess = processGetCurrentProcess();
+    if (!processDuplicateHandle(
+            currentProcess, sourceHandle,
+            currentProcess, duplicatedHandle.address,
+            0, 1, DUPLICATE_SAME_ACCESS)) {
+        let failure = getLastError();
+        duplicatedHandle.release();
+        throw new Exception(
+            "process: DuplicateHandle failed with " + str(failure));
+    }
+    let result = duplicatedHandle.i64(0);
+    duplicatedHandle.release();
+    if (result == 0 or result == INVALID_HANDLE_VALUE) {
+        throw new Exception("process: DuplicateHandle returned an invalid handle");
+    }
+    return result;
+}
+
+func createConsoleProcessResources() -> list {
+    let inputHandle = 0;
+    let outputHandle = 0;
+    let errorHandle = 0;
+    let attributeList = 0;
+    let handleList = 0;
+    try {
+        inputHandle = duplicateConsoleHandle(STD_INPUT_HANDLE);
+        outputHandle = duplicateConsoleHandle(STD_OUTPUT_HANDLE);
+        errorHandle = duplicateConsoleHandle(STD_ERROR_HANDLE);
+        let attributes = createProcessHandleAttributeList(
+            [inputHandle, outputHandle, errorHandle]);
+        attributeList = attributes.get(0);
+        handleList = attributes.get(1);
+    } catch (&failure) {
+        if (attributeList != 0) {
+            deleteProcThreadAttributeList(attributeList);
+            free(attributeList);
+        }
+        if (handleList != 0) free(handleList);
+        if (inputHandle != 0) closeHandle(inputHandle);
+        if (outputHandle != 0) closeHandle(outputHandle);
+        if (errorHandle != 0) closeHandle(errorHandle);
+        throw failure;
+    }
+    return [inputHandle, outputHandle, errorHandle,
+        attributeList, handleList];
+}
+
+func createBoundedCaptureResources(capacityBytes: int) -> list {
+    let pipe = createCapturePipe();
+    let readHandle = pipe.get(0);
+    let writeHandle = pipe.get(1);
+    let inputHandle = 0;
+    let attributeList = 0;
+    let handleList = 0;
+    let captureId = 0;
+    try {
+        inputHandle = openNullDevice();
+        let attributes = createProcessHandleAttributeList(
+            [inputHandle, writeHandle]);
+        attributeList = attributes.get(0);
+        handleList = attributes.get(1);
+        let transferredReadHandle = readHandle;
+        readHandle = 0;
+        let startError = new Buffer(4);
+        startError.setI32(0, 0);
+        captureId = __process_capture_start(
+            transferredReadHandle, capacityBytes, startError.address);
+        let startErrorCode = startError.i32(0);
+        startError.release();
+        if (captureId == 0) {
+            throw new Exception(
+                "process: bounded output capture could not start; error " +
+                str(startErrorCode));
+        }
+    } catch (&error) {
+        if (captureId != 0) __process_capture_release(captureId);
+        if (readHandle != 0) closeHandle(readHandle);
+        if (writeHandle != 0) closeHandle(writeHandle);
+        if (inputHandle != 0) closeHandle(inputHandle);
+        if (attributeList != 0) {
+            deleteProcThreadAttributeList(attributeList);
+            free(attributeList);
+        }
+        if (handleList != 0) free(handleList);
+        throw error;
+    }
+
+    return [captureId, writeHandle, inputHandle, attributeList, handleList];
+}
+
+// Reads the capture file through an already open handle starting at an offset.
+func readCapture(handle: int, fromOffset: int) -> string {
+    if (handle == 0) return "";
+
+    let sizeField = new Buffer(8);
+    if (!getFileSizeEx(handle, sizeField.address)) {
+        let failure = getLastError();
+        sizeField.release();
+        throw new Exception(
+            "process: GetFileSizeEx failed with " + str(failure));
+    }
+    let total = sizeField.i64(0);
+    sizeField.release();
+
+    if (fromOffset < 0) fromOffset = 0;
+    if (fromOffset >= total) return "";
+
+    let wanted = total - fromOffset;
+    if (wanted > MAX_CAPTURE) wanted = MAX_CAPTURE;
+
+    if (!setFilePointerEx(handle, fromOffset, 0, 0)) {
+        let failure = getLastError();
+        throw new Exception(
+            "process: SetFilePointerEx failed with " + str(failure));
+    }
+
+    let chunk = new Buffer(wanted + 8);
+    let readCount = new Buffer(8);
+    let ok = readFile(handle, chunk.address, wanted, readCount.address, 0);
+    let produced = readCount.i32(0);
+    readCount.release();
+
+    if (!ok or produced <= 0) {
+        let failure = getLastError();
+        chunk.release();
+        if (!ok) {
+            throw new Exception("process: ReadFile failed with " + str(failure));
+        }
+        return "";
+    }
+
+    // The capture is turned back into text through the public bytes API: read the
+// raw octets, rebuild a bytes value, then decode it as UTF-8.
+    let values = [];
+    let index = 0;
+    for (true) {
+        if (index >= produced) break;
+        values.append(@faddr(chunk.address + index, 1) -> int);
+        index = index + 1;
+    }
+    let data = bytesFromValues(values);
+    let text = "";
+    try {
+        text = decodeBytes(data);
+    } catch (&e) {
+        chunk.release();
+        throw e;
+    }
+    chunk.release();
+    return text;
+}
+
+func __process_append_replacement(values: list) {
+    values.append(239);
+    values.append(191);
+    values.append(189);
+}
+
+func __process_empty_capture_chunk(start: int, total: int, base: int,
+        done: bool, truncated: bool, lostBytes: int,
+        errorCode: int = 0) -> dict {
+    return {"text": "", "next_offset": start,
+        "buffer_end": total, "buffer_start": base,
+        "buffer_bytes": total - base, "has_more": start < total,
+        "done": done, "truncated": truncated,
+        "output_lost": truncated, "lost_bytes": lostBytes,
+        "capture_error": errorCode};
+}
+
+// Reads one UTF-8-safe slice. A live process may end a write in the middle of
+// a code point, so the returned byte cursor advances only over complete input.
+// Invalid bytes use the same visible replacement character as Python's
+// errors="replace" decoder.
+func __process_decode_capture_buffer(chunk: Buffer, produced: int,
+        start: int, total: int, base: int, maxCharacters: int,
+        final: bool, truncated: bool, lostBytes: int,
+        errorCode: int = 0) -> dict {
+    if (maxCharacters < 0) maxCharacters = 0;
+    if (maxCharacters > MAX_CAPTURE / 4) maxCharacters = MAX_CAPTURE / 4;
+    if (produced <= 0 or maxCharacters == 0) {
+        chunk.release();
+        return __process_empty_capture_chunk(
+            start, total, base, final, truncated, lostBytes, errorCode);
+    }
+
+    let decoded = [];
+    let consumed = 0;
+    let characters = 0;
+    if (truncated) {
+        let skippedContinuationBytes = 0;
+        for (true) {
+            if (skippedContinuationBytes >= produced or
+                    skippedContinuationBytes >= 3) break;
+            let leading = chunk.u8(skippedContinuationBytes);
+            if (leading < 128 or leading > 191) break;
+            skippedContinuationBytes = skippedContinuationBytes + 1;
+        }
+        consumed = skippedContinuationBytes;
+    }
+    for (true) {
+        if (consumed >= produced or characters >= maxCharacters) break;
+        let first = chunk.u8(consumed);
+        let sequenceLength = 1;
+        let valid = true;
+        if (first < 128) {
+            sequenceLength = 1;
+        } else if (first >= 194 and first <= 223) {
+            sequenceLength = 2;
+        } else if (first >= 224 and first <= 239) {
+            sequenceLength = 3;
+        } else if (first >= 240 and first <= 244) {
+            sequenceLength = 4;
+        } else {
+            valid = false;
+        }
+
+        let remaining = produced - consumed;
+        if (valid and sequenceLength > remaining) {
+            if (!final) break;
+            __process_append_replacement(decoded);
+            consumed = produced;
+            characters = characters + 1;
+            break;
+        }
+
+        if (valid and sequenceLength > 1) {
+            let second = chunk.u8(consumed + 1);
+            if (second < 128 or second > 191) valid = false;
+            if (sequenceLength == 3 and first == 224 and second < 160) {
+                valid = false;
+            }
+            if (sequenceLength == 3 and first == 237 and second > 159) {
+                valid = false;
+            }
+            if (sequenceLength == 4 and first == 240 and second < 144) {
+                valid = false;
+            }
+            if (sequenceLength == 4 and first == 244 and second > 143) {
+                valid = false;
+            }
+            let tail = 2;
+            for (true) {
+                if (tail >= sequenceLength) break;
+                let continuation = chunk.u8(consumed + tail);
+                if (continuation < 128 or continuation > 191) valid = false;
+                tail = tail + 1;
+            }
+        }
+
+        if (!valid) {
+            __process_append_replacement(decoded);
+            consumed = consumed + 1;
+        } else {
+            let byteIndex = 0;
+            for (true) {
+                if (byteIndex >= sequenceLength) break;
+                decoded.append(chunk.u8(consumed + byteIndex));
+                byteIndex = byteIndex + 1;
+            }
+            consumed = consumed + sequenceLength;
+        }
+        characters = characters + 1;
+    }
+
+    let text = "";
+    try {
+        text = decodeBytes(bytesFromValues(decoded));
+    } catch (&e) {
+        chunk.release();
+        throw e;
+    }
+    chunk.release();
+    let next = start + consumed;
+    return {"text": text, "next_offset": next,
+        "buffer_end": total, "buffer_start": base,
+        "buffer_bytes": total - base, "has_more": next < total,
+        "done": final, "truncated": truncated,
+        "output_lost": truncated, "lost_bytes": lostBytes,
+        "capture_error": errorCode};
+}
+
+func __process_read_capture_chunk(handle: int, fromOffset: int,
+        maxCharacters: int, final: bool) -> dict {
+    let start = fromOffset;
+    if (start < 0) start = 0;
+    if (maxCharacters < 0) maxCharacters = 0;
+    if (maxCharacters > MAX_CAPTURE / 4) maxCharacters = MAX_CAPTURE / 4;
+    if (handle == 0) {
+        return __process_empty_capture_chunk(
+            start, 0, 0, final, false, 0);
+    }
+
+    let sizeField = new Buffer(8);
+    if (!getFileSizeEx(handle, sizeField.address)) {
+        let failure = getLastError();
+        sizeField.release();
+        throw new Exception(
+            "process: GetFileSizeEx failed with " + str(failure));
+    }
+    let total = sizeField.i64(0);
+    sizeField.release();
+    if (start > total) start = total;
+    if (start >= total or maxCharacters == 0) {
+        return __process_empty_capture_chunk(
+            start, total, 0, final, false, 0);
+    }
+
+    let wanted = maxCharacters * 4;
+    if (wanted > MAX_CAPTURE) wanted = MAX_CAPTURE;
+    if (wanted > total - start) wanted = total - start;
+    if (!setFilePointerEx(handle, start, 0, 0)) {
+        let failure = getLastError();
+        throw new Exception(
+            "process: SetFilePointerEx failed with " + str(failure));
+    }
+
+    let chunk = new Buffer(wanted + 8);
+    let readCount = new Buffer(8);
+    let ok = readFile(handle, chunk.address, wanted, readCount.address, 0);
+    let produced = readCount.i32(0);
+    readCount.release();
+    if (!ok or produced <= 0) {
+        let failure = getLastError();
+        chunk.release();
+        if (!ok) {
+            throw new Exception("process: ReadFile failed with " + str(failure));
+        }
+        return __process_empty_capture_chunk(
+            start, total, 0, final, false, 0);
+    }
+    return __process_decode_capture_buffer(
+        chunk, produced, start, total, 0, maxCharacters,
+        final, false, 0);
+}
+
+func __process_read_bounded_capture_chunk(captureId: int,
+        fromOffset: int, maxCharacters: int) -> dict {
+    let requested = fromOffset;
+    if (requested < 0) requested = 0;
+    if (maxCharacters < 0) maxCharacters = 0;
+    if (maxCharacters > MAX_CAPTURE / 4) maxCharacters = MAX_CAPTURE / 4;
+    let maxBytes = maxCharacters * 4;
+    if (maxBytes > MAX_CAPTURE) maxBytes = MAX_CAPTURE;
+
+    let chunk = new Buffer(maxBytes + 8);
+    let readStartField = new Buffer(8);
+    let baseOffsetField = new Buffer(8);
+    let totalField = new Buffer(8);
+    let copiedField = new Buffer(4);
+    let doneField = new Buffer(4);
+    let errorField = new Buffer(4);
+    let succeeded = __process_capture_read(captureId, requested,
+        maxBytes, chunk.address, readStartField.address,
+        baseOffsetField.address, totalField.address, copiedField.address,
+        doneField.address, errorField.address);
+    if (!succeeded) {
+        let failure = errorField.i32(0);
+        chunk.release();
+        readStartField.release();
+        baseOffsetField.release();
+        totalField.release();
+        copiedField.release();
+        doneField.release();
+        errorField.release();
+        throw new Exception(
+            "process: bounded capture read failed with " + str(failure));
+    }
+
+    let start = readStartField.i64(0);
+    let base = baseOffsetField.i64(0);
+    let total = totalField.i64(0);
+    let produced = copiedField.i32(0);
+    let done = doneField.i32(0) != 0;
+    let errorCode = errorField.i32(0);
+    readStartField.release();
+    baseOffsetField.release();
+    totalField.release();
+    copiedField.release();
+    doneField.release();
+    errorField.release();
+
+    let truncated = requested < base;
+    let lostBytes = 0;
+    if (truncated) lostBytes = base - requested;
+    return __process_decode_capture_buffer(
+        chunk, produced, start, total, base, maxCharacters,
+        done, truncated, lostBytes, errorCode);
+}
+
+// ---------------------------------------------------------------- Process
+
+class Process {
+    using &this;
+
+
+    // 引用语义：本类持有原生资源或共享表项。值语义下「读字段」就会复制一份，
+    // 副本析构时 [~] 会把同一个句柄释放掉（或把状态写在快照上）。
+    func operator[@=]() -> &Process {
+        return this;
+    }
+
+    var processHandle = 0;
+    var processThreadHandle = 0;
+    var processId = 0;
+    var threadId = 0;
+    var exitCode = STILL_OPEN;
+    var captureHandle = 0;
+    var captureSessionId = 0;
+    var captureLimitBytes = 0;
+    // The wide name of the capture file, owned by this Process as a raw address
+    // rather than as a Buffer, so there is exactly one thing that frees it.
+    var captureName = 0;
+    var childStdin = 0;
+
+    // Returns this process's absolute executable path, independent of the
+    // caller's current working directory.
+    func static executablePath() -> string {
+        let maxPathChars = 32768;
+        let widePath = new Buffer(maxPathChars * 2);
+        let pathChars = getModuleFileNameW(0, widePath.address, maxPathChars);
+        if (pathChars == 0 or pathChars >= maxPathChars) {
+            let failure = getLastError();
+            widePath.release();
+            if (pathChars == 0) {
+                throw new Exception(
+                    "process: GetModuleFileNameW failed with " + str(failure));
+            }
+            throw new Exception("process: executable path exceeded the Windows limit");
+        }
+
+        let utf8Path = new Buffer(pathChars * 4 + 1);
+        let byteCount = processWideCharToMultiByte(
+            65001, 0, widePath.address, pathChars,
+            utf8Path.address, pathChars * 4, 0, 0);
+        widePath.release();
+        if (byteCount <= 0) {
+            let failure = getLastError();
+            utf8Path.release();
+            throw new Exception(
+                "process: executable path UTF-8 conversion failed with " +
+                str(failure));
+        }
+
+        let values = [];
+        for (0..byteCount) [const &index] {
+            values.append(utf8Path.u8(index));
+        }
+        let path = decodeBytes(bytesFromValues(values));
+        utf8Path.release();
+        return path;
+    }
+
+    // Returns the current process arguments without argv[0]. The runtime DLL
+    // copies Windows' parsed command line into a length-prefixed UTF-8 block.
+    func static arguments() -> list {
+        let requiredBytes = __process_arguments_size();
+        if (requiredBytes < 4 or requiredBytes > 1048576) {
+            throw new Exception("process: invalid command-line argument block size");
+        }
+        let argumentBuffer = new Buffer(requiredBytes);
+        let writtenBytes = __process_arguments_write(
+            argumentBuffer.address, requiredBytes);
+        if (writtenBytes != requiredBytes) {
+            argumentBuffer.release();
+            throw new Exception("process: could not copy command-line arguments");
+        }
+        let argumentCount = argumentBuffer.i32(0);
+        if (argumentCount < 0 or argumentCount > requiredBytes / 4) {
+            argumentBuffer.release();
+            throw new Exception("process: invalid command-line argument count");
+        }
+        let result = [];
+        let offset = 4;
+        for (0..argumentCount) [const &index] {
+            if (offset + 4 > writtenBytes) {
+                argumentBuffer.release();
+                throw new Exception("process: truncated command-line argument block");
+            }
+            let length = argumentBuffer.i32(offset);
+            offset = offset + 4;
+            if (length < 0 or length > writtenBytes - offset) {
+                argumentBuffer.release();
+                throw new Exception("process: invalid command-line argument length");
+            }
+            let value = [];
+            for (offset..(offset + length)) [const &byteIndex] {
+                value.append(argumentBuffer.u8(byteIndex));
+            }
+            result.append(bytes(value).decode("utf-8"));
+            offset = offset + length;
+        }
+        argumentBuffer.release();
+        return result;
+    }
+
+    // Starts a child. captureOutput points both standard output and standard
+    // error at one temporary file, which is what keeps a verbose child from
+    // deadlocking on a full pipe.
+    func static run(commandLine: string, captureOutput: bool = true,
+            currentDirectory: string="", captureLimitBytes: int = 0,
+            inheritConsole: bool = false) -> Process {
+        let process = new Process();
+        process.start(commandLine, captureOutput, currentDirectory,
+            captureLimitBytes, inheritConsole);
+        return process;
+    }
+
+    func static runConsole(commandLine: string) -> Process {
+        return Process.run(commandLine, false, "", 0, true);
+    }
+
+    func start(commandLine: string, captureOutput: bool,
+            currentDirectory: string="", captureLimitBytes: int = 0,
+            inheritConsole: bool = false) {
+        if (this.processHandle != 0) {
+            throw new Exception("process: this Process was already started");
+        }
+        if (captureLimitBytes < 0 or captureLimitBytes > MAX_CAPTURE) {
+            throw new Exception(
+                "process: captureLimitBytes must be between 0 and " +
+                str(MAX_CAPTURE));
+        }
+        if (!captureOutput and captureLimitBytes != 0) {
+            throw new Exception(
+                "process: a capture limit requires captureOutput=true");
+        }
+
+        // close() makes the instance reusable; do not expose the previous
+        // child's status or identifiers while this start is in progress.
+        this.processId = 0;
+        this.threadId = 0;
+        this.exitCode = STILL_OPEN;
+        this.captureHandle = 0;
+        this.captureSessionId = 0;
+        this.captureLimitBytes = 0;
+        this.captureName = 0;
+        this.childStdin = 0;
+
+        let boundedCapture = captureOutput and captureLimitBytes > 0;
+        let flags = CREATE_NO_WINDOW + CREATE_NEW_PROCESS_GROUP;
+        let inheritHandles = 0;
+        let captureWriter = 0;
+        let startupAttributes = 0;
+        let startupHandleList = 0;
+        let stdinHandle = 0;
+        let inheritedStdInput = 0;
+        let inheritedStdOutput = 0;
+        let inheritedStdError = 0;
+
+        if (captureOutput) {
+            flags = CREATE_NO_WINDOW + CREATE_NEW_PROCESS_GROUP;
+            if (boundedCapture) {
+                let resources = createBoundedCaptureResources(captureLimitBytes);
+                this.captureSessionId = resources.get(0);
+                this.captureLimitBytes = captureLimitBytes;
+                captureWriter = resources.get(1);
+                stdinHandle = resources.get(2);
+                startupAttributes = resources.get(3);
+                startupHandleList = resources.get(4);
+                flags = flags + EXTENDED_STARTUPINFO_PRESENT;
+            } else {
+                let created = createCaptureFile();
+                captureWriter = created.get(0);
+                let captureName = created.get(1);
+                let readerHandle = 0;
+                try {
+                    stdinHandle = openNullDevice();
+                    readerHandle = openCaptureReader(captureName);
+                } catch (&e) {
+                    if (stdinHandle != 0) closeHandle(stdinHandle);
+                    if (captureWriter != 0) closeHandle(captureWriter);
+                    deleteFile(captureName);
+                    free(captureName);
+                    throw e;
+                }
+                this.captureHandle = readerHandle;
+                this.captureName = captureName;
+            }
+            inheritHandles = 1;
+            // The child keeps its own inherited copy from here on.
+            this.childStdin = stdinHandle;
+        } else if (inheritConsole) {
+            let resources = createConsoleProcessResources();
+            inheritedStdInput = resources.get(0);
+            inheritedStdOutput = resources.get(1);
+            inheritedStdError = resources.get(2);
+            startupAttributes = resources.get(3);
+            startupHandleList = resources.get(4);
+            flags = EXTENDED_STARTUPINFO_PRESENT;
+            inheritHandles = 1;
+        }
+
+        let line = new Buffer(commandLine.length() * 2 + 2);
+        line.utf16(0, commandLine);
+        let startupSize = startupLayout.size;
+        if (boundedCapture or inheritConsole) {
+            startupSize = startupExLayout.size;
+        }
+        let startup = new Buffer(startupSize);
+        let startupFlags = 0;
+        if (captureOutput or inheritConsole) {
+            startupFlags = STARTF_USESTDHANDLES;
+        }
+        startup.setI32(startupLayout.offsetOf("cb"), startupSize);
+        startup.setI32(startupLayout.offsetOf("dwFlags"), startupFlags);
+        startup.setI16(startupLayout.offsetOf("wShowWindow"), SW_HIDE);
+        if (captureOutput) {
+            startup.setPointer(
+                startupLayout.offsetOf("hStdInput"), stdinHandle);
+            startup.setPointer(
+                startupLayout.offsetOf("hStdOutput"), captureWriter);
+            startup.setPointer(
+                startupLayout.offsetOf("hStdError"), captureWriter);
+            if (boundedCapture) {
+                startup.setPointer(
+                    startupExLayout.offsetOf("lpAttributeList"),
+                    startupAttributes);
+            }
+        } else if (inheritConsole) {
+            startup.setPointer(
+                startupLayout.offsetOf("hStdInput"), inheritedStdInput);
+            startup.setPointer(
+                startupLayout.offsetOf("hStdOutput"), inheritedStdOutput);
+            startup.setPointer(
+                startupLayout.offsetOf("hStdError"), inheritedStdError);
+            startup.setPointer(
+                startupExLayout.offsetOf("lpAttributeList"),
+                startupAttributes);
+        }
+
+        let info = new Buffer(processInfoLayout.size);
+        let currentDirectoryBuffer = nil;
+        let currentDirectoryAddress = 0;
+        if (currentDirectory != "") {
+            currentDirectoryBuffer = new Buffer(currentDirectory.length() * 2 + 2);
+            currentDirectoryBuffer.utf16(0, currentDirectory);
+            currentDirectoryAddress = currentDirectoryBuffer.address;
+        }
+        let started = createProcessW(
+            0, line.address,
+            0, 0,
+            inheritHandles, flags,
+            0, currentDirectoryAddress,
+            startup.address, info.address);
+
+        if (!started) {
+            let failure = getLastError();
+            let startupDiagnostic = "process: CreateProcessW failed with error " +
+                str(failure) + ", cb=" + str(startupSize) +
+                ", flags=" + str(flags) +
+                ", inheritHandles=" + str(inheritHandles) +
+                ", attributes=" + str(startupAttributes) +
+                ", stdin=" + str(stdinHandle) +
+                ", output=" + str(captureWriter);
+            if (captureWriter != 0) {
+                closeHandle(captureWriter);
+                captureWriter = 0;
+            }
+            if (startupAttributes != 0) {
+                deleteProcThreadAttributeList(startupAttributes);
+                free(startupAttributes);
+                startupAttributes = 0;
+            }
+            if (startupHandleList != 0) {
+                free(startupHandleList);
+                startupHandleList = 0;
+            }
+            if (inheritedStdInput != 0) closeHandle(inheritedStdInput);
+            if (inheritedStdOutput != 0) closeHandle(inheritedStdOutput);
+            if (inheritedStdError != 0) closeHandle(inheritedStdError);
+            line.release();
+            startup.release();
+            info.release();
+            if (currentDirectoryBuffer != nil) currentDirectoryBuffer.release();
+            this.closeCapture();
+            throw new Exception(startupDiagnostic);
+        }
+
+        if (captureWriter != 0) {
+            closeHandle(captureWriter);
+            captureWriter = 0;
+        }
+        if (startupAttributes != 0) {
+            deleteProcThreadAttributeList(startupAttributes);
+            free(startupAttributes);
+            startupAttributes = 0;
+        }
+        if (startupHandleList != 0) {
+            free(startupHandleList);
+            startupHandleList = 0;
+        }
+        if (inheritedStdInput != 0) closeHandle(inheritedStdInput);
+        if (inheritedStdOutput != 0) closeHandle(inheritedStdOutput);
+        if (inheritedStdError != 0) closeHandle(inheritedStdError);
+
+        this.processHandle = info.i64(processInfoLayout.offsetOf("hProcess"));
+        this.processThreadHandle = info.i64(processInfoLayout.offsetOf("hThread"));
+        this.processId = info.i32(processInfoLayout.offsetOf("dwProcessId"));
+        this.threadId = info.i32(processInfoLayout.offsetOf("dwThreadId"));
+        this.exitCode = STILL_ACTIVE;
+
+        // The child inherited its own copy of the input handle.
+        if (this.childStdin != 0) {
+            closeHandle(this.childStdin);
+            this.childStdin = 0;
+        }
+
+        line.release();
+        startup.release();
+        info.release();
+        if (currentDirectoryBuffer != nil) currentDirectoryBuffer.release();
+    }
+
+    // Waits for the child. -1 waits forever, zero polls, and a positive value
+    // gives up after that many milliseconds.
+    func wait(timeoutMillis: int = -1) -> bool {
+        if (this.processHandle == 0) return true;
+        if (timeoutMillis < -1) {
+            throw new Exception("process: timeout must be -1 or non-negative");
+        }
+        let result = waitForSingleObject(this.processHandle, timeoutMillis);
+        if (result == WAIT_OBJECT_0) {
+            this.refreshExitCode();
+            return true;
+        }
+        if (result == WAIT_TIMEOUT) return false;
+        throw new Exception(
+            "process: WaitForSingleObject failed with " + str(result) +
+            " (GetLastError=" + str(getLastError()) + ")");
+    }
+
+    // Reports whether the child has already finished, without blocking.
+    func finished() -> bool {
+        return this.wait(0);
+    }
+
+    func refreshExitCode() {
+        if (this.processHandle == 0) return;
+        let field = new Buffer(4);
+        if (getExitCodeProcess(this.processHandle, field.address)) {
+            this.exitCode = field.i32(0);
+        } else {
+            let failure = getLastError();
+            field.release();
+            throw new Exception(
+                "process: GetExitCodeProcess failed with " + str(failure));
+        }
+        field.release();
+    }
+
+    func exitCodeOf() -> int {
+        if (this.exitCode == STILL_ACTIVE) this.refreshExitCode();
+        return this.exitCode;
+    }
+
+    func running() -> bool {
+        if (this.processHandle == 0) return false;
+        let result = waitForSingleObject(this.processHandle, 0);
+        if (result == WAIT_TIMEOUT) return true;
+        if (result == WAIT_OBJECT_0) {
+            this.refreshExitCode();
+            return false;
+        }
+        throw new Exception(
+            "process: WaitForSingleObject failed with " + str(result) +
+            " (GetLastError=" + str(getLastError()) + ")");
+    }
+
+    func terminate(exitCode: int = 1) -> bool {
+        if (this.processHandle == 0) return false;
+        return terminateProcess(this.processHandle, exitCode) != 0;
+    }
+
+    // Everything the child has written so far.
+    func output() -> string {
+        if (this.captureSessionId != 0) {
+            let chunk = this.outputChunk(0, this.captureLimitBytes);
+            return str(dict_get(chunk, "text", ""));
+        }
+        return readCapture(this.captureHandle, 0);
+    }
+
+    // Only what was written after fromOffset, so a caller can follow a running
+    // child without re-reading the whole file.
+    func outputSince(fromOffset: int) -> string {
+        if (this.captureSessionId != 0) {
+            let chunk = this.outputChunk(fromOffset, this.captureLimitBytes);
+            return str(dict_get(chunk, "text", ""));
+        }
+        return readCapture(this.captureHandle, fromOffset);
+    }
+
+    // Returns a bounded text slice and its exact byte cursor. Unlike
+    // outputSince(), this remains safe while a child is writing a multi-byte
+    // UTF-8 character.
+    func outputChunk(fromOffset: int, maxCharacters: int = 8000) -> dict {
+        if (this.captureSessionId != 0) {
+            return __process_read_bounded_capture_chunk(
+                this.captureSessionId, fromOffset, maxCharacters);
+        }
+        return __process_read_capture_chunk(this.captureHandle, fromOffset,
+            maxCharacters, !this.running());
+    }
+
+    func outputSize() -> int {
+        if (this.captureSessionId != 0) {
+            let chunk = __process_read_bounded_capture_chunk(
+                this.captureSessionId, 0, 0);
+            return int(dict_get(chunk, "buffer_end", 0));
+        }
+        if (this.captureHandle == 0) return 0;
+        let field = new Buffer(8);
+        if (getFileSizeEx(this.captureHandle, field.address)) {
+            let total = field.i64(0);
+            field.release();
+            return total;
+        }
+        let failure = getLastError();
+        field.release();
+        throw new Exception(
+            "process: GetFileSizeEx failed with " + str(failure));
+    }
+
+    func closeCapture() {
+        if (this.childStdin != 0) {
+            closeHandle(this.childStdin);
+            this.childStdin = 0;
+        }
+        if (this.captureSessionId != 0) {
+            __process_capture_release(this.captureSessionId);
+            this.captureSessionId = 0;
+            this.captureLimitBytes = 0;
+        }
+        if (this.captureHandle != 0) {
+            closeHandle(this.captureHandle);
+            this.captureHandle = 0;
+        }
+        if (this.captureName != 0) {
+            deleteFile(this.captureName);
+            free(this.captureName);
+            this.captureName = 0;
+        }
+    }
+
+    func close() {
+        this.closeCapture();
+        if (this.processThreadHandle != 0) {
+            closeHandle(this.processThreadHandle);
+            this.processThreadHandle = 0;
+        }
+        if (this.processHandle != 0) {
+            closeHandle(this.processHandle);
+            this.processHandle = 0;
+        }
+    }
+
+    // This destructor intentionally leaves process cleanup to close(), which
+    // can report errors while the program is still running.
+    func operator[~]() {
+    }
+}
+
+}
+
+using posix {
+    @native("popen", from="c")
+    decl func posixPopen(command: ptr, mode: ptr) -> ptr;
+
+    @native("pclose", from="c")
+    decl func posixPclose(stream: ptr) -> int32;
+
+    @native("fread", from="c")
+    decl func posixFread(buffer: ptr, size: int, count: int, stream: ptr) -> int;
+
+    @native("readlink", from="c")
+    decl func posixReadlink(path: ptr, buf: ptr, bufsiz: int) -> int;
+
+    class Process {
+        using &this;
+
+        func operator[@=]() -> &Process {
+            return this;
+        }
+
+        var stream = 0;
+        var exitCode = -1;
+        var capturedBytes = b"";
+        var isRunning = false;
+
+        func static executablePath() -> string {
+            let buf = new Buffer(4096);
+            let linkPath = new Buffer(16);
+            linkPath.writeCString(0, "/proc/self/exe");
+            let count = posixReadlink(linkPath.address, buf.address, 4096);
+            linkPath.release();
+            if (count <= 0) {
+                buf.release();
+                return "";
+            }
+            let values = [];
+            for (0..count) [const &i] {
+                values.append(buf.u8(i));
+            }
+            buf.release();
+            return bytes(values).decode("utf-8");
+        }
+
+        func static arguments() -> list {
+            let requiredBytes = __process_arguments_size();
+            if (requiredBytes < 4 or requiredBytes > 1048576) {
+                throw new Exception("process: invalid command-line argument block size");
+            }
+            let argumentBuffer = new Buffer(requiredBytes);
+            let writtenBytes = __process_arguments_write(argumentBuffer.address, requiredBytes);
+            if (writtenBytes != requiredBytes) {
+                argumentBuffer.release();
+                throw new Exception("process: could not copy command-line arguments");
+            }
+            let argumentCount = argumentBuffer.i32(0);
+            if (argumentCount < 0 or argumentCount > requiredBytes / 4) {
+                argumentBuffer.release();
+                throw new Exception("process: invalid command-line argument count");
+            }
+            let result = [];
+            let offset = 4;
+            for (0..argumentCount) [const &index] {
+                if (offset + 4 > writtenBytes) {
+                    argumentBuffer.release();
+                    throw new Exception("process: truncated command-line argument block");
+                }
+                let length = argumentBuffer.i32(offset);
+                offset = offset + 4;
+                if (length < 0 or length > writtenBytes - offset) {
+                    argumentBuffer.release();
+                    throw new Exception("process: invalid command-line argument length");
+                }
+                let value = [];
+                for (offset..(offset + length)) [const &byteIndex] {
+                    value.append(argumentBuffer.u8(byteIndex));
+                }
+                result.append(bytes(value).decode("utf-8"));
+                offset = offset + length;
+            }
+            argumentBuffer.release();
+            return result;
+        }
+
+        func static run(commandLine: string, captureOutput: bool = true,
+                currentDirectory: string="", captureLimitBytes: int = 0,
+                inheritConsole: bool = false) -> Process {
+            let process = new Process();
+            process.start(commandLine, captureOutput, currentDirectory,
+                captureLimitBytes, inheritConsole);
+            return process;
+        }
+
+        func static runConsole(commandLine: string) -> Process {
+            return Process.run(commandLine, false, "", 0, true);
+        }
+
+        func start(commandLine: string, captureOutput: bool,
+                currentDirectory: string="", captureLimitBytes: int = 0,
+                inheritConsole: bool = false) {
+            let cmd = commandLine;
+            if (currentDirectory != "") {
+                cmd = "cd \"" + currentDirectory + "\" && " + cmd;
+            }
+            if (captureOutput) {
+                cmd = cmd + " 2>&1";
+            }
+            let cmdBuf = new Buffer(cmd.length() + 1);
+            cmdBuf.writeCString(0, cmd);
+            let modeBuf = new Buffer(4);
+            modeBuf.writeCString(0, "r");
+            let fp = posixPopen(cmdBuf.address, modeBuf.address);
+            cmdBuf.release();
+            modeBuf.release();
+            if (fp == 0) {
+                throw new Exception("process: popen failed for '" + commandLine + "'");
+            }
+            this.stream = fp;
+            this.isRunning = true;
+            this.exitCode = -1;
+            this.capturedBytes = b"";
+
+            if (captureOutput) {
+                let chunk = new Buffer(4096);
+                let values = [];
+                for (true) {
+                    let n = posixFread(chunk.address, 1, 4096, fp);
+                    if (n <= 0) break;
+                    for (0..n) [const &i] {
+                        values.append(chunk.u8(i));
+                    }
+                    if (captureLimitBytes > 0 and values.length() >= captureLimitBytes) {
+                        break;
+                    }
+                }
+                chunk.release();
+                this.capturedBytes = bytes(values);
+                let status = posixPclose(this.stream);
+                this.stream = 0;
+                this.isRunning = false;
+                this.exitCode = int(status / 256) % 256;
+            }
+        }
+
+        func wait(timeoutMillis: int = -1) -> int {
+            if (this.stream != 0) {
+                let status = posixPclose(this.stream);
+                this.stream = 0;
+                this.isRunning = false;
+                this.exitCode = int(status / 256) % 256;
+            }
+            return this.exitCode;
+        }
+
+        func output(startOffset: int = 0, maxBytes: int = -1) -> bytes {
+            let total = this.capturedBytes.length();
+            if (startOffset >= total) return b"";
+            let end = total;
+            if (maxBytes >= 0 and startOffset + maxBytes < end) {
+                end = startOffset + maxBytes;
+            }
+            return this.capturedBytes.slice(startOffset, end);
+        }
+
+        func outputTotalBytes() -> int {
+            return this.capturedBytes.length();
+        }
+
+        func close() {
+            if (this.stream != 0) {
+                posixPclose(this.stream);
+                this.stream = 0;
+            }
+            this.isRunning = false;
+        }
+
+        func kill() {
+            this.close();
+        }
+
+        func operator[~]() {
+            this.close();
+        }
+    }
+}

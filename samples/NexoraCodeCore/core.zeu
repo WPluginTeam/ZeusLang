@@ -1,0 +1,93 @@
+import zeus.exception;
+import zeus.json;
+import zeus.ssl;
+import zeus.websocket;
+import samples.NexoraCodeCore.policy;
+
+func __nexora_core_open_websocket(url: string, sslContext: SSLContext) -> WebSocketConnection {
+    try {
+        return WebSocketClient.connect(url, 1048576, sslContext);
+    } catch (&connectFailure) {
+        print("NEXORA_CORE_WEBSOCKET_CONNECT_FAILED", type(connectFailure));
+        throw connectFailure;
+    }
+}
+
+// Zeus-side transport and envelope handling for the Nexora remote-control
+// connection. Application routing remains with the caller.
+func nexora_core_connect(
+    serverUrl: string,
+    deviceId: string,
+    deviceToken: string,
+    sslContext: SSLContext
+) -> WebSocketConnection {
+    if (deviceId.length() == 0 or deviceToken.length() == 0) {
+        throw new Exception("Nexora authentication requires a device ID and token");
+    }
+
+    let url = nexora_core_websocket_url(serverUrl);
+    print("NEXORA_CORE_CONNECTING");
+    let connection = __nexora_core_open_websocket(url, sslContext);
+    print("NEXORA_CORE_WEBSOCKET_CONNECTED");
+    try {
+        let authFrame = {
+            "type": "auth",
+            "device_id": deviceId,
+            "device_token": deviceToken
+        };
+        connection.sendText(JSON.stringify(authFrame));
+        print("NEXORA_CORE_AUTH_SENT");
+
+        let response = connection.receive();
+        if (response == nil or !response.isText()) {
+            throw new Exception("Nexora server closed before authentication completed");
+        }
+
+        let authReply = JSON.parse(response.text);
+        if (authReply["type"] != "auth_ok") {
+            throw new Exception("Nexora device authentication was rejected");
+        }
+        print("NEXORA_CORE_AUTH_OK");
+        return connection;
+    } catch (&authFailure) {
+        try {
+            connection.close(1000, "authentication_failed");
+        } catch (&authCleanupFailure) {}
+        throw authFailure;
+    }
+}
+
+// 这四个函数只用到 sendText / receive / close 这几个方法，因此按鸭子类型接收：
+// 传输层的连接和测试里的假连接都能直接传进来，不必为了单测造一条真连接。
+func nexora_core_send_ping(connection) {
+    connection.sendText(JSON.stringify({"type": "ping"}));
+}
+
+func nexora_core_receive_frame(connection, timeoutMillis: int = -1) {
+    let message = connection.receive(timeoutMillis);
+    if (message == nil) return nil;
+    if (!message.isText()) {
+        throw new Exception("Nexora remote-control messages must use text frames");
+    }
+    return JSON.parse(message.text);
+}
+
+func nexora_core_send_rpc_result(
+    connection,
+    requestId: string,
+    result
+) {
+    if (requestId.length() == 0) {
+        throw new Exception("Nexora RPC result requires a request ID");
+    }
+    let frame = {
+        "type": "rpc_result",
+        "request_id": requestId,
+        "result": result
+    };
+    connection.sendText(JSON.stringify(frame));
+}
+
+func nexora_core_close(connection) {
+    connection.close(1000, "done");
+}

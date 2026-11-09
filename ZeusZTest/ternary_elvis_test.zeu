@@ -1,0 +1,72 @@
+import zeus.exception;
+
+var ternaryCalls = 0;
+var optionalCalls = 0;
+var fallbackCalls = 0;
+
+func markTernary(value: int) -> int {
+    ternaryCalls = ternaryCalls + 1;
+    return value;
+}
+
+func nextOptional() -> int? {
+    optionalCalls = optionalCalls + 1;
+    if (optionalCalls == 1) return 0;
+    return nil;
+}
+
+func fallbackValue() -> int {
+    fallbackCalls = fallbackCalls + 1;
+    return 9;
+}
+
+func assertTernaryElvis(value: bool, message: string) {
+    if (!value) throw new Exception("ternary/elvis test: " + message);
+}
+
+func choose(value: bool) -> int {
+    return value ? 17 : 23;
+}
+
+func chooseInferred(value: bool) {
+    return value ? 27 : 28;
+}
+
+func main() {
+    let trueBranch = true ? markTernary(1) : markTernary(2);
+    let falseBranch = false ? markTernary(3) : markTernary(4);
+    assertTernaryElvis(trueBranch == 1 and falseBranch == 4 and ternaryCalls == 2,
+        "only the selected ternary branch must run");
+
+    let nestedRight = false ? 10 : true ? 20 : 30;
+    let nestedMiddle = true ? false ? 40 : 50 : 60;
+    let lowerThanOr = false or true ? 70 : 80;
+    assertTernaryElvis(nestedRight == 20 and nestedMiddle == 50 and
+        lowerThanOr == 70 and choose(true) == 17 and chooseInferred(true) == 27,
+        "ternary precedence and nesting must be stable");
+
+    let mixedBranch = false ? 31 : "selected";
+    assertTernaryElvis(mixedBranch == "selected",
+        "mixed branch types must retain the selected value");
+
+    let nilValue: int? = nil;
+    let nilDefault = nilValue ?: fallbackValue();
+    let firstRead = nextOptional() ?: fallbackValue();
+    let secondRead = nextOptional() ?: fallbackValue();
+    assertTernaryElvis(nilDefault == 9 and firstRead == 0 and secondRead == 9,
+        "Elvis must select the value or fallback based only on nil");
+    assertTernaryElvis(optionalCalls == 2 and fallbackCalls == 2,
+        "Elvis must evaluate the left side once and skip unused fallbacks");
+
+    let falseValue: bool? = false;
+    let emptyValue: string? = "";
+    let falseResult = falseValue ?: true;
+    let zeroResult = 0 ?: 5;
+    let emptyResult = emptyValue ?: "fallback";
+    assertTernaryElvis(falseResult == false and zeroResult == 0 and emptyResult == "",
+        "false, zero, and empty strings must not trigger the nil fallback");
+
+    print("TERNARY_ELVIS_PASS");
+}
+
+main();

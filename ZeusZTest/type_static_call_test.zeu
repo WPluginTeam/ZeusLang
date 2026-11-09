@@ -1,0 +1,37 @@
+// A type implementation exposes its static methods through the type name.
+// The call is lowered to a direct call of the qualified method name, so the
+// VM and the AOT resolve the same target.
+impl int {
+    static func twice(value: int) -> int {
+        return value * 2;
+    }
+
+    static func zero() -> int {
+        return 0;
+    }
+}
+
+impl bytes {
+    static func describe(value: bytes) -> int {
+        return 1;
+    }
+}
+
+func main() {
+    // assignment right hand side
+    let doubled = int.twice(3);
+    print(doubled);
+
+    // call argument
+    print(int.twice(4));
+
+    // no arguments
+    print(int.zero());
+
+    // nested calls
+    print(int.twice(int.twice(2)));
+
+    // another type
+    print(bytes.describe(b"ab"));
+}
+main();

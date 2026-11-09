@@ -1,0 +1,29 @@
+import zeus.exception;
+
+// bytes(...) 的返回值必须能直接调方法。之前 zeus.byte 只在出现 b"..." 字面量时
+// 才自动导入，所以只调用 bytes() 的程序里 impl bytes 根本没注册：静态内联的
+// 调用能跑，动态派发则报 "Cannot call method ... on a non-object value"。
+
+func viaParam(value) -> int {
+    let raw = bytes(value);
+    return raw.length();
+}
+
+func viaDynamic(target) -> int {
+    return target.length();
+}
+
+let fromCall = bytes("abcd");
+if (fromCall.length() != 4) throw new Exception("bytes() result length");
+if (fromCall[0] != 97) throw new Exception("bytes() result index");
+
+if (viaParam("abcde") != 5) throw new Exception("bytes(param) length");
+
+let box = {"b": b"xyz"};
+if (viaDynamic(box["b"]) != 3) throw new Exception("dynamic bytes dispatch");
+
+let sliced = fromCall.slice(1, 3);
+if (sliced.length() != 2) throw new Exception("bytes() result slice");
+if (sliced[0] != 98) throw new Exception("slice content");
+
+print("BYTES_METHOD_DISPATCH_PASS");

@@ -147,6 +147,7 @@ enum class VMOperator {
 
     // ===== 循环控制 =====
     LOOP_BREAK,           // 跳出循环：LOOP_BREAK offset
+    LOOP_CONTINUE,        // 进入下一轮：LOOP_CONTINUE offset（回填成 JUMP，跳到步进/条件处）
 
     // ===== 异常处理 =====
     TRY_BEGIN,            // 开始 try 块：TRY_BEGIN catchOffset
@@ -179,7 +180,12 @@ enum class VMOperator {
     LLVM_FADDR,
     LLVM_FSTORE,
     OBJ_REPLACE_STATE,
-    LLVM_SIZEOF
+    LLVM_SIZEOF,
+    // Safe navigation (`?.`): like OBJ_CALL_METHOD / OBJ_LOAD_ATTR, but a
+    // nil receiver short-circuits to nil instead of erroring. Appended at
+    // the end to preserve the numeric values of serialized operators.
+    OBJ_CALL_SAFE,
+    OBJ_LOAD_SAFE_ATTR
 };
 
 
@@ -245,6 +251,8 @@ std::string VMO_toString(VMOperator opr) {
         case VMOperator::OBJ_LOAD_ATTR: return "OBJ_LOAD_ATTR";
         case VMOperator::OBJ_STORE_ATTR: return "OBJ_STORE_ATTR";
         case VMOperator::OBJ_CALL_METHOD: return "OBJ_CALL_METHOD";
+        case VMOperator::OBJ_CALL_SAFE: return "OBJ_CALL_SAFE";
+        case VMOperator::OBJ_LOAD_SAFE_ATTR: return "OBJ_LOAD_SAFE_ATTR";
         // 模块系统
         case VMOperator::IMPORT: return "IMPORT";
         case VMOperator::NAMESPACE_BUILD: return "NAMESPACE_BUILD";
@@ -256,6 +264,7 @@ std::string VMO_toString(VMOperator opr) {
         case VMOperator::SHARED_UNLOCK: return "SHARED_UNLOCK";
         // 循环控制
         case VMOperator::LOOP_BREAK: return "LOOP_BREAK";
+        case VMOperator::LOOP_CONTINUE: return "LOOP_CONTINUE";
         // 异常处理
         case VMOperator::TRY_BEGIN: return "TRY_BEGIN";
         case VMOperator::TRY_END: return "TRY_END";

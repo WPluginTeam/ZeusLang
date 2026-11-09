@@ -6,6 +6,10 @@ class DeleteBox {
         return this.value;
     }
 
+    func shareSelf() -> &DeleteBox {
+        return this;
+    }
+
     func operator[~]() {
         print("DELETE_BOX_DESTROYED");
     }
@@ -17,6 +21,10 @@ shared class SharedDeleteBox {
 
     func get() {
         return this.value;
+    }
+
+    func shareSelf() -> &SharedDeleteBox {
+        return this;
     }
 
     func operator[~]() {
@@ -34,33 +42,42 @@ func main() {
     }
 
     delete shared_count;
+    let sharedScalarRejected = false;
     try {
         print(shared_count);
-        throw new Exception("deleted shared scalar remained readable");
     } catch (&e) {
-        print("PASS shared delete invalidates slot");
+        sharedScalarRejected = true;
     }
+    if (!sharedScalarRejected) throw new Exception("deleted shared scalar remained readable");
+    print("PASS shared delete invalidates slot");
 
     let ordinary = new DeleteBox();
-    let ordinary_alias = ordinary;
+    let ordinary_copy = ordinary;
+    let ordinary_alias = ordinary.shareSelf();
     delete ordinary;
+    if (ordinary_copy.get() != 7) throw new Exception("ordinary value copy did not survive source delete");
+    print("PASS ordinary value copy survives source delete");
+    let ordinaryAliasRejected = false;
     try {
         ordinary_alias.get();
-        throw new Exception("deleted ordinary object remained usable");
     } catch (&e) {
-        print("PASS ordinary delete invalidates aliases");
+        ordinaryAliasRejected = true;
     }
+    if (!ordinaryAliasRejected) throw new Exception("deleted ordinary object remained usable");
+    print("PASS ordinary delete invalidates aliases");
     delete ordinary_alias;
 
     let shared_object = new SharedDeleteBox();
-    let shared_alias = shared_object;
+    let shared_alias = shared_object.shareSelf();
     delete shared_alias;
+    let sharedAliasRejected = false;
     try {
         shared_object.get();
-        throw new Exception("deleted shared object remained usable");
     } catch (&e) {
-        print("PASS shared object delete invalidates aliases");
+        sharedAliasRejected = true;
     }
+    if (!sharedAliasRejected) throw new Exception("deleted shared object remained usable");
+    print("PASS shared object delete invalidates aliases");
     delete shared_object;
 }
 

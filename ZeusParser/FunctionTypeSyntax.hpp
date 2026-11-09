@@ -20,6 +20,7 @@ namespace ZeusParser {
         std::string name;
         std::string argument;
         std::string secondaryArgument;
+        std::string secondaryArgumentName;
         std::vector<std::string> typeArguments;
         bool hasArgument = false;
         bool hasSecondaryArgument = false;
@@ -46,6 +47,7 @@ namespace ZeusParser {
         // Scalar `&T` native parameters use raw pointers by default; "slot"
         // keeps the legacy ZeusValue* reference ABI.
         std::string nativeReferenceABI = "raw";
+        std::string nativeLibraryPath;
         bool valid = false;
     };
 
@@ -125,6 +127,13 @@ namespace ZeusParser {
                 }
                 if (position < tokens.size() && isOperator(tokens[position], ",")) {
                     ++position;
+                    if (position + 1 < tokens.size() &&
+                        std::holds_alternative<LexerType::Keyword>(tokens[position]) &&
+                        isOperator(tokens[position + 1], "=")) {
+                        decorator.secondaryArgumentName =
+                            std::get<LexerType::Keyword>(tokens[position++]).name;
+                        ++position;
+                    }
                     if (position >= tokens.size() ||
                         !std::holds_alternative<LexerType::Value>(tokens[position])) {
                         result.valid = false;
@@ -202,12 +211,20 @@ namespace ZeusParser {
                 if (!decorator.hasArgument || decorator.argument.empty() ||
                     !signature.nativeSymbol.empty() ||
                     (decorator.hasSecondaryArgument &&
-                     decorator.secondaryArgument != "raw" &&
-                     decorator.secondaryArgument != "slot")) {
+                     ((decorator.secondaryArgumentName.empty() &&
+                       decorator.secondaryArgument != "raw" &&
+                       decorator.secondaryArgument != "slot") ||
+                      (decorator.secondaryArgumentName == "from" &&
+                       decorator.secondaryArgument.empty()) ||
+                      (!decorator.secondaryArgumentName.empty() &&
+                       decorator.secondaryArgumentName != "from")))) {
                     return FunctionSignatureSyntax{};
                 }
                 signature.nativeSymbol = decorator.argument;
-                if (decorator.hasSecondaryArgument) {
+                if (decorator.hasSecondaryArgument &&
+                    decorator.secondaryArgumentName == "from") {
+                    signature.nativeLibraryPath = decorator.secondaryArgument;
+                } else if (decorator.hasSecondaryArgument) {
                     signature.nativeReferenceABI = decorator.secondaryArgument;
                 }
             } else {
@@ -322,6 +339,10 @@ namespace ZeusParser {
         if (returnPosition < tokens.size() && isOperator(tokens[returnPosition], "->")) {
             ++returnPosition;
             parseTypeName(tokens, returnPosition, tokens.size(), signature.returnTypeName);
+        } else if (!signature.nativeLibraryPath.empty()) {
+            // A dynamic import with no explicit Zeus return type maps to a C
+            // void function. `nil` is a value keyword rather than a type token.
+            signature.returnTypeName = "nil";
         }
 
         signature.valid = true;

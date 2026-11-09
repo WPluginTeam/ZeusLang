@@ -1,4 +1,4 @@
-
+﻿
 #ifndef IRGenerator_hpp
 #define IRGenerator_hpp
 
@@ -200,6 +200,15 @@ namespace IRGen {
     static std::string _canonicalIRTypeName(const std::string& sourceName) {
         const ZeusTypeInfer::TypeRef type = ZeusTypeInfer::parseTypeRef(sourceName);
         return type.isKnown() ? type.toIRTypeName() : sourceName;
+    }
+
+    // Dynamic native imports need the declared integer width to select the
+    // matching machine return type. `int32` is a true 32-bit type (not an
+    // `int` alias), so its spelling is preserved in the ABI record; the
+    // same holds for the newer fixed-width spellings via parseTypeRef.
+    static std::string _canonicalNativeABITypeName(const std::string& sourceName) {
+        if (sourceName == "int32" || sourceName == "int64") return sourceName;
+        return _canonicalIRTypeName(sourceName);
     }
 
     static std::string _operatorFunctionName(
@@ -437,6 +446,18 @@ namespace IRGen {
             }
         }
 
+        // `@native func name(...)` 定义一个 C 链接函数：符号名取装饰器参数，
+        // 无参数时取函数自己的名字。它仍然是定义（annotation kind 保持
+        // function_signature），所以函数体照常发射，只是不改名。
+        std::string nativeDefinitionSymbol;
+        if (!codeBlock.isClassMethod &&
+            std::find(codeBlock.decorators.begin(), codeBlock.decorators.end(),
+                      "native") != codeBlock.decorators.end()) {
+            nativeDefinitionSymbol = !codeBlock.nativeSymbol.empty()
+                ? codeBlock.nativeSymbol
+                : signatureName;
+        }
+
         annotation.metadata = IRType::IRMetadata::functionSignature(
             signatureName,
             returnTypeName,
@@ -450,7 +471,8 @@ namespace IRGen {
             std::move(parameterNames),
             std::move(parameterIsReference),
             codeBlock.isInline,
-            codeBlock.isNoSafepoint
+            codeBlock.isNoSafepoint,
+            std::move(nativeDefinitionSymbol)
         );
 
         return annotation;
@@ -468,7 +490,14 @@ namespace IRGen {
             signatureName = IRScope::currentPackageName + "." + signatureName;
         }
         annotation.args.push_back(signatureName);
-        const std::string returnType = _canonicalIRTypeName(signature.returnTypeName);
+        const bool isDynamicNativeImport = !signature.nativeSymbol.empty() &&
+            !signature.nativeLibraryPath.empty();
+        const auto canonicalSignatureType = [&](const std::string& typeName) {
+            return isDynamicNativeImport
+                ? _canonicalNativeABITypeName(typeName)
+                : _canonicalIRTypeName(typeName);
+        };
+        const std::string returnType = canonicalSignatureType(signature.returnTypeName);
         annotation.args.push_back(returnType);
         annotation.args.push_back(LexerType::Value(0));
         annotation.args.push_back(LexerType::Value(
@@ -482,20 +511,25 @@ namespace IRGen {
         std::vector<bool> parameterIsReference;
         parameterIsReference.reserve(signature.parameters.size());
         for (const auto& parameter : signature.parameters) {
-            const std::string typeName = _canonicalIRTypeName(parameter.typeName);
+            const std::string typeName = canonicalSignatureType(parameter.typeName);
             annotation.args.push_back(typeName);
             parameterTypes.push_back(typeName);
             parameterNames.push_back(parameter.name);
             parameterIsReference.push_back(parameter.isReference);
         }
+        const std::string nativeLibraryPath = signature.nativeLibraryPath.empty()
+            ? std::string()
+            : IRImport::resolveNativeLibraryPath(signature.nativeLibraryPath);
         if (!signature.nativeSymbol.empty()) {
             annotation.args.push_back(signature.nativeSymbol);
             annotation.args.push_back(signature.nativeReferenceABI);
+            annotation.args.push_back(nativeLibraryPath);
         }
         annotation.metadata = IRType::IRMetadata::externalFunctionSignature(
             signatureName, returnType, std::move(parameterTypes),
             signature.nativeSymbol, std::move(parameterNames),
-            std::move(parameterIsReference), signature.nativeReferenceABI
+            std::move(parameterIsReference), signature.nativeReferenceABI,
+            nativeLibraryPath
         );
         return annotation;
     }
@@ -513,6 +547,129 @@ namespace IRGen {
         return annotation;
     }
 
+    // 类型实现通过类型名暴露它的静态方法：impl int { static func twice() }
+    // 可以写成 int.twice(...)。用户自定义的类仍然使用类句柄调用静态方法。
+    static bool isTypeStaticCallTarget(const std::string& name) {
+        if (name.empty()) return false;
+        return ZeusBuiltins::findNativeTypeABI(name) != nullptr ||
+               ZeusBuiltins::findTypeImplementation(name) != nullptr;
+    }
+
+    // 类型静态方法的限定名：TypeName::method
+    static std::string typeStaticCallName(
+        const std::string& typeName,
+        const std::string& methodName
+    ) {
+        return typeName + "::" + methodName;
+    }
+
+    // 类型静态调用的被调用者：LOAD_VALUE "TypeName::method"
+    // VM 在类型实现表里查这个限定名，AOT 把它解析成函数签名。
+    static IRType::IRInstr makeTypeStaticCallee(
+        const std::string& typeName,
+        const std::string& methodName,
+        int line
+    ) {
+        IRType::IRInstr load;
+        load.op = VMOperator::LOAD_VALUE;
+        load.line = line;
+        load.args.push_back(typeStaticCallName(typeName, methodName));
+        return load;
+    }
+
+    // 类型静态调用的调用指令：direct_call 标注 + CALL_CLOSURE
+    static void emitTypeStaticCall(
+        const std::string& typeName,
+        const std::string& methodName,
+        int argc,
+        std::vector<IRType::CallArgumentSource> callArguments,
+        int line,
+        std::vector<IRType::IRInstr>& out
+    ) {
+        out.push_back(makeDirectCallAnnotation(typeStaticCallName(typeName, methodName)));
+
+        IRType::IRInstr call;
+        call.op = VMOperator::CALL_CLOSURE;
+        call.line = line;
+        call.args.push_back(LexerType::Value(argc));
+        call.metadata = IRType::IRMetadata::callArgumentSources(
+            std::move(callArguments));
+        out.push_back(std::move(call));
+    }
+
+    static bool _parseArguments(
+        ExprParseCtx& ctx,
+        const std::vector<LexerType::Token>& tokens,
+        size_t& pos,
+        int& argc,
+        std::vector<IRType::IRInstr>& out,
+        std::vector<IRType::CallArgumentSource>* callArguments
+    );
+
+    // 安全导航调用 `recv?.method(args)` / 属性读取 `recv?.attr`。
+    // 调用方保证：接收者 IR 已在 out 栈顶；pos 指向成员名 keyword。
+    // 降级为专用指令而非分支：AOT 的线性 emitter 要求分支点操作数栈
+    // 为空，表达式内分支无法满足；专用指令在各后端内部自行处理
+    // nil 短路（VM 与 AOT 动态路径走运行时判定，原生路径走内联比较）。
+    // 参数是 eager 求值（与 && 操作数一致），只有接收者享受短路。
+    // `?.` 的结果恒为动态，链式 `a?.b()?.c` 可直接组合；同一条后缀链
+    // 里一旦出现 `?.`，其后所有 `.` 按 `?.` 处理（nil 向后传播）。
+    static bool emitSafeNavigation(
+        ExprParseCtx& ctx,
+        const std::vector<LexerType::Token>& tokens,
+        size_t& pos,
+        const IRType::SymbolRef& receiverSource,
+        std::vector<IRType::IRInstr>& out
+    ) {
+        if (pos >= tokens.size() || !_isKeyword(tokens[pos])) return false;
+        const std::string memberName =
+            std::get<LexerType::Keyword>(tokens[pos]).name;
+        const int memberLine = _getTokenLine(tokens[pos]);
+        ++pos; // consume the member name
+
+        size_t callPosition = pos;
+        std::vector<std::string> explicitTypeArguments;
+        const bool hasExplicitTypeArguments =
+            ZeusParser::consumeGenericCallSuffix(
+                tokens, callPosition, explicitTypeArguments);
+        const bool isCall = hasExplicitTypeArguments ||
+            (callPosition < tokens.size() &&
+             _isOperator(tokens[callPosition]) &&
+             _opSym(tokens[callPosition]) == "(");
+        if (hasExplicitTypeArguments) {
+            if (callPosition >= tokens.size() ||
+                !_isOperator(tokens[callPosition]) ||
+                _opSym(tokens[callPosition]) != "(") {
+                return false;
+            }
+            pos = callPosition;
+        }
+
+        if (isCall) {
+            int argc = 0;
+            std::vector<IRType::CallArgumentSource> callArguments;
+            if (!_parseArguments(ctx, tokens, pos, argc, out, &callArguments)) {
+                return false;
+            }
+            IRType::IRInstr call;
+            call.op = VMOperator::OBJ_CALL_SAFE;
+            call.line = memberLine;
+            call.args.push_back(memberName);
+            call.args.push_back(LexerType::Value(argc));
+            call.metadata = IRType::IRMetadata::callArgumentSources(
+                std::move(callArguments), explicitTypeArguments);
+            _appendMethodReceiverSource(call, receiverSource);
+            out.push_back(std::move(call));
+        } else {
+            IRType::IRInstr get;
+            get.op = VMOperator::OBJ_LOAD_SAFE_ATTR;
+            get.line = memberLine;
+            get.args.push_back(memberName);
+            out.push_back(std::move(get));
+        }
+        return true;
+    }
+
     // 封装：给已经在栈顶的 callee 追加一串后缀 () () ... 调用
     
 
@@ -523,6 +680,7 @@ namespace IRGen {
     // CallOrLoad := '(' ArgList? ')' → CALL_FUNC | ε → LOAD_VALUE
 
     static bool _parseExpression(ExprParseCtx& ctx, const std::vector<LexerType::Token>& tokens, size_t& pos, int minPrec, std::vector<IRType::IRInstr>& out);
+    static bool _parseConditionalTail(ExprParseCtx& ctx, const std::vector<LexerType::Token>& tokens, size_t& pos, int minPrec, std::vector<IRType::IRInstr>& out);
     static bool _parseUnary(ExprParseCtx& ctx, const std::vector<LexerType::Token>& tokens, size_t& pos, std::vector<IRType::IRInstr>& out);
     static bool _parsePrimary(ExprParseCtx& ctx, const std::vector<LexerType::Token>& tokens, size_t& pos, std::vector<IRType::IRInstr>& out);
 
@@ -903,7 +1061,8 @@ namespace IRGen {
                     targetType == "str" || targetType == "String";
                 const bool isBytesType = targetType == "bytes";
                 const bool isIntegerType = targetType == "int" ||
-                    targetType == "int32" || targetType == "int64";
+                    targetType == "int32" || targetType == "int64" ||
+                    ZeusBuiltins::findNativeIntegerABI(targetType) != nullptr;
                 if (isRawBytesRange && (!hasSizeArgument || !nativeSlotMode.empty())) {
                     TreeParser::Node dummy;
                     dummy.sourceLine = addressLine;
@@ -1075,6 +1234,14 @@ namespace IRGen {
         // Dict literal: { key : value (, key : value)* }
         // 规则：在表达式位置看到 '{' 且后续存在 ':' 判定为字典字面量；否则不是（可能是语句块，不应在此处进入）。
         if (_isOperator(tk) && _opSym(tk) == "{") {
+            // 空字典 {}：没有 ':' 可供试探，直接判定为字典字面量。
+            // 表达式位置的空花括号只可能是空字典，不可能是语句块。
+            if (pos + 1 < tokens.size() && _isOperator(tokens[pos + 1]) &&
+                _opSym(tokens[pos + 1]) == "}") {
+                pos += 2;
+                out.push_back(IRUtils::makeDictBuild(0));
+                return true;
+            }
             // 试探：向前看，找到与之匹配的 '}' 之前是否出现 ':'
             size_t look = pos + 1;
             int depthBrace = 1;
@@ -1150,8 +1317,10 @@ namespace IRGen {
             }
 
             pos++; // consume ')'
-            
-            // 处理后缀：方法调用、属性访问、下标访问、函数调用
+
+            // A chain that used `?.` stays nil-propagating: later bare `.`
+            // links behave as `?.` (`a?.b.c` means `a?.b?.c`).
+            bool chainSafeNav = false;
             while (pos < tokens.size()) {
                 // 函数调用 ()
                 if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == "(") {
@@ -1168,13 +1337,34 @@ namespace IRGen {
                     continue;
                 }
                 
+                // 安全导航调用/属性访问 ?.name 或 ?.name()
+                if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == "?" &&
+                    pos + 1 < tokens.size() && _isOperator(tokens[pos + 1]) &&
+                    _opSym(tokens[pos + 1]) == ".") {
+                    pos += 2; // consume '?.'
+                    const auto safeReceiverSource = _lastMethodReceiverSource(out);
+                    if (!emitSafeNavigation(ctx, tokens, pos, safeReceiverSource, out)) {
+                        return false;
+                    }
+                    chainSafeNav = true;
+                    continue;
+                }
+
                 // 方法调用/属性访问 .name 或 .name()
                 if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == ".") {
+                    if (chainSafeNav) {
+                        ++pos; // consume '.'
+                        const auto poisonedSource = _lastMethodReceiverSource(out);
+                        if (!emitSafeNavigation(ctx, tokens, pos, poisonedSource, out)) {
+                            return false;
+                        }
+                        continue;
+                    }
                     if (pos + 1 >= tokens.size() || !_isKeyword(tokens[pos + 1])) break;
                     std::string attrName = std::get<LexerType::Keyword>(tokens[pos + 1]).name;
                     int attrLine = _getTokenLine(tokens[pos + 1]);
                     pos += 2; // consume '.' and name
-                    
+
                     // 检查是否是方法调用
                     if (pos < tokens.size() && _isOperator(tokens[pos]) && _opSym(tokens[pos]) == "(") {
                         const auto receiverSource = _lastMethodReceiverSource(out);
@@ -1273,8 +1463,14 @@ namespace IRGen {
             IRScope::SymRef s = IRScope::resolve(name);
             const bool hasMemberSuffix = pos < tokens.size() &&
                 _isOperator(tokens[pos]) && _opSym(tokens[pos]) == ".";
+            // 未解析的名字，或由之前的编译单元（其它包 / main）声明的全局：
+            // 按名字延迟解析，不沿用其编译期槽位（包合并不跨包重定位全局引用）。
+            const bool unresolvedOrForeignName =
+                s.kind == IRScope::Kind::UNDEFINED ||
+                (s.kind == IRScope::Kind::GLOBAL &&
+                 IRScope::isForeignGlobal(s.index));
             const std::string nativeConstructionType =
-                s.kind == IRScope::Kind::UNDEFINED && !hasMemberSuffix
+                unresolvedOrForeignName && !hasMemberSuffix
                     ? _nativeConstructionType(name)
                     : std::string();
             const size_t classReferenceStart = out.size();
@@ -1284,6 +1480,10 @@ namespace IRGen {
             if (!nativeConstructionType.empty()) {
                 // Native type constructors are encoded on OBJ_BUILD itself;
                 // they do not push a class handle onto the operand stack.
+            } else if (unresolvedOrForeignName && !hasMemberSuffix) {
+                // 名字形式（延迟解析）：未声明的名字，或由之前的编译单元
+                // 声明的全局（跨包类引用不做槽位重定位）。
+                load.args.push_back(LexerType::Value(name));
             } else if (s.kind != IRScope::Kind::UNDEFINED) {
                 switch (s.kind) {
                     case IRScope::Kind::LOCAL:
@@ -1320,7 +1520,7 @@ namespace IRGen {
             }
             if (nativeConstructionType.empty() &&
                 !hasMemberSuffix &&
-                s.kind == IRScope::Kind::UNDEFINED) {
+                unresolvedOrForeignName) {
                 // Unresolved names in `new Name(...)` are static class
                 // references. Scope-bound names remain runtime expressions.
                 load.metadata.symbol = IRType::SymbolRef::classType(
@@ -1428,6 +1628,33 @@ namespace IRGen {
             const bool hasLexicalBinding =
                 s.kind != IRScope::Kind::UNDEFINED &&
                 s.kind != IRScope::Kind::GLOBAL;
+
+            // 类型名调用类型实现的静态方法：int.twice(3)
+            // 类型名同时可能是内建转换函数（int(x)），所以要在内建解析之前
+            // 判断，否则 "int.twice(3)" 会被当成对 int() 的方法调用。
+            if (isTypeStaticCallTarget(name) && !hasLexicalBinding &&
+                s.kind == IRScope::Kind::UNDEFINED &&
+                pos + 3 < tokens.size() &&
+                _isOperator(tokens[pos]) && _opSym(tokens[pos]) == "." &&
+                _isKeyword(tokens[pos + 1]) &&
+                _isOperator(tokens[pos + 2]) && _opSym(tokens[pos + 2]) == "(") {
+                const std::string method =
+                    std::get<LexerType::Keyword>(tokens[pos + 1]).name;
+                const int methodLine = _getTokenLine(tokens[pos + 1]);
+                pos += 2; // consume '.' and the method name
+
+                out.push_back(makeTypeStaticCallee(name, method, methodLine));
+
+                int argc = 0;
+                std::vector<IRType::CallArgumentSource> callArguments;
+                if (!_parseArguments(ctx, tokens, pos, argc, out, &callArguments)) {
+                    return false;
+                }
+                emitTypeStaticCall(name, method, argc, std::move(callArguments),
+                                   methodLine, out);
+                return true;
+            }
+
             if (IRScope::isCompilingPackage) {
                 const auto native = IRScope::nativeFunctionHandles.find(name);
                 if (native != IRScope::nativeFunctionHandles.end() &&
@@ -1525,7 +1752,7 @@ namespace IRGen {
                     out.push_back(ins);
                     calleeKind = CalleeKind::ClosureLike;
                     directFunctionCandidate = s.kind == IRScope::Kind::GLOBAL &&
-                                              IRScope::isStaticFunctionName(name);
+                                              IRScope::isStaticFunctionNameAt(name, s.index);
                 }
             }
             else {
@@ -1682,6 +1909,7 @@ namespace IRGen {
             // 通用后缀解析：属性链和下标访问
             // 支持： ident '.' attr ('.' attr)* 以及 ident '[' expr ']'
             // 说明：此前 emitExprIR 有“前缀”快速路径用于顶层；这里补齐一般情况下（例如作为函数参数）
+            bool postfixSafeNav = false;
             while (pos < tokens.size()) {
                 if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == "(") {
                     // Chain call: f()() or c.method()()
@@ -1697,7 +1925,27 @@ namespace IRGen {
                     out.push_back(call);
                     continue;
                 }
+                // 安全导航调用/属性访问 ?.name 或 ?.name()
+                if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == "?" &&
+                    pos + 1 < tokens.size() && _isOperator(tokens[pos + 1]) &&
+                    _opSym(tokens[pos + 1]) == ".") {
+                    pos += 2; // consume '?.'
+                    const auto safeReceiverSource = _lastMethodReceiverSource(out);
+                    if (!emitSafeNavigation(ctx, tokens, pos, safeReceiverSource, out)) {
+                        return false;
+                    }
+                    postfixSafeNav = true;
+                    continue;
+                }
                 if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == ".") {
+                    if (postfixSafeNav) {
+                        ++pos; // consume '.'
+                        const auto poisonedSource = _lastMethodReceiverSource(out);
+                        if (!emitSafeNavigation(ctx, tokens, pos, poisonedSource, out)) {
+                            return false;
+                        }
+                        continue;
+                    }
                     // 属性访问：要求后面紧跟标识符
                     // Lookahead: if pattern is . ident '(' -> method call on object
                     if (pos + 1 < tokens.size() && _isKeyword(tokens[pos + 1])) {
@@ -1718,11 +1966,36 @@ namespace IRGen {
                             ++pos; // consume method name
                             if (hasExplicitTypeArguments) pos = callPosition;
 
+                            // 类型名调用类型实现的静态方法：int.twice(3)
+                            // 接收者不是变量而是类型名时，把它的 LOAD 换成限定名。
+                            std::string typeStaticReceiver;
+                            if (!out.empty() &&
+                                out.back().op == VMOperator::LOAD_VALUE &&
+                                out.back().args.size() == 1 &&
+                                std::holds_alternative<std::string>(
+                                    out.back().args[0])) {
+                                const std::string& receiverName =
+                                    std::get<std::string>(out.back().args[0]);
+                                if (isTypeStaticCallTarget(receiverName)) {
+                                    typeStaticReceiver = receiverName;
+                                    out.pop_back();
+                                    out.push_back(makeTypeStaticCallee(
+                                        receiverName, method, methodLine));
+                                }
+                            }
+
                             const auto receiverSource = _lastMethodReceiverSource(out);
                             int argc = 0;
                             std::vector<IRType::CallArgumentSource> callArguments;
                             if (!_parseArguments(ctx, tokens, pos, argc, out, &callArguments)) {
                                 return false;
+                            }
+
+                            if (!typeStaticReceiver.empty()) {
+                                emitTypeStaticCall(typeStaticReceiver, method, argc,
+                                                   std::move(callArguments),
+                                                   methodLine, out);
+                                continue;
                             }
 
                             IRType::IRInstr call;
@@ -1735,8 +2008,7 @@ namespace IRGen {
                             _appendMethodReceiverSource(call, receiverSource);
                             out.push_back(call);
                             continue;
-                        }
-                    }
+                        }                    }
                     {
                         pos++; // consume '.'
                         if (pos >= tokens.size() || !_isKeyword(tokens[pos])) {
@@ -1799,6 +2071,7 @@ namespace IRGen {
     }
 
     static bool _parsePostfix(ExprParseCtx& ctx, const std::vector<LexerType::Token>& tokens, size_t& pos, std::vector<IRType::IRInstr>& out) {
+        bool postfixSafeNav = false;
         while (pos < tokens.size()) {
             if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == "(") {
                 const int callLine = _getTokenLine(tokens[pos]);
@@ -1812,7 +2085,27 @@ namespace IRGen {
                 continue;
             }
 
+            if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == "?" &&
+                pos + 1 < tokens.size() && _isOperator(tokens[pos + 1]) &&
+                _opSym(tokens[pos + 1]) == ".") {
+                pos += 2; // consume '?.'
+                const auto safeReceiverSource = _lastMethodReceiverSource(out);
+                if (!emitSafeNavigation(ctx, tokens, pos, safeReceiverSource, out)) {
+                    return false;
+                }
+                postfixSafeNav = true;
+                continue;
+            }
+
             if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == ".") {
+                if (postfixSafeNav) {
+                    ++pos; // consume '.'
+                    const auto poisonedSource = _lastMethodReceiverSource(out);
+                    if (!emitSafeNavigation(ctx, tokens, pos, poisonedSource, out)) {
+                        return false;
+                    }
+                    continue;
+                }
                 if (pos + 1 < tokens.size() && _isKeyword(tokens[pos + 1])) {
                     const std::string method =
                         std::get<LexerType::Keyword>(tokens[pos + 1]).name;
@@ -1971,6 +2264,80 @@ namespace IRGen {
             }
         }
 
+        return _parseConditionalTail(ctx, tokens, pos, minPrec, out);
+    }
+
+    static bool _parseConditionalTail(ExprParseCtx& ctx, const std::vector<LexerType::Token>& tokens, size_t& pos, int minPrec, std::vector<IRType::IRInstr>& out) {
+        // Conditional expressions bind below `or` (precedence 1). The parser
+        // also starts full expressions at 1 in call/list/dictionary contexts.
+        if (minPrec > 1 || pos >= tokens.size() || !_isOperator(tokens[pos]) ||
+            _opSym(tokens[pos]) != "?") {
+            return true;
+        }
+
+        const int questionLine = _getTokenLine(tokens[pos]);
+        ++pos;
+        const int resultSlot = IRScope::allocateInternalLocal();
+        auto storeResult = IRUtils::makeStoreLocal(resultSlot, false);
+        // Branches may have different native types (for example `bool? ?: bool`).
+        // Give the hidden merge slot ZeusValue storage so both paths share one
+        // representation; the surrounding typed store/return can unbox it.
+        storeResult.metadata = IRType::IRMetadata::localBindingType("any");
+        const auto loadResult = IRUtils::makeLoadLocal(resultSlot);
+
+        // `value ?: fallback` is nil-coalescing. Spill before checking so the
+        // left side (including a call with side effects) is evaluated once.
+        if (pos < tokens.size() && _isOperator(tokens[pos]) &&
+            _opSym(tokens[pos]) == ":") {
+            ++pos;
+            out.push_back(storeResult);
+            out.push_back(loadResult);
+
+            IRType::IRInstr pushNil;
+            pushNil.op = VMOperator::PUSH;
+            pushNil.line = questionLine;
+            pushNil.args.push_back(IRType::NullLiteral{});
+            out.push_back(std::move(pushNil));
+            out.push_back(IRUtils::makeBinaryOpBySymbol("=="));
+
+            IRType::IRInstr keepValue = IRUtils::makeJumpIfFalsePlaceholder();
+            keepValue.line = questionLine;
+            const size_t keepValueIndex = out.size();
+            out.push_back(std::move(keepValue));
+
+            if (!_parseExpression(ctx, tokens, pos, 1, out)) return false;
+            out.push_back(storeResult);
+            out[keepValueIndex].args[0] = LexerType::Value(
+                static_cast<int>(out.size() - keepValueIndex - 1));
+            out.push_back(loadResult);
+            return true;
+        }
+
+        IRType::IRInstr skipTrue = IRUtils::makeJumpIfFalsePlaceholder();
+        skipTrue.line = questionLine;
+        const size_t skipTrueIndex = out.size();
+        out.push_back(std::move(skipTrue));
+
+        if (!_parseExpression(ctx, tokens, pos, 1, out)) return false;
+        if (pos >= tokens.size() || !_isOperator(tokens[pos]) ||
+            _opSym(tokens[pos]) != ":") {
+            return false;
+        }
+        ++pos;
+        out.push_back(storeResult);
+
+        IRType::IRInstr skipFalse = IRUtils::makeJump(0);
+        skipFalse.line = questionLine;
+        const size_t skipFalseIndex = out.size();
+        out.push_back(std::move(skipFalse));
+
+        out[skipTrueIndex].args[0] = LexerType::Value(
+            static_cast<int>(out.size() - skipTrueIndex - 1));
+        if (!_parseExpression(ctx, tokens, pos, 1, out)) return false;
+        out.push_back(storeResult);
+        out[skipFalseIndex].args[0] = LexerType::Value(
+            static_cast<int>(out.size() - skipFalseIndex - 1));
+        out.push_back(loadResult);
         return true;
     }
 
@@ -2005,7 +2372,7 @@ namespace IRGen {
             }
         }
 
-        return true;
+        return _parseConditionalTail(ctx, tokens, pos, minPrec, out);
     }
 
     // 入口：表达式 -> IR
@@ -2020,7 +2387,8 @@ namespace IRGen {
             for (const auto& token : inTokens) {
                 if (std::holds_alternative<LexerType::Operator>(token)) {
                     const std::string& sym = std::get<LexerType::Operator>(token).symbol;
-                    if (sym == "[" || sym == "]" || sym == "{" || sym == "}" || sym == "(" || sym == ")") {
+                    if (sym == "[" || sym == "]" || sym == "{" || sym == "}" ||
+                        sym == "(" || sym == ")" || sym == "?" || sym == ":") {
                         return true;
                     }
                 }
@@ -2347,13 +2715,26 @@ namespace IRGen {
         auto tryEmitLeadingStaticCall = [&](const std::vector<LexerType::Token>& toks) -> size_t {
             if (toks.size() < 5) return 0; // a . m ( ) 至少 5 个 token
             if (!_isKeyword(toks[0])) return 0;
-            if (!_isOperator(toks[1]) || _opSym(toks[1]) != ".") return 0;
-            if (!_isKeyword(toks[2])) return 0;
-            if (!_isOperator(toks[3]) || _opSym(toks[3]) != "(") return 0;
+
+            // 收集限定名 a.b.c… 直到 '(' 之前。单点情形（a.m）与原来的路径一致，
+            // 多点（zeus.string.str）在下面按完整包名解析。
+            std::string qualifiedName = std::get<LexerType::Keyword>(toks[0]).name;
+            size_t nameEnd = 1;
+            while (nameEnd + 1 < toks.size() &&
+                   _isOperator(toks[nameEnd]) && _opSym(toks[nameEnd]) == "." &&
+                   _isKeyword(toks[nameEnd + 1])) {
+                qualifiedName += ".";
+                qualifiedName += std::get<LexerType::Keyword>(toks[nameEnd + 1]).name;
+                nameEnd += 2;
+            }
+            if (nameEnd + 1 >= toks.size()) return 0;
+            // 没有点就不是限定调用（裸函数调用走普通调用路径）。
+            if (nameEnd == 1) return 0;
+            if (!_isOperator(toks[nameEnd]) || _opSym(toks[nameEnd]) != "(") return 0;
 
             // 找到匹配的 ')'
             int depth = 0; size_t closePos = 0; bool found=false;
-            for (size_t i = 3; i < toks.size(); ++i) {
+            for (size_t i = nameEnd; i < toks.size(); ++i) {
                 if (_isOperator(toks[i])) {
                     std::string s = _opSym(toks[i]);
                     if (s == "(") depth++;
@@ -2362,10 +2743,10 @@ namespace IRGen {
             }
             if (!found) return 0;
 
-            // 收集参数 tokens: (4..closePos-1) 可能含逗号分隔
+            // 收集参数 tokens: (nameEnd+1..closePos-1) 可能含逗号分隔
             std::vector<std::vector<LexerType::Token>> argTokList;
             {
-                size_t p = 4; size_t end = closePos; int brace=0, brack=0, paren=0; bool started=false; size_t segStart=p;
+                size_t p = nameEnd + 1; size_t end = closePos; int brace=0, brack=0, paren=0; bool started=false; size_t segStart=p;
                 while (p < end) {
                     if (_isOperator(toks[p])) {
                         std::string sym = _opSym(toks[p]);
@@ -2390,15 +2771,15 @@ namespace IRGen {
                     for (size_t k = segStart; k < end; ++k) seg.push_back(toks[k]);
                     argTokList.push_back(seg);
                 }
-                if (end == 4) {
+                if (end == nameEnd + 1) {
                     // 空参
                 }
             }
 
             // 先检查 prefix.method 是否是完整的全局函数名(用于包导入)
             std::string leftName = std::get<LexerType::Keyword>(toks[0]).name;
-            std::string methodName = std::get<LexerType::Keyword>(toks[2]).name;
-            std::string fullName = leftName + "." + methodName;
+            std::string methodName = std::get<LexerType::Keyword>(toks[nameEnd - 1]).name;
+            std::string fullName = qualifiedName;
             
             IRScope::SymRef fullRef = IRScope::resolve(fullName);
             ZEUS_DEBUG_PRINT("[IRGen] static-call lookup '%s': kind=%d static=%d",
@@ -2406,8 +2787,11 @@ namespace IRGen {
                 IRScope::isStaticFunctionName(fullName) ? 1 : 0);
             
             if (fullRef.kind == IRScope::Kind::GLOBAL &&
-                IRScope::isStaticFunctionName(fullName)) {
-                // 找到了完整的全局函数名,直接调用
+                (IRScope::isStaticFunctionName(fullName) || nameEnd > 3)) {
+                // 找到了完整的全局函数名,直接调用。
+                // 多级限定名（zeus.string.str）是包在 Zeus.cpp 里按完整路径声明的全局，
+                // 函数就住在那个槽位里，因此按包函数调用；目标不是函数时运行时会报
+                // “non-function value”，与直接调用同名变量的行为一致。
                 ZEUS_DEBUG_PRINT("[IRGen    ] %s -> CALL (package function)", fullName.c_str());
                 
                 IRType::IRInstr load; 
@@ -2436,12 +2820,28 @@ namespace IRGen {
                 return closePos + 1;
             }
 
+            // 多级限定名只有解析成包函数才有意义；没命中时交回原有路径处理，
+            // 避免把 a.b.c() 误当成对 a 的实例/类方法调用。
+            if (nameEnd > 3) return 0;
+
             // 解析左侧标识符，判断是类名还是变量(实例)
             IRScope::SymRef lhsRef = IRScope::resolve(leftName);
+            const std::string typeStaticMethodName =
+                std::get<LexerType::Keyword>(toks[nameEnd - 1]).name;
+            // 类型名(不是变量)调用类型实现的静态方法：int.twice(3)
+            // 只有完全没有绑定名字才走类型路径，否则同名变量/类优先。
+            const bool typeStaticReceiver =
+                lhsRef.kind == IRScope::Kind::UNDEFINED &&
+                isTypeStaticCallTarget(leftName);
 
             // 先生成左侧值的 LOAD 指令（无论是 class handle 还是对象变量）
             {
                 IRType::IRInstr load; load.op = VMOperator::LOAD_VALUE;
+                if (typeStaticReceiver) {
+                    // 类型静态调用的被调用者是限定名，VM/AOT 都按它解析目标。
+                    load = makeTypeStaticCallee(leftName, typeStaticMethodName,
+                                               _getTokenLine(toks[nameEnd - 1]));
+                } else {
                 switch (lhsRef.kind) {
                     case IRScope::Kind::LOCAL:   load.args.push_back(std::string("local"));   load.args.push_back(LexerType::Value(lhsRef.index)); load.args.push_back(leftName); break;
                     case IRScope::Kind::GLOBAL:  load.args.push_back(std::string("global"));  load.args.push_back(LexerType::Value(lhsRef.index)); load.args.push_back(leftName); break;
@@ -2452,11 +2852,12 @@ namespace IRGen {
                         break;
                     default: load.args.push_back(std::string("global")); load.args.push_back(LexerType::Value(-1)); load.args.push_back(leftName); break;
                 }
+                }
                 out.push_back(load);
             }
 
             int argc = 0;
-            size_t argumentPos = 3;
+            size_t argumentPos = nameEnd;
             ExprParseCtx methodCtx{status, strictDecl, futureFuncDefs,
                 IRScope::isUsingOriginal(ZeusBuiltins::BuiltinLiteralKind::Array)};
             std::vector<IRType::CallArgumentSource> callArguments;
@@ -2465,16 +2866,21 @@ namespace IRGen {
                 return 0;
             }
 
-            int methodLine = _getTokenLine(toks[2]);
+            int methodLine = _getTokenLine(toks[nameEnd - 1]);
             // 如果左侧解析到的是变量/实例(LOCAL/GLOBAL/UPVALUE/SHARED)，生成对象方法调用指令；
-            // 否则当作类名生成 CLASS_STATIC_METHOD_CALL
-            if (lhsRef.kind == IRScope::Kind::LOCAL || lhsRef.kind == IRScope::Kind::GLOBAL || lhsRef.kind == IRScope::Kind::UPVALUE || lhsRef.kind == IRScope::Kind::SHARED) {
+            // 类型名调用类型实现的静态方法；否则当作类名生成 CLASS_STATIC_METHOD_CALL
+            if (typeStaticReceiver) {
+                ZEUS_DEBUG_PRINT("[IRGen    ] %s.%s() -> type static call",
+                                 leftName.c_str(), typeStaticMethodName.c_str());
+                emitTypeStaticCall(leftName, typeStaticMethodName, argc,
+                                   std::move(callArguments), methodLine, out);
+            } else if (lhsRef.kind == IRScope::Kind::LOCAL || lhsRef.kind == IRScope::Kind::GLOBAL || lhsRef.kind == IRScope::Kind::UPVALUE || lhsRef.kind == IRScope::Kind::SHARED) {
                 ZEUS_DEBUG_PRINT("[IRGen    ] %s.%s() -> OBJ_CALL_METHOD (instance)", 
-                                 leftName.c_str(), std::get<LexerType::Keyword>(toks[2]).name.c_str());
+                                 leftName.c_str(), std::get<LexerType::Keyword>(toks[nameEnd - 1]).name.c_str());
                 IRType::IRInstr call;
                 call.op = VMOperator::OBJ_CALL_METHOD;
                 call.line = methodLine;
-                call.args.push_back(std::get<LexerType::Keyword>(toks[2]).name);
+                call.args.push_back(std::get<LexerType::Keyword>(toks[nameEnd - 1]).name);
                 call.args.push_back(LexerType::Value(argc));
                 call.metadata = IRType::IRMetadata::callArgumentSources(
                     std::move(callArguments));
@@ -2482,11 +2888,11 @@ namespace IRGen {
                 out.push_back(call);
             } else {
                 ZEUS_DEBUG_PRINT("[IRGen    ] %s.%s() -> CLASS_STATIC_METHOD_CALL (static)", 
-                                 leftName.c_str(), std::get<LexerType::Keyword>(toks[2]).name.c_str());
+                                 leftName.c_str(), std::get<LexerType::Keyword>(toks[nameEnd - 1]).name.c_str());
                 IRType::IRInstr call;
                 call.op = VMOperator::CLASS_STATIC_METHOD_CALL;
                 call.line = methodLine;
-                call.args.push_back(std::get<LexerType::Keyword>(toks[2]).name);
+                call.args.push_back(std::get<LexerType::Keyword>(toks[nameEnd - 1]).name);
                 call.args.push_back(LexerType::Value(argc));
                 call.metadata = IRType::IRMetadata::callArgumentSources(
                     std::move(callArguments));
@@ -2556,7 +2962,11 @@ namespace IRGen {
                 std::holds_alternative<LexerType::Keyword>(classExprTokens.front())) {
                 const std::string& targetName =
                     std::get<LexerType::Keyword>(classExprTokens.front()).name;
-                if (IRScope::resolve(targetName).kind == IRScope::Kind::UNDEFINED) {
+                const IRScope::SymRef targetRef = IRScope::resolve(targetName);
+                // 未解析或跨编译单元的名字都按名字解析：先检查原生类型。
+                if (targetRef.kind == IRScope::Kind::UNDEFINED ||
+                    (targetRef.kind == IRScope::Kind::GLOBAL &&
+                     IRScope::isForeignGlobal(targetRef.index))) {
                     nativeConstructionType = _nativeConstructionType(targetName);
                 }
             }
@@ -2583,21 +2993,42 @@ namespace IRGen {
                     const std::string& className =
                         std::get<LexerType::Keyword>(classExprTokens.front()).name;
                     if (classExprIR.size() == 1 &&
-                        classExprIR.front().op == VMOperator::LOAD_VALUE &&
-                        classExprIR.front().args.size() == 1) {
+                        classExprIR.front().op == VMOperator::LOAD_VALUE) {
+                        IRType::IRInstr& classRef = classExprIR.front();
                         bool loadsClassName = false;
-                        if (const auto* loadedName = std::get_if<std::string>(
-                                &classExprIR.front().args[0])) {
-                            loadsClassName = *loadedName == className;
-                        } else if (const auto* loadedValue = std::get_if<LexerType::Value>(
-                                       &classExprIR.front().args[0])) {
-                            const auto* loadedName =
-                                std::get_if<std::string>(&loadedValue->data);
-                            loadsClassName = loadedName != nullptr && *loadedName == className;
+                        if (classRef.args.size() == 1) {
+                            if (const auto* loadedName = std::get_if<std::string>(
+                                    &classRef.args[0])) {
+                                loadsClassName = *loadedName == className;
+                            } else if (const auto* loadedValue = std::get_if<LexerType::Value>(
+                                           &classRef.args[0])) {
+                                const auto* loadedName =
+                                    std::get_if<std::string>(&loadedValue->data);
+                                loadsClassName = loadedName != nullptr && *loadedName == className;
+                            }
+                        } else if (classRef.args.size() == 2 &&
+                                   std::holds_alternative<std::string>(classRef.args[0]) &&
+                                   std::get<std::string>(classRef.args[0]) == "global") {
+                            // 其它编译单元声明的类：改写为按名字引用，不沿用槽位。
+                            int64_t slot = -1;
+                            if (std::holds_alternative<LexerType::Value>(classRef.args[1])) {
+                                const auto& slotValue =
+                                    std::get<LexerType::Value>(classRef.args[1]);
+                                if (const auto* integer =
+                                        std::get_if<ZeusType::BigInteger>(&slotValue.data)) {
+                                    integer->tryToInt64(slot);
+                                }
+                            }
+                            if (IRScope::isForeignGlobal(static_cast<int>(slot))) {
+                                classRef.args.clear();
+                                classRef.args.push_back(LexerType::Value(className));
+                                loadsClassName = true;
+                            }
                         }
                         if (loadsClassName) {
-                            classExprIR.front().metadata.symbol =
+                            classRef.metadata.symbol =
                                 IRType::SymbolRef::classType(className);
+                            classRef.metadata.typeName = className;
                         }
                     }
                 }
@@ -2699,6 +3130,11 @@ namespace IRGen {
             if (!_isOperator(toks[1]) || _opSym(toks[1]) != ".") return 0;
             if (!_isKeyword(toks[2])) return 0;
             if (!_isOperator(toks[3]) || _opSym(toks[3]) != "(") return 0;
+            {
+                std::string staticCandidate = std::get<LexerType::Keyword>(toks[0]).name + "." +
+                                              std::get<LexerType::Keyword>(toks[2]).name;
+                if (IRScope::isStaticFunctionName(staticCandidate)) return 0;
+            }
 
             // find matching ')'
             int depth = 0; size_t closePos = 0; bool found=false;
@@ -2905,6 +3341,7 @@ namespace IRGen {
             // This handles patterns like obj.method1().method2() or obj.method()[0].attr
             ExprParseCtx suffixCtx { status, strictDecl, futureFuncDefs,
                 IRScope::isUsingOriginal(ZeusBuiltins::BuiltinLiteralKind::Array) };
+            bool tailSafeNav = false;
             while (pos < tokens.size()) {
                 // Check for call suffix: ()
                 if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == "(") {
@@ -2919,8 +3356,29 @@ namespace IRGen {
                     continue;
                 }
                 
+                // Check for safe navigation: ?.attr or ?.method()
+                if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == "?" &&
+                    pos + 1 < tokens.size() && _isOperator(tokens[pos + 1]) &&
+                    _opSym(tokens[pos + 1]) == ".") {
+                    pos += 2; // consume '?.'
+                    const auto safeReceiverSource = _lastMethodReceiverSource(out);
+                    if (!emitSafeNavigation(suffixCtx, tokens, pos, safeReceiverSource, out)) {
+                        return std::vector<IRType::IRInstr>();
+                    }
+                    tailSafeNav = true;
+                    continue;
+                }
+
                 // Check for attribute access: .attr
                 if (_isOperator(tokens[pos]) && _opSym(tokens[pos]) == ".") {
+                    if (tailSafeNav) {
+                        ++pos; // consume '.'
+                        const auto poisonedSource = _lastMethodReceiverSource(out);
+                        if (!emitSafeNavigation(suffixCtx, tokens, pos, poisonedSource, out)) {
+                            return std::vector<IRType::IRInstr>();
+                        }
+                        continue;
+                    }
                     if (pos + 1 >= tokens.size() || !_isKeyword(tokens[pos + 1])) break;
                     std::string attrName = std::get<LexerType::Keyword>(tokens[pos + 1]).name;
                     int attrLine = _getTokenLine(tokens[pos + 1]);
@@ -3169,13 +3627,18 @@ void parseVarDecl(
                         // Leave qualified or otherwise complex targets to the
                         // expression parser below.
                     } else {
-                    const std::string nativeConstructionType = isPlainClassConstruction &&
-                        IRScope::resolve(clsName).kind == IRScope::Kind::UNDEFINED
-                            ? IRGen::_nativeConstructionType(clsName)
-                            : std::string();
                     // 生成：LOAD_VALUE class + OBJ_BUILD
                     // 优先尝试解析为符号，如果失败则使用类名字符串（支持 forward declaration）
                     IRScope::SymRef cls = IRScope::resolve(clsName);
+                    // 未解析或由之前的编译单元声明的名字：按名字解析（先查原生类型）。
+                    const bool unresolvedOrForeignName =
+                        cls.kind == IRScope::Kind::UNDEFINED ||
+                        (cls.kind == IRScope::Kind::GLOBAL &&
+                         IRScope::isForeignGlobal(cls.index));
+                    const std::string nativeConstructionType = isPlainClassConstruction &&
+                        unresolvedOrForeignName
+                            ? IRGen::_nativeConstructionType(clsName)
+                            : std::string();
                     if (isGenericClassConstruction) {
                         IRType::IRInstr load;
                         load.op = VMOperator::LOAD_VALUE;
@@ -3189,7 +3652,13 @@ void parseVarDecl(
                         instructions.push_back(std::move(load));
                     } else if (nativeConstructionType.empty()) {
                         IRType::IRInstr load; load.op = VMOperator::LOAD_VALUE;
-                        if (cls.kind == IRScope::Kind::LOCAL) {
+                        if (unresolvedOrForeignName &&
+                            cls.kind == IRScope::Kind::GLOBAL) {
+                            // 跨编译单元的类：按名字引用，不沿用编译期槽位
+                            load.args.push_back(LexerType::Value(clsName));
+                            load.metadata.symbol = IRType::SymbolRef::classType(clsName);
+                            load.metadata.typeName = clsName;
+                        } else if (cls.kind == IRScope::Kind::LOCAL) {
                             load.args.push_back(std::string("local"));
                             load.args.push_back(LexerType::Value((int)cls.index));
                             load.args.push_back(clsName); // 添加类名用于错误报告
@@ -3280,6 +3749,11 @@ void parseVarDecl(
                 std::vector<IRType::IRInstr> rhs = IRGen::emitExprIR(status, strictDecl, futureFuncDefs, rightValue);
                 if (!rhs.empty()) {
                     instructions.insert(instructions.end(), rhs.begin(), rhs.end());
+                } else if (!savingRightValue) {
+                    IRType::IRInstr loadNil;
+                    loadNil.op = VMOperator::PUSH;
+                    loadNil.args.push_back(IRType::NullLiteral{});
+                    instructions.push_back(loadNil);
                 }
 
                 ZEUS_DEBUG_EXEC({
@@ -3307,6 +3781,9 @@ void parseVarDecl(
                 if (bindingTypesByNode != nullptr) {
                     const auto bindingType = bindingTypesByNode->find(node.id);
                     if (bindingType != bindingTypesByNode->end()) {
+                        if (ZeusBuiltins::findNativeSignedIntegerABI(bindingType->second)) {
+                            throw std::runtime_error("Native integer types are not supported for shared bindings");
+                        }
                         st.metadata = IRType::IRMetadata::sharedBindingType(
                             bindingType->second);
                     }
@@ -3377,23 +3854,38 @@ void parseVarAssignStmt(
         exprTokens.push_back(tk);
     }
 
-    const bool isThisAssignment = leftTokens.size() == 2 &&
+    const IRScope::ReceiverContext* receiverContext =
+        IRScope::currentReceiverContext();
+
+    const bool isAtThisOrAlias =
+        leftTokens.size() == 2 &&
         std::holds_alternative<LexerType::Operator>(leftTokens[0]) &&
         std::get<LexerType::Operator>(leftTokens[0]).symbol == "@" &&
         std::holds_alternative<LexerType::Keyword>(leftTokens[1]) &&
-        std::get<LexerType::Keyword>(leftTokens[1]).name == "this";
+        (std::get<LexerType::Keyword>(leftTokens[1]).name == "this" ||
+         (receiverContext != nullptr &&
+          !receiverContext->alias.empty() &&
+          std::get<LexerType::Keyword>(leftTokens[1]).name == receiverContext->alias));
+
+    const bool isPlainThisOrAlias =
+        leftTokens.size() == 1 &&
+        std::holds_alternative<LexerType::Keyword>(leftTokens[0]) &&
+        (std::get<LexerType::Keyword>(leftTokens[0]).name == "this" ||
+         (receiverContext != nullptr &&
+          !receiverContext->alias.empty() &&
+          std::get<LexerType::Keyword>(leftTokens[0]).name == receiverContext->alias));
+
+    const bool isThisAssignment = isAtThisOrAlias || isPlainThisOrAlias;
     if (isThisAssignment) {
-        const IRScope::ReceiverContext* receiverContext =
-            IRScope::currentReceiverContext();
         if (receiverContext == nullptr || receiverContext->ownerType.empty() ||
             receiverContext->alias.empty()) {
             IR_THROW_NODE(0, mirror,
-                "@this assignment is only valid inside an instance method",
+                "this assignment is only valid inside an instance method",
                 status);
             return;
         }
         if (exprTokens.empty()) {
-            IR_THROW_NODE(0, mirror, "@this assignment requires a value", status);
+            IR_THROW_NODE(0, mirror, "this assignment requires a value", status);
             return;
         }
 
@@ -3405,7 +3897,7 @@ void parseVarAssignStmt(
         if (receiver.kind != IRScope::Kind::LOCAL &&
             receiver.kind != IRScope::Kind::UPVALUE) {
             IR_THROW_NODE(0, mirror,
-                "@this receiver is not available in this function",
+                "this receiver is not available in this function",
                 status);
             return;
         }
@@ -3423,7 +3915,7 @@ void parseVarAssignStmt(
             status, strictDecl, futureFuncDefs, exprTokens);
         if (replacementIR.empty()) {
             IR_THROW_NODE(0, mirror,
-                "@this replacement value could not be compiled",
+                "this replacement value could not be compiled",
                 status);
             return;
         }
@@ -3506,7 +3998,8 @@ void parseVarAssignStmt(
         const bool isRawBytesRange = targetType == "&bytes";
         const bool isBytesType = targetType == "bytes";
         const bool isIntegerType = targetType == "int" ||
-            targetType == "int32" || targetType == "int64";
+            targetType == "int32" || targetType == "int64" ||
+            ZeusBuiltins::findNativeIntegerABI(targetType) != nullptr;
         const bool isStringType = targetType == "string" ||
             targetType == "str" || targetType == "String";
         int64_t integerWidth = 0;
@@ -3621,21 +4114,27 @@ void parseVarAssignStmt(
     }
 
     if (isSubscriptAssign) {
-        // key tokens = between first '[' and final ']'
-        std::vector<LexerType::Token> keyTokens;
-        bool inside = false;
-        for (size_t i = 1; i < leftTokens.size(); ++i) {
-            const auto &tk = leftTokens[i];
-            if (!inside) {
-                if (std::holds_alternative<LexerType::Operator>(tk) && std::get<LexerType::Operator>(tk).symbol == "[") {
-                    inside = true; continue;
+        // a[b][c] = v 的外层下标是最后一个 '['。以前只取第一个，值被写到 a[b] 上，
+        // 容器被静默改坏（不报错），所以这里先定位最外层的下标组。
+        size_t subscriptOpen = 1;
+        {
+            int depth = 0;
+            for (size_t i = 0; i < leftTokens.size(); ++i) {
+                if (!std::holds_alternative<LexerType::Operator>(leftTokens[i])) continue;
+                const std::string& symbol = std::get<LexerType::Operator>(leftTokens[i]).symbol;
+                if (symbol == "[") {
+                    depth++;
+                    if (depth == 1) subscriptOpen = i;
+                } else if (symbol == "]") {
+                    depth--;
                 }
-            } else {
-                if (std::holds_alternative<LexerType::Operator>(tk) && std::get<LexerType::Operator>(tk).symbol == "]") {
-                    break; // 完成 key 收集
-                }
-                keyTokens.push_back(tk);
             }
+        }
+
+        // key tokens = 最外层 '[' 与最后的 ']' 之间
+        std::vector<LexerType::Token> keyTokens;
+        for (size_t i = subscriptOpen + 1; i + 1 < leftTokens.size(); ++i) {
+            keyTokens.push_back(leftTokens[i]);
         }
 
         if (s.isConst) {
@@ -3643,9 +4142,9 @@ void parseVarAssignStmt(
             return;
         }
 
-        // 生成：LOAD_VALUE baseVar  + keyExpr IR + rhsExpr IR + DICT_STORE_VALUE
-        // base variable
-        {
+        // 生成：base  + keyExpr IR + rhsExpr IR + DICT_STORE_VALUE
+        // base 是单个名字时按槽位装载；a[b][c] 这类链式下标则把前缀当表达式求值。
+        if (subscriptOpen == 1) {
             IRType::IRInstr load;
             load.op = VMOperator::LOAD_VALUE;
             if (s.kind == IRScope::Kind::UNDEFINED) {
@@ -3685,6 +4184,13 @@ void parseVarAssignStmt(
                     return;
             }
             instructions.push_back(load);
+        } else {
+            // a[b][c] = v：先把 a[b] 求值成容器，再写最外层的键。
+            std::vector<LexerType::Token> baseTokens(
+                leftTokens.begin(), leftTokens.begin() + subscriptOpen);
+            auto baseIR = IRGen::emitExprIR(
+                status, strictDecl, futureFuncDefs, baseTokens);
+            instructions.insert(instructions.end(), baseIR.begin(), baseIR.end());
         }
 
         // key expr
@@ -3806,11 +4312,14 @@ void parseVarAssignStmt(
             store.op = VMOperator::DICT_STORE_VALUE;
             store.line = !leftTokens.empty()
                 ? IRGen::_getTokenLine(leftTokens[0]) : -1;
-            if (IRScope::isRawBytesRangeBinding(varName)) {
+            if (subscriptOpen == 1 && IRScope::isRawBytesRangeBinding(varName)) {
                 store.metadata = IRType::IRMetadata::rawBytesRangeIndexStore();
             }
-            store.metadata.subscriptWritebackTarget =
-                IRGen::_makeSymbolRef(varName, s);
+            // 链式下标的容器是表达式求值出来的临时值，没有可回写的具名槽位。
+            if (subscriptOpen == 1) {
+                store.metadata.subscriptWritebackTarget =
+                    IRGen::_makeSymbolRef(varName, s);
+            }
             instructions.push_back(store);
         }
         instructions.push_back(IRUtils::makePop());
@@ -4290,8 +4799,96 @@ namespace IRGen {
             std::vector<IRType::IRInstr>* funcSink = nullptr; // 内部：当处于函数体生成阶段时，子节点的 IR 将汇聚到该 sink
             std::vector<std::string> globalNamesByIndex; // index -> name
             std::vector<std::string> returnReferenceTypeStack;
+            struct ActiveExitScope {
+                size_t handlerCount = 0;
+                std::vector<IRType::IRInstr> finBody;
+            };
+            std::vector<ActiveExitScope> activeExitScopes;
+            std::vector<size_t> loopExitScopeDepths;
             std::unordered_map<TreeParser::NodeId, std::string> inferredFunctionReturnTypes;
             std::unordered_map<TreeParser::NodeId, std::string> inferredBindingTypesByNode;
+
+            void appendExitScopesForExit(
+                std::vector<IRType::IRInstr>& instructions,
+                size_t keepDepth = 0
+            ) const {
+                for (size_t depth = activeExitScopes.size(); depth > keepDepth; --depth) {
+                    const auto& scope = activeExitScopes[depth - 1];
+                    for (size_t count = 0; count < scope.handlerCount; ++count) {
+                        IRType::IRInstr tryEnd;
+                        tryEnd.op = VMOperator::TRY_END;
+                        tryEnd.metadata.tag = "fin_exit_handler";
+                        instructions.push_back(std::move(tryEnd));
+                    }
+                    instructions.insert(instructions.end(), scope.finBody.begin(),
+                                        scope.finBody.end());
+                }
+            }
+
+            std::vector<IRType::IRInstr> makeClearLocalIR(int slot) const {
+                IRType::IRInstr nil;
+                nil.op = VMOperator::PUSH;
+                nil.args.push_back(IRType::NullLiteral{});
+                return {std::move(nil), IRUtils::makeStoreLocal(slot, false)};
+            }
+
+            std::vector<IRType::IRInstr> wrapProtectedWithCleanup(
+                const std::vector<IRType::IRInstr>& protectedIR,
+                const std::vector<IRType::IRInstr>& normalCleanup,
+                const std::vector<IRType::IRInstr>& exceptionCleanup
+            ) {
+                if (protectedIR.empty()) return normalCleanup;
+                if (normalCleanup.empty() && exceptionCleanup.empty()) return protectedIR;
+
+                const int exceptionSlot = IRScope::allocateInternalLocal();
+                std::vector<IRType::IRInstr> result;
+
+                IRType::IRInstr tryBegin;
+                tryBegin.op = VMOperator::TRY_BEGIN;
+                tryBegin.args.push_back(LexerType::Value(static_cast<int64_t>(
+                    protectedIR.size() + normalCleanup.size() + 3)));
+                result.push_back(std::move(tryBegin));
+                result.insert(result.end(), protectedIR.begin(), protectedIR.end());
+
+                IRType::IRInstr tryEnd;
+                tryEnd.op = VMOperator::TRY_END;
+                result.push_back(std::move(tryEnd));
+                result.insert(result.end(), normalCleanup.begin(), normalCleanup.end());
+
+                IRType::IRInstr jumpToEnd;
+                jumpToEnd.op = VMOperator::JUMP;
+                jumpToEnd.args.push_back(LexerType::Value(
+                    static_cast<int64_t>(exceptionCleanup.size() + 6)));
+                result.push_back(std::move(jumpToEnd));
+
+                IRType::IRInstr catchBegin;
+                catchBegin.op = VMOperator::CATCH_BEGIN;
+                catchBegin.args.push_back(std::string("$fin_exception"));
+                catchBegin.args.push_back(LexerType::Value(exceptionSlot));
+                result.push_back(std::move(catchBegin));
+                result.insert(result.end(), exceptionCleanup.begin(), exceptionCleanup.end());
+                result.push_back(IRUtils::makeLoadLocal(exceptionSlot));
+                const auto clearExceptionSlot = makeClearLocalIR(exceptionSlot);
+                result.insert(result.end(), clearExceptionSlot.begin(),
+                              clearExceptionSlot.end());
+
+                IRType::IRInstr catchEnd;
+                catchEnd.op = VMOperator::CATCH_END;
+                result.push_back(std::move(catchEnd));
+
+                IRType::IRInstr rethrow;
+                rethrow.op = VMOperator::THROW;
+                rethrow.metadata.tag = "fin_cleanup_rethrow";
+                result.push_back(std::move(rethrow));
+                return result;
+            }
+
+            std::vector<IRType::IRInstr> wrapWithFin(
+                const std::vector<IRType::IRInstr>& protectedIR,
+                const std::vector<IRType::IRInstr>& finBody
+            ) {
+                return wrapProtectedWithCleanup(protectedIR, finBody, finBody);
+            }
 
             // --- Forward Declaration Helpers (Refactored) ---
             FuncProto* findProto(const std::string& name) {
@@ -4497,8 +5094,34 @@ namespace IRGen {
                             if (signature.valid && !signature.name.empty()) {
                                 IRScope::functionNames.insert(signature.name);
                                 if (!signature.nativeSymbol.empty()) {
-                                    const int handle = ZeusBuiltins::nativeInjectionHandle(
-                                        signature.nativeSymbol);
+                                    int handle = 0;
+                                    if (!signature.nativeLibraryPath.empty()) {
+                                        ZeusBuiltins::DynamicNativeImportDescriptor dynamic;
+                                        dynamic.declarationName = signature.name;
+                                        if (IRScope::isCompilingPackage &&
+                                            !IRScope::currentPackageName.empty()) {
+                                            dynamic.declarationName =
+                                                IRScope::currentPackageName + "." +
+                                                signature.name;
+                                        }
+                                        dynamic.symbol = signature.nativeSymbol;
+                                        dynamic.libraryPath = IRImport::resolveNativeLibraryPath(
+                                            signature.nativeLibraryPath);
+                                        dynamic.returnType = _canonicalNativeABITypeName(
+                                            signature.returnTypeName);
+                                        dynamic.referenceABI = signature.nativeReferenceABI;
+                                        for (const auto& parameter : signature.parameters) {
+                                            dynamic.parameterTypes.push_back(
+                                                _canonicalNativeABITypeName(parameter.typeName));
+                                            dynamic.parameterIsReference.push_back(
+                                                parameter.isReference);
+                                        }
+                                        handle = ZeusBuiltins::registerDynamicNativeImport(
+                                            std::move(dynamic));
+                                    } else {
+                                        handle = ZeusBuiltins::nativeInjectionHandle(
+                                            signature.nativeSymbol);
+                                    }
                                     if (handle < 0) {
                                         IRScope::nativeFunctionHandles[signature.name] = handle;
                                     }
@@ -4521,6 +5144,9 @@ namespace IRGen {
 
             void parse(std::vector<TreeParser::NodeAndBlock>& nodes) {
                 // 将NodeAndBlock编译为IR
+                // 标记本次编译会话的全局边界：此前声明的全局属于其它编译
+                // 单元，跨会话类引用按名字解析，不做跨包槽位重定位。
+                IRScope::beginCompileSession();
                 if (IRScope::scopeStack.empty()) IRScope::pushScope();
                 status = IRType::IRCompilerStatus::Running;
 
@@ -4635,8 +5261,13 @@ namespace IRGen {
                             instructions.push_back(nil);
                         }
 
+                        const bool leavesExitScopes = !activeExitScopes.empty();
+                        appendExitScopesForExit(instructions);
                         IRType::IRInstr ret;
                         ret.op = VMOperator::RETURN;
+                        if (leavesExitScopes) {
+                            ret.metadata.tag = "fin_exit_terminator";
+                        }
                         instructions.push_back(ret);
 
                         ZEUS_DEBUG_EXEC({
@@ -4683,10 +5314,39 @@ namespace IRGen {
                     case NodeType::BREAK_STMT: {
                         // 生成 LOOP_BREAK 占位符指令
                         // 实际的跳转偏移会在循环 IR 生成完成后由 patchBreakPlaceholders 回填
+                        const size_t keepScopeDepth = loopExitScopeDepths.empty()
+                            ? activeExitScopes.size()
+                            : loopExitScopeDepths.back();
+                        const bool leavesExitScopes =
+                            activeExitScopes.size() > keepScopeDepth;
+                        appendExitScopesForExit(instructions, keepScopeDepth);
                         IRType::IRInstr breakInstr = IRUtils::makeLoopBreakPlaceholder();
+                        if (leavesExitScopes) {
+                            breakInstr.metadata.tag = "fin_exit_terminator";
+                        }
                         instructions.push_back(breakInstr);
 
                         ZEUS_DEBUG_PRINT("[IRGen    ] {Break} Generated LOOP_BREAK placeholder");
+                        break;
+                    }
+
+
+                    case NodeType::CONTINUE_STMT: {
+                        // 与 break 同样用占位符：实际的跳转目标（步进/条件重判）
+                        // 由所在循环生成完成后由 patchContinuePlaceholders 回填
+                        const size_t keepScopeDepth = loopExitScopeDepths.empty()
+                            ? activeExitScopes.size()
+                            : loopExitScopeDepths.back();
+                        const bool leavesExitScopes =
+                            activeExitScopes.size() > keepScopeDepth;
+                        appendExitScopesForExit(instructions, keepScopeDepth);
+                        IRType::IRInstr continueInstr = IRUtils::makeLoopContinuePlaceholder();
+                        if (leavesExitScopes) {
+                            continueInstr.metadata.tag = "fin_exit_terminator";
+                        }
+                        instructions.push_back(continueInstr);
+
+                        ZEUS_DEBUG_PRINT("[IRGen    ] {Continue} Generated LOOP_CONTINUE placeholder");
                         break;
                     }
 
@@ -4760,11 +5420,16 @@ namespace IRGen {
                         bool expectAmpersand = false;
                         bool expectAlias = false;
                         
-                        for (const auto& tk : node.tokens) {
-                            if (first) {  // skip 'import'
-                                first = false;
-                                continue;
+                        size_t startTok = 0;
+                        while (startTok < node.tokens.size()) {
+                            if (std::holds_alternative<LexerType::Keyword>(node.tokens[startTok]) &&
+                                std::get<LexerType::Keyword>(node.tokens[startTok]).name == "import") {
+                                break;
                             }
+                            ++startTok;
+                        }
+                        for (size_t tkIdx = startTok + 1; tkIdx < node.tokens.size(); ++tkIdx) {
+                            const auto& tk = node.tokens[tkIdx];
                             
                             if (std::holds_alternative<LexerType::Operator>(tk)) {
                                 const auto& op = std::get<LexerType::Operator>(tk);
@@ -4837,7 +5502,7 @@ namespace IRGen {
                         importInstr.op = VMOperator::IMPORT;
                         importInstr.args.push_back(LexerType::Value(packageName));
                         importInstr.args.push_back(LexerType::Value(alias));
-                        importInstr.args.push_back(LexerType::Value((long long)(isNamespaceImport ? 1 : 0)));
+                        importInstr.args.push_back(LexerType::Value(static_cast<int64_t>(isNamespaceImport ? 1 : 0)));
                         instructions.push_back(importInstr);
                         
                         ZEUS_DEBUG_PRINT("[IRGen] {Import} Generated IMPORT instruction for: %s (alias: %s, mode: %s)", 
@@ -4893,6 +5558,11 @@ namespace IRGen {
                         }
                         
                         // using语句本身不生成任何IR指令,只影响编译行为
+                        break;
+                    }
+
+                    case NodeType::USING_EXPORTS_STMT: {
+                        // Export lists affect package visibility in the loader, not runtime code.
                         break;
                     }
                     
@@ -4957,6 +5627,8 @@ namespace IRGen {
                                     signature.returnTypeName
                                 );
                             } else if (!strictDecl && !isNativeDeclaration) {
+                                IRScope::declareGlobal(signature.name);
+                            } else if (IRScope::isCompilingPackage) {
                                 IRScope::declareGlobal(signature.name);
                             }
                             instructions.push_back(
@@ -5945,6 +6617,7 @@ namespace IRGen {
                         // 构建 body IR（复用现有遍历逻辑至临时 sink）
                         std::vector<IRType::IRInstr> bodyIR;
                         auto* prevSink = funcSink;
+                        loopExitScopeDepths.push_back(activeExitScopes.size());
                         funcSink = &bodyIR;
                         for (const auto& node : codeBlock.nodes) {
                             if (std::holds_alternative<TreeParser::Node>(node)) {
@@ -5954,6 +6627,7 @@ namespace IRGen {
                             }
                         }
                         funcSink = prevSink;
+                        loopExitScopeDepths.pop_back();
 
                         // 组装 ForBuildInput
                         IRFor::ForBuildInput input{
@@ -5991,51 +6665,70 @@ namespace IRGen {
                         return;
                     }
 
-                    case CodeBlockType::TRY: {
-                        // ===== try-catch 代码块生成 =====
-                        // try { ... } catch (&e) { ... }
-                        // 结构：TRY 块的 nodes 中：
-                        //   - 普通节点是 try 体
-                        //   - 最后一个 CodeBlock (类型 CATCH) 是 catch 块
-
-                        // 找到 catch 块
-                        TreeParser::CodeBlock* catchBlock = nullptr;
-                        
+                    case CodeBlockType::FIN: {
+                        std::vector<IRType::IRInstr> finIR;
+                        auto* prevSink = funcSink;
+                        funcSink = &finIR;
                         for (const auto& node : codeBlock.nodes) {
-                            if (std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(node)) {
-                                auto& cbPtr = std::get<std::unique_ptr<TreeParser::CodeBlock>>(node);
-                                if (cbPtr && cbPtr->type == CodeBlockType::CATCH) {
-                                    catchBlock = cbPtr.get();
-                                }
+                            if (std::holds_alternative<TreeParser::Node>(node)) {
+                                parseNodeToBytecodes(std::get<TreeParser::Node>(node));
+                            } else if (std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(node)) {
+                                parseCodeBlock(*std::get<std::unique_ptr<TreeParser::CodeBlock>>(node));
                             }
                         }
+                        funcSink = prevSink;
+                        if (funcSink) {
+                            funcSink->insert(funcSink->end(), finIR.begin(), finIR.end());
+                        } else {
+                            bytecodes.push_back(std::move(finIR));
+                        }
+                        return;
+                    }
 
-                        // 生成 try 体 IR (排除 catch 块)
-                        std::vector<IRType::IRInstr> tryBodyIR;
+                    case CodeBlockType::TRY: {
+                        TreeParser::CodeBlock* catchBlock = nullptr;
+                        TreeParser::CodeBlock* finBlock = nullptr;
+                        for (const auto& node : codeBlock.nodes) {
+                            if (!std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(node)) continue;
+                            auto* child = std::get<std::unique_ptr<TreeParser::CodeBlock>>(node).get();
+                            if (!child) continue;
+                            if (child->type == CodeBlockType::CATCH) catchBlock = child;
+                            if (child->type == CodeBlockType::FIN) finBlock = child;
+                        }
+
                         auto* prevSink = funcSink;
+                        std::vector<IRType::IRInstr> finBodyIR;
+                        if (finBlock) {
+                            funcSink = &finBodyIR;
+                            parseCodeBlock(*finBlock);
+                            funcSink = prevSink;
+                            activeExitScopes.push_back(ActiveExitScope{1, finBodyIR});
+                        }
+
+                        std::vector<IRType::IRInstr> tryBodyIR;
+                        if (catchBlock) {
+                            activeExitScopes.push_back(ActiveExitScope{1, {}});
+                        }
                         funcSink = &tryBodyIR;
                         for (const auto& node : codeBlock.nodes) {
                             if (std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(node)) {
-                                auto& cbPtr = std::get<std::unique_ptr<TreeParser::CodeBlock>>(node);
-                                if (cbPtr && cbPtr->type == CodeBlockType::CATCH) {
-                                    continue; // 跳过 catch 块
-                                }
-                                parseCodeBlock(*cbPtr);
+                                auto* child = std::get<std::unique_ptr<TreeParser::CodeBlock>>(node).get();
+                                if (!child || child->type == CodeBlockType::CATCH ||
+                                    child->type == CodeBlockType::FIN) continue;
+                                parseCodeBlock(*child);
                             } else if (std::holds_alternative<TreeParser::Node>(node)) {
                                 parseNodeToBytecodes(std::get<TreeParser::Node>(node));
                             }
                         }
                         funcSink = prevSink;
+                        if (catchBlock) activeExitScopes.pop_back();
 
-                        // 生成 catch 体 IR
                         std::vector<IRType::IRInstr> catchBodyIR;
-                        int catchVarSlot = -1;  // catch 变量的局部槽索引
+                        int catchVarSlot = -1;
                         if (catchBlock) {
-                            // 若 catch 有变量，声明局部槽
                             if (!catchBlock->catchVarName.empty()) {
                                 catchVarSlot = IRScope::declareLocal(catchBlock->catchVarName);
                             }
-
                             funcSink = &catchBodyIR;
                             for (const auto& node : catchBlock->nodes) {
                                 if (std::holds_alternative<TreeParser::Node>(node)) {
@@ -6047,100 +6740,94 @@ namespace IRGen {
                             funcSink = prevSink;
                         }
 
-                        // 组装最终 IR:
-                        // TRY_BEGIN catchOffset        ; catchOffset = tryBody.size + 1 (跳过 JUMP)
-                        // <tryBody IR>
-                        // TRY_END
-                        // JUMP endOffset               ; 跳过 catch 块
-                        // CATCH_BEGIN "varName" slotIndex
-                        // <catchBody IR>
-                        // CATCH_END
-                        // :end
+                        if (finBlock) activeExitScopes.pop_back();
 
-                        std::vector<IRType::IRInstr> resultIR;
-                        
-                        // TRY_BEGIN: catchOffset = tryBody.size + 3 (跳过 tryBody + TRY_END + JUMP)
-                        // 从 TRY_BEGIN 位置偏移到 CATCH_BEGIN
-                        IRType::IRInstr tryBeginInstr;
-                        tryBeginInstr.op = VMOperator::TRY_BEGIN;
-                        tryBeginInstr.args.push_back(LexerType::Value(static_cast<int64_t>(tryBodyIR.size() + 3)));
-                        resultIR.push_back(tryBeginInstr);
-                        
-                        // try body
-                        for (auto& ins : tryBodyIR) {
-                            resultIR.push_back(std::move(ins));
-                        }
-                        
-                        // TRY_END
-                        IRType::IRInstr tryEndInstr;
-                        tryEndInstr.op = VMOperator::TRY_END;
-                        resultIR.push_back(tryEndInstr);
-                        
-                        // JUMP to end (skip catch block)
-                        // endOffset = catchBody.size + 2 (CATCH_BEGIN + catchBody + CATCH_END)
-                        IRType::IRInstr jumpInstr;
-                        jumpInstr.op = VMOperator::JUMP;
-                        jumpInstr.args.push_back(LexerType::Value(static_cast<int64_t>(catchBodyIR.size() + 2)));
-                        resultIR.push_back(jumpInstr);
-                        
-                        // CATCH_BEGIN "varName" slotIndex
-                        IRType::IRInstr catchBeginInstr;
-                        catchBeginInstr.op = VMOperator::CATCH_BEGIN;
+                        std::vector<IRType::IRInstr> protectedIR;
                         if (catchBlock) {
+                            IRType::IRInstr tryBeginInstr;
+                            tryBeginInstr.op = VMOperator::TRY_BEGIN;
+                            tryBeginInstr.args.push_back(LexerType::Value(
+                                static_cast<int64_t>(tryBodyIR.size() + 3)));
+                            protectedIR.push_back(std::move(tryBeginInstr));
+                            protectedIR.insert(protectedIR.end(), tryBodyIR.begin(), tryBodyIR.end());
+
+                            IRType::IRInstr tryEndInstr;
+                            tryEndInstr.op = VMOperator::TRY_END;
+                            protectedIR.push_back(std::move(tryEndInstr));
+
+                            IRType::IRInstr jumpInstr;
+                            jumpInstr.op = VMOperator::JUMP;
+                            jumpInstr.args.push_back(LexerType::Value(
+                                static_cast<int64_t>(catchBodyIR.size() + 2)));
+                            protectedIR.push_back(std::move(jumpInstr));
+
+                            IRType::IRInstr catchBeginInstr;
+                            catchBeginInstr.op = VMOperator::CATCH_BEGIN;
                             catchBeginInstr.args.push_back(catchBlock->catchVarName);
                             catchBeginInstr.args.push_back(LexerType::Value(catchVarSlot));
-                        } else {
-                            catchBeginInstr.args.push_back(std::string(""));
-                        }
-                        resultIR.push_back(catchBeginInstr);
-                        
-                        // catch body
-                        for (auto& ins : catchBodyIR) {
-                            resultIR.push_back(std::move(ins));
-                        }
-                        
-                        // CATCH_END
-                        IRType::IRInstr catchEndInstr;
-                        catchEndInstr.op = VMOperator::CATCH_END;
-                        resultIR.push_back(catchEndInstr);
+                            protectedIR.push_back(std::move(catchBeginInstr));
+                            protectedIR.insert(protectedIR.end(), catchBodyIR.begin(), catchBodyIR.end());
 
-                        // 输出到当前 sink
+                            IRType::IRInstr catchEndInstr;
+                            catchEndInstr.op = VMOperator::CATCH_END;
+                            protectedIR.push_back(std::move(catchEndInstr));
+                        } else {
+                            protectedIR = std::move(tryBodyIR);
+                        }
+
+                        std::vector<IRType::IRInstr> resultIR = finBlock
+                            ? wrapWithFin(protectedIR, finBodyIR)
+                            : std::move(protectedIR);
                         if (funcSink) {
                             funcSink->insert(funcSink->end(), resultIR.begin(), resultIR.end());
                         } else {
                             bytecodes.push_back(std::move(resultIR));
                         }
-                        
                         ZEUS_DEBUG_PRINT("[IRGen] .. TRY END addr=%p", (void*)&codeBlock);
                         return;
                     }
 
                     case CodeBlockType::WITH: {
-                        // ===== with 代码块生成 =====
-                        // with (expr) { ... }
-                        // 语义：
-                        // 1. 计算 expr 得到对象
-                        // 2. 调用对象的 operator[with]() 进入
-                        // 3. 执行 with 体
-                        // 4. 结束时自动清理
-
-                        // 生成 with 表达式 IR
                         std::vector<IRType::IRInstr> exprIR;
                         if (!codeBlock.withExprTokens.empty()) {
-                            exprIR = IRGen::emitExprIR(status, strictDecl, futureFuncDefs, codeBlock.withExprTokens);
+                            exprIR = IRGen::emitExprIR(status, strictDecl, futureFuncDefs,
+                                                       codeBlock.withExprTokens);
                         }
 
-                        // 如果有 capture 变量，声明局部槽
+                        const int receiverSlot = IRScope::allocateInternalLocal();
                         int withCaptureSlot = -1;
                         if (!codeBlock.withCaptureVarName.empty()) {
                             withCaptureSlot = IRScope::declareLocal(codeBlock.withCaptureVarName);
-                            ZEUS_DEBUG_PRINT("[IRGen] WITH: capture var '%s' at slot %d, isRef=%d", 
-                                codeBlock.withCaptureVarName.c_str(), withCaptureSlot, codeBlock.withCaptureIsRef);
                         }
 
-                        // 生成 with 体 IR
+                        IRType::IRInstr callEnter;
+                        callEnter.op = VMOperator::OBJ_CALL_METHOD;
+                        callEnter.args.push_back(std::string("operator[with]"));
+                        callEnter.args.push_back(LexerType::Value(0));
+                        std::vector<IRType::IRInstr> enterBodyIR;
+                        enterBodyIR.push_back(IRUtils::makeLoadLocal(receiverSlot));
+                        enterBodyIR.push_back(std::move(callEnter));
+                        IRType::IRInstr discardEnterResult;
+                        discardEnterResult.op = VMOperator::POP;
+                        enterBodyIR.push_back(std::move(discardEnterResult));
+
+                        IRType::IRInstr callExit;
+                        callExit.op = VMOperator::OBJ_CALL_METHOD;
+                        callExit.args.push_back(std::string("operator[~with]"));
+                        callExit.args.push_back(LexerType::Value(0));
+                        std::vector<IRType::IRInstr> exitCallIR{
+                            IRUtils::makeLoadLocal(receiverSlot), callExit
+                        };
+                        IRType::IRInstr discardExitResult;
+                        discardExitResult.op = VMOperator::POP;
+                        exitCallIR.push_back(std::move(discardExitResult));
+                        auto exitFinIR = wrapProtectedWithCleanup(
+                            exitCallIR, makeClearLocalIR(receiverSlot),
+                            makeClearLocalIR(receiverSlot));
+
                         std::vector<IRType::IRInstr> bodyIR;
                         auto* prevSink = funcSink;
+                        activeExitScopes.push_back(ActiveExitScope{1, exitFinIR});
                         funcSink = &bodyIR;
                         for (const auto& node : codeBlock.nodes) {
                             if (std::holds_alternative<TreeParser::Node>(node)) {
@@ -6150,44 +6837,49 @@ namespace IRGen {
                             }
                         }
                         funcSink = prevSink;
-
-                        // 组装最终 IR:
-                        // <expr IR>           ; 将 with 对象压栈
-                        // WITH_BEGIN slotIdx  ; 调用 operator[with]，保存对象引用，可选存入 capture 槽
-                        // <body IR>
-                        // WITH_END            ; 清理
+                        activeExitScopes.pop_back();
 
                         std::vector<IRType::IRInstr> resultIR;
-                        
-                        // expr IR
-                        for (auto& ins : exprIR) {
-                            resultIR.push_back(std::move(ins));
+                        resultIR.insert(resultIR.end(), exprIR.begin(), exprIR.end());
+                        auto storeReceiver = IRUtils::makeStoreLocal(receiverSlot, false);
+                        storeReceiver.metadata.tag = "class_identity_transfer";
+                        resultIR.push_back(std::move(storeReceiver));
+                        if (withCaptureSlot >= 0) {
+                            resultIR.push_back(IRUtils::makeLoadLocal(receiverSlot));
+                            auto storeCapture = IRUtils::makeStoreLocal(withCaptureSlot, false);
+                            if (codeBlock.withCaptureIsRef) {
+                                storeCapture.metadata.tag = "class_identity_transfer";
+                            }
+                            resultIR.push_back(std::move(storeCapture));
                         }
-                        
-                        // WITH_BEGIN slotIdx (-1 表示无 capture)
-                        IRType::IRInstr withBeginInstr;
-                        withBeginInstr.op = VMOperator::WITH_BEGIN;
-                        withBeginInstr.args.push_back(LexerType::Value(static_cast<int64_t>(withCaptureSlot)));
-                        resultIR.push_back(withBeginInstr);
-                        
-                        // body IR
-                        for (auto& ins : bodyIR) {
-                            resultIR.push_back(std::move(ins));
-                        }
-                        
-                        // WITH_END
-                        IRType::IRInstr withEndInstr;
-                        withEndInstr.op = VMOperator::WITH_END;
-                        resultIR.push_back(withEndInstr);
 
-                        // 输出到当前 sink
+                        auto entryFailureCleanup = makeClearLocalIR(receiverSlot);
+                        auto protectedEnterIR = wrapProtectedWithCleanup(
+                            enterBodyIR, {}, entryFailureCleanup);
+                        resultIR.insert(resultIR.end(), protectedEnterIR.begin(),
+                                        protectedEnterIR.end());
+                        auto protectedBodyIR = wrapWithFin(bodyIR, exitFinIR);
+                        resultIR.insert(resultIR.end(), protectedBodyIR.begin(),
+                                        protectedBodyIR.end());
+
                         if (funcSink) {
                             funcSink->insert(funcSink->end(), resultIR.begin(), resultIR.end());
                         } else {
                             bytecodes.push_back(std::move(resultIR));
                         }
-                        
-                        ZEUS_DEBUG_PRINT("[IRGen] .. WITH END addr=%p", (void*)&codeBlock);
+                        ZEUS_DEBUG_PRINT("[IRGen] .. WITH lowered through try/fin at addr=%p",
+                                         (void*)&codeBlock);
+                        return;
+                    }
+
+                    case CodeBlockType::USING_PLATFORM: {
+                        for (const auto& node : codeBlock.nodes) {
+                            if (std::holds_alternative<TreeParser::Node>(node)) {
+                                parseNodeToBytecodes(std::get<TreeParser::Node>(node));
+                            } else if (std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(node)) {
+                                parseCodeBlock(*std::get<std::unique_ptr<TreeParser::CodeBlock>>(node));
+                            }
+                        }
                         return;
                     }
 
@@ -6583,6 +7275,11 @@ namespace IRGen {
                     }
                 }
 
+                auto savedExitScopes = std::move(activeExitScopes);
+                auto savedLoopExitScopeDepths = std::move(loopExitScopeDepths);
+                activeExitScopes.clear();
+                loopExitScopeDepths.clear();
+
                 returnReferenceTypeStack.push_back(
                     !codeBlock.returnTypeName.empty() && codeBlock.returnTypeName.front() == '&'
                         ? codeBlock.returnTypeName.substr(1)
@@ -6596,6 +7293,8 @@ namespace IRGen {
                     }
                 }
                 returnReferenceTypeStack.pop_back();
+                activeExitScopes = std::move(savedExitScopes);
+                loopExitScopeDepths = std::move(savedLoopExitScopeDepths);
                 funcSink = prevSink;
 
                 IRScope::FuncEnv env = IRScope::endFunction();

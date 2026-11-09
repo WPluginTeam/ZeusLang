@@ -1,0 +1,557 @@
+"""
+NexoraCode.model.ConversationStore — 本地会话存储
+
+对话历史以 JSON 文件保存在本地 data/conversations/：
+- index.json: 会话索引（id / title / updated_at）
+- {id}.json: 会话详情（消息历史）
+
+对外提供：
+- ConversationStore: 会话增删改查与消息追加
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Optional
+
+from core.config import get_app_root
+
+
+# 多个本地/远程请求创建不同 Store 实例，共享锁才能避免文件读改写互相覆盖。
+_STORE_LOCK = threading.RLock()
+
+# 未命名会话的占位标题：前端默认「新对话」、后端默认「新会话」，
+# 以及读取兜底用的「未命名会话」。命中即视为尚未生成真实标题。
+_PLACEHOLDER_TITLES = {"新对话", "新会话", "未命名会话"}
+
+
+def is_placeholder_title(title: Any) -> bool:
+    """判断标题是否为未命名占位值（空串或内置占位文案）。"""
+    return not str(title or "").strip() or str(title or "").strip() in _PLACEHOLDER_TITLES
+
+
+# 标题来源标记：区分「用户手动改名」与「系统自动写入」。
+# append_message 的截断标题与 TitleGenerator 的智能标题都属 auto，
+# 用户通过改名接口写入的属 user。自动标题只允许覆盖 auto，绝不覆盖 user。
+TITLE_SOURCE_AUTO = "auto"
+TITLE_SOURCE_USER = "user"
+
+
+def can_overwrite_title(title: Any, title_source: Any) -> bool:
+    """判断自动标题是否允许覆盖当前标题：占位值或来源为 auto 时可覆盖。"""
+    if is_placeholder_title(title):
+        return True
+
+    return str(title_source or "").strip() == TITLE_SOURCE_AUTO
+
+
+# 悬空工具调用的占位结果文案：进程被外部终止（工具命令杀掉自身、崩溃、断电）时，
+# 历史会停在 assistant.tool_calls 而没有对应的 tool 结果。补齐这条结果即恢复协议。
+INTERRUPTED_TOOL_RESULT = "该工具调用未返回结果（进程中断或任务被终止），请勿重复执行。"
+
+
+def write_json_atomic(path: Path, data: dict) -> None:
+    """同目录临时文件 + os.replace 原子写入，读取方不会看到写到一半的 JSON。
+
+    会话、任务请求去重记录与远程连接凭据都要用到，放在这里供各模块直接调用，
+    避免跨模块去调 ConversationStore 的私有方法。
+    """
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+
+    try:
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _sanitize_filename(value: str) -> str:
+    text = str(value or "").strip()
+
+    text = re.sub(r'[\\/:*?"<>|]', "_", text)
+    text = re.sub(r"\s+", "_", text)
+    return text[:60]
+
+
+class ConversationStore:
+    def __init__(self):
+        self._root = get_app_root() / "data" / "conversations"
+        self._root.mkdir(parents=True, exist_ok=True)
+        self._lock = _STORE_LOCK
+
+    def _index_path(self):
+        return self._root / "index.json"
+
+    def _conversation_path(self, conversation_id: str):
+        return self._root / f"{_sanitize_filename(conversation_id)}.json"
+
+    def _load_index(self) -> dict:
+        path = self._index_path()
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_index(self, index: dict) -> None:
+        write_json_atomic(self._index_path(), index)
+
+    def list(self) -> list[dict]:
+        with self._lock:
+            index = self._load_index()
+            cleaned = False
+
+            # 会话文件缺失时清理 index，避免显示幽灵会话
+            for conversation_id in list(index.keys()):
+                if not self._conversation_path(conversation_id).is_file():
+                    index.pop(conversation_id, None)
+                    cleaned = True
+
+            if cleaned:
+                self._save_index(index)
+
+            items = []
+
+            for conversation_id, meta in index.items():
+                item = {
+                    "conversation_id": conversation_id,
+                    "title": str(meta.get("title") or "未命名会话"),
+                    "created_at": meta.get("created_at"),
+                    "updated_at": meta.get("updated_at"),
+                }
+
+                if isinstance(meta.get("metadata"), dict):
+                    item["metadata"] = meta["metadata"]
+
+                items.append(item)
+
+            items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+            return items
+
+    def get(self, conversation_id: str) -> Optional[dict]:
+        with self._lock:
+            path = self._conversation_path(conversation_id)
+
+            if not path.is_file():
+                return None
+
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else None
+            except Exception:
+                return None
+
+    def create(self, title: str = "", metadata: dict | None = None) -> dict:
+        conversation_id = f"conv_{uuid.uuid4().hex[:10]}"
+        now = time.time()
+        conversation = {
+            "conversation_id": conversation_id,
+            "title": str(title or "").strip() or "新会话",
+            "created_at": now,
+            "updated_at": now,
+            "messages": [],
+            "metadata": metadata if isinstance(metadata, dict) and metadata else {},
+        }
+
+        with self._lock:
+            self._save_conversation(conversation)
+            index = self._load_index()
+            index[conversation_id] = {
+                "title": conversation["title"],
+                "created_at": now,
+                "updated_at": now,
+                "metadata": dict(conversation["metadata"]),
+            }
+            self._save_index(index)
+
+        return conversation
+
+    def delete(self, conversation_id: str) -> bool:
+        with self._lock:
+            path = self._conversation_path(conversation_id)
+
+            if path.is_file():
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+
+            index = self._load_index()
+
+            if conversation_id in index:
+                index.pop(conversation_id, None)
+                self._save_index(index)
+                return True
+
+            return False
+
+    def append_message(self, conversation_id: str, message: dict) -> bool:
+        with self._lock:
+            conversation = self.get(conversation_id)
+
+            if conversation is None:
+                return False
+
+            conversation.setdefault("messages", []).append(message)
+            conversation["updated_at"] = time.time()
+            self._save_conversation(conversation)
+
+            index = self._load_index()
+            meta = index.setdefault(conversation_id, {})
+
+            # 占位标题（前端默认「新对话」、后端默认「新会话」）都视为未命名，
+            # 首条用户消息到达时用其开头生成可辨识标题并落盘。
+            if is_placeholder_title(meta.get("title")):
+                title = self._guess_title(message)
+
+                if title:
+                    meta["title"] = title
+                    meta["title_source"] = TITLE_SOURCE_AUTO
+                    conversation["title"] = title
+                    self._save_conversation(conversation)
+
+            meta["updated_at"] = conversation["updated_at"]
+            self._save_index(index)
+            return True
+
+    def set_title(self, conversation_id: str, title: str, source: str = TITLE_SOURCE_USER) -> bool:
+        """更新会话标题（会话文件与索引同步写入）。空标题视为无效，返回 False。
+
+        source 标记标题来源：默认 user（手动改名）；TitleGenerator 回写时传 auto，
+        便于后续自动标题判断能否覆盖。
+        """
+        clean_title = str(title or "").strip()
+
+        if not clean_title:
+            return False
+
+        clean_source = str(source or "").strip() or TITLE_SOURCE_USER
+
+        with self._lock:
+            conversation = self.get(conversation_id)
+
+            if conversation is None:
+                return False
+
+            conversation["title"] = clean_title
+            self._save_conversation(conversation)
+
+            index = self._load_index()
+            meta = index.setdefault(conversation_id, {})
+            meta["title"] = clean_title
+            meta["title_source"] = clean_source
+            self._save_index(index)
+            return True
+
+    def get_title_state(self, conversation_id: str) -> dict:
+        """读取会话标题状态：返回 {title, title_source}。
+
+        标题来源仅记录在索引中（会话文件只存标题文本），自动标题回写前
+        需要据此判断能否覆盖用户手动改写的标题。
+        """
+        clean_id = str(conversation_id or "").strip()
+
+        if not clean_id:
+            return {"title": "", "title_source": ""}
+
+        with self._lock:
+            index = self._load_index()
+            meta = index.get(clean_id)
+
+            if not isinstance(meta, dict):
+                return {"title": "", "title_source": ""}
+
+            return {
+                "title": str(meta.get("title") or ""),
+                "title_source": str(meta.get("title_source") or ""),
+            }
+
+    def replace_tool_result(self, conversation_id: str, tool_call_id: str, content: str) -> bool:
+        """更新权限确认占位结果，批准后仍保留原工具调用的协议位置。"""
+        clean_call_id = str(tool_call_id or "").strip()
+
+        if not clean_call_id:
+            return False
+
+        with self._lock:
+            conversation = self.get(conversation_id)
+
+            if conversation is None:
+                return False
+
+            for message in reversed(conversation.get("messages") or []):
+                if (
+                    str(message.get("role") or "") == "tool"
+                    and str(message.get("tool_call_id") or "") == clean_call_id
+                ):
+                    updated_at = time.time()
+                    message["content"] = str(content or "")
+                    message["timestamp"] = updated_at
+                    conversation["updated_at"] = updated_at
+                    self._save_conversation(conversation)
+
+                    index = self._load_index()
+                    meta = index.setdefault(str(conversation_id), {})
+                    meta["updated_at"] = updated_at
+                    self._save_index(index)
+                    return True
+
+            return False
+
+    def repair_dangling_tool_calls(self, conversation_id: str) -> int:
+        """补齐历史里悬空的工具调用结果，返回修补条数。
+
+        进程被外部终止（工具命令杀掉自身、崩溃、断电）时，落盘历史会停在
+        assistant.tool_calls 而没有对应的 tool 结果。这类历史会让后续每次请求
+        都在协议校验处失败，会话永久不可用。这里就地补齐占位结果并落盘，
+        修补一次即长期有效，而不是每次请求都临时打补丁。
+        """
+        with self._lock:
+            conversation = self.get(conversation_id)
+
+            if conversation is None:
+                return 0
+
+            messages = conversation.get("messages")
+
+            if not isinstance(messages, list):
+                return 0
+
+            repaired = self._repair_tool_messages(messages)
+
+            if repaired is None:
+                return 0
+
+            conversation["messages"] = repaired
+            conversation["updated_at"] = time.time()
+            self._save_conversation(conversation)
+
+            index = self._load_index()
+            meta = index.setdefault(str(conversation_id), {})
+            meta["updated_at"] = conversation["updated_at"]
+            self._save_index(index)
+            return len(repaired) - len(messages)
+
+    @staticmethod
+    def _repair_tool_messages(messages: list) -> Optional[list]:
+        """按工具协议补齐悬空调用、丢弃孤儿结果；无需修补时返回 None。"""
+        repaired: list = []
+        pending: list[str] = []
+        changed = False
+
+        for message in messages:
+            if not isinstance(message, dict):
+                repaired.append(message)
+                continue
+
+            role = str(message.get("role") or "")
+
+            if role == "tool":
+                call_id = str(message.get("tool_call_id") or "")
+
+                if call_id not in pending:
+                    # 孤儿结果：没有对应调用，丢弃。
+                    changed = True
+                    continue
+
+                pending.remove(call_id)
+                repaired.append(message)
+                continue
+
+            if pending:
+                for open_id in pending:
+                    repaired.append({
+                        "role": "tool",
+                        "tool_call_id": open_id,
+                        "content": INTERRUPTED_TOOL_RESULT,
+                        "timestamp": time.time(),
+                    })
+
+                changed = True
+                pending = []
+
+            calls = message.get("tool_calls") or []
+            pending.extend(str(call.get("id") or "") for call in calls if isinstance(call, dict))
+            repaired.append(message)
+
+        if pending:
+            for open_id in pending:
+                repaired.append({
+                    "role": "tool",
+                    "tool_call_id": open_id,
+                    "content": INTERRUPTED_TOOL_RESULT,
+                    "timestamp": time.time(),
+                })
+
+            changed = True
+
+        return repaired if changed else None
+
+    def _save_conversation(self, conversation: dict) -> None:
+        path = self._conversation_path(str(conversation.get("conversation_id") or ""))
+        write_json_atomic(path, conversation)
+
+    def save_context(self, conversation_id: str, record: dict, expected_prefix: list) -> None:
+        """摘要只移动请求边界，保留所有消息；历史被改写时拒绝提交旧摘要。"""
+        with self._lock:
+            conversation = self.get(conversation_id)
+
+            if conversation is None or conversation.get("messages", [])[:len(expected_prefix)] != expected_prefix:
+                raise ValueError("摘要生成期间历史已变化，未保存旧摘要")
+
+            conversation["context_state"] = {
+                "summary": record["summary"],
+                "history_cut_index": record["history_cut_index"],
+            }
+            conversation.setdefault("context_compressions", []).append(record)
+            self._save_conversation(conversation)
+
+    def save_injection_baseline(self, conversation_id: str, baseline: dict) -> None:
+        """落盘 tail 注入块的基线快照，供下一轮比对。
+
+        基线跨请求持久化是「无变化不注入」的前提：只存内存的话，
+        每次新请求都拿不到上一轮的基线，会被当成首轮全量注入。
+        """
+        with self._lock:
+            conversation = self.get(conversation_id)
+
+            if conversation is None:
+                raise ValueError("本地会话不存在")
+
+            conversation["injection_baseline"] = dict(baseline or {})
+            self._save_conversation(conversation)
+
+    def get_settings(self, conversation_id: str) -> dict:
+        """读取会话级设置（模型 / 工具权限）。
+
+        会话设置是「每个会话独立持有」的一份完整值：新建会话时从全局默认复制一份，
+        之后各会话互不影响，全局改动只作用于新建会话。老会话可能没有 settings 段，
+        此时返回空字典，由调用方用 ensure_settings 惰性补齐。
+        """
+        conversation = self.get(conversation_id) or {}
+        settings = conversation.get("settings")
+        return dict(settings) if isinstance(settings, dict) else {}
+
+    def save_settings(self, conversation_id: str, patch: dict) -> dict:
+        """合并写入会话级设置，返回写入后的完整设置。
+
+        只接受白名单字段，避免前端塞入任意键污染会话文件。
+        """
+        if not isinstance(patch, dict):
+            raise ValueError("会话设置必须是对象")
+
+        allowed = {"model_name", "permission_mode", "approval_model_id"}
+
+        with self._lock:
+            conversation = self.get(conversation_id)
+
+            if conversation is None:
+                raise ValueError("本地会话不存在")
+
+            settings = conversation.get("settings")
+
+            if not isinstance(settings, dict):
+                settings = {}
+
+            for key in allowed:
+                if key not in patch:
+                    continue
+
+                settings[key] = str(patch.get(key) or "").strip()
+
+            conversation["settings"] = settings
+            self._save_conversation(conversation)
+
+            return dict(settings)
+
+    def ensure_settings(self, conversation_id: str, defaults: dict) -> dict:
+        """老会话惰性补齐设置：没有 settings 段时用给定默认值填一次并落盘。
+
+        这样老会话在首次被访问后也拥有独立设置，之后全局改动不再影响它。
+        已有 settings 段则原样返回，不覆盖用户改过的值。
+        """
+        with self._lock:
+            conversation = self.get(conversation_id)
+
+            if conversation is None:
+                raise ValueError("本地会话不存在")
+
+            settings = conversation.get("settings")
+
+            if isinstance(settings, dict) and settings:
+                return dict(settings)
+
+            merged = {
+                "model_name": str((defaults or {}).get("model_name") or "").strip(),
+                "permission_mode": str((defaults or {}).get("permission_mode") or "").strip(),
+                "approval_model_id": str((defaults or {}).get("approval_model_id") or "").strip(),
+            }
+            conversation["settings"] = merged
+            self._save_conversation(conversation)
+
+            return dict(merged)
+
+    def record_context_usage(self, conversation_id: str, input_tokens: int, message_count: int,
+                             estimated_tokens: int) -> None:
+        """落盘上游实测输入与当时的消息条数，作为下一轮占用的锚点。
+
+        同时保留上一轮的实测与整体估算：相邻两轮的差值就是「新增内容的真实
+        token 数」，由此得到的每轮边际速率不再依赖字符启发式。
+        摘要换代会重写 context_state（这里只写 last_* / prev_* 字段），旧锚点随之作废。
+        """
+        with self._lock:
+            conversation = self.get(conversation_id)
+
+            if conversation is None:
+                raise ValueError("本地会话不存在")
+
+            state = conversation.setdefault("context_state", {})
+            state["prev_input_tokens"] = max(0, int(state.get("last_input_tokens") or 0))
+            state["last_input_tokens"] = max(0, int(input_tokens or 0))
+            state["last_estimated_tokens"] = max(0, int(estimated_tokens or 0))
+            state["last_measured_message_count"] = max(0, int(message_count or 0))
+            self._save_conversation(conversation)
+
+    def record_compression_call(self, conversation_id: str, record: dict) -> None:
+        """压缩请求用量独立保存，即使摘要最终未提交也不能漏计该调用。"""
+        with self._lock:
+            conversation = self.get(conversation_id)
+
+            if conversation is None:
+                raise ValueError("本地会话不存在")
+
+            conversation.setdefault("context_compression_calls", []).append(record)
+            self._save_conversation(conversation)
+
+    def _guess_title(self, message: dict) -> str:
+        # 仅用用户消息做标题：助手/工具消息的开头没有辨识度。
+        if not isinstance(message, dict) or str(message.get("role") or "") != "user":
+            return ""
+
+        content = message.get("content")
+
+        if isinstance(content, list):
+            parts = []
+
+            for part in content:
+                if isinstance(part, dict):
+                    parts.append(str(part.get("text") or ""))
+
+            content = "".join(parts)
+
+        # 折叠换行与连续空白，避免标题里出现多行或超长空白。
+        text = re.sub(r"\s+", " ", str(content or "")).strip()
+        return text[:24]

@@ -1,4 +1,4 @@
-#ifndef TreeParser_hpp
+﻿#ifndef TreeParser_hpp
 #define TreeParser_hpp
 
 #include <algorithm>
@@ -12,6 +12,7 @@
 #include "LexerType.hpp"
 #include "TreeType.hpp"
 #include "FunctionTypeSyntax.hpp"
+#include "SyntaxDesugar.hpp"
 #include "../ZeusDiagnostics.hpp"
 #ifdef ZEUS_DEBUG_FILE_CHANNEL
 #undef ZEUS_DEBUG_FILE_CHANNEL
@@ -45,6 +46,7 @@ namespace TreeParser {
         bool isCompileTimeStatic = false; // @static 要求 LLVM 静态检查通过
         bool isInline = false; // inline asks LLVM to inline calls to this definition
         bool isNoSafepoint = false; // @no_safepoint disables compiler-inserted polls in LLVM lowering
+        bool isStaticOnlyFile = false; // @static; marks file as static/AOT-only
         
         // 默认参数和变长参数支持
         std::vector<std::vector<Token>> paramDefaults; // 参数默认值表达式(与paramNames对应,空表示无默认值)
@@ -52,6 +54,10 @@ namespace TreeParser {
         std::string variadicKwargs; // **kwargs 参数名(空表示无命名参数)
         
         bool isStaticMethod = false; // whether the function declaration included 'static' modifier
+        // The method became static because the enclosing class or impl block
+        // declares no receiver alias. The syntax validator warns about it,
+        // because the method then has no receiver at all.
+        bool staticByMissingReceiverAlias = false;
         std::string className;
         std::vector<std::string> implementedInterfaces;
         std::string interfaceName;
@@ -61,6 +67,7 @@ namespace TreeParser {
         std::vector<std::string> copyVars;
         // CLASS/IMPL 代码块中通过 `using &alias;` 声明的实例接收者别名
         std::string classDefaultAlias;
+        std::string platformName;
         // 若为 CLASS 内的函数:标记是否为类方法以及推断的实例别名
         bool isClassMethod = false;                // 当前函数是否直接定义于类体内
         std::string inferredInstanceAlias;         // 若被判定为实例方法,记录推断的别名(可能来自 using 或捕获列表)
@@ -164,9 +171,11 @@ namespace TreeParser {
     }
 
     std::vector<NodeAndBlock> parse(
-        const std::vector<Token>& tokens,
+        const std::vector<Token>& inputTokens,
         std::vector<ZeusDiagnostics::Diagnostic>* diagnostics = nullptr
     ) {
+        const std::vector<Token> tokens =
+            ZeusParser::desugarTokens(inputTokens, diagnostics);
         std::vector<NodeAndBlock> result;      // 最外层 AST
         std::vector<Token> stack;              // Node token 缓存
         std::vector<CodeBlock*> blockStack;    // 追踪当前嵌套的 CodeBlock
@@ -366,6 +375,13 @@ namespace TreeParser {
                     }
                 }
 
+                if (kwStr == "import") {
+                    const auto prefix = leadingFunctionPrefix();
+                    if (prefix.valid && !prefix.decorators.empty()) {
+                        ndtype = NodeType::IMPORT_STMT;
+                    }
+                }
+
                 if (counter == 1) {
                     if (kwStr == "var")  ndtype = NodeType::VAR_DECL_STMT;
                     if (kwStr == "let")  ndtype = NodeType::VAR_DECL_STMT;
@@ -378,6 +394,15 @@ namespace TreeParser {
                     if (kwStr == "try")  ndtype = NodeType::TRY_DECL_STMT;
                     if (kwStr == "throw") ndtype = NodeType::THROW_STMT;
                     if (kwStr == "with") ndtype = NodeType::WITH_DECL_STMT;
+                    // 'static func name()' is a function declaration: the
+                    // modifier may precede the 'func' keyword.
+                    if (kwStr == "static" && __i + 1 < tokens.size()) {
+                        const auto& nextTok = tokens[__i + 1];
+                        if (std::holds_alternative<LexerType::Keyword>(nextTok) &&
+                            std::get<LexerType::Keyword>(nextTok).name == "func") {
+                            ndtype = NodeType::FUNC_DECL_STMT;
+                        }
+                    }
                     
                     // 支持 shared class ClassName 语法
                     if (kwStr == "shared") {
@@ -400,8 +425,10 @@ namespace TreeParser {
                         // Need to check pattern: 'using original {' (block scope) vs 'using original;' (global scope)
                         bool nextIsAmpersand = false;
                         bool nextIsOpenBrace = false;
+                        bool nextIsExportList = false;
                         bool nextIsLLVM = false;
                         bool nextIsVM = false;
+                        bool nextIsPlatform = false;
                         if (__i + 1 < tokens.size()) {
                             auto& nextTok = tokens[__i + 1];
                             if (std::holds_alternative<LexerType::Operator>(nextTok)) {
@@ -409,6 +436,7 @@ namespace TreeParser {
                                     nextIsAmpersand = true;
                                 } else if (std::get<LexerType::Operator>(nextTok).symbol == "{") {
                                     nextIsOpenBrace = true;
+                                    nextIsExportList = true;
                                 }
                             } else if (std::holds_alternative<LexerType::Keyword>(nextTok)) {
                                 // Check for 'using original {' pattern
@@ -424,6 +452,14 @@ namespace TreeParser {
                                     std::holds_alternative<LexerType::Operator>(tokens[__i + 2]) &&
                                     std::get<LexerType::Operator>(tokens[__i + 2]).symbol == "{") {
                                     nextIsVM = true;
+                                }
+                                if ((kwNext.name == "windows" || kwNext.name == "win32" ||
+                                     kwNext.name == "linux" || kwNext.name == "darwin" ||
+                                     kwNext.name == "macos" || kwNext.name == "posix") &&
+                                    __i + 2 < tokens.size() &&
+                                    std::holds_alternative<LexerType::Operator>(tokens[__i + 2]) &&
+                                    std::get<LexerType::Operator>(tokens[__i + 2]).symbol == "{") {
+                                    nextIsPlatform = true;
                                 }
                                 if (kwNext.name == "original" && __i + 2 < tokens.size()) {
                                     auto& tokenAfter = tokens[__i + 2];
@@ -441,6 +477,10 @@ namespace TreeParser {
                                 ndtype = NodeType::USING_LLVM_BLOCK_STMT;
                             } else if (nextIsVM) {
                                 ndtype = NodeType::USING_VM_BLOCK_STMT;
+                            } else if (nextIsPlatform) {
+                                ndtype = NodeType::USING_PLATFORM_BLOCK_STMT;
+                            } else if (nextIsExportList) {
+                                ndtype = NodeType::USING_EXPORTS_STMT;
                             } else if (nextIsOpenBrace) {
                                 ndtype = NodeType::USING_BLOCK_STMT;
                             } else {
@@ -451,6 +491,7 @@ namespace TreeParser {
                     }
                     if (kwStr == "return") ndtype = NodeType::RETURN_STMT;
                     if (kwStr == "break") ndtype = NodeType::BREAK_STMT;
+                    if (kwStr == "continue") ndtype = NodeType::CONTINUE_STMT;
                     if (kwStr == "delete") ndtype = NodeType::DELETE_STMT;
                     if (kwStr == "decl") ndtype = NodeType::WAIT; // 需要看下一个 token 是否 func
                 } else if (counter == 2) {
@@ -475,9 +516,19 @@ namespace TreeParser {
                     单个 Node 语句的结束
                 */
                 if (opStr == ";") {
-                    // 在语句结束时，若 ndtype 仍是 MAIN/WAIT，尝试判定是表达式语句或赋值语句
                     NodeType finalType = ndtype;
-                    if (ndtype == NodeType::MAIN || ndtype == NodeType::WAIT) {
+                    if (stack.size() == 2 &&
+                        std::holds_alternative<LexerType::Operator>(stack[0]) &&
+                        std::get<LexerType::Operator>(stack[0]).symbol == "@" &&
+                        std::holds_alternative<LexerType::Keyword>(stack[1]) &&
+                        std::get<LexerType::Keyword>(stack[1]).name == "static") {
+                        finalType = NodeType::STATIC_FILE_STMT;
+                        if (!blockStack.empty()) {
+                            blockStack.front()->isStaticOnlyFile = true;
+                        }
+                    }
+                    // 在语句结束时，若 ndtype 仍是 MAIN/WAIT，尝试判定是表达式语句或赋值语句
+                    if (finalType != NodeType::STATIC_FILE_STMT && (ndtype == NodeType::MAIN || ndtype == NodeType::WAIT)) {
                         bool hasEq = false;
                         int parenDepth = 0;
                         for (const auto& tkTmp : stack) {
@@ -491,7 +542,7 @@ namespace TreeParser {
                         if (hasEq) finalType = NodeType::VAR_ASSIGN_STMT; else finalType = NodeType::EXP_STMT;
                     }
                     // 如果第一 token 是非保留关键字（如函数名/内建名）或值字面量，也应当认定为表达式语句
-                    if ((ndtype == NodeType::MAIN || ndtype == NodeType::WAIT) && !stack.empty()) {
+                    if (finalType != NodeType::STATIC_FILE_STMT && (ndtype == NodeType::MAIN || ndtype == NodeType::WAIT) && !stack.empty()) {
                         const auto& firstTk = stack.front();
                         if (std::holds_alternative<LexerType::Keyword>(firstTk)) {
                             auto nm = std::get<LexerType::Keyword>(firstTk).name;
@@ -730,43 +781,57 @@ namespace TreeParser {
                     一般代码块的起始
                 */
                 if (opStr == "{") {
-                    bool beginsCatchOrElseBlock = false;
-                    for (size_t i = 0; i < stack.size(); ++i) {
-                        if (!std::holds_alternative<LexerType::Keyword>(stack[i])) continue;
-                        const std::string& name = std::get<LexerType::Keyword>(stack[i]).name;
-                        const bool followsMemberAccess = i > 0 &&
-                            std::holds_alternative<LexerType::Operator>(stack[i - 1]) &&
-                            std::get<LexerType::Operator>(stack[i - 1]).symbol == ".";
-                        if ((name == "catch" || name == "else") &&
-                            !followsMemberAccess) {
-                            beginsCatchOrElseBlock = true;
-                            break;
+                    if (exprBraceDepth > 0) {
+                        // 已经在一个字典/表达式花括号内部：嵌套的 '{' 只加深计数，
+                        // 不能再开代码块，否则 {"a": {"b": 1}} 会被当成语句块。
+                        exprBraceDepth++;
+                        stack.push_back(token);
+                        continue;
+                    }
+                    if (ndtype == NodeType::USING_EXPORTS_STMT) {
+                        exprBraceDepth++;
+                        stack.push_back(token);
+                        continue;
+                    }
+                    const bool beginsCatchElseOrFinBlock = !stack.empty() &&
+                        std::holds_alternative<LexerType::Keyword>(stack.front()) &&
+                        (std::get<LexerType::Keyword>(stack.front()).name == "catch" ||
+                         std::get<LexerType::Keyword>(stack.front()).name == "fin" ||
+                         std::get<LexerType::Keyword>(stack.front()).name == "else");
+                    // 若当前不是在 dict 字面量内部，并且此 '{' 应判定为字典字面量起始，则不创建代码块。
+                    // 未闭合的 '(' 比 ndtype 更直接：参数里的 '{' 一定是字面量。
+                    // 没有这条，f({"a": 1}) 和 if (f({"a": 1})) 会把 '{' 当成代码块。
+                    int parenBalance = 0;
+                    for (auto const &tkTmp : stack) {
+                        if (!std::holds_alternative<LexerType::Operator>(tkTmp)) continue;
+                        const std::string& sym = std::get<LexerType::Operator>(tkTmp).symbol;
+                        if (sym == "(") {
+                            parenBalance++;
+                        } else if (sym == ")") {
+                            parenBalance--;
                         }
                     }
-                    // 若当前不是在 dict 字面量内部，并且此 '{' 应判定为字典字面量起始，则不创建代码块。
-                    auto canBeExprDictContext = !beginsCatchOrElseBlock &&
-                        (ndtype == NodeType::VAR_DECL_STMT || ndtype == NodeType::VAR_ASSIGN_STMT ||
-                         ndtype == NodeType::EXP_STMT || ndtype == NodeType::WAIT || ndtype == NodeType::MAIN);
+                    const bool inParentheses = parenBalance > 0;
+
+                    auto canBeExprDictContext = !beginsCatchElseOrFinBlock &&
+                        (inParentheses ||
+                         ndtype == NodeType::VAR_DECL_STMT || ndtype == NodeType::VAR_ASSIGN_STMT ||
+                         ndtype == NodeType::EXP_STMT || ndtype == NodeType::WAIT || ndtype == NodeType::MAIN ||
+                         ndtype == NodeType::RETURN_STMT);
                     bool treatAsDictLiteral = false;
                     if (exprBraceDepth == 0 && canBeExprDictContext) {
                         // 判断 stack 中是否有 '=' （表示正在处理赋值/初始化右侧）或 当前 ndtype 为 EXP_STMT 仍未结束。
                         // 或者判断 stack 中是否有未匹配的 '(' （表示在函数参数内）
                         bool hasEqInStack = false;
-                        int parenBalance = 0;
                         for (auto const &tkTmp : stack) {
                             if (std::holds_alternative<LexerType::Operator>(tkTmp)) {
                                 const std::string& sym = std::get<LexerType::Operator>(tkTmp).symbol;
                                 if (sym == "=") {
                                     hasEqInStack = true;
-                                } else if (sym == "(") {
-                                    parenBalance++;
-                                } else if (sym == ")") {
-                                    parenBalance--;
                                 }
                             }
                         }
-                        bool inParentheses = (parenBalance > 0);
-                        if (hasEqInStack || inParentheses || ndtype == NodeType::EXP_STMT || ndtype == NodeType::VAR_ASSIGN_STMT || ndtype == NodeType::VAR_DECL_STMT) {
+                        if (hasEqInStack || inParentheses || ndtype == NodeType::EXP_STMT || ndtype == NodeType::VAR_ASSIGN_STMT || ndtype == NodeType::VAR_DECL_STMT || ndtype == NodeType::RETURN_STMT) {
                             // 向前看匹配此 '{' 的 '}' 期间是否出现 ':'
                             int depthLook = 1;
                             bool colonAtTop = false;
@@ -828,11 +893,24 @@ namespace TreeParser {
                         case NodeType::USING_BLOCK_STMT: cdbType = CodeBlockType::USING; break;
                         case NodeType::USING_LLVM_BLOCK_STMT: cdbType = CodeBlockType::USING_LLVM; break;
                         case NodeType::USING_VM_BLOCK_STMT: cdbType = CodeBlockType::USING_VM; break;
+                        case NodeType::USING_PLATFORM_BLOCK_STMT: cdbType = CodeBlockType::USING_PLATFORM; break;
                         default: cdbType = CodeBlockType::BLOCK; break;
                     }
 
                     auto newBlock = makeBlock();
                     newBlock->type = cdbType;
+
+                    if (cdbType == CodeBlockType::USING_PLATFORM) {
+                        if (stack.size() >= 2 && std::holds_alternative<LexerType::Keyword>(stack[1])) {
+                            std::string name = std::get<LexerType::Keyword>(stack[1]).name;
+                            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+                                return static_cast<char>(std::tolower(c));
+                            });
+                            if (name == "win32") name = "windows";
+                            else if (name == "macos") name = "darwin";
+                            newBlock->platformName = std::move(name);
+                        }
+                    }
 
                     if (cdbType == CodeBlockType::FUNC) {
                         newBlock->isInline = leadingFunctionPrefix().isInline;
@@ -1357,6 +1435,12 @@ namespace TreeParser {
                                 if (!seenFunc) {
                                     if (kw.name == "func") { seenFunc = true; continue; }
 
+                                    // 'static' may precede the 'func' keyword
+                                    if (kw.name == "static") {
+                                        newBlock->isStaticMethod = true;
+                                        continue;
+                                    }
+
                                 } else {
                                     // 检查是否为 operator 关键字
                                     if (!seenOperator && kw.name == "operator") {
@@ -1801,9 +1885,20 @@ namespace TreeParser {
                                 ) != newBlock->overloadedOps.end();
                                 const std::string& receiverAlias =
                                     parentCb->classDefaultAlias;
+                                const bool declaredStatic =
+                                    newBlock->isStaticMethod ||
+                                    newBlock->isCompileTimeStatic;
                                 newBlock->isStaticMethod =
-                                    newBlock->isStaticMethod || newBlock->isCompileTimeStatic ||
-                                    isFactoryOperator || receiverAlias.empty();
+                                    declaredStatic || isFactoryOperator ||
+                                    receiverAlias.empty();
+                                if (!declaredStatic && !isFactoryOperator &&
+                                    receiverAlias.empty() &&
+                                    !newBlock->isOperatorOverload) {
+                                    // The impl block declares no receiver
+                                    // alias, so the method has no receiver
+                                    // and is compiled as a static function.
+                                    newBlock->staticByMissingReceiverAlias = true;
+                                }
                                 if (!newBlock->isStaticMethod && !receiverAlias.empty()) {
                                     newBlock->inferredInstanceAlias = receiverAlias;
                                     const size_t oldParameterCount = newBlock->paramNames.size();
@@ -1837,6 +1932,7 @@ namespace TreeParser {
                                 }
                             }
                             if (parentCb && parentCb->type == CodeBlockType::CLASS) {
+                                newBlock->ownerClassName = parentCb->className;
                                 newBlock->isClassMethod = true;
                                 const bool isFactoryOperator = std::find(
                                     newBlock->overloadedOps.begin(),
@@ -1857,6 +1953,17 @@ namespace TreeParser {
                                 } else {
                                     // 类未声明 using:若函数声明显式捕获 [&name] 则视为实例方法(别名为该 name),否则默认 static
                                     classifyAsInstance = !newBlock->isStaticMethod && !newBlock->captureVars.empty();
+                                    if (!classifyAsInstance && !newBlock->isStaticMethod &&
+                                        !newBlock->isOperatorOverload) {
+                                        // The class declares no receiver alias
+                                        // and the method captures nothing,
+                                        // so the method has no receiver and
+                                        // is compiled as a static function.
+                                        // Operator overloads are excluded: they
+                                        // take the receiver as an explicit
+                                        // first parameter.
+                                        newBlock->staticByMissingReceiverAlias = true;
+                                    }
                                 }
                                 ZEUS_DEBUG_PRINT("[Parser   ]   -> classifyAsInstance=%d", classifyAsInstance);
                                 if (classifyAsInstance) {
@@ -2011,12 +2118,17 @@ namespace TreeParser {
                     }
                     newBlock->isElseBranch = isElseBlock;
 
-                    // 检测是否 catch 块：当前收集的 stack 中包含关键字 catch 且上一兄弟是 TRY
+                    // catch and fin are standalone block headers. Inspect only the first
+                    // header token so a nested function or member named `fin` is not
+                    // mistaken for a cleanup block.
                     bool isCatchBlock = false;
-                    for (auto const& tk : stack) {
-                        if (std::holds_alternative<LexerType::Keyword>(tk)) {
-                            if (std::get<LexerType::Keyword>(tk).name == "catch") { isCatchBlock = true; break; }
-                        }
+                    bool isFinBlock = false;
+                    if (cdbType == CodeBlockType::BLOCK && !stack.empty() &&
+                        std::holds_alternative<LexerType::Keyword>(stack.front())) {
+                        const std::string& headerKeyword =
+                            std::get<LexerType::Keyword>(stack.front()).name;
+                        isCatchBlock = headerKeyword == "catch";
+                        isFinBlock = headerKeyword == "fin";
                     }
 
                     CodeBlock* ptr = newBlock.get();
@@ -2085,6 +2197,29 @@ namespace TreeParser {
                         }
                     }
                     // ===== end catch 块处理 =====
+
+                    // fin attaches to the preceding TRY block. Catch and fin
+                    // are stored in source order under that TRY node.
+                    if (isFinBlock) {
+                        newBlock->type = CodeBlockType::FIN;
+                        if (!blockStack.back()->nodes.empty()) {
+                            auto& lastVariant = blockStack.back()->nodes.back();
+                            if (std::holds_alternative<std::unique_ptr<CodeBlock>>(lastVariant)) {
+                                auto* tryBlock =
+                                    std::get<std::unique_ptr<CodeBlock>>(lastVariant).get();
+                                if (tryBlock && tryBlock->type == CodeBlockType::TRY) {
+                                    tryBlock->nodes.push_back(std::move(newBlock));
+                                    auto& finVariant = tryBlock->nodes.back();
+                                    ptr = std::get<std::unique_ptr<CodeBlock>>(finVariant).get();
+                                    blockStack.push_back(ptr);
+                                    stack.clear();
+                                    ndtype = NodeType::WAIT;
+                                    counter = 0;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
 
                     if (isElseBlock && !blockStack.back()->nodes.empty()) {
                         auto &lastVariant = blockStack.back()->nodes.back();

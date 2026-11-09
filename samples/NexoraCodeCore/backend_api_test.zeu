@@ -1,0 +1,418 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.http;
+import zeus.json;
+
+import samples.NexoraCodeCore.backend_api;
+import samples.NexoraCodeCore.agent_settings;
+import samples.NexoraCodeCore.agent_settings_test;
+import samples.NexoraCodeCore.conversation_store;
+import samples.NexoraCodeCore.journal;
+import samples.NexoraCodeCore.project_instructions_test;
+import samples.NexoraCodeCore.storage;
+import samples.NexoraCodeCore.stream_runtime;
+
+func __nexora_backend_assert(value: bool, message: string) {
+    if (!value) throw new Exception("backend API test: " + message);
+}
+
+func __nexora_backend_status(result, expected: int, message: string) {
+    __nexora_backend_assert(dict_get(result, "status", 0) == expected, message);
+}
+
+class NexoraBackendApiTextWorker {
+    using &this;
+
+    func run(context) {
+        context.onEvent({"type": "text", "text": "first"});
+        context.onEvent({"type": "text", "text": "second"});
+        return {"status": "done"};
+    }
+}
+
+func testBackendApi(root: string) {
+    testNexoraProjectInstructions(root);
+    testNexoraAgentSettings(root);
+    let base = root + "/backend_api";
+    let store = new NexoraCoreConversationStore(base + "/conversations");
+    let runtime = new NexoraCoreStreamRuntime(
+        new NexoraCoreTaskJournal(base + "/tasks"), 16, 4);
+    let providers = {"default_id": "offline-provider", "providers": [{
+        "id": "offline-provider",
+        "name": "offline",
+        "model": "test-model",
+        "base_url": "https://example.invalid/v1",
+        "api_key": "offline-secret-must-not-leak",
+        "template_id": "custom",
+        "temperature": 0.7,
+        "context_window": 10000,
+        "max_tokens": 1000
+    }]};
+    let api = new NexoraCoreBackendApi(store, runtime, providers, root);
+    __nexora_backend_assert(api.systemPrompt.index("NexoraCode") >= 0,
+        "backend must use the NexoraCode default system prompt");
+    __nexora_backend_assert(api.systemPrompt.index("local_file_list") >= 0,
+        "default system prompt must explain how to inspect the workspace");
+
+    let settingsPath = base + "/local-config.json";
+    let settingsFile = file.open(settingsPath, "w");
+    settingsFile.write(JSON.stringify({
+        "local_custom_system_prompt": "Original prompt",
+        "local_read_agents_md": true,
+        "preserved_setting": "keep this field"
+    }));
+    settingsFile.close();
+    let providersPath = base + "/providers.json";
+    let settingsApi = new NexoraCoreBackendApi(store, runtime, providers, root,
+        nexora_load_agent_settings(settingsPath), settingsPath, providersPath);
+    let localSettings = nil;
+    try {
+        localSettings = settingsApi.dispatch("GET", "/api/local/settings", "", nil);
+    } catch (&error) {
+        print("BACKEND_API_SETTINGS_GET_ERROR: " + error.getMessage());
+        throw error;
+    }
+    __nexora_backend_status(localSettings, 200,
+        "local agent settings must be readable");
+    let localGeneral = dict_get(dict_get(localSettings, "body", {}), "general", {});
+    let localProvider = dict_get(dict_get(localSettings, "body", {}), "provider", {});
+    let publicProviders = dict_get(localProvider, "providers", []);
+    __nexora_backend_assert(
+        dict_get(localGeneral, "custom_system_prompt", "") == "Original prompt" and
+        dict_get(localGeneral, "read_agents_md", false) == true and
+        dict_get(localGeneral, "username", "") == "local" and
+        dict_get(localGeneral, "theme", "") == "system" and
+        dict_get(localGeneral, "auto_retry_count", 0) == 5 and
+        dict_get(localGeneral, "empty_response_retry_count", 0) == 2,
+        "settings response must expose current NexoraCode general settings: " +
+            JSON.stringify(localGeneral));
+    __nexora_backend_assert(
+        publicProviders.length() == 1 and
+        dict_get(publicProviders[0], "id", "") == "offline-provider" and
+        dict_get(publicProviders[0], "has_api_key", false) == true and
+        dict_get(publicProviders[0], "api_key", nil) == nil and
+        dict_get(localProvider, "default_id", "") == "offline-provider",
+        "provider settings must expose public fields and only a saved-key flag");
+    __nexora_backend_assert(
+        JSON.stringify(dict_get(localSettings, "body", {})).index(
+            "offline-secret-must-not-leak") < 0,
+        "local settings response must not contain provider credentials");
+
+    let promptUpdate = settingsApi.dispatch("POST", "/api/local/settings", "", {
+        "general": {"custom_system_prompt": "  Updated prompt  "}
+    });
+    __nexora_backend_status(promptUpdate, 200,
+        "custom prompt settings must be saved");
+    __nexora_backend_assert(
+        dict_get(settingsApi.agentSettings, "local_custom_system_prompt", "") ==
+            "  Updated prompt  " and
+        dict_get(settingsApi.agentSettings, "local_read_agents_md", false) == true,
+        "partial updates must retain the stored prompt and other agent settings");
+
+    let toggleUpdate = settingsApi.dispatch("POST", "/api/local/settings", "", {
+        "general": {
+            "read_agents_md": false,
+            "username": "  Nexora user  ",
+            "tool_auto_expand": false,
+            "telemetry_enabled": false,
+            "theme": "Dark",
+            "auto_retry_count": "3",
+            "empty_response_retry_count": 0
+        }
+    });
+    __nexora_backend_status(toggleUpdate, 200,
+        "AGENTS reading setting must be saved");
+    let persistedConfig = JSON.parse(nexora_core_read_text(settingsPath));
+    __nexora_backend_assert(
+        dict_get(persistedConfig, "local_custom_system_prompt", "") ==
+            "  Updated prompt  " and
+        dict_get(persistedConfig, "local_read_agents_md", true) == false and
+        dict_get(persistedConfig, "local_username", "") == "Nexora user" and
+        dict_get(persistedConfig, "local_tool_auto_expand", true) == false and
+        dict_get(persistedConfig, "local_telemetry_enabled", true) == false and
+        dict_get(persistedConfig, "local_theme", "") == "dark" and
+        dict_get(persistedConfig, "local_auto_retry_count", 0) == 3 and
+        dict_get(persistedConfig, "local_empty_response_retry_count", 99) == 0 and
+        dict_get(persistedConfig, "preserved_setting", "") == "keep this field",
+        "settings writes must preserve whitespace and unrelated config fields");
+    let updatedSettings = dict_get(dict_get(
+        settingsApi.dispatch("GET", "/api/local/settings", "", nil),
+        "body", {}), "general", {});
+    __nexora_backend_assert(
+        dict_get(updatedSettings, "custom_system_prompt", "") ==
+            "  Updated prompt  " and
+        dict_get(updatedSettings, "read_agents_md", true) == false and
+        dict_get(updatedSettings, "username", "") == "Nexora user" and
+        dict_get(updatedSettings, "tool_auto_expand", true) == false and
+        dict_get(updatedSettings, "telemetry_enabled", true) == false and
+        dict_get(updatedSettings, "theme", "") == "dark" and
+        dict_get(updatedSettings, "auto_retry_count", 0) == 3 and
+        dict_get(updatedSettings, "empty_response_retry_count", 99) == 0,
+        "GET must reflect the successfully saved values");
+
+    __nexora_backend_status(settingsApi.dispatch("POST", "/api/local/settings", "", {
+        "general": {"tool_auto_expand": "false"}
+    }), 400, "boolean settings must reject string values");
+    __nexora_backend_status(settingsApi.dispatch("POST", "/api/local/settings", "", {
+        "general": {"theme": "blue"}
+    }), 400, "unsupported theme names must be rejected");
+    __nexora_backend_status(settingsApi.dispatch("POST", "/api/local/settings", "", {
+        "general": {"auto_retry_count": 11}
+    }), 400, "retry counts must stay within the supported range");
+    let providerTemplates = settingsApi.dispatch("GET",
+        "/api/local/provider-templates", "", nil);
+    __nexora_backend_status(providerTemplates, 200,
+        "provider templates must be available without a network request");
+    __nexora_backend_assert(dict_get(
+        dict_get(providerTemplates, "body", {}), "templates", []).length() == 10,
+        "the reviewed provider template registry must be exposed");
+
+    let providerUpdate = settingsApi.dispatch("POST", "/api/local/settings", "", {
+        "provider": {
+            "providers": [{
+                "id": "offline-provider", "template_id": "custom",
+                "name": "offline updated",
+                "base_url": "https://example.invalid/v1/",
+                "model": "updated-model", "temperature": 0.4,
+                "max_tokens": 900, "context_window": 12000,
+                "thinking_protocol": "deepseek"
+            }],
+            "default_id": "offline-provider"
+        }
+    });
+    __nexora_backend_status(providerUpdate, 200,
+        "saving a custom provider with the same endpoint must keep its key");
+    let savedProviderDocument = JSON.parse(nexora_core_read_text(providersPath));
+    let savedProvider = dict_get(savedProviderDocument, "providers", [])[0];
+    __nexora_backend_assert(
+        dict_get(savedProvider, "api_key", "") == "offline-secret-must-not-leak" and
+        dict_get(savedProvider, "model", "") == "updated-model" and
+        dict_get(settingsApi.providers, "default_id", "") == "offline-provider",
+        "provider save must retain same-endpoint credentials and update runtime state");
+
+    let cloneUpdate = settingsApi.dispatch("POST", "/api/local/settings", "", {
+        "provider": {"providers": [
+            {"id": "offline-provider", "template_id": "custom",
+                "name": "offline updated", "base_url": "https://example.invalid/v1",
+                "model": "updated-model", "api_key": "offline-secret-must-not-leak",
+                "max_tokens": 900, "context_window": 12000},
+            {"id": "offline-clone", "key_source_id": "offline-provider",
+                "template_id": "custom", "name": "offline clone",
+                "base_url": "https://example.invalid/v1/", "model": "clone-model",
+                "max_tokens": 900, "context_window": 12000}
+        ], "default_id": "offline-clone"}
+    });
+    __nexora_backend_status(cloneUpdate, 200,
+        "a provider clone may reuse a key for the same custom endpoint");
+    savedProviderDocument = JSON.parse(nexora_core_read_text(providersPath));
+    let clonedProviders = dict_get(savedProviderDocument, "providers", []);
+    __nexora_backend_assert(clonedProviders.length() == 2 and
+        dict_get(clonedProviders[1], "api_key", "") ==
+            "offline-secret-must-not-leak" and
+        dict_get(savedProviderDocument, "default_id", "") == "offline-clone",
+        "same-endpoint key cloning and default selection must persist");
+
+    let changedEndpoint = settingsApi.dispatch("POST", "/api/local/settings", "", {
+        "provider": {"providers": [{
+            "id": "offline-provider", "key_source_id": "offline-provider",
+            "template_id": "custom", "name": "changed endpoint",
+            "base_url": "https://different.example/v1", "model": "new-model",
+            "max_tokens": 900, "context_window": 12000
+        }], "default_id": "offline-provider"}
+    });
+    __nexora_backend_status(changedEndpoint, 200,
+        "changing a custom endpoint must clear the previous key");
+    savedProviderDocument = JSON.parse(nexora_core_read_text(providersPath));
+    savedProvider = dict_get(savedProviderDocument, "providers", [])[0];
+    __nexora_backend_assert(dict_get(savedProvider, "api_key", "") == "",
+        "credentials must not cross custom provider endpoints");
+
+    let beforeInvalidProviderSave = nexora_core_read_text(providersPath);
+    __nexora_backend_status(settingsApi.dispatch("POST", "/api/local/settings", "", {
+        "provider": {"providers": [{
+            "id": "bad-budget", "template_id": "custom",
+            "base_url": "https://example.invalid/v1", "model": "invalid",
+            "max_tokens": 1000, "context_window": 1000
+        }]}
+    }), 400, "provider output limit must fit inside its context window");
+    __nexora_backend_assert(nexora_core_read_text(providersPath) == beforeInvalidProviderSave,
+        "invalid provider settings must not overwrite the saved file");
+
+    __nexora_backend_status(settingsApi.dispatch("POST", "/api/local/settings", "", {
+        "provider": {"providers": [{
+            "id": "unknown-template", "template_id": "unknown",
+            "api_key": "synthetic-key", "model": "model"
+        }]}
+    }), 400, "unknown provider templates must be rejected");
+
+    let presetUpdate = settingsApi.dispatch("POST", "/api/local/settings", "", {
+        "provider": {"providers": [{
+            "id": "deepseek-provider", "template_id": "deepseek",
+            "name": "untrusted name", "base_url": "https://attacker.example/v1",
+            "api_key": "synthetic-deepseek-key", "model": "deepseek-chat",
+            "max_tokens": 900, "context_window": 12000
+        }]}
+    });
+    __nexora_backend_status(presetUpdate, 200,
+        "known presets must save their canonical endpoint and display name");
+    savedProviderDocument = JSON.parse(nexora_core_read_text(providersPath));
+    savedProvider = dict_get(savedProviderDocument, "providers", [])[0];
+    __nexora_backend_assert(
+        dict_get(savedProvider, "base_url", "") ==
+            "https://api.deepseek.com/chat/completions" and
+        dict_get(savedProvider, "name", "") == "DeepSeek" and
+        dict_get(savedProviderDocument, "default_id", "") == "deepseek-provider",
+        "preset save must ignore client-supplied endpoint fields");
+
+    let publicSettingsAfterSave = settingsApi.dispatch(
+        "GET", "/api/local/settings", "", nil);
+    __nexora_backend_assert(
+        JSON.stringify(dict_get(publicSettingsAfterSave, "body", {})).index(
+            "synthetic-deepseek-key") < 0 and
+        dict_get(dict_get(dict_get(publicSettingsAfterSave, "body", {}),
+            "provider", {}), "providers", [])[0]["has_api_key"] == true,
+        "provider credentials must stay hidden after a successful save");
+
+    __nexora_backend_status(settingsApi.dispatch("POST", "/api/local/settings", "", {
+        "provider": {"providers": [{
+            "id": "openai-copy", "key_source_id": "deepseek-provider",
+            "template_id": "openai", "model": "gpt-model",
+            "max_tokens": 900, "context_window": 12000
+        }]}
+    }), 400, "a saved key must not cross provider templates");
+
+    let invalidLocalSettings = settingsApi.dispatch("POST",
+        "/api/local/settings", "", "{");
+    __nexora_backend_status(invalidLocalSettings, 400,
+        "invalid local settings JSON must be rejected");
+
+    let health = api.dispatch("GET", "/health", "", nil);
+    __nexora_backend_status(health, 200, "health route must be available");
+    __nexora_backend_assert(dict_get(dict_get(health, "body", {}), "ok", false),
+        "health route must identify a ready backend");
+    let healthRequest = new HTTPRequest();
+    healthRequest.method = "GET";
+    healthRequest.path = "/health";
+    let healthResponse: HTTPResponse = api.handleRequest(healthRequest);
+    __nexora_backend_assert(healthResponse.status == 200,
+        "HTTP adapter must map the health dispatch to a response");
+    __nexora_backend_assert(healthResponse.headerLines.index(
+        "content-type: application/json") == 0,
+        "HTTP response must identify its JSON body");
+
+    let foreignSettingsRequest = new HTTPRequest();
+    foreignSettingsRequest.method = "POST";
+    foreignSettingsRequest.path = "/api/local/settings";
+    foreignSettingsRequest.rawHeaders = "POST /api/local/settings HTTP/1.1\r\n" +
+        "Host: 127.0.0.1:8765\r\nOrigin: http://evil.example\r\n\r\n";
+    foreignSettingsRequest.body = bytes("{}");
+    let foreignSettingsResponse: HTTPResponse =
+        settingsApi.handleRequest(foreignSettingsRequest);
+    __nexora_backend_assert(foreignSettingsResponse.status == 403,
+        "settings POST must reject a cross-origin browser request");
+
+    let sameOriginSettingsRequest = new HTTPRequest();
+    sameOriginSettingsRequest.method = "POST";
+    sameOriginSettingsRequest.path = "/api/local/settings";
+    sameOriginSettingsRequest.rawHeaders = "POST /api/local/settings HTTP/1.1\r\n" +
+        "Host: 127.0.0.1:8765\r\nOrigin: http://127.0.0.1:8765\r\n\r\n";
+    sameOriginSettingsRequest.body = bytes("{}");
+    let sameOriginSettingsResponse: HTTPResponse =
+        settingsApi.handleRequest(sameOriginSettingsRequest);
+    __nexora_backend_assert(sameOriginSettingsResponse.status == 200,
+        "same-origin settings POST must continue to work");
+
+    let models = api.dispatch("GET", "/api/models", "", nil);
+    __nexora_backend_status(models, 200, "model list must be available");
+    let modelJson = JSON.stringify(dict_get(models, "body", {}));
+    __nexora_backend_assert(modelJson.index("offline") >= 0 and
+        modelJson.index("test-model") >= 0, "model list must include public model information");
+    __nexora_backend_assert(modelJson.index("offline-secret-must-not-leak") < 0,
+        "model list must never include provider credentials");
+
+    let invalidJson = api.dispatch("POST", "/api/conversations", "", "{");
+    __nexora_backend_status(invalidJson, 400, "invalid JSON must be a client error");
+
+    let created = api.dispatch("POST", "/api/conversations", "",
+        JSON.stringify({"title": "Backend API"}));
+    __nexora_backend_status(created, 201, "conversation creation must persist a conversation");
+    let conversation = dict_get(dict_get(created, "body", {}), "conversation", {});
+    let conversationId = str(dict_get(conversation, "conversation_id", ""));
+    __nexora_backend_assert(conversationId != "", "created conversation must have an id");
+    let initialSettings = store.getSettings(conversationId);
+    __nexora_backend_assert(dict_get(initialSettings, "permission_mode", "") == "confirm",
+        "new conversations must default to confirmation for write tools");
+
+    let listed = api.dispatch("GET", "/api/conversations", "", nil);
+    __nexora_backend_status(listed, 200, "conversation list must be available");
+    __nexora_backend_assert(dict_get(dict_get(listed, "body", {}), "items", []).length() == 1,
+        "conversation list must contain the created entry");
+    let loaded = api.dispatch("GET", "/api/conversations/get",
+        "conversation_id=" + conversationId, nil);
+    __nexora_backend_status(loaded, 200, "conversation detail must be queryable");
+    let invalidPermissionMode = api.dispatch("POST", "/api/conversations/settings", "",
+        {"conversation_id": conversationId, "permission_mode": "auto"});
+    __nexora_backend_status(invalidPermissionMode, 422,
+        "automatic approval without an approval model must be rejected");
+    let permissionSettings = api.dispatch("POST", "/api/conversations/settings", "",
+        {"conversation_id": conversationId, "permission_mode": "read_only"});
+    __nexora_backend_status(permissionSettings, 200,
+        "conversation permission mode must be configurable");
+    __nexora_backend_assert(dict_get(
+        dict_get(permissionSettings, "body", {})["settings"], "permission_mode", "") == "read_only",
+        "permission update must persist for its conversation");
+    let missing = api.dispatch("GET", "/api/conversations/get",
+        "conversation_id=missing", nil);
+    __nexora_backend_status(missing, 404, "missing conversation must be reported");
+
+    let missingProvider = api.dispatch("POST", "/api/chat", "",
+        {"message": "hello", "provider": "missing"});
+    __nexora_backend_status(missingProvider, 404, "unknown provider must be rejected");
+    __nexora_backend_assert(dict_get(dict_get(
+        api.dispatch("GET", "/api/conversations", "", nil), "body", {}),
+        "items", []).length() == 1, "rejected chat must not create a conversation");
+
+    let tasks = api.dispatch("GET", "/api/tasks", "", nil);
+    __nexora_backend_status(tasks, 200, "task list must be available");
+
+    let textWorker = new NexoraBackendApiTextWorker();
+    let streamId = runtime.startSession(conversationId, textWorker.run);
+    __nexora_backend_assert(runtime.joinSession(streamId, 5000),
+        "task fixture must finish before polling");
+    let currentTask = api.dispatch("GET", "/api/tasks",
+        "stream_id=" + streamId + "&after_seq=0", nil);
+    let currentBody = dict_get(currentTask, "body", {});
+    __nexora_backend_assert(dict_get(currentBody, "gap", true) == false,
+        "new clients must receive incremental task events without a gap");
+    __nexora_backend_assert(dict_get(currentBody, "content", nil) == nil,
+        "normal task polls must not copy the accumulated response body");
+
+    let gapRuntime = new NexoraCoreStreamRuntime(
+        new NexoraCoreTaskJournal(base + "/gap_tasks"), 1, 4);
+    let gapApi = new NexoraCoreBackendApi(store, gapRuntime, providers, root);
+    let gapStreamId = gapRuntime.startSession(conversationId, textWorker.run);
+    __nexora_backend_assert(gapRuntime.joinSession(gapStreamId, 5000),
+        "gap task fixture must finish before polling");
+    let gapTask = gapApi.dispatch("GET", "/api/tasks",
+        "stream_id=" + gapStreamId + "&after_seq=0", nil);
+    let gapBody = dict_get(gapTask, "body", {});
+    __nexora_backend_assert(dict_get(gapBody, "gap", false) == true,
+        "expired in-memory events must report a cursor gap");
+    __nexora_backend_assert(dict_get(gapBody, "content", "") == "firstsecond",
+        "gap responses must include the accumulated response for recovery");
+
+    let missingTask = api.dispatch("GET", "/api/tasks",
+        "stream_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", nil);
+    __nexora_backend_status(missingTask, 404, "missing task must be reported");
+    let cancelMissing = api.dispatch("POST", "/api/tasks/cancel", "",
+        {"stream_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"});
+    __nexora_backend_status(cancelMissing, 404, "missing task cannot be cancelled");
+    let approvalMissing = api.dispatch("POST", "/api/tasks/approval", "",
+        {"stream_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "approval_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "decision": "approve"});
+    __nexora_backend_status(approvalMissing, 404,
+        "approval resolution must reject an unknown task");
+    __nexora_backend_status(api.dispatch("GET", "/unknown", "", nil), 404,
+        "unknown route must be reported");
+}

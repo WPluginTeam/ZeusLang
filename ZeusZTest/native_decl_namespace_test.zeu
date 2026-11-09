@@ -1,0 +1,7 @@
+import native_decl_package [&types];
+
+var value: types.PackageDouble = 1.25;
+var small: types.PackageInt8 = -123;
+if (types.packageDoubleSum(value, 2.5) != 3.75) throw "namespace native alias signature";
+if (small != -123) throw "namespace native alias local";
+print("NATIVE_DECL_NAMESPACE_PASS");

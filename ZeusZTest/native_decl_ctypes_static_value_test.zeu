@@ -1,0 +1,6 @@
+import zeus.ctypes [&types];
+
+@native decl NativeInt32 = types.INT32;
+var value: NativeInt32 = 456;
+if (value != 456) throw "qualified static TypeID mismatch";
+print("NATIVE_DECL_CTYPES_STATIC_VALUE_PASS");

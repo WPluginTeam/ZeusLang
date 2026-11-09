@@ -1,0 +1,433 @@
+import zeus.dict;
+import zeus.json;
+import zeus.string;
+
+// Agent 事件纯函数（S9）。对应 Python：
+//   AgentLoop._group_tool_calls / _accumulate_usage / _stringify_content
+//   Provider._extract_usage_io（含 cached/miss/uncached/creation 四个提取器）
+//   Routes._translate_event
+//
+// 全部无 IO、无线程、无网络：输入是已解码的字典，输出是新字典。
+// Provider 流式 HTTP 与工具执行仍在宿主，Zeus 只做事件归一。
+//
+// 写法说明：入参是字典的函数直接标 `: dict`（调用边界会校验，
+// 比老式的 `type() != "dict"` 自查报错更清楚）；缺键取默认值用
+// 字面量方法 `d.get(k, fb)`；只有“可能不是字典”的宿主输入才走
+// 自由函数 `dict_get` 做 nil 宽容探测。
+
+func __nexora_safe_int(value, fallback: int = 0) -> int {
+    if (value == nil) return fallback;
+    if (type(value) == "int") return value;
+    if (type(value) == "float") return int(value);
+    if (type(value) == "bool") {
+        if (value) return 1;
+        return 0;
+    }
+    if (type(value) == "string") {
+        let parsed = nil;
+        try {
+            parsed = int(value);
+        } catch (&error) {
+            return fallback;
+        }
+        if (type(parsed) == "int") return parsed;
+        return fallback;
+    }
+    return fallback;
+}
+
+func __nexora_safe_float(value, fallback = 0.0) {
+    if (value == nil) return fallback;
+    if (type(value) == "float") return value;
+    if (type(value) == "int") return float(value);
+    if (type(value) == "string") {
+        let parsed = nil;
+        try {
+            parsed = float(value);
+        } catch (&error) {
+            return fallback;
+        }
+        if (type(parsed) == "float") return parsed;
+        if (type(parsed) == "int") return float(parsed);
+        return fallback;
+    }
+    return fallback;
+}
+
+func __nexora_is_cache_hit_key(key) -> bool {
+    if (type(key) != "string") return false;
+    let text = key.lower();
+    if (text.index("cache") < 0 or text.index("token") < 0) return false;
+    if (text.index("creation") >= 0 or text.index("create") >= 0 or
+        text.index("write") >= 0) return false;
+    return text.index("read") >= 0 or text.index("cached") >= 0;
+}
+
+// 宿主输入可能不是字典：nil 宽容，缺键回 nil，非字典回 nil。
+func __nexora_details_of(source, name: string) {
+    let probe = nil;
+    try {
+        probe = dict_get(source, name, nil);
+    } catch (&error) {
+        return nil;
+    }
+    if (type(probe) == "dict") return probe;
+    return nil;
+}
+
+func __nexora_scan_cached_tokens(raw: dict) -> Array {
+    let best = 0;
+    let bestKey = "";
+    let promptDetails = __nexora_details_of(raw, "prompt_tokens_details");
+    let inputDetails = __nexora_details_of(raw, "input_tokens_details");
+    let containers = [promptDetails, inputDetails, raw];
+    let containerNames = ["prompt_tokens_details", "input_tokens_details", "top"];
+    for (0..3) [const &ci] {
+        let container = containers[ci];
+        if (type(container) != "dict") continue;
+        for (container) [&key: &value] {
+            if (!__nexora_is_cache_hit_key(key)) continue;
+            let number = __nexora_safe_int(value, -1);
+            if (number < 0 and value != nil and type(value) != "int") continue;
+            if (number > best) {
+                best = number;
+                if (containerNames[ci] == "top") {
+                    bestKey = str(key);
+                } else {
+                    bestKey = containerNames[ci] + "." + str(key);
+                }
+            }
+        }
+    }
+    return [best, bestKey];
+}
+
+func __nexora_first_positive(values: Array) -> int {
+    for (values) [value] {
+        if (value == nil) continue;
+        let number = __nexora_safe_int(value, -1);
+        if (number < 0 and type(value) != "int") continue;
+        if (number > 0) return number;
+    }
+    return 0;
+}
+
+func nexora_extract_cached_tokens(raw: dict) -> Array {
+    let promptSafe = __nexora_details_of(raw, "prompt_tokens_details");
+    if (promptSafe == nil) promptSafe = {};
+    let inputSafe = __nexora_details_of(raw, "input_tokens_details");
+    if (inputSafe == nil) inputSafe = {};
+
+    let names = ["prompt_tokens_details.cached_tokens",
+        "input_tokens_details.cached_tokens",
+        "input_tokens_details.cache_read_input_tokens",
+        "input_tokens_details.cache_read_tokens",
+        "cached_tokens",
+        "input_cached_tokens",
+        "prompt_cache_hit_tokens",
+        "cache_read_input_tokens",
+        "cache_read_tokens"];
+    let values = [promptSafe.get("cached_tokens", nil),
+        inputSafe.get("cached_tokens", nil),
+        inputSafe.get("cache_read_input_tokens", nil),
+        inputSafe.get("cache_read_tokens", nil),
+        raw.get("cached_tokens", nil),
+        raw.get("input_cached_tokens", nil),
+        raw.get("prompt_cache_hit_tokens", nil),
+        raw.get("cache_read_input_tokens", nil),
+        raw.get("cache_read_tokens", nil)];
+    for (0..names.length()) [const &i] {
+        let value = values[i];
+        if (value == nil) continue;
+        let number = __nexora_safe_int(value, -1);
+        if (number < 0 and type(value) != "int") continue;
+        if (number > 0) return [number, names[i]];
+    }
+    return __nexora_scan_cached_tokens(raw);
+}
+
+func nexora_extract_cache_miss_tokens(raw: dict) -> int {
+    let inputSafe = __nexora_details_of(raw, "input_tokens_details");
+    if (inputSafe == nil) inputSafe = {};
+    return __nexora_first_positive([raw.get("prompt_cache_miss_tokens", nil),
+        raw.get("cache_miss_input_tokens", nil),
+        inputSafe.get("prompt_cache_miss_tokens", nil),
+        inputSafe.get("cache_miss_input_tokens", nil)]);
+}
+
+func nexora_extract_uncached_tokens(raw: dict) -> int {
+    let promptSafe = __nexora_details_of(raw, "prompt_tokens_details");
+    if (promptSafe == nil) promptSafe = {};
+    let inputSafe = __nexora_details_of(raw, "input_tokens_details");
+    if (inputSafe == nil) inputSafe = {};
+    return __nexora_first_positive([raw.get("prompt_cache_miss_tokens", nil),
+        promptSafe.get("prompt_cache_miss_tokens", nil),
+        promptSafe.get("cache_miss_input_tokens", nil),
+        raw.get("cache_creation_input_tokens", nil),
+        raw.get("cache_write_input_tokens", nil),
+        raw.get("created_cache_tokens", nil),
+        promptSafe.get("cache_creation_input_tokens", nil),
+        promptSafe.get("cache_write_input_tokens", nil),
+        promptSafe.get("created_cache_tokens", nil),
+        inputSafe.get("cache_creation_input_tokens", nil),
+        inputSafe.get("cache_write_input_tokens", nil),
+        inputSafe.get("created_cache_tokens", nil)]);
+}
+
+func nexora_extract_cache_creation_tokens(raw: dict) -> int {
+    let promptSafe = __nexora_details_of(raw, "prompt_tokens_details");
+    if (promptSafe == nil) promptSafe = {};
+    let inputSafe = __nexora_details_of(raw, "input_tokens_details");
+    if (inputSafe == nil) inputSafe = {};
+    return __nexora_first_positive([raw.get("cache_creation_input_tokens", nil),
+        raw.get("cache_write_input_tokens", nil),
+        raw.get("created_cache_tokens", nil),
+        promptSafe.get("cache_creation_input_tokens", nil),
+        promptSafe.get("cache_write_input_tokens", nil),
+        promptSafe.get("created_cache_tokens", nil),
+        inputSafe.get("cache_creation_input_tokens", nil),
+        inputSafe.get("cache_write_input_tokens", nil),
+        inputSafe.get("created_cache_tokens", nil)]);
+}
+
+// 口径与 Provider._extract_usage_io 一致：OpenAI prompt_tokens 已含缓存，
+// Anthropic input_tokens 需把读写缓存加回；total 缺失时用 raw+output 补齐。
+func nexora_extract_usage_io(rawUsage: dict) {
+    let hasPrompt = rawUsage.get("prompt_tokens", nil) != nil;
+    let hasInput = rawUsage.get("input_tokens", nil) != nil;
+
+    let rawInput = __nexora_safe_int(rawUsage.get("prompt_tokens", 0));
+    if (!hasPrompt) rawInput = __nexora_safe_int(rawUsage.get("input_tokens", 0));
+
+    let completionDetails = __nexora_details_of(rawUsage, "completion_tokens_details");
+    if (completionDetails == nil) completionDetails = {};
+    let outputDetails = __nexora_details_of(rawUsage, "output_tokens_details");
+    if (outputDetails == nil) outputDetails = {};
+
+    let output = __nexora_safe_int(rawUsage.get("completion_tokens",
+        rawUsage.get("output_tokens", 0)));
+    let total = __nexora_safe_int(rawUsage.get("total_tokens", 0));
+
+    let cachedPair = nexora_extract_cached_tokens(rawUsage);
+    let cached = cachedPair[0];
+    let cachedSource = cachedPair[1];
+    let uncached = nexora_extract_uncached_tokens(rawUsage);
+    let creation = nexora_extract_cache_creation_tokens(rawUsage);
+
+    let anthropicStyle = !hasPrompt and hasInput and (cached > 0 or creation > 0);
+    if (anthropicStyle) {
+        rawInput = __nexora_safe_int(rawUsage.get("input_tokens", 0)) + cached + creation;
+        uncached = __nexora_safe_int(rawUsage.get("input_tokens", 0)) + creation;
+        if (cached > 0 and cachedSource == "") cachedSource = "cache_read_input_tokens";
+    }
+
+    let reasoning = __nexora_safe_int(completionDetails.get("reasoning_tokens", 0));
+    if (reasoning <= 0) reasoning = __nexora_safe_int(outputDetails.get("reasoning_tokens", 0));
+
+    let cost = __nexora_safe_float(rawUsage.get("total_cost", rawUsage.get("cost", 0.0)));
+
+    if (cached <= 0) {
+        let miss = nexora_extract_cache_miss_tokens(rawUsage);
+        if (miss > 0) {
+            cached = rawInput - miss;
+            if (cached < 0) cached = 0;
+            cachedSource = "derived_from_cache_miss";
+        }
+    }
+    if (cached > rawInput) cached = rawInput;
+    if (cached < 0) cached = 0;
+    if (rawInput < 0) rawInput = 0;
+    if (total <= 0) total = rawInput + output;
+
+    let answer = {"raw_input": rawInput,
+        "cached_input": cached,
+        "cached_tokens_source": cachedSource,
+        "uncached_input": uncached,
+        "effective_input": rawInput - cached,
+        "output": output,
+        "total": total,
+        "reasoning_tokens": reasoning,
+        "cost": cost};
+    if (answer["effective_input"] < 0) answer["effective_input"] = 0;
+    return answer;
+}
+
+// 本轮 usage 归一并累加进 totals；无 usage 返回 nil（基线 _accumulate_usage）。
+func nexora_accumulate_usage(roundUsage, totals: dict) {
+    if (roundUsage == nil) return nil;
+    if (type(roundUsage) != "dict") return nil;
+    let empty = true;
+    for (roundUsage) [&key: &value] {
+        empty = false;
+        break;
+    }
+    if (empty) return nil;
+
+    let io = nexora_extract_usage_io(roundUsage);
+    totals["raw_input"] = __nexora_safe_int(totals.get("raw_input", 0)) +
+        __nexora_safe_int(io.get("raw_input", 0));
+    totals["cached_input"] = __nexora_safe_int(totals.get("cached_input", 0)) +
+        __nexora_safe_int(io.get("cached_input", 0));
+    totals["effective_input"] = __nexora_safe_int(totals.get("effective_input", 0)) +
+        __nexora_safe_int(io.get("effective_input", 0));
+    totals["output"] = __nexora_safe_int(totals.get("output", 0)) +
+        __nexora_safe_int(io.get("output", 0));
+    totals["total"] = __nexora_safe_int(totals.get("total", 0)) +
+        __nexora_safe_int(io.get("total", 0));
+    totals["cost"] = __nexora_safe_float(totals.get("cost", 0.0)) +
+        __nexora_safe_float(io.get("cost", 0.0));
+    return io;
+}
+
+// Provider tool_call 增量按 index 分组拼 arguments_delta，id/name 后到覆盖先到。
+// arguments 不是合法 JSON 对象时按基线落成 {}。
+func nexora_group_tool_calls(events: Array) -> Array {
+    let indexes: Array = [];
+    let ids: Array = [];
+    let names: Array = [];
+    let argumentsList: Array = [];
+
+    for (events) [event] {
+        let index = 0;
+        let eventId = nil;
+        let eventName = nil;
+        let delta = "";
+        try {
+            index = __nexora_safe_int(event.get("index", 0));
+            eventId = event.get("id", nil);
+            eventName = event.get("name", nil);
+            delta = event.get("arguments_delta", "");
+        } catch (&error) {
+            index = 0;
+        }
+        let slot = -1;
+        for (0..indexes.length()) [const &i] {
+            if (indexes[i] == index) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            indexes.append(index);
+            ids.append("");
+            names.append("");
+            argumentsList.append([]);
+            slot = indexes.length() - 1;
+        }
+        if (eventId != nil and type(eventId) == "string" and eventId != "") ids[slot] = eventId;
+        if (eventName != nil and type(eventName) == "string" and eventName != "") names[slot] = eventName;
+        if (delta == nil) delta = "";
+        argumentsList[slot].append(str(delta));
+    }
+
+    let result: Array = [];
+    for (0..indexes.length()) [const &i] {
+        let text = string_join(argumentsList[i]).strip();
+        let parsed = nil;
+        if (text == "") {
+            parsed = {};
+        } else {
+            try {
+                parsed = JSON.parse(text);
+            } catch (&error) {
+                parsed = {};
+            }
+            if (type(parsed) != "dict") parsed = {};
+        }
+        result.append({"id": ids[i], "name": names[i], "arguments": parsed});
+    }
+    return result;
+}
+
+func nexora_stringify_content(content) -> string {
+    if (content == nil) return "";
+    if (type(content) == "string") return content;
+    if (type(content) == "Array") {
+        let textParts: Array = [];
+        for (content) [part] {
+            if (type(part) != "dict") continue;
+            let piece = part.get("text", "");
+            if (piece == nil) continue;
+            textParts.append(str(piece));
+        }
+        return string_join(textParts);
+    }
+    try {
+        return JSON.stringify(content);
+    } catch (&error) {
+        return str(content);
+    }
+}
+
+// Routes._translate_event：AgentLoop 事件转 SSE 前端格式，未知类型原样透传。
+func nexora_translate_event(event: dict) {
+    let eventType = str(event.get("type", ""));
+
+    if (eventType == "function_call") {
+        return {"type": "function_call",
+            "name": event.get("name", nil),
+            "call_id": event.get("call_id", nil),
+            "arguments": JSON.stringify(event.get("arguments", {}))};
+    }
+    if (eventType == "function_result") {
+        let success = false;
+        if (event.get("success", false)) success = true;
+        return {"type": "function_result",
+            "name": event.get("name", nil),
+            "call_id": event.get("call_id", nil),
+            "result": event.get("result", nil),
+            "success": success};
+    }
+    if (eventType == "question") {
+        return {"type": "question",
+            "question": event.get("question", nil),
+            "await": true};
+    }
+    if (eventType == "conversation_id") {
+        return {"type": "conversation_id",
+            "conversation_id": event.get("conversation_id", nil)};
+    }
+    if (eventType == "content") {
+        return {"type": "content", "content": event.get("content", nil)};
+    }
+    if (eventType == "error") {
+        return {"type": "error", "message": event.get("message", nil)};
+    }
+    if (eventType == "auto_retry") {
+        return {"type": "auto_retry",
+            "reason": event.get("reason", nil),
+            "attempt": event.get("attempt", nil),
+            "limit": event.get("limit", nil),
+            "delay_ms": event.get("delay_ms", 0),
+            "round": event.get("round", nil)};
+    }
+    if (eventType == "done") return {"type": "done"};
+    if (eventType == "model_info") {
+        let searchEnabled = false;
+        if (event.get("search_enabled", false)) searchEnabled = true;
+        return {"type": "model_info",
+            "model_name": event.get("model_name", nil),
+            "provider": event.get("provider", nil),
+            "search_enabled": searchEnabled};
+    }
+    if (eventType == "token_usage") {
+        return {"type": "token_usage",
+            "input_tokens": event.get("input_tokens", nil),
+            "output_tokens": event.get("output_tokens", nil),
+            "total_tokens": event.get("total_tokens", nil),
+            "raw_input_tokens": event.get("raw_input_tokens", nil),
+            "cached_input_tokens": event.get("cached_input_tokens", nil)};
+    }
+    if (eventType == "context_injection") {
+        let blocks = event.get("blocks", nil);
+        if (blocks == nil) blocks = [];
+        return {"type": "context_injection",
+            "head_chars": event.get("head_chars", nil),
+            "blocks": blocks};
+    }
+    let passthrough = {};
+    for (event) [&key: &value] {
+        passthrough[key] = value;
+    }
+    return passthrough;
+}

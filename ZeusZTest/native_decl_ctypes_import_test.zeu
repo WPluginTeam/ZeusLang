@@ -1,0 +1,14 @@
+import zeus.ctypes;
+
+@native decl ImportedDouble = DOUBLE;
+@native decl ImportedWide = LONGLONG;
+@native decl ImportedMedium = INT32;
+@native decl ImportedSmall = INT8;
+
+var real: ImportedDouble = 1.25;
+var wide: ImportedWide = 4294967296;
+var medium: ImportedMedium = -123456;
+var small: ImportedSmall = -128;
+if (real != 1.25 or wide != 4294967296) throw "ordinary ctypes import wide types";
+if (medium != -123456 or small != -128) throw "ordinary ctypes import narrow types";
+print("NATIVE_DECL_CTYPES_IMPORT_PASS");

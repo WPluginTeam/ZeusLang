@@ -5,9 +5,21 @@
 
 #include "zeus_rt.h"
 
+namespace {
+
+int zeusProcessExitCode = 0;
+
+}
+
+extern "C" void zeus_runtime_set_exit_code(ZeusValue* result, int code) {
+    zeus_value_init_nil(result);
+    zeusProcessExitCode = code;
+}
+
 int main() {
     try {
-        return zeus_entry();
+        zeus_entry();
+        return zeusProcessExitCode;
     } catch (...) {
         zeus_exception_report_current();
         return 1;

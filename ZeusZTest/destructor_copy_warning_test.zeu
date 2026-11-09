@@ -1,0 +1,62 @@
+// P0045 的触发样本：
+//   OwnsResource   —— 有 [~] 没有 [@=]，应当报警
+//   DeclaresBind   —— 有 [~] 也有 [@=] -> &T（绑定），不报
+//   DeclaresCopy   —— 有 [~] 也有 [@=] -> T（显式拷贝），不报
+//   PlainValue     —— 没有 [~]，不报
+
+class OwnsResource {
+    using &this;
+
+    let handle = 0;
+
+    func operator[~]() {
+        this.handle = 0;
+    }
+}
+
+class DeclaresBind {
+    using &this;
+
+    let handle = 0;
+
+    func operator[@=]() -> &DeclaresBind {
+        return this;
+    }
+
+    func operator[~]() {
+        this.handle = 0;
+    }
+}
+
+class DeclaresCopy {
+    using &this;
+
+    let handle = 0;
+
+    func operator[@=]() -> DeclaresCopy {
+        let copy = new DeclaresCopy();
+        copy.handle = this.handle;
+        return copy;
+    }
+
+    func operator[~]() {
+        this.handle = 0;
+    }
+}
+
+class PlainValue {
+    using &this;
+
+    let x = 0;
+}
+
+func main() {
+    let owner = new OwnsResource();
+    let bound = new DeclaresBind();
+    let copied = new DeclaresCopy();
+    let plain = new PlainValue();
+    print("DESTRUCTOR_COPY_WARNING_TEST_DONE", owner.handle, bound.handle,
+        copied.handle, plain.x);
+}
+
+main();

@@ -19,12 +19,15 @@
 #include "./ZeusBuiltins/BuiltinCompilation.hpp"
 #include "./ZeusLLVM/ZeusEmitter.hpp"
 #include "./ZeusLLVM/ZeusModuleGraph.hpp"
+#include "./ZeusLLVM/ZeusModulePruner.hpp"
+#include "./ZeusLLVM/ZeusReachabilityPruner.hpp"
 #include "./ZeusRunner/ZeusThread.hpp"
 #include "./ZeusTyping/TypeChecker.hpp"
 
 #include <algorithm>
 #include <iostream>
 #include <cstdio>
+#include <limits>
 #include <new>
 #include <unordered_map>
 #ifdef _WIN32
@@ -57,6 +60,7 @@ int main(int argc, char* argv[]) {
     bool timingFlag = false;
     bool enableHotspot = true;
     bool strictCapture = true;
+    bool targetMCU = false;
     ZeusDebug::BreakpointConfig breakpointConfig;
 
     // 第一遍：扫描全局 flag
@@ -64,6 +68,10 @@ int main(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
+        if (a == "--mcu" || a == "--arduino") {
+            targetMCU = true;
+            continue;
+        }
         if (a == "--strict-decl") {
             strictDecl = true;
             continue;
@@ -128,6 +136,8 @@ int main(int argc, char* argv[]) {
     while (argIndex < argc) {
         std::string a = argv[argIndex];
         if (a == "--strict-decl" ||
+            a == "--mcu" ||
+            a == "--arduino" ||
             a == "--debug" ||
             a == "-t" ||
             a == "--time" ||
@@ -252,7 +262,7 @@ int main(int argc, char* argv[]) {
         VMException::setSourceCode(code);
 
         std::vector<ZeusDiagnostics::Diagnostic> sourceDiagnostics;
-        const auto prescanTokens = LexerParser::parse(code, &sourceDiagnostics);
+        const auto prescanTokens = ZeusParser::parseNativeTypeSource(code, srcPath, sourceDiagnostics);
         ZeusDiagnostics::append(
             sourceDiagnostics,
             ZeusParser::validateSyntax(prescanTokens)
@@ -264,11 +274,21 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         bool usesBytesLiteral = false;
-        for (const auto& token : prescanTokens) {
-            if (std::holds_alternative<LexerType::BytesLiteral>(token)) {
+        for (size_t tokenIndex = 0; tokenIndex < prescanTokens.size(); ++tokenIndex) {
+            if (std::holds_alternative<LexerType::BytesLiteral>(prescanTokens[tokenIndex])) {
                 usesBytesLiteral = true;
                 break;
             }
+            // `bytes(...)` 转换同样需要 zeus.byte：它的 impl 提供了 bytes 的方法实现，
+            // 只出现转换调用（没有 b"..." 字面量）时以前不导入，返回值的方法只能靠
+            // 静态内联，动态派发会报 "no type impl"。
+            if (!std::holds_alternative<LexerType::Keyword>(prescanTokens[tokenIndex])) continue;
+            if (std::get<LexerType::Keyword>(prescanTokens[tokenIndex]).name != "bytes") continue;
+            if (tokenIndex + 1 >= prescanTokens.size()) continue;
+            if (!std::holds_alternative<LexerType::Operator>(prescanTokens[tokenIndex + 1])) continue;
+            if (std::get<LexerType::Operator>(prescanTokens[tokenIndex + 1]).symbol != "(") continue;
+            usesBytesLiteral = true;
+            break;
         }
 
         const auto builtinTarget = emitLLVM
@@ -286,6 +306,122 @@ int main(int argc, char* argv[]) {
         };
         std::unordered_map<std::string, ModuleTypeInference>
             moduleTypeInferences;
+
+        auto findModule = [&](const std::string& packageName) -> const ZeusLLVM::ModuleNode* {
+            for (const auto& module : llvmModuleGraph.dependencyOrder) {
+                if (module.packageName == packageName) return &module;
+            }
+            return nullptr;
+        };
+
+        auto registerImportedInterfaces = [&](ZeusTypeInfer::TypeChecker& checker,
+                                               const std::vector<ZeusLLVM::ModuleImport>& imports) {
+            for (const auto& imported : imports) {
+                const ZeusLLVM::ModuleNode* module = findModule(imported.packageName);
+                if (module == nullptr) continue;
+
+                std::string alias = imported.alias;
+                if (alias.empty()) {
+                    alias = imported.packageName;
+                    const size_t dot = alias.find_last_of('.');
+                    if (dot != std::string::npos) alias = alias.substr(dot + 1);
+                }
+
+                for (const auto& function : module->functions) {
+                    if (function.isClassMethod && !function.ownerType.empty()) {
+                        if (!module->isExported(function.ownerType)) continue;
+                    } else if (!module->isExported(function.name)) {
+                        continue;
+                    }
+                    if (function.isClassMethod && !function.ownerType.empty()) {
+                        std::vector<std::string> ownerTypes;
+                        if (const auto* builtin =
+                                ZeusBuiltins::findTypeImplementation(function.ownerType)) {
+                            ownerTypes.push_back(std::string(builtin->canonicalName));
+                        } else {
+                            ownerTypes.push_back(
+                                imported.packageName + "." + function.ownerType);
+                            ownerTypes.push_back(
+                                imported.namespaceMode
+                                    ? alias + "." + function.ownerType
+                                    : function.ownerType);
+                        }
+
+                        for (const auto& ownerType : ownerTypes) {
+                            checker.registerExternalMethod(
+                                ownerType,
+                                function.name,
+                                function.returnType,
+                                function.parameterNames,
+                                function.parameterTypes,
+                                function.typeParameters,
+                                function.ownerTypeParameters,
+                                function.isStaticMethod
+                            );
+                        }
+                        continue;
+                    }
+
+                    checker.registerExternalFunction(
+                        imported.packageName + "." + function.name,
+                        function.returnType,
+                        function.parameterTypes
+                    );
+                    if (imported.namespaceMode) {
+                        checker.registerExternalFunction(
+                            alias + "." + function.name,
+                            function.returnType,
+                            function.parameterTypes
+                        );
+                    } else {
+                        checker.registerExternalFunction(
+                            function.name,
+                            function.returnType,
+                            function.parameterTypes
+                        );
+                    }
+                }
+                for (const auto& classInterface : module->classes) {
+                    if (!module->isExported(classInterface.name)) continue;
+                    checker.registerExternalClass(
+                        imported.packageName + "." + classInterface.name,
+                        classInterface.fields
+                    );
+                    checker.registerExternalClass(
+                        imported.namespaceMode
+                            ? alias + "." + classInterface.name
+                            : classInterface.name,
+                        classInterface.fields
+                    );
+                }
+            }
+        };
+
+        auto importedInterfaceContracts = [&](const std::vector<ZeusLLVM::ModuleImport>& imports) {
+            ZeusParser::InterfaceContractRegistry contracts;
+            for (const auto& imported : imports) {
+                const ZeusLLVM::ModuleNode* module = findModule(imported.packageName);
+                if (module == nullptr) continue;
+                auto visibleContracts = module->interfaceContracts;
+                for (auto contract = visibleContracts.contractsByName.begin();
+                     contract != visibleContracts.contractsByName.end();) {
+                    if (!module->isExported(contract->first)) {
+                        contract = visibleContracts.contractsByName.erase(contract);
+                    } else {
+                        ++contract;
+                    }
+                }
+                ZeusParser::bindImportedInterfaceContracts(
+                    contracts,
+                    imported.packageName,
+                    imported.alias,
+                    imported.namespaceMode,
+                    visibleContracts
+                );
+            }
+            return contracts;
+        };
+
         if (emitLLVM) {
             llvmModuleGraph = ZeusLLVM::buildModuleGraph(
                 srcPath, code, builtinCompilationPlan.implementationModules);
@@ -294,80 +430,9 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
 
-            auto findModule = [&](const std::string& packageName) -> const ZeusLLVM::ModuleNode* {
-                for (const auto& module : llvmModuleGraph.dependencyOrder) {
-                    if (module.packageName == packageName) return &module;
-                }
-                return nullptr;
-            };
-
-            auto registerImportedInterfaces = [&](ZeusTypeInfer::TypeChecker& checker,
-                                                   const std::vector<ZeusLLVM::ModuleImport>& imports) {
-                for (const auto& imported : imports) {
-                    const ZeusLLVM::ModuleNode* module = findModule(imported.packageName);
-                    if (module == nullptr) continue;
-
-                    std::string alias = imported.alias;
-                    if (alias.empty()) {
-                        alias = imported.packageName;
-                        const size_t dot = alias.find_last_of('.');
-                        if (dot != std::string::npos) alias = alias.substr(dot + 1);
-                    }
-
-                    for (const auto& function : module->functions) {
-                        checker.registerExternalFunction(
-                            imported.packageName + "." + function.name,
-                            function.returnType,
-                            function.parameterTypes
-                        );
-                        if (imported.namespaceMode) {
-                            checker.registerExternalFunction(
-                                alias + "." + function.name,
-                                function.returnType,
-                                function.parameterTypes
-                            );
-                        } else {
-                            checker.registerExternalFunction(
-                                function.name,
-                                function.returnType,
-                                function.parameterTypes
-                            );
-                        }
-                    }
-                    for (const auto& classInterface : module->classes) {
-                        checker.registerExternalClass(
-                            imported.packageName + "." + classInterface.name,
-                            classInterface.fields
-                        );
-                        checker.registerExternalClass(
-                            imported.namespaceMode
-                                ? alias + "." + classInterface.name
-                                : classInterface.name,
-                            classInterface.fields
-                        );
-                    }
-                }
-            };
-
-            auto importedInterfaceContracts = [&](const std::vector<ZeusLLVM::ModuleImport>& imports) {
-                ZeusParser::InterfaceContractRegistry contracts;
-                for (const auto& imported : imports) {
-                    const ZeusLLVM::ModuleNode* module = findModule(imported.packageName);
-                    if (module == nullptr) continue;
-                    ZeusParser::bindImportedInterfaceContracts(
-                        contracts,
-                        imported.packageName,
-                        imported.alias,
-                        imported.namespaceMode,
-                        module->interfaceContracts
-                    );
-                }
-                return contracts;
-            };
-
             for (const auto& module : llvmModuleGraph.dependencyOrder) {
                 std::vector<ZeusDiagnostics::Diagnostic> moduleDiagnostics;
-                auto moduleTokens = LexerParser::parse(module.source, &moduleDiagnostics);
+                auto moduleTokens = ZeusParser::parseNativeTypeSource(module.source, module.path, moduleDiagnostics);
                 ZeusDiagnostics::append(
                     moduleDiagnostics,
                     ZeusParser::validateSyntax(moduleTokens)
@@ -381,11 +446,13 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
                 auto moduleAst = TreeParser::parse(moduleTokens, &moduleDiagnostics);
+                ZeusParser::selectPlatformBlocks(moduleAst);
                 ZeusParser::selectBackendBlocks(
                     moduleAst, ZeusParser::BackendTarget::LLVM);
+                std::vector<ZeusDiagnostics::Diagnostic> moduleWarnings;
                 ZeusDiagnostics::append(
                     moduleDiagnostics,
-                    ZeusParser::validateParsedSyntax(moduleAst)
+                    ZeusParser::validateParsedSyntax(moduleAst, &moduleWarnings)
                 );
                 if (!moduleDiagnostics.empty()) {
                     for (const auto& diagnostic : moduleDiagnostics) {
@@ -394,6 +461,11 @@ int main(int argc, char* argv[]) {
                         ) << std::endl;
                     }
                     return 1;
+                }
+                for (const auto& warning : moduleWarnings) {
+                    std::cout << ZeusDiagnostics::render(
+                        warning, module.path, module.source, "warning"
+                    ) << std::endl;
                 }
                 const auto interfaceDiagnostics =
                     ZeusParser::validateInterfaceConformance(
@@ -428,7 +500,7 @@ int main(int argc, char* argv[]) {
             }
 
             std::vector<ZeusDiagnostics::Diagnostic> parseDiagnostics;
-            auto typingTokens = LexerParser::parse(code, &parseDiagnostics);
+            auto typingTokens = ZeusParser::parseNativeTypeSource(code, srcPath, parseDiagnostics);
             ZeusDiagnostics::append(
                 parseDiagnostics,
                 ZeusParser::validateSyntax(typingTokens)
@@ -440,6 +512,7 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             auto typingAst = TreeParser::parse(typingTokens, &parseDiagnostics);
+            ZeusParser::selectPlatformBlocks(typingAst);
             ZeusParser::selectBackendBlocks(
                 typingAst, ZeusParser::BackendTarget::LLVM);
             ZeusDiagnostics::append(
@@ -474,6 +547,39 @@ int main(int argc, char* argv[]) {
         // 快速词法分析找imports
         // Reuse the tokenized source snapshot created before module planning.
         
+        if (!emitLLVM) {
+            for (size_t i = 0; i < prescanTokens.size(); ++i) {
+                if (i + 2 < prescanTokens.size() &&
+                    std::holds_alternative<LexerType::Operator>(prescanTokens[i]) &&
+                    std::get<LexerType::Operator>(prescanTokens[i]).symbol == "@" &&
+                    std::holds_alternative<LexerType::Keyword>(prescanTokens[i + 1]) &&
+                    std::get<LexerType::Keyword>(prescanTokens[i + 1]).name == "static" &&
+                    std::holds_alternative<LexerType::Operator>(prescanTokens[i + 2]) &&
+                    std::get<LexerType::Operator>(prescanTokens[i + 2]).symbol == ";") {
+                    std::cout << ZeusDiagnostics::render(
+                        { "E_STATIC_VM", "File is marked with '@static;' and can only be compiled via AOT, not in VM",
+                          std::get<LexerType::Operator>(prescanTokens[i]).line,
+                          std::get<LexerType::Operator>(prescanTokens[i]).column },
+                        srcPath, code) << std::endl;
+                    return 1;
+                }
+                if (i >= 5 &&
+                    std::holds_alternative<LexerType::Operator>(prescanTokens[i - 5]) &&
+                    std::get<LexerType::Operator>(prescanTokens[i - 5]).symbol == "@" &&
+                    std::holds_alternative<LexerType::Keyword>(prescanTokens[i - 4]) &&
+                    std::get<LexerType::Keyword>(prescanTokens[i - 4]).name == "native" &&
+                    std::holds_alternative<LexerType::Keyword>(prescanTokens[i]) &&
+                    std::get<LexerType::Keyword>(prescanTokens[i]).name == "import") {
+                    std::cout << ZeusDiagnostics::render(
+                        { "E_NATIVE_IMPORT_VM", "@native header import is only supported in AOT compilation, not in VM",
+                          std::get<LexerType::Keyword>(prescanTokens[i]).line,
+                          std::get<LexerType::Keyword>(prescanTokens[i]).column },
+                        srcPath, code) << std::endl;
+                    return 1;
+                }
+            }
+        }
+
         // 简单扫描:找 "import" keyword后跟package name  
         std::vector<std::string> importedPackages;
         for (size_t i = 0; i < prescanTokens.size(); ++i) {
@@ -546,9 +652,76 @@ int main(int argc, char* argv[]) {
             ZEUS_DEBUG_PRINT("[Main] VM package dependency order contains %zu packages", importedPackages.size());
         }
 
+        // A compile unit inherits the merged globals of everything its imports
+        // pull in, so the symbol tables have to cover that whole closure. Names
+        // that arrive only through an import's own imports have no entry
+        // otherwise, and their compile-time slot index names whichever global
+        // the merge happened to put in that position.
+        const auto bindTransitiveImports = [&](
+            const std::vector<ZeusLLVM::ModuleImport>& roots,
+            const std::string& ownerPackage
+        ) {
+            std::vector<std::string> pending;
+            for (const auto& imported : roots) {
+                pending.push_back(imported.packageName);
+            }
+
+            std::unordered_set<std::string> visited;
+            if (!ownerPackage.empty()) visited.insert(ownerPackage);
+
+            while (!pending.empty()) {
+                const std::string closureName = pending.back();
+                pending.pop_back();
+                if (!visited.insert(closureName).second) continue;
+
+                const ZeusLLVM::ModuleNode* closureModule = nullptr;
+                for (const auto& module : llvmModuleGraph.dependencyOrder) {
+                    if (module.packageName == closureName) {
+                        closureModule = &module;
+                        break;
+                    }
+                }
+                if (closureModule == nullptr) continue;
+
+                ZeusPackage::CompiledPackage* closurePackage = nullptr;
+                for (auto* candidate : packages) {
+                    if (candidate != nullptr && candidate->packageName == closureName) {
+                        closurePackage = candidate;
+                        break;
+                    }
+                }
+
+                if (closurePackage != nullptr) {
+                    const int offset = packageGlobalOffsets[closurePackage->packageName];
+                    for (size_t gi = 0; gi < closurePackage->globalNames.size(); ++gi) {
+                        const std::string& globalName = closurePackage->globalNames[gi];
+                        if (!closurePackage->isExported(globalName)) continue;
+                        // A direct import registered the name already, either
+                        // bare or under its namespace alias. It keeps it.
+                        if (IRScope::importedGlobalSlots.find(globalName) !=
+                            IRScope::importedGlobalSlots.end()) {
+                            continue;
+                        }
+                        IRScope::importedGlobalSlots[globalName] =
+                            offset + static_cast<int>(gi);
+                        for (const auto& function : closureModule->functions) {
+                            if (function.name != globalName) continue;
+                            IRScope::registerImportedFunction(
+                                globalName,
+                                closurePackage->packageName + "." + globalName);
+                            break;
+                        }
+                    }
+                }
+
+                for (const auto& imported : closureModule->imports) {
+                    pending.push_back(imported.packageName);
+                }
+            }
+        };
+
         if (!importedPackages.empty()) {
-            ZEUS_DEBUG_PRINT("[Main] Phase 2: Loading packages (without re-registering globals)...");
-            
+            ZEUS_DEBUG_PRINT("[Main] Phase 2: Loading packages (without re-registering globals)...");            
             for (const auto& packageName : importedPackages) {
                 ZEUS_DEBUG_PRINT("[Main] Loading package: %s", packageName.c_str());
 
@@ -591,6 +764,7 @@ int main(int argc, char* argv[]) {
 
                             for (size_t gi = 0; gi < dependency->globalNames.size(); ++gi) {
                                 const std::string& globalName = dependency->globalNames[gi];
+                                if (!dependency->isExported(globalName)) continue;
                                 const int globalIndex = dependencyOffset + static_cast<int>(gi);
                                 const std::string localName = imported.namespaceMode
                                     ? alias + "." + globalName
@@ -606,8 +780,26 @@ int main(int argc, char* argv[]) {
                                         break;
                                     }
                                 }
+
+                                // 完整包路径同样可用：zeus.string.str(...) 与别名形式并存。
+                                const std::string fullPathName =
+                                    dependency->packageName + "." + globalName;
+                                if (fullPathName != localName) {
+                                    IRScope::importedGlobalSlots[fullPathName] = globalIndex;
+                                    if (dependencyModule != nullptr) {
+                                        for (const auto& function : dependencyModule->functions) {
+                                            if (function.name != globalName) continue;
+                                            IRScope::importedFunctionNames.insert(fullPathName);
+                                            IRScope::importedFunctionTargets[fullPathName] =
+                                                dependency->packageName + "." + globalName;
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
+
+                        bindTransitiveImports(currentModule->imports, packageName);
                     }
                 }
                 
@@ -640,6 +832,7 @@ int main(int argc, char* argv[]) {
                                 vmNamespaceAliasSentinels[sentinel] =
                                     ZeusPackage::moduleNamespaceGlobalName(packageName, alias);
                                 for (const auto& functionName : dependency->functionNames) {
+                                    if (!dependency->isExported(functionName)) continue;
                                     auto functionIt = std::find(
                                         dependency->globalNames.begin(), dependency->globalNames.end(), functionName);
                                     if (functionIt == dependency->globalNames.end()) continue;
@@ -652,6 +845,16 @@ int main(int argc, char* argv[]) {
                                     IRScope::importedFunctionNames.insert(localName);
                                     IRScope::importedFunctionTargets[localName] =
                                         dependency->packageName + "." + functionName;
+
+                                    // 完整包路径同样可用：zeus.string.str(...)。
+                                    const std::string fullPathName =
+                                        dependency->packageName + "." + functionName;
+                                    if (fullPathName != localName) {
+                                        IRScope::importedGlobalSlots[fullPathName] = functionSentinel;
+                                        IRScope::importedFunctionNames.insert(fullPathName);
+                                        IRScope::importedFunctionTargets[fullPathName] =
+                                            dependency->packageName + "." + functionName;
+                                    }
                                 }
                                 continue;
                             }
@@ -663,6 +866,7 @@ int main(int argc, char* argv[]) {
                                 return 1;
                             }
                             for (size_t gi = 0; gi < dependency->globalNames.size(); ++gi) {
+                                if (!dependency->isExported(dependency->globalNames[gi])) continue;
                                 const int sentinel = -2 - nextImportSentinel++;
                                 IRScope::importedGlobalSlots[dependency->globalNames[gi]] = sentinel;
                                 vmImportedGlobalSlotSentinels[sentinel] =
@@ -671,6 +875,15 @@ int main(int argc, char* argv[]) {
                                     dependency->functionNames.end()) {
                                     IRScope::importedFunctionNames.insert(dependency->globalNames[gi]);
                                     IRScope::importedFunctionTargets[dependency->globalNames[gi]] =
+                                        dependency->packageName + "." + dependency->globalNames[gi];
+
+                                    // 完整包路径同样可用：zeus.string.str(...)，即使这条 import
+                                    // 是把名字直接引进来的（非命名空间模式）。
+                                    const std::string fullPathName =
+                                        dependency->packageName + "." + dependency->globalNames[gi];
+                                    IRScope::importedGlobalSlots[fullPathName] = sentinel;
+                                    IRScope::importedFunctionNames.insert(fullPathName);
+                                    IRScope::importedFunctionTargets[fullPathName] =
                                         dependency->packageName + "." + dependency->globalNames[gi];
                                 }
                             }
@@ -704,7 +917,8 @@ int main(int argc, char* argv[]) {
                             packageName, module->path, strictDecl,
                             ZeusParser::BackendTarget::LLVM,
                             &inference->second.functionReturnTypes,
-                            &inference->second.bindingTypesByNode);
+                            &inference->second.bindingTypesByNode,
+                            &module->source);
                         ZeusPackage::loadedPackages[packageName] = std::move(compiled);
                         pkg = &ZeusPackage::loadedPackages[packageName];
                     } catch (const std::exception& ex) {
@@ -799,6 +1013,7 @@ int main(int argc, char* argv[]) {
                         pkg->globalNames.size(), pkgName.c_str());
                         
                     for (const auto& globalName : pkg->globalNames) {
+                        if (!pkg->isExported(globalName)) continue;
                         std::string prefixedName = pkgName + "." + globalName;
                         
                         auto it = IRScope::globals.find(prefixedName);
@@ -820,6 +1035,7 @@ int main(int argc, char* argv[]) {
         ZEUS_DEBUG_PRINT("[Main] Phase 2.75: Pre-registering namespace import aliases...");
 
         const auto& prescanTokensForAlias = prescanTokens;
+        std::vector<size_t> rootNamespaceAliasSlots;
 
         for (size_t i = 0; i < prescanTokensForAlias.size(); ++i) {
             if (std::holds_alternative<LexerType::Keyword>(prescanTokensForAlias[i])) {
@@ -878,7 +1094,8 @@ int main(int argc, char* argv[]) {
 
                         ZEUS_DEBUG_PRINT("[Main] About to register namespace alias: '%s' (pkgName='%s', isNamespaceMode=%d)", 
                             aliasName.c_str(), pkgName.c_str(), isNamespaceMode ? 1 : 0);
-                        IRScope::declareGlobal(aliasName);
+                        rootNamespaceAliasSlots.push_back(
+                            static_cast<size_t>(IRScope::declareGlobal(aliasName)));
                         ZEUS_DEBUG_PRINT("[Main] Pre-registered namespace alias: %s", aliasName.c_str());
                     }
                     else if (!pkgName.empty()) {
@@ -893,6 +1110,7 @@ int main(int argc, char* argv[]) {
                                     pkg->globalNames.size(), pkgName.c_str());
                                     
                                 for (const auto& globalName : pkg->globalNames) {
+                                    if (!pkg->isExported(globalName)) continue;
                                     // 同时注册带前缀和不带前缀的版本
                                     // 带前缀的已经在Phase 2.5注册,这里只注册不带前缀的
                                     // 它们会映射到相同的索引
@@ -936,6 +1154,11 @@ int main(int argc, char* argv[]) {
                 for (const auto& function : module->functions) {
                     ZEUS_DEBUG_PRINT("[emit-llvm] module '%s' interface function='%s'",
                         module->packageName.c_str(), function.name.c_str());
+                    if (function.isClassMethod
+                            ? !package->isExported(function.ownerType)
+                            : !package->isExported(function.name)) {
+                        continue;
+                    }
                     auto nameIt = std::find(package->globalNames.begin(), package->globalNames.end(), function.name);
                     if (nameIt == package->globalNames.end()) continue;
                     const int index = offset + static_cast<int>(std::distance(package->globalNames.begin(), nameIt));
@@ -974,6 +1197,7 @@ int main(int argc, char* argv[]) {
 
                 for (size_t gi = 0; gi < package->globalNames.size(); ++gi) {
                     const std::string& globalName = package->globalNames[gi];
+                    if (!package->isExported(globalName)) continue;
                     const std::string localName = imported.namespaceMode
                         ? alias + "." + globalName
                         : globalName;
@@ -989,10 +1213,23 @@ int main(int argc, char* argv[]) {
                             break;
                         }
                     }
+                    // 完整包路径同样可用：zeus.string.str(...) 与别名形式并存。
+                    const std::string fullPathName =
+                        package->packageName + "." + globalName;
+                    if (fullPathName != localName) {
+                        IRScope::importedGlobalSlots[fullPathName] = offset + static_cast<int>(gi);
+                        if (isFunction) {
+                            IRScope::importedFunctionNames.insert(fullPathName);
+                            IRScope::importedFunctionTargets[fullPathName] =
+                                package->packageName + "." + globalName;
+                        }
+                    }
                     ZEUS_DEBUG_PRINT("[emit-llvm] import binding '%s' -> global %d (function=%d)",
                         localName.c_str(), offset + static_cast<int>(gi), isFunction ? 1 : 0);
                 }
             }
+
+            bindTransitiveImports(llvmModuleGraph.rootImports, std::string());
         }
 
         if (!emitLLVM) {
@@ -1003,6 +1240,7 @@ int main(int argc, char* argv[]) {
                 const std::string alias = ZeusPackage::defaultImportAlias(imported);
                 const int offset = packageGlobalOffsets[package->packageName];
                 for (const auto& functionName : package->functionNames) {
+                    if (!package->isExported(functionName)) continue;
                     auto functionIt = std::find(
                         package->globalNames.begin(), package->globalNames.end(), functionName);
                     if (functionIt == package->globalNames.end()) continue;
@@ -1042,12 +1280,21 @@ int main(int argc, char* argv[]) {
             ZeusPackage::CompiledPackage* package =
                 ZeusPackage::findPackage(packages, imported.packageName);
             if (package == nullptr) continue;
+            auto visibleContracts = package->interfaceContracts;
+            for (auto contract = visibleContracts.contractsByName.begin();
+                 contract != visibleContracts.contractsByName.end();) {
+                if (!package->isExported(contract->first)) {
+                    contract = visibleContracts.contractsByName.erase(contract);
+                } else {
+                    ++contract;
+                }
+            }
             ZeusParser::bindImportedInterfaceContracts(
                 rootImportedInterfaceContracts,
                 imported.packageName,
                 imported.alias,
                 imported.importMode == 1,
-                package->interfaceContracts
+                visibleContracts
             );
         }
 
@@ -1056,13 +1303,59 @@ int main(int argc, char* argv[]) {
             emitLLVM ? ZeusParser::BackendTarget::LLVM
                      : ZeusParser::BackendTarget::VirtualMachine,
             !packages.empty(),
-            rootImportedInterfaceContracts
+            rootImportedInterfaceContracts,
+            [&](ZeusTypeInfer::TypeChecker& checker) {
+                if (emitLLVM) {
+                    registerImportedInterfaces(checker, llvmModuleGraph.rootImports);
+                }
+            }
         );
         
         // 设置源文件信息用于错误报告
         cr.sourceFilePath = srcPath;
         cr.sourceCode = code;
+        cr.mcuTarget = targetMCU;
 
+        std::vector<ZeusPackage::PrivateGlobalSlot> privatePackageGlobals;
+        for (auto* package : packages) {
+            if (package == nullptr || !package->hasExplicitExportList) continue;
+            const auto offset = packageGlobalOffsets.find(package->packageName);
+            if (offset == packageGlobalOffsets.end()) continue;
+            for (size_t i = 0; i < package->globalNames.size(); ++i) {
+                const std::string& name = package->globalNames[i];
+                if (package->isExported(name)) continue;
+                const size_t index = static_cast<size_t>(offset->second) + i;
+                if (index > static_cast<size_t>(std::numeric_limits<int>::max())) continue;
+                privatePackageGlobals.push_back({
+                    package->packageName, name, static_cast<int>(index)
+                });
+            }
+        }
+        std::vector<std::string> mainGlobalNamesForVisibility;
+        const size_t packageGlobalNameCount = std::min(
+            static_cast<size_t>(packageGlobalCount), cr.globalNames.size()
+        );
+        mainGlobalNamesForVisibility.assign(
+            cr.globalNames.begin() + packageGlobalNameCount, cr.globalNames.end()
+        );
+        const auto visibilityDiagnostics = ZeusPackage::findPrivateGlobalReferences(
+            cr.program, privatePackageGlobals, std::string(), mainGlobalNamesForVisibility
+        );
+        if (!visibilityDiagnostics.empty()) {
+            std::cout << ZeusDiagnostics::render(
+                visibilityDiagnostics.front(), srcPath, code
+            ) << std::endl;
+            return 1;
+        }
+
+        if (emitLLVM) {
+            const auto pruning = ZeusLLVM::pruneUnusedModuleBodies(
+                cr.program, llvmModuleGraph,
+                builtinCompilationPlan.implementationModules,
+                packages, packageGlobalOffsets
+            );
+            ZeusLLVM::reportModulePruning(pruning, llvmModuleGraph);
+        }
         for (const auto& diagnostic : cr.diagnostics) {
             std::cout << ZeusDiagnostics::render(diagnostic, srcPath, code) << std::endl;
         }
@@ -1114,6 +1407,15 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
+        size_t mainGlobalStart = static_cast<size_t>(packageGlobalCount);
+        for (const size_t aliasSlot : rootNamespaceAliasSlots) {
+            if (aliasSlot >= static_cast<size_t>(packageGlobalCount)) {
+                mainGlobalStart = std::max(mainGlobalStart, aliasSlot + 1);
+            }
+        }
+        const size_t mainGlobalEnd =
+            static_cast<size_t>(packageGlobalCount) + cr.globalNames.size();
+
         // 第四阶段:合并包chunks
         if (!packages.empty()) {
             ZEUS_DEBUG_PRINT("[Main] Phase 4: Merging package chunks...");
@@ -1123,12 +1425,17 @@ int main(int argc, char* argv[]) {
             
             // 合并包到主程序
             // 注意: 传入mainAndAliasGlobals,这样索引从0开始,对应运行时的packageGlobalCount+0...
-            ZeusPackage::mergePackageChunks(cr.program, mainAndAliasGlobals, packages, imports, packageGlobalOffsets);
+            ZeusPackage::mergePackageChunks(cr.program, mainAndAliasGlobals, packages, imports, packageGlobalOffsets,
+                emitLLVM ? ZeusParser::BackendTarget::LLVM : ZeusParser::BackendTarget::VirtualMachine);
             
             // mergePackageChunks修改了mainAndAliasGlobals,现在它包含完整的globalNames (package + main)
             // 需要赋值回cr.globalNames,这样VM才能正确访问
             cr.globalNames = mainAndAliasGlobals;
         }
+        cr.packageGlobalCount = static_cast<size_t>(packageGlobalCount);
+        cr.mainGlobalStart = mainGlobalStart;
+        cr.mainGlobalEnd = mainGlobalEnd;
+        cr.hasGlobalTeardownLayout = true;
 
         // Package implementations add the concrete impl signatures needed by
         // value-returning setters. Resolve them after package merge for both
@@ -1178,6 +1485,17 @@ int main(int argc, char* argv[]) {
         IRStaticOperator::annotate(cr.program);
 
         if (emitLLVM) {
+            const auto reachabilityPruning = ZeusLLVM::pruneUnreachablePackageCode(
+                cr, llvmModuleGraph,
+                builtinCompilationPlan.implementationModules,
+                packages
+            );
+            if (!reachabilityPruning.ok) {
+                std::cout << reachabilityPruning.error << std::endl;
+                return 1;
+            }
+            ZeusLLVM::reportReachabilityPruning(reachabilityPruning);
+
             ZeusLLVM::EmitResult emitted = ZeusLLVM::emit(cr);
             for (const auto& warning : emitted.warnings) {
                 std::cout << "[emit-llvm] warning: " << warning << std::endl;
@@ -1194,7 +1512,7 @@ int main(int argc, char* argv[]) {
             const std::string outPath = emitOut.empty() ? (srcPath + ".ll") : emitOut;
             std::ofstream output(outPath);
             if (!output) {
-                std::cout << "Cannot open output file: " << outPath << std::endl;
+                std::cout << "Cannot open output file: " << outPath << " [reason: " << strerror(errno) << "]" << std::endl;
                 return 1;
             }
             output << emitted.text;

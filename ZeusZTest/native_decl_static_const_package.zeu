@@ -1,0 +1,4 @@
+let const InferredID = 3;
+let const TypedID: int = 2;
+
+using {InferredID, TypedID};

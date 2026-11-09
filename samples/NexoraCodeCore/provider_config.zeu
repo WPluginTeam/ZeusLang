@@ -1,0 +1,88 @@
+import zeus.byte;
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import zeus.string;
+import zeus.url;
+
+import samples.NexoraCodeCore.storage;
+
+// Provider 配置读取与请求连接信息（S10）。对应 Python：
+//   Provider.ProviderConfig / load_providers / ProviderClient._completions_url
+//   ProviderClient._headers
+//
+// 从 `data/providers.json` 读取连接配置；脱敏展示、模板规范化和设置写入
+// 由 provider_settings.zeu 与 provider_templates.zeu 处理。
+
+func nexora_load_providers(path: string) {
+    let doc = JSON.parse(nexora_core_read_text(path));
+    if (type(doc) != "dict") throw new Exception("providers 文件顶层必须是对象");
+    let providers = doc.get("providers", nil);
+    if (type(providers) != "Array") throw new Exception("providers 文件缺少 providers 列表");
+    return {"default_id": doc.get("default_id", ""), "providers": providers};
+}
+
+func nexora_find_provider(doc: dict, name: string) {
+    for (doc.get("providers", [])) [entry] {
+        if (type(entry) != "dict") continue;
+        if (entry.get("name", "") == name) return entry;
+    }
+    return nil;
+}
+
+func __nexora_url_tail_is_version(tail: string) -> bool {
+    // 字节比较：AOT 动态路径的字符串关系比较（<, >）尚未注册，
+    // 与 policy.zeu 的 __nexora_is_hex 一样走字节码点。
+    let raw = bytes(tail);
+    if (raw.length() < 2) return false;
+    if (__bytes_get(raw, 0) != 118) return false; // 'v'
+    for (1..raw.length()) [const &i] {
+        let code = __bytes_get(raw, i);
+        if (code < 48 or code > 57) return false;
+    }
+    return true;
+}
+
+// 拼 /chat/completions：自带则直用，末段是 /vN 则追加，全量路径则补 /v1。
+// 基线 ProviderClient._completions_url 的三分支，校验同样拒绝
+// credentials / query / fragment（loopback 才允许 http，与远控 URL 策略一致）。
+func nexora_completions_url(baseUrl: string) -> string {
+    let parsed: URLParts = URL.parse(baseUrl.strip());
+    if (!parsed.hasAuthority or parsed.authority.length() == 0) {
+        throw new Exception("provider base_url 缺少 host");
+    }
+    if (parsed.scheme != "http" and parsed.scheme != "https") {
+        throw new Exception("provider base_url 必须是 http(s)");
+    }
+    if (parsed.authority.index("@") >= 0 or parsed.hasQuery or parsed.hasFragment) {
+        throw new Exception("provider base_url 不能带 credentials、query 或 fragment");
+    }
+
+    let base = parsed.scheme + "://" + parsed.authority + parsed.path;
+    for (base.endswith("/") and base.length() > 0) {
+        base = base.slice(0, base.length() - 1);
+    }
+    if (base.endswith("/chat/completions")) return base;
+
+    let tail = base;
+    let slash = base.rindex("/");
+    if (slash >= 0) tail = base.slice(slash + 1, base.length());
+    if (__nexora_url_tail_is_version(tail)) return base + "/chat/completions";
+    return base + "/v1/chat/completions";
+}
+
+func nexora_provider_headers(apiKey: string) {
+    let headers = {"Content-Type": "application/json"};
+    let key = apiKey.strip();
+    if (key != "") headers["Authorization"] = "Bearer " + key;
+    return headers;
+}
+
+func nexora_provider_timeout(entry: dict) -> int {
+    let seconds = entry.get("timeout_seconds", 120.0);
+    if (type(seconds) != "int" and type(seconds) != "float") return 120;
+    if (seconds <= 0) return 120;
+    let millis = int(seconds * 1000);
+    if (millis < 1000) millis = 1000;
+    return millis;
+}

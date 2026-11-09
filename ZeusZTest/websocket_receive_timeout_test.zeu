@@ -1,0 +1,47 @@
+import zeus.websocket;
+import zeus.ssl;
+import zeus.exception;
+import zeus.time;
+
+func assertReceiveTimeout(condition, message: string) {
+    if (!condition) throw new Exception("websocket receive timeout test failed: " + message);
+}
+
+// The peer answers the handshake, stays silent for 400 ms, then sends one frame.
+let url = "wss://127.0.0.1:__PORT__/slow";
+let client = WebSocketClient.connect(url, 1048576, createInsecureContext());
+assertReceiveTimeout(client.isOpen, "the client connects");
+
+var timedOut = false;
+var timedOutType = "";
+let timeoutStart = monotonic_ns();
+try {
+    let early = client.receive(150);
+    print("UNEXPECTED_EARLY_FRAME", early);
+} catch (&failure) {
+    timedOut = true;
+    timedOutType = type(failure);
+    print("RECEIVE_TIMEOUT_TYPE", timedOutType);
+}
+let timeoutMillis = int((monotonic_ns() - timeoutStart) / 1000000);
+assertReceiveTimeout(timedOut, "a silent peer makes receive(timeout) time out");
+assertReceiveTimeout(timedOutType == "WebSocketTimeout", "the timeout keeps its own type");
+assertReceiveTimeout(timeoutMillis >= 130, "the wait lasts for the requested timeout");
+assertReceiveTimeout(client.isOpen, "a timeout leaves the connection open");
+print("RECEIVE_TIMEOUT_MS", timeoutMillis);
+
+// A timed-out connection still carries traffic in both directions: nothing was
+// consumed, so the frame that arrives late is delivered intact.
+client.sendText("{\"type\":\"ping\"}");
+let late = client.receive(3000);
+assertReceiveTimeout(late != nil and late.isText(), "the delayed frame is delivered");
+assertReceiveTimeout(late.text == "after-timeout", "the delayed frame survives the timeout");
+print("LATE_FRAME", late.text);
+
+client.sendText("{\"type\":\"ping\"}");
+let second = client.receive(3000);
+assertReceiveTimeout(second != nil and second.text == "second",
+    "a second timed read delivers the next frame");
+
+client.close(1000, "done");
+print("WEBSOCKET_RECEIVE_TIMEOUT_PASS");

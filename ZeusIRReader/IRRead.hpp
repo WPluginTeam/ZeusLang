@@ -170,7 +170,6 @@ namespace IRBinary {
         if (!readString(ifs, meta.compilerName)) { if (errorMsg) *errorMsg = "File too short (compilerName)"; return prog; }
         if (!readString(ifs, meta.buildTime)) { if (errorMsg) *errorMsg = "File too short (buildTime)"; return prog; }
         if (!readString(ifs, meta.buildVersion)) { if (errorMsg) *errorMsg = "File too short (buildVersion)"; return prog; }
-        if (outMeta) *outMeta = meta;
 
         std::streamoff programStart = ifs.tellg();
 
@@ -198,6 +197,19 @@ namespace IRBinary {
                     } else if (ent.type == SECTION_INSTRUCTION_METADATA) {
                         metadataSection = ent;
                         hasMetadataSection = true;
+                    } else if (ent.type == SECTION_GLOBAL_TEARDOWN_LAYOUT) {
+                        if (ent.size != 3 * sizeof(uint32_t)) {
+                            if (errorMsg) *errorMsg = "Invalid global teardown layout section";
+                            return {};
+                        }
+                        ifs.seekg(ent.offset, std::ios::beg);
+                        if (!ifs || !readUint32(ifs, meta.packageGlobalCount) ||
+                            !readUint32(ifs, meta.mainGlobalStart) ||
+                            !readUint32(ifs, meta.mainGlobalEnd)) {
+                            if (errorMsg) *errorMsg = "Failed to read global teardown layout";
+                            return {};
+                        }
+                        meta.hasGlobalTeardownLayout = true;
                     }
                 }
             }
@@ -207,6 +219,15 @@ namespace IRBinary {
             if (errorMsg) *errorMsg = "Version 4 IR is missing its instruction metadata section";
             return {};
         }
+
+        if (meta.hasGlobalTeardownLayout &&
+            (meta.packageGlobalCount > meta.mainGlobalStart ||
+             meta.mainGlobalStart > meta.mainGlobalEnd ||
+             meta.mainGlobalEnd > globals.size())) {
+            if (errorMsg) *errorMsg = "Invalid global teardown layout";
+            return {};
+        }
+        if (outMeta) *outMeta = meta;
 
         if (outGlobalNames) *outGlobalNames = globals;
 

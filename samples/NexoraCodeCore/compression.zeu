@@ -1,0 +1,278 @@
+import zeus.byte;
+import zeus.dict;
+import zeus.exception;
+import zeus.string;
+import samples.NexoraCodeCore.context;
+import samples.NexoraCodeCore.turn_injection;
+
+// 上下文压缩（S12）。对应 Python ContextManager.prepare 的确定性部分：
+//
+//   1. 装得下 -> direct（原样发送）
+//   2. 装不下但历史里有超长工具结果 -> 反复砍半最长的几条（只改本次发送副本）
+//   3. 还装不下 -> 把「当前轮之前」的历史折成一段摘要，当前轮保持原样
+//   4. 当前轮自己就超窗 -> overflow
+//
+// 和基线的差异：基线的摘要由模型生成（分批调用 + 流式回传），这里留了一根
+// summarize(messages) -> string 的缝交给宿主；没接缝时退化成确定性摘要
+// （每条历史取首行），保证对话不会因为超窗直接卡死。
+//
+// 压缩结果由调用方继续处理；折叠历史后可通过 Agent Loop 的 saveContext
+// 回调把摘要、边界和当前完整注入一并持久化。
+
+var const COMPRESSION_TRIM_MIN_CHARS = 2000;
+var const COMPRESSION_TRIM_FLOOR_CHARS = 256;
+var const COMPRESSION_SUMMARY_HEADER =
+    "以下是此前对话的压缩摘要，仅作为历史资料；具体事实可以用工具核实：\n";
+
+// 按字节截断但保持 UTF-8 完整：从截断点往回退到字符首字节。
+func nexora_truncate_utf8(text: string, limit: int) -> string {
+    let raw = bytes(text);
+    if (raw.length() <= limit) return text;
+    let cut = limit;
+    for (cut > 0) {
+        let code = __bytes_get(raw, cut);
+        if (code < 128 or code >= 192) break;
+        cut = cut - 1;
+    }
+    return raw.slice(0, cut).decode("utf-8");
+}
+
+// 返回：
+//   {"status": "direct" | "trimmed" | "folded" | "overflow",
+//    "messages": Array | nil,
+//    "before": 压缩前估算, "estimate": 压缩后估算, "budget": 目标上限,
+//    "droppedMessages": 被折掉的消息数, "summary": 摘要文本（没有则 ""）}
+func nexora_compress(messages: Array, window: int, output: int, tools = nil, summarize = nil) {
+    if (window <= 0 or output <= 0 or output >= window) {
+        throw new Exception("上下文预算非法：窗口 " + str(window) +
+            "，单次输出上限 " + str(output));
+    }
+
+    let budget = nexora_adaptive_input_limit(window, output);
+    let before = __nexora_compress_estimate(messages, tools);
+
+    if (budget <= 0) {
+        return __nexora_compress_result("overflow", nil, before, before, budget, 0, "");
+    }
+    if (before < budget) {
+        return __nexora_compress_result("direct", messages, before, before, budget, 0, "");
+    }
+
+    // 第 1 层：收缩超长工具结果。改的是副本，历史原文不动。
+    let trial = __nexora_compress_copy(messages);
+    let trimmed = __nexora_compress_trim_tools(trial, tools, budget);
+    if (trimmed != nil) {
+        return __nexora_compress_result("trimmed", trimmed, before,
+            __nexora_compress_estimate(trimmed, tools), budget, 0, "");
+    }
+
+    // 第 2 层：把当前轮之前的历史折成摘要。
+    let folded = __nexora_compress_fold(messages, window, output, tools, summarize);
+    if (folded != nil) {
+        let result = __nexora_compress_result("folded", folded["messages"], before,
+            __nexora_compress_estimate(folded["messages"], tools), budget,
+            folded["droppedMessages"], folded["summary"]);
+        result["injectionIndex"] = folded["injectionIndex"];
+        result["historyCutIndex"] = folded["historyCutIndex"];
+        return result;
+    }
+
+    return __nexora_compress_result("overflow", nil, before, before, budget, 0, "");
+}
+
+func __nexora_compress_result(status: string, messages, before: int, estimate: int,
+        budget: int, dropped: int, summary: string) {
+    return {
+        "status": status,
+        "messages": messages,
+        "before": before,
+        "estimate": estimate,
+        "budget": budget,
+        "droppedMessages": dropped,
+        "summary": summary
+    };
+}
+
+func __nexora_compress_estimate(messages: Array, tools) -> int {
+    if (tools == nil) return nexora_estimate_tokens({"messages": messages});
+    return nexora_estimate_tokens({"messages": messages, "tools": tools});
+}
+
+// 逐条复制消息：dict 的底层存储是共享的，直接 append 会改到调用方的历史。
+func __nexora_compress_copy(messages: Array) -> Array {
+    let copy: Array = [];
+    for (messages) [message] {
+        copy.append(__nexora_compress_copy_one(message));
+    }
+    return copy;
+}
+
+func __nexora_compress_copy_one(message) {
+    let entry = {};
+    if (type(message) != "dict") return entry;
+    for (message) [&key: &value] {
+        entry[key] = value;
+    }
+    return entry;
+}
+
+func __nexora_compress_head_tail(text: string, head: int, tail: int) -> string {
+    let length = text.length();
+    if (length <= head + tail) return text;
+    let omitted = length - head - tail;
+    let headPart = nexora_truncate_utf8(text, head);
+    // 尾部起点必须落在字符首字节上，否则回填的 JSON 会带坏字节。
+    let raw = bytes(text);
+    let start = length - tail;
+    for (start < length) {
+        let code = __bytes_get(raw, start);
+        if (code < 128 or code >= 192) break;
+        start = start + 1;
+    }
+    return headPart + "\n\n[工具结果过长，已省略中间 " + str(omitted) +
+        " 字节；如需完整内容请用更精确的参数重新调用工具]\n\n" +
+        text.slice(start, length);
+}
+
+// 反复砍半当前最长的工具结果，直到装进 budget。每次从原文重新裁剪，
+// 避免省略提示一层层叠加。装不下（单条 user 消息就超窗）返回 nil。
+func __nexora_compress_trim_tools(messages: Array, tools, budget: int) {
+    let indexes: Array = [];
+    for (0..messages.length()) [const &index] {
+        let message = messages[index];
+        if (type(message) != "dict") continue;
+        if (str(message.get("role", "")) != "tool") continue;
+        let content = message.get("content", nil);
+        if (type(content) != "string") continue;
+        if (content.length() <= COMPRESSION_TRIM_MIN_CHARS) continue;
+        indexes.append(index);
+    }
+    if (indexes.length() == 0) return nil;
+
+    let keep: Array = [];
+    for (indexes) [&index] {
+        keep.append(str(messages[index].get("content", "")).length());
+    }
+
+    // 每轮减半，32 轮足够覆盖任何真实窗口；上限只是防御性兜底。
+    for (0..32) [const &round] {
+        if (__nexora_compress_estimate(messages, tools) < budget) return messages;
+
+        let longest = 0;
+        for (1..indexes.length()) [const &slot] {
+            if (keep[slot] > keep[longest]) longest = slot;
+        }
+        if (keep[longest] <= COMPRESSION_TRIM_FLOOR_CHARS) return nil;
+
+        let nextKeep = int(keep[longest] / 2);
+        if (nextKeep < COMPRESSION_TRIM_FLOOR_CHARS) nextKeep = COMPRESSION_TRIM_FLOOR_CHARS;
+        keep[longest] = nextKeep;
+
+        let index = indexes[longest];
+        let source = str(messages[index].get("content", ""));
+        let half = int(nextKeep / 2);
+        if (half < 1) half = 1;
+        let entry = __nexora_compress_copy_one(messages[index]);
+        entry["content"] = __nexora_compress_head_tail(source, half, half);
+        messages.set(index, entry);
+    }
+    return nil;
+}
+
+// 把「当前用户轮次之前」的历史折成一段摘要消息。system 前缀保留，
+// 当前轮（含它的工具结果）原样跟在摘要后面。
+func __nexora_compress_fold(messages: Array, window: int, output: int, tools, summarize) {
+    let systemCount = 0;
+    for (0..messages.length()) [const &index] {
+        let message = messages[index];
+        if (type(message) != "dict") break;
+        if (str(message.get("role", "")) != "system") break;
+        if (nexora_injection_is_message(message)) break;
+        systemCount = systemCount + 1;
+    }
+
+    let lastUser = -1;
+    for (0..messages.length()) [const &index] {
+        let message = messages[index];
+        if (type(message) != "dict") continue;
+        if (str(message.get("role", "")) == "user") lastUser = index;
+    }
+    if (lastUser <= systemCount) return nil;
+
+    let dropped: Array = [];
+    for (systemCount..lastUser) [const &index] {
+        dropped.append(messages[index]);
+    }
+    if (dropped.length() == 0) return nil;
+
+    let limit = nexora_compress_summary_chars(window, output);
+    let summary = "";
+    if (summarize != nil) {
+        summary = nexora_truncate_utf8(str(summarize(dropped)), limit);
+    } else {
+        summary = __nexora_compress_digest(dropped, limit);
+    }
+    if (summary.strip() == "") summary = "(较早的 " + str(dropped.length()) + " 条消息)";
+
+    let rebuilt: Array = [];
+    for (0..systemCount) [const &index] {
+        rebuilt.append(__nexora_compress_copy_one(messages[index]));
+    }
+    rebuilt.append({"role": "user", "content": COMPRESSION_SUMMARY_HEADER + summary});
+    let injectionIndex = rebuilt.length();
+    for (lastUser..messages.length()) [const &index] {
+        rebuilt.append(messages[index]);
+    }
+
+    if (__nexora_compress_estimate(rebuilt, tools) >= nexora_adaptive_input_limit(window, output)) {
+        return nil;
+    }
+    return {
+        "messages": rebuilt,
+        "summary": summary,
+        "droppedMessages": dropped.length(),
+        "injectionIndex": injectionIndex,
+        "historyCutIndex": lastUser - systemCount
+    };
+}
+
+func nexora_compress_summary_chars(window: int, output: int) -> int {
+    let summaryOutput = output;
+    if (summaryOutput < 2048) summaryOutput = 2048;
+    if (summaryOutput > 8192) summaryOutput = 8192;
+    let capped = int(window / 3);
+    if (capped < 256) capped = 256;
+    if (summaryOutput > capped) summaryOutput = capped;
+    let chars = summaryOutput * 3;
+    if (chars < 2000) chars = 2000;
+    if (chars > 60000) chars = 60000;
+    return chars;
+}
+
+// 确定性摘要：每条历史取首行，超过字数上限就停。信息量不如模型摘要，
+// 但保证「压缩一定成功、内容一定可读」，不会把对话卡死在超窗上。
+func __nexora_compress_digest(dropped: Array, maxChars: int) -> string {
+    let pieces: Array = [];
+    let charCount = 0;
+    for (dropped) [message] {
+        if (type(message) != "dict") continue;
+        let role = str(message.get("role", "?"));
+        let line = __nexora_compress_first_line(str(message.get("content", "")), 120);
+        if (line == "") continue;
+        let piece = "- " + role + ": " + line + "\n";
+        if (charCount + piece.length() > maxChars) break;
+        pieces.append(piece);
+        charCount = charCount + piece.length();
+    }
+    return string_join(pieces);
+}
+
+func __nexora_compress_first_line(text: string, limit: int) -> string {
+    if (text == "") return "";
+    let newlineAt = text.index("\n");
+    let line = text;
+    if (newlineAt >= 0) line = text.slice(0, newlineAt);
+    line = line.strip();
+    if (line.length() > limit) line = nexora_truncate_utf8(line, limit) + "…";
+    return line;
+}

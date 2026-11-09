@@ -3,9 +3,109 @@
 // Provides comprehensive time functions similar to Python's time module
 // By Himpq
 
+@native("zeus_native_time_time", from="ZeusNativeRuntime")
+decl func __time_time() -> f64;
+
+@native("zeus_native_time_time_ms", from="ZeusNativeRuntime")
+decl func __time_time_ms() -> int64;
+
+@native("zeus_native_time_time_ns", from="ZeusNativeRuntime")
+decl func __time_time_ns() -> int64;
+
+@native("zeus_native_time_clock", from="ZeusNativeRuntime")
+decl func __time_clock() -> f64;
+
+@native("zeus_native_time_perf_counter", from="ZeusNativeRuntime")
+decl func __time_perf_counter() -> f64;
+
+@native("zeus_native_time_perf_counter_ns", from="ZeusNativeRuntime")
+decl func __time_perf_counter_ns() -> int64;
+
+@native("zeus_native_time_localtime", from="ZeusNativeRuntime")
+decl func __time_localtime(timestamp: f64) -> string;
+
+@native("zeus_native_time_gmtime", from="ZeusNativeRuntime")
+decl func __time_gmtime(timestamp: f64) -> string;
+
+@native("zeus_native_time_mktime", from="ZeusNativeRuntime")
+decl func __time_mktime(
+    year: int64,
+    month: int64,
+    day: int64,
+    hour: int64,
+    minute: int64,
+    second: int64,
+    daylightSaving: int64
+) -> int64;
+
+@native("zeus_native_time_strftime", from="ZeusNativeRuntime")
+decl func __time_strftime(
+    format: string,
+    year: int64,
+    month: int64,
+    day: int64,
+    hour: int64,
+    minute: int64,
+    second: int64,
+    weekday: int64,
+    yearDay: int64,
+    daylightSaving: int64
+) -> string;
+
+@native("zeus_native_time_strptime", from="ZeusNativeRuntime")
+decl func __time_strptime(text: string, format: string) -> string;
+
+@native("zeus_native_time_monotonic", from="ZeusNativeRuntime")
+decl func __time_monotonic() -> f64;
+
+@native("zeus_native_time_monotonic_ns", from="ZeusNativeRuntime")
+decl func __time_monotonic_ns() -> int64;
+
+@native("zeus_native_time_sleep", from="ZeusNativeRuntime")
+decl func __time_sleep(seconds: f64);
+
 // sleep(seconds): 暂停执行指定秒数（支持浮点数，如0.5表示500毫秒）
 func sleep(seconds) {
     __time_sleep(seconds);
+}
+
+func _time_decode_struct(encoded) {
+    if (encoded == nil) {
+        throw new Exception("time conversion failed");
+    }
+
+    let fields = encoded.split(",");
+    if (len(fields) != 9) {
+        throw new Exception("invalid native time structure");
+    }
+
+    return {
+        "tm_year": int(fields[0]),
+        "tm_mon": int(fields[1]),
+        "tm_mday": int(fields[2]),
+        "tm_hour": int(fields[3]),
+        "tm_min": int(fields[4]),
+        "tm_sec": int(fields[5]),
+        "tm_wday": int(fields[6]),
+        "tm_yday": int(fields[7]),
+        "tm_isdst": int(fields[8])
+    };
+}
+
+func _time_require_struct(value, functionName) {
+    let valueType = type(value);
+    if (valueType != "dict" and valueType != "object") {
+        throw new Exception(functionName + ": argument must be a time struct dict");
+    }
+}
+
+func _time_get_field(value, key, fallback) {
+    for (value) [&entryKey: &entryValue] {
+        if (entryKey == key and type(entryValue) == "int") {
+            return entryValue;
+        }
+    }
+    return fallback;
 }
 
 // time(): 返回当前时间的Unix时间戳（秒，浮点数）
@@ -23,6 +123,11 @@ func monotonic() {
     return __time_monotonic();
 }
 
+// monotonic_ns(): 单调时钟纳秒值，供需要整数期限计算的代码使用。
+func monotonic_ns() -> int {
+    return __time_monotonic_ns();
+}
+
 // perf_counter(): 返回高精度性能计数器（秒，用于精确计时）
 func perf_counter() {
     return __time_perf_counter();
@@ -35,7 +140,7 @@ func localtime(timestamp=nil) {
     if (timestamp == nil) {
         timestamp = __time_time();
     }
-    return __time_localtime(timestamp);
+    return _time_decode_struct(__time_localtime(timestamp));
 }
 
 // gmtime(timestamp=nil): 将时间戳转换为UTC时间的字典
@@ -45,13 +150,22 @@ func gmtime(timestamp=nil) {
     if (timestamp == nil) {
         timestamp = __time_time();
     }
-    return __time_gmtime(timestamp);
+    return _time_decode_struct(__time_gmtime(timestamp));
 }
 
 // mktime(timeDict): 将时间字典转换为时间戳
 // timeDict: 包含year, month, day, hour, minute, second的字典
 func mktime(timeDict) {
-    return __time_mktime(timeDict);
+    _time_require_struct(timeDict, "mktime");
+    return __time_mktime(
+        _time_get_field(timeDict, "tm_year", 1970),
+        _time_get_field(timeDict, "tm_mon", 1),
+        _time_get_field(timeDict, "tm_mday", 1),
+        _time_get_field(timeDict, "tm_hour", 0),
+        _time_get_field(timeDict, "tm_min", 0),
+        _time_get_field(timeDict, "tm_sec", 0),
+        _time_get_field(timeDict, "tm_isdst", -1)
+    );
 }
 
 // strftime(format, timeDict=nil): 格式化时间字符串
@@ -61,7 +175,22 @@ func strftime(format, timeDict=nil) {
     if (timeDict == nil) {
         timeDict = localtime();
     }
-    return __time_strftime(format, timeDict);
+    if (type(format) != "string") {
+        throw new Exception("strftime: format must be a string");
+    }
+    _time_require_struct(timeDict, "strftime");
+    return __time_strftime(
+        format,
+        _time_get_field(timeDict, "tm_year", 1970),
+        _time_get_field(timeDict, "tm_mon", 1),
+        _time_get_field(timeDict, "tm_mday", 1),
+        _time_get_field(timeDict, "tm_hour", 0),
+        _time_get_field(timeDict, "tm_min", 0),
+        _time_get_field(timeDict, "tm_sec", 0),
+        _time_get_field(timeDict, "tm_wday", 0),
+        _time_get_field(timeDict, "tm_yday", 1),
+        _time_get_field(timeDict, "tm_isdst", -1)
+    );
 }
 
 // strptime(timeStr, format): 解析时间字符串
@@ -69,7 +198,7 @@ func strftime(format, timeDict=nil) {
 // format: 格式字符串，如"%Y-%m-%d %H:%M:%S"
 // 返回: 时间字典
 func strptime(timeStr, format) {
-    return __time_strptime(timeStr, format);
+    return _time_decode_struct(__time_strptime(timeStr, format));
 }
 
 // ctime(timestamp=nil): 返回可读的时间字符串

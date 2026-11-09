@@ -42,14 +42,25 @@ namespace IRGenericClass {
         const std::string& specializedClass = {}
     ) {
         if (typeName.empty()) return typeName;
-        bool isReference = typeName.front() == '&';
-        const std::string base = isReference ? typeName.substr(1) : typeName;
+        const bool isReference = typeName.front() == '&';
+        const std::string stripped = isReference ? typeName.substr(1) : typeName;
+        const bool isNullable = !stripped.empty() && stripped.back() == '?';
+        const std::string base = isNullable ? stripped.substr(0, stripped.size() - 1) : stripped;
+
+        auto formatResult = [&](const std::string& substitutedBase) {
+            std::string res;
+            if (isReference) res += '&';
+            res += substitutedBase;
+            if (isNullable) res += '?';
+            return res;
+        };
+
         if (!originalClass.empty() && base == originalClass) {
-            return (isReference ? "&" : "") + specializedClass;
+            return formatResult(specializedClass);
         }
         const auto replacement = substitutions.find(base);
         if (replacement != substitutions.end()) {
-            return (isReference ? "&" : "") + replacement->second;
+            return formatResult(replacement->second);
         }
 
         std::string genericBase;
@@ -68,7 +79,7 @@ namespace IRGenericClass {
         if (!changed) return typeName;
         const std::string specialized =
             ZeusTypeInfer::genericSpecializationName(genericBase, typeArguments);
-        return (isReference ? "&" : "") + specialized;
+        return formatResult(specialized);
     }
 
     inline std::string rewriteQualifiedClassFunctionName(

@@ -6,16 +6,17 @@
 #include "../ZeusRunner/ZeusBuiltins/bytes.hpp"
 #include "../ZeusRunner/ZeusBuiltins/gc.hpp"
 #include "../ZeusRunner/ZeusBuiltins/ThreadNativeBuiltins.hpp"
-#include "../ZeusRunner/ZeusBuiltins/socket.hpp"
 #include "../ZeusRunner/ZeusBuiltins/crypto.hpp"
 #include "../ZeusRunner/ZeusBuiltins/websocket.hpp"
 #include "../ZeusRunner/ZeusBuiltins/type.hpp"
 #include "../ZeusRunner/ZeusBuiltins/strings.hpp"
-#include "../ZeusRunner/ZeusBuiltins/time.hpp"
+#include "../ZeusRunner/ZeusBuiltins/regex.hpp"
+#include "../ZeusRunner/ZeusBuiltins/io.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -24,10 +25,6 @@
 #include <vector>
 
 namespace {
-
-void registerStandaloneSocketBuiltins() {
-    ZeusBuiltins::registerSocketBuiltins();
-}
 
 [[noreturn]] void nativeCallPanic(const char* name, const char* reason) {
     throw std::runtime_error(std::string("[ZeusValue native ABI] ") +
@@ -45,7 +42,50 @@ ZeusNativeString nativeStringTextOf(const ZeusValue* value,
         classHandle->state->typeName != "String") {
         return nullptr;
     }
-    return zeus_value_intern_string(value);
+    return zeus_value_to_native_string(value);
+}
+
+using RegexNativeCallback = ZeusType::UniversalVariant (*)(
+    const std::vector<ZeusType::UniversalVariant>&);
+
+void invokeRegexNativeValue(
+    ZeusValue* out,
+    const char* symbol,
+    std::initializer_list<const ZeusValue*> values,
+    RegexNativeCallback callback
+) {
+    if (!out) nativeCallPanic(symbol, "null result pointer");
+    zeus_value_init_nil(out);
+
+    try {
+        std::vector<ZeusType::UniversalVariant> arguments;
+        arguments.reserve(values.size());
+        for (const ZeusValue* value : values) {
+            std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> box(
+                zeus_value_to_box(value), &zeus_box_release);
+            const ZeusNativeString text = nativeStringTextOf(value, box->v);
+            std::unique_ptr<const char, decltype(&zeus_string_release)> ownedText(
+                text, &zeus_string_release);
+            if (text) {
+                uint64_t length = 0;
+                std::memcpy(&length, text - sizeof(uint64_t), sizeof(length));
+                if (length > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+                    throw std::length_error("String argument is too large");
+                }
+                arguments.emplace_back(std::string(text, static_cast<size_t>(length)));
+            } else {
+                arguments.push_back(box->v);
+            }
+        }
+
+        ZeusBox result;
+        result.assignVariant(callback(arguments));
+        zeus_value_from_box(out, &result);
+    } catch (const std::exception& error) {
+        nativeCallPanic(symbol, error.what());
+    } catch (...) {
+        nativeCallPanic(symbol, "callback threw a non-standard exception");
+    }
 }
 
 void initializeStandaloneBuiltins() {
@@ -58,12 +98,8 @@ void initializeStandaloneBuiltins() {
         // Thread sleep/id/stop stay reachable through the standalone ZeusValue
         // call ABI; mutex operations use the direct zeus_mutex_* ABI instead.
         ZeusBuiltins::registerStandaloneThreadBuiltins();
-        // Both VM callbacks and standalone ZeusValue callbacks call the same
-        // process-wide Socket C ABI for handle and OS resource management.
-        registerStandaloneSocketBuiltins();
-        // The time builtins need no VM state, so imported packages that use them
-        // work in AOT binaries too.
-        ZeusBuiltins::registerTimeBuiltins();
+        // Console I/O is available to native AOT programs through the same builtin ABI.
+        ZeusBuiltins::registerIOBuiltins();
     });
 }
 
@@ -107,6 +143,8 @@ void zeus_value_native_call(
             // carries its text behind the registered toString method, so it is
             // normalized here instead of in every builtin.
             const ZeusNativeString text = nativeStringTextOf(values[i], box->v);
+            std::unique_ptr<const char, decltype(&zeus_string_release)> ownedText(
+                text, &zeus_string_release);
             if (text) {
                 uint64_t length = 0;
                 std::memcpy(&length, text - sizeof(uint64_t), sizeof(length));
@@ -129,6 +167,91 @@ void zeus_value_native_call(
         nativeCallPanic(builtin_name, "callback threw a non-standard exception");
     }
 }
+
+extern "C" {
+
+void zeus_re_compile(
+    ZeusValue* out,
+    const ZeusValue* pattern,
+    const ZeusValue* flags
+) {
+    invokeRegexNativeValue(out, "zeus_re_compile", {pattern, flags},
+        ZeusBuiltins::RegexBuiltinDetail::builtinCompile);
+}
+
+void zeus_re_matches(
+    ZeusValue* out,
+    const ZeusValue* pattern,
+    const ZeusValue* flags,
+    const ZeusValue* text,
+    const ZeusValue* mode
+) {
+    invokeRegexNativeValue(out, "zeus_re_matches", {pattern, flags, text, mode},
+        ZeusBuiltins::RegexBuiltinDetail::builtinMatches);
+}
+
+void zeus_re_match_at(
+    ZeusValue* out,
+    const ZeusValue* records,
+    const ZeusValue* index
+) {
+    invokeRegexNativeValue(out, "zeus_re_match_at", {records, index},
+        ZeusBuiltins::RegexBuiltinDetail::builtinMatchAt);
+}
+
+void zeus_re_findall(
+    ZeusValue* out,
+    const ZeusValue* pattern,
+    const ZeusValue* flags,
+    const ZeusValue* text
+) {
+    invokeRegexNativeValue(out, "zeus_re_findall", {pattern, flags, text},
+        ZeusBuiltins::RegexBuiltinDetail::builtinFindall);
+}
+
+void zeus_re_split(
+    ZeusValue* out,
+    const ZeusValue* pattern,
+    const ZeusValue* flags,
+    const ZeusValue* text,
+    const ZeusValue* maxsplit
+) {
+    invokeRegexNativeValue(out, "zeus_re_split", {pattern, flags, text, maxsplit},
+        ZeusBuiltins::RegexBuiltinDetail::builtinSplit);
+}
+
+void zeus_re_sub(
+    ZeusValue* out,
+    const ZeusValue* pattern,
+    const ZeusValue* flags,
+    const ZeusValue* replacement,
+    const ZeusValue* text,
+    const ZeusValue* count
+) {
+    invokeRegexNativeValue(out, "zeus_re_sub",
+        {pattern, flags, replacement, text, count},
+        ZeusBuiltins::RegexBuiltinDetail::builtinSub);
+}
+
+void zeus_re_subn(
+    ZeusValue* out,
+    const ZeusValue* pattern,
+    const ZeusValue* flags,
+    const ZeusValue* replacement,
+    const ZeusValue* text,
+    const ZeusValue* count
+) {
+    invokeRegexNativeValue(out, "zeus_re_subn",
+        {pattern, flags, replacement, text, count},
+        ZeusBuiltins::RegexBuiltinDetail::builtinSubn);
+}
+
+void zeus_re_escape(ZeusValue* out, const ZeusValue* pattern) {
+    invokeRegexNativeValue(out, "zeus_re_escape", {pattern},
+        ZeusBuiltins::RegexBuiltinDetail::builtinEscape);
+}
+
+} // extern "C"
 
 namespace {
 

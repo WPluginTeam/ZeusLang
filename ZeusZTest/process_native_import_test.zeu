@@ -1,0 +1,24 @@
+import zeus.process;
+import zeus.exception;
+
+func assertTrue(condition, message: string) {
+    if (!condition) {
+        throw new Exception("process test failed: " + message);
+    }
+}
+
+let outputChild = Process.run("cmd.exe /c echo zeus-process-output");
+assertTrue(outputChild.wait(), "captured child exits");
+assertTrue(outputChild.exitCodeOf() == 0, "captured child exit code");
+let captured = outputChild.output();
+assertTrue(captured.length() > 0, "stdout is captured");
+assertTrue(outputChild.output() == captured, "reading output does not change it");
+assertTrue(outputChild.outputSize() > 0, "capture file size is available");
+outputChild.close();
+
+let plainChild = Process.run("cmd.exe /c exit 7", false);
+assertTrue(plainChild.wait(10000), "uncaptured child exits before timeout");
+assertTrue(plainChild.exitCodeOf() == 7, "uncaptured child exit code");
+plainChild.close();
+
+print("PROCESS_NATIVE_IMPORT_PASS");

@@ -9,9 +9,11 @@ namespace ZeusBuiltins {
         const std::vector<ZeusType::UniversalVariant>& args
     ) {
         int64_t size = 0;
-        if (args.size() != 1 || !ZeusVMUtils::tryGetInt64(args[0], size) || size < 0) {
-            throw std::runtime_error("__zeus_malloc requires a nonnegative int size");
+        if (args.size() != 1 || !ZeusVMUtils::tryGetInt64(args[0], size)) {
+            throw std::runtime_error("__zeus_malloc requires an int size");
         }
+        // 负数/超限尺寸按运行时层的约定是“分配失败、返回地址 0”（见 mem.zeu 与
+        // ZeusMemoryABI.cpp）。这里不再单独抛错，否则 VM 与 AOT 的行为会分叉。
         return LexerType::Value(__zeus_malloc(size));
     }
 

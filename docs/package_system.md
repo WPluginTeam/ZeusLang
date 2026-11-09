@@ -16,6 +16,18 @@ var product = multiply(4, 7);
 var squared = square(6);
 ```
 
+### 模块导出名单
+
+模块可在顶层声明 `using {名称, ...};`。名单中的顶层变量、函数和 class 可通过全局导入或命名空间导入访问；未列出的名称仍可在模块内部使用。没有导出名单的模块继续导出全部全局名称。
+
+```zeus
+let version = "1.0";
+func add(a, b) { return a + b; }
+class Point {}
+
+using {version, add, Point};
+```
+
 ## 文件结构
 
 ```
@@ -211,12 +223,55 @@ Chunk #11: 主程序调用代码
 ...
 ```
 
+## 名字可见性与绑定
+
+一个编译单元能看到的名字，是它**依赖闭包**里的导出名：直接 `import` 的模块，以及
+这些模块自己 `import` 的模块，只要名字被导出（没有 `using {…}` 名单，或列在名单
+里），都可以用裸名字访问。
+
+```zeus
+// helper.zeu
+let helperValue = 11;
+func describeTag(value: string) -> string { return "helper:" + value; }
+
+// bridge.zeu
+import helper;
+func bridgeTag(value: string) -> string { return describeTag(value); }
+
+// main.zeu
+import bridge;                    // 只 import bridge，没有 import helper
+print(bridgeTag("a"));            // helper:a
+print(describeTag("b"));          // helper:b —— helper 在 bridge 的依赖闭包里
+print(helperValue);               // 11
+```
+
+三条规则：
+
+1. **可见范围 = 依赖闭包**。解释器和 AOT 读同一份名字表：AOT 会为闭包里每个模块
+   登记导出名及其最终槽位与限定函数名，因此不会出现“解释器能跑、AOT 报
+   `indirect call target ... classref`”。
+2. **声明优先**。模块里的 `let` / `func` 会遮蔽依赖闭包里的同名符号：声明拿到自己
+   的新槽位，旧符号的槽位保持原值（不会被写坏），旧名字退到
+   `<name>.__previous__`，此后裸名 `<name>` 指新声明。旧符号仍可用命名空间导入
+   访问：
+
+   ```zeus
+   import zeus.string [&strmod];
+   let str = "shadowed";          // 裸名 str 现在指这个变量
+   print(strmod.str(41));         // 41 —— 库函数还在自己的槽位里
+   ```
+3. **跨模块调用携带限定名**。调用被标注为 `pkg.func`（例如 `zeus.string.str`），
+   合并后的槽位号只用来取值，不再用来决定“调用谁”。
+
+这三条把旧文档里“可能存在命名冲突”变成了确定结果，不再取决于包的加载顺序。
+
 ## 限制和未来改进
 
 ### 当前限制
 1. 不支持包内函数的命名空间访问(如 `math.add()`)
 2. 包中的所有函数都导入到全局作用域
-3. 可能存在命名冲突
+3. 全局名字是扁平的：同一名字被多次声明时，最后一次声明接管裸名，早先的符号只能
+   用限定名访问；模块级变量与库函数同名时尤其要注意
 4. 循环导入未处理
 
 ### 未来改进方向

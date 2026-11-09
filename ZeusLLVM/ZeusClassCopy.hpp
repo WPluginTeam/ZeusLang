@@ -7,6 +7,19 @@
         return llvmFunctionName("__class_copy_default_" + typeName);
     }
 
+    const FunctionSignature* findClassCopyHook(const std::string& typeName) const {
+        for (const auto& function : functionSignatures) {
+            const FunctionSignature& candidate = function.second;
+            if (candidate.ownerType == typeName &&
+                candidate.operatorSymbol == "@=" &&
+                candidate.parameterTypes.size() == 1 &&
+                !candidate.isGenericTemplate) {
+                return &candidate;
+            }
+        }
+        return nullptr;
+    }
+
     template <typename EmitLine, typename FreshTemporary>
     void emitClassAssignmentCopy(const IRType::IRInstr& ins, NativeValue& value,
                                  EmitLine&& emit, FreshTemporary&& fresh) {
@@ -37,20 +50,16 @@
     std::string emitClassCopyHelpers() {
         std::string generated;
         for (const auto& entry : classLayouts) {
+            // Copy helpers are registered from the entry prologue and
+            // reference the class finalizer, so they share its gate exactly.
+            if (!classNeedsRuntimeMachinery(entry.first)) {
+                continue;
+            }
             const std::string& className = entry.first;
             const ClassLayout& layout = entry.second;
             const std::string typeName = poolStr(className);
             const std::string structType = llvmStructType(className);
-            const FunctionSignature* hook = nullptr;
-            for (const auto& function : functionSignatures) {
-                if (function.second.ownerType == className &&
-                    function.second.operatorSymbol == "@=" &&
-                    function.second.parameterTypes.size() == 1 &&
-                    !function.second.isGenericTemplate) {
-                    hook = &function.second;
-                    break;
-                }
-            }
+            const FunctionSignature* hook = findClassCopyHook(className);
             generated += "define internal ptr " + classCopyCallback(className) +
                 "(ptr %source, ptr %context) personality ptr @__CxxFrameHandler3 {\nentry:\n";
             generated += "  call void @zeus_class_ref_require_live(ptr %source)\n";
@@ -102,6 +111,12 @@
                         generated += "  %bytes.copy." + suffix + " = call ptr @zeus_bytes_clone(ptr %field." +
                             suffix + ")\n";
                         generated += "  store ptr %bytes.copy." + suffix + ", ptr %target." +
+                            suffix + "\n";
+                    } else if (fieldABI != nullptr &&
+                        fieldABI->valueABI == ZeusBuiltins::NativeValueABI::NativeString) {
+                        generated += "  %string.copy." + suffix + " = call ptr @zeus_string_retain(ptr %field." +
+                            suffix + ")\n";
+                        generated += "  store ptr %string.copy." + suffix + ", ptr %target." +
                             suffix + "\n";
                     } else if (isClassType(fieldType)) {
                         generated += "  %copy." + suffix + " = call ptr @zeus_class_copy_object(ptr %field." +

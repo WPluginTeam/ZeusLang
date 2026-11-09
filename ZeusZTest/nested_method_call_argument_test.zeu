@@ -1,0 +1,22 @@
+import zeus.ctypes;
+import zeus.exception;
+
+class BufferCleanupProbe {
+    using &this;
+
+    func value() -> int {
+        let buffer = new Buffer(8);
+        buffer.release();
+        return 17;
+    }
+}
+
+func assertValue(label: string, value: int) {
+    if (value != 17) {
+        throw new Exception("nested method result mismatch");
+    }
+}
+
+let probe = new BufferCleanupProbe();
+assertValue("prefix", probe.value());
+print("NESTED_METHOD_CALL_ARGUMENT_PASS");

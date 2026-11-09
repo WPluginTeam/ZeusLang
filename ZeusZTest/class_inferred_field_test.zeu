@@ -1,0 +1,17 @@
+// A class with declared fields can still gain new attributes after
+// construction. The declared fields keep their inline native layout while
+// the inferred field falls back to a dynamic slot.
+class Box {
+    using &this;
+    var count: int = 0;
+    func get() -> int { return this.count; }
+}
+
+func main() {
+    let b = new Box();
+    b.count = 5;
+    b.extra = 9;
+    print(b.get());
+    print(b.extra);
+}
+main();

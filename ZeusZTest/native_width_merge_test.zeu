@@ -1,0 +1,48 @@
+// Native scalars of every fixed width have to survive a control flow join.
+// The LLVM backend used to reject everything but int, bool and double there,
+// so a local of type i8/i16/i32/float only failed to compile once it
+// reached a merge point.
+@native decl Int8 = 4;
+@native decl Int16 = 12;
+@native decl Int32 = 3;
+@native decl Float = 11;
+@native decl Double = 1;
+
+func pickInt8(flag: bool, a: Int8, b: Int8) -> Int8 {
+    let value: Int8 = 0;
+    if (flag) { value = a; } else { value = b; }
+    return value;
+}
+
+func pickInt16(flag: bool, a: Int16, b: Int16) -> Int16 {
+    let value: Int16 = 0;
+    if (flag) { value = a; } else { value = b; }
+    return value;
+}
+
+func pickInt32(flag: bool, a: Int32, b: Int32) -> Int32 {
+    let value: Int32 = 0;
+    if (flag) { value = a; } else { value = b; }
+    return value;
+}
+
+func pickFloat(flag: bool, a: Float, b: Float) -> Float {
+    let value: Float = 0.0;
+    if (flag) { value = a; } else { value = b; }
+    return value;
+}
+
+func pickDouble(flag: bool, a: Double, b: Double) -> Double {
+    let value: Double = 0.0;
+    if (flag) { value = a; } else { value = b; }
+    return value;
+}
+
+if (pickInt8(true, 1, 2) != 1) throw "int8 merge";
+if (pickInt8(false, 1, 2) != 2) throw "int8 merge";
+if (pickInt16(true, 1, 2) != 1) throw "int16 merge";
+if (pickInt32(false, 1, 2) != 2) throw "int32 merge";
+if (pickFloat(true, 0.5, 0.25) != 0.5) throw "float32 merge";
+if (pickFloat(false, 0.5, 0.25) != 0.25) throw "float32 merge";
+if (pickDouble(true, 0.5, 0.25) != 0.5) throw "double merge";
+print("PASS native width control flow merge");

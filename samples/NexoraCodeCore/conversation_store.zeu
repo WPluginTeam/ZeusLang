@@ -1,0 +1,860 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.thread;
+import zeus.time [&zeusTime];
+
+import samples.NexoraCodeCore.storage;
+import samples.NexoraCodeCore.turn_injection;
+
+// 本地会话存储（S7）。契约和基线 ConversationStore 一致：
+//   index.json   会话索引（title / title_source / created_at / updated_at / metadata）
+//   {id}.json    会话详情（messages / metadata / settings / context_state ...）
+//
+// 基线用一把模块级 RLock 保护索引的读改写：多个请求会各自 new 一个 Store，
+// 锁必须是共用的，否则两个实例同时写索引会互相覆盖。这里同样共用一把。
+//
+// 存储读写写成自由函数（收 root），类方法只是薄壳。原因是 VM 的一个限制：
+// 方法体里再调 this.other() 时，会报 "VM method receiver changed before its
+// borrowed address was used"，而同样形状的自由函数调用不会触发。
+
+// 未命名会话的占位标题：前端默认「新对话」、后端默认「新会话」、读取兜底「未命名会话」。
+let NEXORA_PLACEHOLDER_TITLES = ["新对话", "新会话", "未命名会话"];
+let NEXORA_TITLE_SOURCE_AUTO = "auto";
+let NEXORA_TITLE_SOURCE_USER = "user";
+let NEXORA_GUESSED_TITLE_LIMIT = 24;
+
+// 悬空工具调用的占位结果文案（S8 补齐历史时使用）。
+let NEXORA_INTERRUPTED_TOOL_RESULT =
+    "该工具调用未返回结果（进程中断或任务被终止），请勿重复执行。";
+
+let __nexora_conversation_lock = new RLock();
+
+func nexora_core_text_or_empty(value) -> string {
+    if (value == nil) return "";
+    return str(value);
+}
+
+func nexora_core_is_placeholder_title(title) -> bool {
+    let text = nexora_core_collapse_whitespace(nexora_core_text_or_empty(title)).strip();
+    if (text == "") return true;
+    for (NEXORA_PLACEHOLDER_TITLES) [placeholder] {
+        if (text == placeholder) return true;
+    }
+    return false;
+}
+
+// 自动标题只能覆盖占位标题或上一版自动标题，绝不覆盖用户手动改的名字。
+func nexora_core_can_overwrite_title(title, titleSource) -> bool {
+    if (nexora_core_is_placeholder_title(title)) return true;
+    return nexora_core_text_or_empty(titleSource).strip() == NEXORA_TITLE_SOURCE_AUTO;
+}
+
+// ---------------------------------------------------------------- 存储路径
+
+func nexora_core_index_path(root: string) -> string {
+    return root + "/index.json";
+}
+
+func nexora_core_conversation_path(root: string, conversationId) -> string {
+    let text = "";
+    if (conversationId != nil) text = str(conversationId);
+    let name = nexora_core_sanitize_file_name(text);
+    return root + "/" + name + ".json";
+}
+
+func nexora_core_load_index(root: string) {
+    let index = nexora_core_read_json(nexora_core_index_path(root));
+    if (type(index) != "dict") return {};
+    return index;
+}
+
+func nexora_core_save_index(root: string, index) {
+    nexora_core_write_json_atomic(nexora_core_index_path(root), index);
+}
+
+func nexora_core_save_conversation(root: string, conversation) {
+    let conversationId = dict_get(conversation, "conversation_id", "");
+    nexora_core_write_json_atomic(
+        nexora_core_conversation_path(root, conversationId), conversation);
+}
+
+func nexora_core_load_conversation(root: string, conversationId) {
+    let path = nexora_core_conversation_path(root, conversationId);
+    if (!file.exists(path)) return nil;
+    let conversation = nexora_core_read_json(path);
+    if (type(conversation) != "dict") return nil;
+    return conversation;
+}
+
+// 新的在前。列表没有 insert，先按数量铺开再往后挪。
+func nexora_core_sort_conversations(items) {
+    let ordered = [];
+    for (0..items.length()) [const &index] {
+        ordered.append(nil);
+    }
+
+    let count = 0;
+    for (items) [item] {
+        let timestampValue = nexora_core_number(dict_get(item, "updated_at", 0));
+        let position = count;
+        for (true) {
+            if (position <= 0) break;
+            if (nexora_core_number(dict_get(ordered[position - 1], "updated_at", 0)) >= timestampValue) {
+                break;
+            }
+            ordered[position] = ordered[position - 1];
+            position = position - 1;
+        }
+        ordered[position] = item;
+        count = count + 1;
+    }
+    return ordered;
+}
+
+// 只用用户消息做标题：助手/工具消息的开头没有辨识度。content 可能是
+// 字符串，也可能是 [{"type":"text","text":...}] 这样的分段列表。
+func nexora_core_guess_title(message) -> string {
+    if (type(message) != "dict") return "";
+    if (nexora_core_text_or_empty(dict_get(message, "role", "")) != "user") return "";
+
+    let content = dict_get(message, "content", nil);
+    let text = "";
+    if (type(content) == "Array") {
+        let parts = [];
+        for (content) [part] {
+            if (type(part) != "dict") continue;
+            parts.append(nexora_core_text_or_empty(dict_get(part, "text", "")));
+        }
+        text = nexora_core_join(parts);
+    } else {
+        text = nexora_core_text_or_empty(content);
+    }
+
+    return nexora_core_truncate(nexora_core_collapse_whitespace(text).strip(),
+        NEXORA_GUESSED_TITLE_LIMIT);
+}
+
+// ---------------------------------------------------------------- 业务辅助
+
+func nexora_core_copy_dict(source) {
+    let copy = {};
+    if (type(source) != "dict") return copy;
+    for (source) [&key: &value] {
+        copy[key] = value;
+    }
+    return copy;
+}
+
+func nexora_core_dict_is_empty(source) -> bool {
+    if (type(source) != "dict") return true;
+    for (source) [&key: &value] {
+        return false;
+    }
+    return true;
+}
+
+// 前缀比较：摘要提交前用它判断"生成期间历史有没有被改动"。
+// 逐项按序列化文本比，字符串、数字、字典都能覆盖。
+func nexora_core_prefix_equals(values, prefix) -> bool {
+    if (type(values) != "Array" or type(prefix) != "Array") return false;
+    if (values.length() < prefix.length()) return false;
+    for (0..prefix.length()) [const &index] {
+        if (JSON.stringify(values[index]) != JSON.stringify(prefix[index])) return false;
+    }
+    return true;
+}
+
+func nexora_core_insert_messages(values, index: int, additions: Array) -> Array {
+    let source = values;
+    if (type(source) != "Array") source = [];
+
+    let position = index;
+    if (position < 0) position = 0;
+    if (position > source.length()) position = source.length();
+
+    let result: Array = [];
+    let cursorCount = source.length() + 1;
+    for (0..cursorCount) [const &cursor] {
+        if (cursor == position) {
+        for (additions) [addition] {
+            result.append(nexora_core_copy_dict(addition));
+        }
+        }
+        if (cursor < source.length()) result.append(source[cursor]);
+    }
+
+    return result;
+}
+
+// 基线的 max(0, int(x or 0))。
+func nexora_core_count(value) -> int {
+    if (type(value) == "int") {
+        if (value < 0) return 0;
+        return value;
+    }
+    if (type(value) == "float") {
+        let rounded = int(value);
+        if (rounded < 0) return 0;
+        return rounded;
+    }
+    return 0;
+}
+
+// 悬空工具调用的修补：补齐没有结果的调用、丢弃没有调用的结果。
+// 返回 nil 表示无需修补——这是基线的约定，调用方据此判断要不要落盘。
+func nexora_core_repair_tool_messages(messages) {
+    if (type(messages) != "Array") return nil;
+
+    let repaired = [];
+    let pending = [];
+    let changed = false;
+
+    for (messages) [message] {
+        if (type(message) != "dict") {
+            repaired.append(message);
+            continue;
+        }
+
+        let role = nexora_core_text_or_empty(dict_get(message, "role", ""));
+
+        if (role == "tool") {
+            let callId = nexora_core_text_or_empty(dict_get(message, "tool_call_id", ""));
+            let known = false;
+            for (pending) [openId] {
+                if (openId == callId) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) {
+                changed = true; // 没有对应调用的孤儿结果：丢掉
+                continue;
+            }
+
+            let remaining = [];
+            let skipped = false;
+            for (pending) [openId] {
+                if (!skipped and openId == callId) {
+                    skipped = true;
+                    continue;
+                }
+                remaining.append(openId);
+            }
+            pending = remaining;
+            repaired.append(message);
+            continue;
+        }
+
+        // 非 tool 消息出现时，上一批调用已经没有机会再拿到结果了：补占位。
+        if (pending.length() > 0) {
+            for (pending) [openId] {
+                repaired.append({
+                    "role": "tool",
+                    "tool_call_id": openId,
+                    "content": NEXORA_INTERRUPTED_TOOL_RESULT,
+                    "timestamp": zeusTime.time()
+                });
+            }
+            changed = true;
+            pending = [];
+        }
+
+        let calls = dict_get(message, "tool_calls", nil);
+        if (type(calls) == "Array") {
+            for (calls) [call] {
+                if (type(call) != "dict") continue;
+                pending.append(nexora_core_text_or_empty(dict_get(call, "id", "")));
+            }
+        }
+        repaired.append(message);
+    }
+
+    // 结尾还挂着的调用：进程被杀时历史就停在这里。
+    if (pending.length() > 0) {
+        for (pending) [openId] {
+            repaired.append({
+                "role": "tool",
+                "tool_call_id": openId,
+                "content": NEXORA_INTERRUPTED_TOOL_RESULT,
+                "timestamp": zeusTime.time()
+            });
+        }
+        changed = true;
+    }
+
+    if (!changed) return nil;
+    return repaired;
+}
+
+// ---------------------------------------------------------------- 会话存储
+
+class NexoraCoreConversationStore {
+    using &this;
+
+    let root = "";
+    let lock = nil;
+
+    func init(rootPath) {
+        this.root = rootPath;
+        this.lock = __nexora_conversation_lock;
+        file.mkdirs(this.root);
+    }
+
+    func indexPath() -> string {
+        return nexora_core_index_path(this.root);
+    }
+
+    func conversationPath(conversationId) -> string {
+        return nexora_core_conversation_path(this.root, conversationId);
+    }
+
+    func loadIndex() {
+        return nexora_core_load_index(this.root);
+    }
+
+    func saveIndex(index) {
+        nexora_core_save_index(this.root, index);
+    }
+
+    func saveConversation(conversation) {
+        nexora_core_save_conversation(this.root, conversation);
+    }
+
+    func get(conversationId) {
+        return nexora_core_load_conversation(this.root, conversationId);
+    }
+
+    // 会话列表：会话文件缺失的条目顺手从索引里清掉，避免显示幽灵会话。
+    func list() {
+        this.lock.acquire();
+        let items = [];
+        try {
+            let index = nexora_core_load_index(this.root);
+            let kept = {};
+            let cleaned = false;
+
+            for (index) [&conversationId: &meta] {
+                if (!file.exists(nexora_core_conversation_path(this.root, conversationId))) {
+                    cleaned = true;
+                    continue;
+                }
+                kept[conversationId] = meta;
+
+                let item = {
+                    "conversation_id": conversationId,
+                    "title": nexora_core_text_or_empty(dict_get(meta, "title", "")),
+                    "created_at": dict_get(meta, "created_at", nil),
+                    "updated_at": dict_get(meta, "updated_at", nil)
+                };
+                if (item["title"] == "") item["title"] = "未命名会话";
+
+                let extra = dict_get(meta, "metadata", nil);
+                if (type(extra) == "dict") item["metadata"] = extra;
+
+                items.append(item);
+            }
+
+            if (cleaned) nexora_core_save_index(this.root, kept);
+            items = nexora_core_sort_conversations(items);
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+        return items;
+    }
+
+    func create(title="", metadata=nil) {
+        let conversationId = "conv_" + nexora_core_uuid_hex().slice(0, 10);
+        let now = zeusTime.time();
+
+        // 分开两个变量：VM 里"刚当过方法接收者的变量再被赋值"会触发
+        // "receiver changed before its borrowed address was used"。
+        let requestedTitle = nexora_core_text_or_empty(title).strip();
+        let cleanTitle = requestedTitle;
+        if (requestedTitle == "") cleanTitle = "新会话";
+
+        let cleanMetadata = {};
+        if (type(metadata) == "dict") cleanMetadata = metadata;
+
+        let conversation = {
+            "conversation_id": conversationId,
+            "title": cleanTitle,
+            "created_at": now,
+            "updated_at": now,
+            "messages": [],
+            "metadata": cleanMetadata
+        };
+
+        let base = this.root;
+        this.lock.acquire();
+        try {
+            nexora_core_save_conversation(base, conversation);
+
+            let index = nexora_core_load_index(base);
+            index[conversationId] = {
+                "title": cleanTitle,
+                "created_at": now,
+                "updated_at": now,
+                "metadata": cleanMetadata
+            };
+            nexora_core_save_index(base, index);
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+        return conversation;
+    }
+
+    // `delete` 是 Zeus 关键字，方法名改成 remove，语义与基线一致。
+    func remove(conversationId) -> bool {
+        this.lock.acquire();
+        let removed = false;
+        try {
+            let path = nexora_core_conversation_path(this.root, conversationId);
+            if (file.exists(path)) file.removeFile(path);
+
+            let index = nexora_core_load_index(this.root);
+            if (dict_get(index, conversationId, nil) != nil) {
+                let kept = {};
+                for (index) [&key: &meta] {
+                    if (key == conversationId) continue;
+                    kept[key] = meta;
+                }
+                nexora_core_save_index(this.root, kept);
+                removed = true;
+            }
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+        return removed;
+    }
+
+    func appendMessage(conversationId, message) -> bool {
+        this.lock.acquire();
+        let appended = false;
+        try {
+            let conversation = nexora_core_load_conversation(this.root, conversationId);
+            if (conversation != nil) {
+                // 取出来的数组和字典共享同一块存储，append 会落回 conversation。
+                let messages = dict_get(conversation, "messages", nil);
+                if (type(messages) != "Array") {
+                    messages = [];
+                    dict_set(conversation, "messages", messages);
+                }
+                messages.append(message);
+                // 取出来的数组不一定是共享引用：写回一次，落盘才包含新消息。
+                dict_set(conversation, "messages", messages);
+                dict_set(conversation, "updated_at", zeusTime.time());
+                nexora_core_save_conversation(this.root, conversation);
+
+                let index = nexora_core_load_index(this.root);
+                let meta = dict_get(index, conversationId, nil);
+                if (type(meta) != "dict") meta = {};
+
+                // 占位标题在首条用户消息到达时用其开头生成。
+                if (nexora_core_is_placeholder_title(dict_get(meta, "title", ""))) {
+                    let guessed = nexora_core_guess_title(message);
+                    if (guessed != "") {
+                        dict_set(meta, "title", guessed);
+                        dict_set(meta, "title_source", NEXORA_TITLE_SOURCE_AUTO);
+                        dict_set(conversation, "title", guessed);
+                        nexora_core_save_conversation(this.root, conversation);
+                    }
+                }
+
+                dict_set(meta, "updated_at", dict_get(conversation, "updated_at", 0));
+                index[conversationId] = meta;
+                nexora_core_save_index(this.root, index);
+                appended = true;
+            }
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+        return appended;
+    }
+
+    func setTitle(conversationId, title, source=NEXORA_TITLE_SOURCE_USER) -> bool {
+        let cleanTitle = nexora_core_text_or_empty(title).strip();
+        if (cleanTitle == "") return false;
+
+        let cleanSource = nexora_core_text_or_empty(source).strip();
+        if (cleanSource == "") cleanSource = NEXORA_TITLE_SOURCE_USER;
+
+        this.lock.acquire();
+        let stored = false;
+        try {
+            let conversation = nexora_core_load_conversation(this.root, conversationId);
+            if (conversation != nil) {
+                dict_set(conversation, "title", cleanTitle);
+                nexora_core_save_conversation(this.root, conversation);
+
+                let index = nexora_core_load_index(this.root);
+                let meta = dict_get(index, conversationId, nil);
+                if (type(meta) != "dict") meta = {};
+                dict_set(meta, "title", cleanTitle);
+                dict_set(meta, "title_source", cleanSource);
+                index[conversationId] = meta;
+                nexora_core_save_index(this.root, index);
+                stored = true;
+            }
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+        return stored;
+    }
+
+    // 标题来源只记在索引里：会话文件只存标题文本，自动回写前要靠这里判断
+    // 能不能覆盖用户改过的名字。
+    func getTitleState(conversationId) {
+        let cleanId = nexora_core_text_or_empty(conversationId).strip();
+        if (cleanId == "") return {"title": "", "title_source": ""};
+
+        this.lock.acquire();
+        let state = {"title": "", "title_source": ""};
+        try {
+            let meta = dict_get(nexora_core_load_index(this.root), cleanId, nil);
+            if (type(meta) == "dict") {
+                dict_set(state, "title",
+                    nexora_core_text_or_empty(dict_get(meta, "title", "")));
+                dict_set(state, "title_source",
+                    nexora_core_text_or_empty(dict_get(meta, "title_source", "")));
+            }
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+        return state;
+    }
+
+    func guessTitle(message) -> string {
+        return nexora_core_guess_title(message);
+    }
+
+    // 权限确认的占位结果换成真实结果：位置不动，工具协议仍成立。
+    func replaceToolResult(conversationId, toolCallId, content) -> bool {
+        let cleanCallId = nexora_core_text_or_empty(toolCallId).strip();
+        if (cleanCallId == "") return false;
+
+        this.lock.acquire();
+        let replaced = false;
+        try {
+            let conversation = nexora_core_load_conversation(this.root, conversationId);
+            if (conversation != nil) {
+                let messages = dict_get(conversation, "messages", nil);
+                if (type(messages) == "Array") {
+                    for (0..messages.length()) [const &offset] {
+                        let index = messages.length() - 1 - offset; // 从最新往回找
+                        let message = messages[index];
+                        if (type(message) != "dict") continue;
+                        if (nexora_core_text_or_empty(dict_get(message, "role", "")) != "tool") continue;
+
+                        let callId = nexora_core_text_or_empty(
+                            dict_get(message, "tool_call_id", ""));
+                        if (callId != cleanCallId) continue;
+
+                        let now = zeusTime.time();
+                        let updated = nexora_core_copy_dict(message);
+                        dict_set(updated, "content", nexora_core_text_or_empty(content));
+                        dict_set(updated, "timestamp", now);
+                        messages[index] = updated;
+                        dict_set(conversation, "messages", messages);
+                        dict_set(conversation, "updated_at", now);
+                        nexora_core_save_conversation(this.root, conversation);
+                        this.touchIndex(conversationId, now);
+                        replaced = true;
+                        break;
+                    }
+                }
+            }
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+        return replaced;
+    }
+
+    // 补齐历史里悬空的工具调用结果，返回修补条数（0 表示没动）。
+    func repairDanglingToolCalls(conversationId) -> int {
+        this.lock.acquire();
+        let added = 0;
+        try {
+            let conversation = nexora_core_load_conversation(this.root, conversationId);
+            if (conversation != nil) {
+                let messages = dict_get(conversation, "messages", nil);
+                if (type(messages) == "Array") {
+                    let repaired = nexora_core_repair_tool_messages(messages);
+                    if (repaired != nil) {
+                        dict_set(conversation, "messages", repaired);
+                        dict_set(conversation, "updated_at", zeusTime.time());
+                        nexora_core_save_conversation(this.root, conversation);
+                        added = repaired.length() - messages.length();
+                        this.touchIndex(conversationId,
+                            dict_get(conversation, "updated_at", 0));
+                    }
+                }
+            }
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+        return added;
+    }
+
+    // 提交摘要：只移动请求边界，消息一条不删。
+    // 生成期间历史被改过（前缀不一致）就拒绝，旧摘要不覆盖新历史。
+    func saveContext(conversationId, record, expectedPrefix, injections = nil) {
+        this.lock.acquire();
+        try {
+            let conversation = nexora_core_load_conversation(this.root, conversationId);
+            if (conversation == nil) {
+                throw new Exception("摘要生成期间历史已变化，未保存旧摘要");
+            }
+
+            let messages = dict_get(conversation, "messages", nil);
+            if (!nexora_core_prefix_equals(messages, expectedPrefix)) {
+                throw new Exception("摘要生成期间历史已变化，未保存旧摘要");
+            }
+
+            if (injections != nil and type(injections) != "Array") {
+                throw new Exception("摘要注入内容必须是数组");
+            }
+            let injectionCount = nexora_core_count(injections?.length());
+            if (injectionCount > 0) {
+                let cut = nexora_core_count(dict_get(record, "history_cut_index", 0));
+                messages = nexora_core_insert_messages(messages, cut, injections);
+                dict_set(conversation, "messages", messages);
+            }
+
+            dict_set(conversation, "context_state", {
+                "summary": dict_get(record, "summary", ""),
+                "history_cut_index": dict_get(record, "history_cut_index", 0)
+            });
+
+            let compressions = dict_get(conversation, "context_compressions", nil);
+            if (type(compressions) != "Array") compressions = [];
+            compressions.append(record);
+            dict_set(conversation, "context_compressions", compressions);
+
+            nexora_core_save_conversation(this.root, conversation);
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+    }
+
+    func __insertInjectionsLocked(conversation, index: int, messages: Array,
+            baseline, permissionMode) -> bool {
+        if (messages.length() == 0 and baseline == nil and permissionMode == nil) {
+            return false;
+        }
+        if (conversation == nil) throw new Exception("本地会话不存在");
+
+        let history = dict_get(conversation, "messages", []);
+        dict_set(conversation, "messages",
+            nexora_core_insert_messages(history, index, messages));
+
+        if (type(baseline) == "dict") {
+            dict_set(conversation, "injection_baseline", nexora_core_copy_dict(baseline));
+            dict_set(conversation, "injection_version", NEXORA_INJECTION_VERSION);
+        }
+        if (permissionMode != nil) {
+            dict_set(conversation, "injection_permission_mode",
+                str(permissionMode).strip().lower());
+        }
+
+        dict_set(conversation, "updated_at", zeusTime.time());
+        nexora_core_save_conversation(this.root, conversation);
+        return true;
+    }
+
+    // 注入消息、最新基线和审批模式一起写入，避免重启后状态与历史分叉。
+    func insertInjections(conversationId, index: int, messages: Array,
+            baseline = nil, permissionMode = nil) -> bool {
+        this.lock.acquire();
+        let inserted = false;
+        try {
+            let conversation = nexora_core_load_conversation(this.root, conversationId);
+            inserted = this.__insertInjectionsLocked(conversation, index,
+                messages, baseline, permissionMode);
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+        return inserted;
+    }
+
+    // Compute the live insertion point under the same lock as the write. New
+    // chats place instructions before their last user message; approval resumes
+    // append them after the existing tool result.
+    func insertTurnInjections(conversationId, messages: Array, baseline,
+            permissionMode, skipUserMessage: bool) -> bool {
+        this.lock.acquire();
+        let inserted = false;
+        try {
+            let conversation = nexora_core_load_conversation(this.root, conversationId);
+            if (conversation == nil) throw new Exception("本地会话不存在");
+            let history = dict_get(conversation, "messages", []);
+            let index = history.length();
+            if (!skipUserMessage and index > 0) index = index - 1;
+            inserted = this.__insertInjectionsLocked(conversation, index,
+                messages, baseline, permissionMode);
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+        return inserted;
+    }
+
+    // tail 注入块的基线快照：跨请求持久化是"无变化不注入"的前提。
+    func saveInjectionBaseline(conversationId, baseline) {
+        this.lock.acquire();
+        try {
+            let conversation = nexora_core_load_conversation(this.root, conversationId);
+            if (conversation == nil) throw new Exception("本地会话不存在");
+            dict_set(conversation, "injection_baseline", nexora_core_copy_dict(baseline));
+            nexora_core_save_conversation(this.root, conversation);
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+    }
+
+    func getSettings(conversationId) {
+        let conversation = nexora_core_load_conversation(this.root, conversationId);
+        if (conversation == nil) return {};
+        return nexora_core_copy_dict(dict_get(conversation, "settings", nil));
+    }
+
+    // 只接受白名单字段，避免前端塞任意键污染会话文件。
+    func saveSettings(conversationId, patch) {
+        if (type(patch) != "dict") throw new Exception("会话设置必须是对象");
+
+        let allowed = ["model_name", "permission_mode", "approval_model_id"];
+        this.lock.acquire();
+        let result = {};
+        try {
+            let conversation = nexora_core_load_conversation(this.root, conversationId);
+            if (conversation == nil) throw new Exception("本地会话不存在");
+
+            let settings = dict_get(conversation, "settings", nil);
+            if (type(settings) != "dict") settings = {};
+
+            for (allowed) [key] {
+                if (dict_get(patch, key, nil) == nil) continue;
+                dict_set(settings, key,
+                    nexora_core_text_or_empty(dict_get(patch, key, "")).strip());
+            }
+
+            dict_set(conversation, "settings", settings);
+            nexora_core_save_conversation(this.root, conversation);
+            result = nexora_core_copy_dict(settings);
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+        return result;
+    }
+
+    // 老会话惰性补齐设置：已有设置段就原样返回，不覆盖用户改过的值。
+    func ensureSettings(conversationId, defaults) {
+        this.lock.acquire();
+        let result = {};
+        try {
+            let conversation = nexora_core_load_conversation(this.root, conversationId);
+            if (conversation == nil) throw new Exception("本地会话不存在");
+
+            let settings = dict_get(conversation, "settings", nil);
+            if (type(settings) == "dict" and !nexora_core_dict_is_empty(settings)) {
+                result = nexora_core_copy_dict(settings);
+            } else {
+                let merged = {
+                    "model_name": nexora_core_text_or_empty(
+                        dict_get(defaults, "model_name", "")).strip(),
+                    "permission_mode": nexora_core_text_or_empty(
+                        dict_get(defaults, "permission_mode", "")).strip(),
+                    "approval_model_id": nexora_core_text_or_empty(
+                        dict_get(defaults, "approval_model_id", "")).strip()
+                };
+                dict_set(conversation, "settings", merged);
+                nexora_core_save_conversation(this.root, conversation);
+                result = nexora_core_copy_dict(merged);
+            }
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+        return result;
+    }
+
+    // 落盘上游实测输入与当时的消息条数，作为下一轮占用的锚点。
+    func recordContextUsage(conversationId, inputTokens, messageCount, estimatedTokens) {
+        this.lock.acquire();
+        try {
+            let conversation = nexora_core_load_conversation(this.root, conversationId);
+            if (conversation == nil) throw new Exception("本地会话不存在");
+
+            let state = dict_get(conversation, "context_state", nil);
+            if (type(state) != "dict") state = {};
+
+            dict_set(state, "prev_input_tokens",
+                nexora_core_count(dict_get(state, "last_input_tokens", 0)));
+            dict_set(state, "last_input_tokens", nexora_core_count(inputTokens));
+            dict_set(state, "last_estimated_tokens", nexora_core_count(estimatedTokens));
+            dict_set(state, "last_measured_message_count", nexora_core_count(messageCount));
+
+            dict_set(conversation, "context_state", state);
+            nexora_core_save_conversation(this.root, conversation);
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+    }
+
+    // 压缩请求的用量单独记：即使摘要最终没提交，这次调用也不能漏计。
+    func recordCompressionCall(conversationId, record) {
+        this.lock.acquire();
+        try {
+            let conversation = nexora_core_load_conversation(this.root, conversationId);
+            if (conversation == nil) throw new Exception("本地会话不存在");
+
+            let calls = dict_get(conversation, "context_compression_calls", nil);
+            if (type(calls) != "Array") calls = [];
+            calls.append(record);
+            dict_set(conversation, "context_compression_calls", calls);
+            nexora_core_save_conversation(this.root, conversation);
+        } catch (&error) {
+            this.lock.release();
+            throw error;
+        }
+        this.lock.release();
+    }
+
+    // 索引里的更新时间跟着会话文件走，任务列表才排得对。
+    func touchIndex(conversationId, timestampValue) {
+        let index = nexora_core_load_index(this.root);
+        let meta = dict_get(index, conversationId, nil);
+        if (type(meta) != "dict") meta = {};
+        dict_set(meta, "updated_at", timestampValue);
+        index[conversationId] = meta;
+        nexora_core_save_index(this.root, index);
+    }
+}

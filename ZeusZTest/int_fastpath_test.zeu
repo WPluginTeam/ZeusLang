@@ -1,0 +1,50 @@
+// The dynamic integer fast path has to agree with the generic path on every
+// result.
+//
+// The overflow behaviour is deliberately not checked here. The VM promotes an
+// overflowing result to an arbitrary precision integer, while the LLVM
+// backend keeps the int64 representation and wraps. That divergence is a
+// known issue and it predates the fast path, which falls back to the generic
+// path on an overflow so that it keeps the behaviour of its backend.
+using original;
+import zeus.exception;
+
+func expectValue(actual, expected, message: string) {
+    if (actual != expected) {
+        throw new Exception(
+            message + ": expected " + __builtin_str(expected) +
+            ", got " + __builtin_str(actual));
+    }
+}
+
+func checkArithmetic() {
+    expectValue(1 + 2, 3, "integer addition");
+    expectValue(7 - 3, 4, "integer subtraction");
+    expectValue(6 * 7, 42, "integer multiplication");
+    expectValue(22 / 7, 3, "integer division");
+    expectValue(22 % 7, 1, "integer modulus");
+    expectValue(-7 / 2, -3, "negative division truncates toward zero");
+    expectValue(-7 % 2, -1, "negative modulus keeps the dividend sign");
+    expectValue(7 / -2, -3, "negative divisor truncates toward zero");
+    expectValue(7 % -2, 1, "negative divisor keeps the dividend sign");
+    expectValue(0 - 5, -5, "unary minus");
+    expectValue(5 * 1000000, 5000000, "a product that still fits");
+}
+
+func checkComparisons() {
+    expectValue(1 < 2, true, "less than");
+    expectValue(2 <= 2, true, "less or equal");
+    expectValue(3 > 4, false, "greater than");
+    expectValue(4 >= 4, true, "greater or equal");
+    expectValue(5 == 5, true, "equal");
+    expectValue(5 != 5, false, "not equal");
+    expectValue(-1 < 0, true, "negative comparison");
+}
+
+func main() {
+    checkArithmetic();
+    checkComparisons();
+    print("INT_FASTPATH_TEST_PASS");
+}
+
+main();

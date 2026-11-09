@@ -1,0 +1,58 @@
+// UUID helpers. v4 generation uses the cryptographically secure random source.
+
+import zeus.byte;
+import zeus.crypto;
+import zeus.exception;
+
+func __uuid_hex_value(character: string) -> int {
+    let digits = "0123456789abcdef";
+    return digits.index(character.lower());
+}
+
+class UUID {
+    func static v4() -> string {
+        let data = Crypto.randomBytes(16);
+        data[6] = (data[6] % 16) + 64;
+        data[8] = (data[8] % 64) + 128;
+
+        let digits = "0123456789abcdef";
+        let output = "";
+        for (0..16) [const &i] {
+            if (i == 4 or i == 6 or i == 8 or i == 10) {
+                output = output + "-";
+            }
+            let value = data.get(i);
+            output = output + digits.slice(int(value / 16), int(value / 16) + 1);
+            output = output + digits.slice(value % 16, value % 16 + 1);
+        }
+        return output;
+    }
+
+    func static isValid(value: string) -> bool {
+        if (value.length() != 36) return false;
+        for (0..36) [const &i] {
+            let character = value.slice(i, i + 1);
+            if (i == 8 or i == 13 or i == 18 or i == 23) {
+                if (character != "-") return false;
+            } else if (__uuid_hex_value(character) < 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    func static isV4(value: string) -> bool {
+        if (!UUID.isValid(value)) return false;
+        let version = value.slice(14, 15);
+        let variant = value.slice(19, 20).lower();
+        return version == "4" and
+            (variant == "8" or variant == "9" or variant == "a" or variant == "b");
+    }
+
+    func static normalize(value: string) -> string {
+        if (!UUID.isValid(value)) {
+            throw new Exception("invalid UUID text");
+        }
+        return value.lower();
+    }
+}

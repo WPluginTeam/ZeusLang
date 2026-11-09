@@ -67,6 +67,18 @@ namespace IRScope {
         return isFunctionName(name) || importedFunctionNames.find(name) != importedFunctionNames.end();
     }
 
+    // Records a function that an already compiled package exports. Compile units
+    // that only see such a package indirectly still inherit its globals, so the
+    // call has to carry the qualified target: the phase-2 slot index alone names
+    // whatever global the merge put in that position, not the function.
+    inline void registerImportedFunction(
+        const std::string& name,
+        const std::string& qualifiedName
+    ) {
+        importedFunctionNames.insert(name);
+        importedFunctionTargets[name] = qualifiedName;
+    }
+
     // ---- 闭包/函数环境 ----
 
 
@@ -178,8 +190,13 @@ namespace IRScope {
     inline std::string currentPackageName = "";  // 当前包名（如 "zeus.cppfunctions"）
 
     inline std::string functionTargetName(const std::string& name) {
-        if (isFunctionName(name) && isCompilingPackage && !currentPackageName.empty()) {
-            return currentPackageName + "." + name;
+        // A function defined in this compile unit shadows one inherited from a
+        // package, so it must never be redirected by the import table.
+        if (isFunctionName(name)) {
+            if (isCompilingPackage && !currentPackageName.empty()) {
+                return currentPackageName + "." + name;
+            }
+            return name;
         }
         auto imported = importedFunctionTargets.find(name);
         return imported == importedFunctionTargets.end() ? name : imported->second;
@@ -314,13 +331,54 @@ namespace IRScope {
         return slot;
     }
 
-    // 声明或获取一个全局变量槽位
+    inline bool isForeignGlobal(int index);
+
+    // 声明或获取一个全局变量槽位。
+    // 名字已被其它编译单元占用时，旧名字连同槽位一起收到私有名下，本次声明
+    // 另占一个新槽位。否则模块级 `let str = ...` 会写进库函数 `str` 的槽位，
+    // 之后所有 `str(...)` 调用都变成「调用了非函数」；反过来，库函数也会让
+    // 同名变量在 AOT 里被当成函数值。
     inline int declareGlobal (const std::string& name) {
         auto it = globals.find(name);
-        if (it != globals.end()) return it->second;
+        if (it != globals.end()) {
+            if (!isForeignGlobal(it->second)) return it->second;
+            const int previousIndex = it->second;
+            globals.erase(it);
+            std::string retiredName = name + ".__previous__";
+            while (globals.find(retiredName) != globals.end()) retiredName += "_";
+            globals.emplace(std::move(retiredName), previousIndex);
+        }
         int gid = static_cast<int>(globals.size());
         globals[name] = gid;
         return gid;
+    }
+
+    // 编译会话边界：每个编译单元（包 / main / 单文件编译）开始生成 IR 时
+    // 记录 globals 的规模。索引小于它的全局由之前的编译单元声明，其编译期
+    // 槽位只在包内做重定位，因此跨会话引用（如 `new 其它包里的类`）一律按
+    // 名字延迟解析，不沿用槽位。
+    inline size_t compileSessionGlobalsBase = 0;
+
+    inline void beginCompileSession() {
+        compileSessionGlobalsBase = globals.size();
+    }
+
+    inline bool isForeignGlobal(int index) {
+        return index >= 0 && static_cast<size_t>(index) < compileSessionGlobalsBase;
+    }
+
+    // A global inherited from an earlier package names a function when that
+    // package exported one under the name. A binding made by this compile unit
+    // wins over the inherited table, so a module that declares its own `str`
+    // still loads its own slot instead of calling the package function.
+    inline bool isStaticFunctionNameAt(const std::string& name, int index) {
+        if (isFunctionName(name)) return true;
+        if (importedFunctionNames.find(name) == importedFunctionNames.end()) return false;
+        // A name resolved through the import table already carries the final
+        // slot, so its index says nothing about this compile session. The
+        // session boundary only decides names that came from `globals`.
+        if (importedGlobalSlots.find(name) != importedGlobalSlots.end()) return true;
+        return isForeignGlobal(index);
     }
 
     // 声明一个共享变量（进程级共享堆）
@@ -464,10 +522,16 @@ namespace IRScope {
         }
 
         // 4) 全局
+        // 本编译单元自己声明的全局优先于导入表：导入只补充本单元没有的名字，
+        // 声明了同名全局的模块读自己的槽位，而不是走别人的绑定。
+        auto g = globals.find(name);
+        if (g != globals.end() && !isForeignGlobal(g->second)) {
+            return SymRef{ Kind::GLOBAL, g->second };
+        }
+
         auto imported = importedGlobalSlots.find(name);
         if (imported != importedGlobalSlots.end()) return SymRef{ Kind::GLOBAL, imported->second };
 
-        auto g = globals.find(name);
         if (g != globals.end()) return SymRef{ Kind::GLOBAL, g->second };
 
         // 引用绑定使用独立符号表；先让显式局部、共享变量和全局变量完成解析。

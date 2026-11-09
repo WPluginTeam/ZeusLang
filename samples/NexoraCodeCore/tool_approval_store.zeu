@@ -1,0 +1,197 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import zeus.thread;
+import zeus.time [&zeusTime];
+
+import samples.NexoraCodeCore.storage;
+import samples.NexoraCodeCore.tool_permissions;
+
+let NEXORA_CORE_APPROVAL_TTL_SECONDS = 1800;
+let NEXORA_CORE_APPROVAL_MAX_PENDING = 256;
+let NEXORA_CORE_APPROVAL_MAX_RECORDS = 512;
+
+func __nexora_approval_snapshot(value) {
+    return JSON.parse(JSON.stringify(value));
+}
+
+class NexoraCoreToolApprovalStore {
+    using &this;
+
+    let entries = [];
+    let lockId = -1;
+
+    func init() {
+        this.entries = [];
+        this.lockId = create_shared_lock();
+    }
+
+    func operator[@=]() -> &NexoraCoreToolApprovalStore {
+        return this;
+    }
+
+    func compactUnsafe(now) {
+        let retained = [];
+        for (this.entries) [entry] {
+            if (dict_get(entry, "expires_at", 0) > now) retained.append(entry);
+        }
+        this.entries = retained;
+    }
+
+    func create(streamId: string, conversationId: string, providerName: string,
+            mode: string, operation: string, call: dict) -> dict {
+        let now = zeusTime.time();
+        let public = {};
+        lock_acquire(this.lockId);
+        try {
+            this.compactUnsafe(now);
+            let pendingCount = 0;
+            for (this.entries) [entry] {
+                let status = str(dict_get(entry, "status", ""));
+                if (status == "pending" or status == "resolving") {
+                    pendingCount = pendingCount + 1;
+                }
+            }
+
+            let kept = [];
+            let excess = this.entries.length() - NEXORA_CORE_APPROVAL_MAX_RECORDS + 1;
+            if (excess < 0) excess = 0;
+            let removedResolved = 0;
+            for (this.entries) [entry] {
+                if (dict_get(entry, "status", "") == "resolved" and
+                        removedResolved < excess) {
+                    removedResolved = removedResolved + 1;
+                    continue;
+                }
+                kept.append(entry);
+            }
+            this.entries = kept;
+
+            if (pendingCount >= NEXORA_CORE_APPROVAL_MAX_PENDING or
+                    this.entries.length() >= NEXORA_CORE_APPROVAL_MAX_RECORDS) {
+                public = {"error": "Too many tool approval requests are pending."};
+            } else {
+                let approvalId = nexora_core_uuid_hex();
+                let summary = nexora_tool_approval_summary(call, operation);
+                let expiresAt = now + NEXORA_CORE_APPROVAL_TTL_SECONDS;
+                let entry = {
+                    "approval_id": approvalId,
+                    "stream_id": streamId,
+                    "conversation_id": conversationId,
+                    "provider_name": providerName,
+                    "permission_mode": mode,
+                    "operation": operation,
+                    "name": str(dict_get(call, "name", "")),
+                    "summary": summary,
+                    "call": __nexora_approval_snapshot(call),
+                    "status": "pending",
+                    "decision": "",
+                    "response": nil,
+                    "created_at": now,
+                    "expires_at": expiresAt
+                };
+                this.entries.append(entry);
+                public = {"approval_id": approvalId, "operation": operation,
+                    "name": entry["name"], "summary": summary,
+                    "expires_at": expiresAt};
+            }
+        } catch (&error) {
+            lock_release(this.lockId);
+            throw error;
+        }
+        lock_release(this.lockId);
+        return public;
+    }
+
+    // Atomically claims one decision so concurrent requests cannot run the same tool twice.
+    func beginResolve(streamId: string, approvalId: string, decision: string) -> dict {
+        let now = zeusTime.time();
+        lock_acquire(this.lockId);
+        let result = {"status": "not_found"};
+        try {
+            this.compactUnsafe(now);
+            for (0..this.entries.length()) [const &index] {
+                let entry = this.entries[index];
+                if (dict_get(entry, "approval_id", "") != approvalId) continue;
+                if (dict_get(entry, "stream_id", "") != streamId) break;
+
+                let status = str(dict_get(entry, "status", ""));
+                if (status == "resolved") {
+                    if (dict_get(entry, "decision", "") == decision) {
+                        result = {"status": "resolved",
+                            "response": __nexora_approval_snapshot(
+                                dict_get(entry, "response", {}))};
+                    } else {
+                        result = {"status": "conflict"};
+                    }
+                    break;
+                }
+                if (status == "resolving") {
+                    result = {"status": "resolving"};
+                    break;
+                }
+                if (status != "pending") break;
+
+                let claimed = __nexora_approval_snapshot(entry);
+                dict_set(claimed, "status", "resolving");
+                dict_set(claimed, "decision", decision);
+                this.entries[index] = claimed;
+                result = {"status": "pending", "request":
+                    __nexora_approval_snapshot(claimed)};
+                break;
+            }
+        } catch (&error) {
+            lock_release(this.lockId);
+            throw error;
+        }
+        lock_release(this.lockId);
+        return result;
+    }
+
+    func completeResolve(approvalId: string, response: dict) -> bool {
+        lock_acquire(this.lockId);
+        let completed = false;
+        try {
+            for (0..this.entries.length()) [const &index] {
+                let entry = this.entries[index];
+                if (dict_get(entry, "approval_id", "") != approvalId or
+                        dict_get(entry, "status", "") != "resolving") continue;
+                let resolved = __nexora_approval_snapshot(entry);
+                dict_set(resolved, "status", "resolved");
+                dict_set(resolved, "response", __nexora_approval_snapshot(response));
+                this.entries[index] = resolved;
+                completed = true;
+                break;
+            }
+        } catch (&error) {
+            lock_release(this.lockId);
+            throw error;
+        }
+        lock_release(this.lockId);
+        return completed;
+    }
+
+    func publicPending(streamId: string) {
+        let now = zeusTime.time();
+        lock_acquire(this.lockId);
+        let public = nil;
+        try {
+            this.compactUnsafe(now);
+            for (this.entries) [entry] {
+                if (dict_get(entry, "stream_id", "") != streamId or
+                        dict_get(entry, "status", "") != "pending") continue;
+                public = {"approval_id": dict_get(entry, "approval_id", ""),
+                    "operation": dict_get(entry, "operation", ""),
+                    "name": dict_get(entry, "name", "tool"),
+                    "summary": dict_get(entry, "summary", "Tool operation"),
+                    "expires_at": dict_get(entry, "expires_at", 0)};
+                break;
+            }
+        } catch (&error) {
+            lock_release(this.lockId);
+            throw error;
+        }
+        lock_release(this.lockId);
+        return public;
+    }
+}

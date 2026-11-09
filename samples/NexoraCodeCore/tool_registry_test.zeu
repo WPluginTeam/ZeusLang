@@ -1,0 +1,185 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.time;
+
+import samples.NexoraCodeCore.tool_registry;
+
+func __nexora_tool_test_assert(value: bool, message: string) {
+    if (!value) throw new Exception("tool registry test: " + message);
+}
+
+func __nexora_tool_test_write(path: string, content: string) {
+    let handle = file.open(path, "w");
+    handle.write(content);
+    handle.close();
+}
+
+func testNexoraToolRegistry(ground: string) {
+    let root = ground + "/tool-workspace";
+    file.mkdirs(root + "/nested");
+    file.mkdirs(root + "/.hidden");
+    __nexora_tool_test_write(root + "/a.txt", "alpha file");
+    __nexora_tool_test_write(root + "/nested/b.txt", "beta file");
+    __nexora_tool_test_write(root + "/.hidden/hidden.txt", "hidden file");
+    __nexora_tool_test_write(root + "/.env", "dummy fixture content");
+
+    let registry = new NexoraCoreToolRegistry(root);
+    let definitions = registry.toolDefinitions();
+    __nexora_tool_test_assert(definitions.length() == 6,
+        "registry must expose file, short-command, and terminal-session tools");
+    __nexora_tool_test_assert(registry.operationOf("read_file") == "read" and
+        registry.operationOf("local_file_write") == "write" and
+        registry.operationOf("local_shell_exec") == "command",
+        "permission operation must survive tool aliases and registration");
+    __nexora_tool_test_assert(
+        registry.operationOf("local_terminal", {"action": "read"}) == "read" and
+        registry.operationOf("local_terminal", {"action": "run"}) == "command" and
+        registry.operationOf("local_terminal", {"action": "terminate"}) == "command",
+        "terminal reads must be safe while starting and stopping processes require approval");
+
+    let read = registry.execute({"name": "local_file_read",
+        "arguments": {"path": "a.txt"}});
+    __nexora_tool_test_assert(dict_get(read, "content", "") == "alpha file",
+        "canonical read tool must return file content");
+
+    let aliasRead = registry.execute({"name": "read_file",
+        "arguments": {"path": "nested/b.txt"}});
+    __nexora_tool_test_assert(dict_get(aliasRead, "content", "") == "beta file",
+        "legacy read_file name must resolve to the migrated tool");
+
+    let listing = registry.execute({"name": "local_file_list",
+        "arguments": {"path": "."}});
+    let listingText = str(dict_get(listing, "content", ""));
+    __nexora_tool_test_assert(listingText.index("a.txt") >= 0 and
+        listingText.index("nested/") >= 0, "file list must show direct entries");
+
+    let tree = registry.execute({"name": "local_file_search_tree",
+        "arguments": {"path": ".", "max_depth": 3, "pattern": "*.txt"}});
+    let treeText = str(dict_get(tree, "content", ""));
+    __nexora_tool_test_assert(treeText.index("a.txt") >= 0 and
+        treeText.index("nested/b.txt") >= 0, "tree search must apply filename globs recursively");
+    __nexora_tool_test_assert(treeText.index("hidden.txt") < 0 and
+        treeText.index(".env") < 0, "tree search must hide hidden and sensitive files by default");
+
+    let traversal = registry.execute({"name": "local_file_read",
+        "arguments": {"path": "../../outside.txt"}});
+    __nexora_tool_test_assert(dict_get(traversal, "error", "") != "",
+        "path traversal must be rejected");
+
+    let sensitive = registry.execute({"name": "local_file_read",
+        "arguments": {"path": ".env"}});
+    __nexora_tool_test_assert(dict_get(sensitive, "error", "").index("Sensitive") >= 0,
+        "sensitive paths must be denied before reading");
+
+    let written = registry.execute({"name": "local_file_write",
+        "arguments": {"path": "nested/new.txt", "content": "written fixture"}});
+    __nexora_tool_test_assert(dict_get(written, "content", "").index("nested/new.txt") >= 0,
+        "workspace write handler must report its target");
+    let writtenRead = registry.execute({"name": "local_file_read",
+        "arguments": {"path": "nested/new.txt"}});
+    __nexora_tool_test_assert(dict_get(writtenRead, "content", "") == "written fixture",
+        "workspace write handler must persist UTF-8 content");
+
+    let sensitiveWrite = registry.execute({"name": "local_file_write",
+        "arguments": {"path": ".env.local", "content": "blocked"}});
+    __nexora_tool_test_assert(dict_get(sensitiveWrite, "error", "").index("Sensitive") >= 0,
+        "sensitive workspace paths must remain blocked after approval");
+
+    let writeTraversal = registry.execute({"name": "local_file_write",
+        "arguments": {"path": "../../outside.txt", "content": "blocked"}});
+    __nexora_tool_test_assert(dict_get(writeTraversal, "error", "") != "",
+        "workspace writes must reject path traversal");
+
+    let command = registry.execute({"name": "local_shell_exec",
+        "arguments": {"command": "echo registry command fixture",
+            "cwd": root, "timeout": 5}});
+    let commandPassed = dict_get(command, "exit_code", -1) == 0 and
+        dict_get(command, "content", "").index("registry command fixture") >= 0;
+    if (!commandPassed) {
+        print("NEXORA_TOOL_COMMAND_DEBUG " + JSON.stringify(command));
+        __nexora_tool_test_assert(false,
+            "short command tool must return its exit code and captured output");
+    }
+
+    let terminal = registry.execute({"name": "local_terminal",
+        "arguments": {"action": "run",
+            "command": "echo registry terminal fixture",
+            "cwd": root, "wait_seconds": 3}});
+    let terminalId = str(dict_get(terminal, "terminal_id", ""));
+    let terminalPassed = dict_get(terminal, "success", false) and
+        dict_get(terminal, "status", "") == "exited" and
+        dict_get(terminal, "returncode", -1) == 0 and
+        dict_get(terminal, "output", "").index("registry terminal fixture") >= 0;
+    if (!terminalPassed) {
+        print("NEXORA_TOOL_TERMINAL_DEBUG " + JSON.stringify(terminal));
+        __nexora_tool_test_assert(false,
+            "terminal run must wait, capture output, and return its session id");
+    }
+    let terminalRead = registry.execute({"name": "local_terminal",
+        "arguments": {"action": "read", "terminal_id": terminalId}});
+    __nexora_tool_test_assert(dict_get(terminalRead, "success", false) and
+        dict_get(terminalRead, "output", "") == "",
+        "terminal reads must advance the byte cursor without replaying output");
+
+    let splitUtf8 = registry.execute({"name": "local_terminal",
+        "arguments": {"action": "run",
+            "command": "powershell.exe -NoProfile -Command \"$s=[Console]::OpenStandardOutput();$a=[byte[]](228,189);$s.Write($a,0,$a.Length);Start-Sleep -Milliseconds 1800;$b=[byte[]](160);$s.Write($b,0,$b.Length)\"",
+            "cwd": root, "wait_seconds": 1}});
+    let splitUtf8Id = str(dict_get(splitUtf8, "terminal_id", ""));
+    __nexora_tool_test_assert(dict_get(splitUtf8, "success", false) and
+        dict_get(splitUtf8, "status", "") == "running" and
+        dict_get(splitUtf8, "output", "") == "" and
+        dict_get(splitUtf8, "has_more", false),
+        "a live terminal must hold an incomplete UTF-8 character at its byte cursor");
+    sleep(1.2);
+    let completedUtf8 = registry.execute({"name": "local_terminal",
+        "arguments": {"action": "read", "terminal_id": splitUtf8Id}});
+    __nexora_tool_test_assert(dict_get(completedUtf8, "success", false) and
+        dict_get(completedUtf8, "output", "") == "你" and
+        dict_get(completedUtf8, "status", "") == "exited",
+        "the next terminal read must decode the completed UTF-8 character once");
+
+    let oversizedTerminal = registry.execute({"name": "local_terminal",
+        "arguments": {"action": "run",
+            "command": "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Out.Write(('x' * 400000))\"",
+            "cwd": root, "wait_seconds": 5}});
+    let oversizedPassed = dict_get(oversizedTerminal, "success", false) and
+        dict_get(oversizedTerminal, "status", "") == "exited" and
+        dict_get(oversizedTerminal, "truncated", false) and
+        dict_get(oversizedTerminal, "output_lost", false) and
+        int(dict_get(oversizedTerminal, "buffer_bytes", 999999)) <= 200000 and
+        dict_get(oversizedTerminal, "has_more", false) and
+        str(dict_get(oversizedTerminal, "output", "")).length() > 0;
+    if (!oversizedPassed) {
+        print("NEXORA_TOOL_TERMINAL_BUFFER_DEBUG " +
+            JSON.stringify(oversizedTerminal));
+        __nexora_tool_test_assert(false,
+            "oversized terminal output must stay bounded and report truncation");
+    }
+
+    let longTerminal = registry.execute({"name": "local_terminal",
+        "arguments": {"action": "run",
+            "command": "ping -n 30 127.0.0.1 > nul",
+            "cwd": root, "wait_seconds": 0}});
+    let longTerminalId = str(dict_get(longTerminal, "terminal_id", ""));
+    __nexora_tool_test_assert(dict_get(longTerminal, "success", false) and
+        dict_get(longTerminal, "status", "") == "running",
+        "a long command must return a live terminal session");
+    let stoppedTerminal = registry.execute({"name": "local_terminal",
+        "arguments": {"action": "terminate",
+            "terminal_id": longTerminalId}});
+    __nexora_tool_test_assert(dict_get(stoppedTerminal, "success", false) and
+        dict_get(stoppedTerminal, "status", "") == "terminated" and
+        dict_get(stoppedTerminal, "stopped_by", "") == "taskkill",
+        "terminating a terminal must stop its Windows process tree");
+
+    let invalidType = registry.execute({"name": "local_file_list",
+        "arguments": {"path": 4}});
+    __nexora_tool_test_assert(dict_get(invalidType, "error", "").index("must be string") >= 0,
+        "registry must validate argument types");
+
+    let unknown = registry.execute({"name": "missing_tool", "arguments": {}});
+    __nexora_tool_test_assert(dict_get(unknown, "error", "").index("Unknown tool") >= 0,
+        "unknown tool names must return a clear error");
+}

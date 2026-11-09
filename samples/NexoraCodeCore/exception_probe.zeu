@@ -1,0 +1,62 @@
+import zeus.exception;
+import zeus.ssl;
+import zeus.websocket;
+
+class ThrowingConstructor {
+    using &this;
+
+    func init() {
+        throw new Exception("constructor probe");
+    }
+}
+
+class CatchingThrowConstructor {
+    using &this;
+
+    func init() {
+        try {
+            fail("constructor relay", -2146893019);
+        } catch (&failure) {
+            try {} catch (&cleanupFailure) {}
+            throw failure;
+        }
+    }
+}
+
+func nestedThrow() {
+    try {
+        throw new Exception("nested probe");
+    } catch (&inner) {
+        throw inner;
+    }
+}
+
+try {
+    nestedThrow();
+} catch (&outer) {
+    print("PROBE_OUTER_TYPE", type(outer));
+    print("PROBE_OUTER_VALUE", outer);
+}
+
+print("PROBE_PASS");
+
+try {
+    let broken = new ThrowingConstructor();
+} catch (&constructorFailure) {
+    print("PROBE_CONSTRUCTOR_TYPE", type(constructorFailure));
+    print("PROBE_CONSTRUCTOR_VALUE", constructorFailure);
+}
+
+try {
+    fail("module probe", -2146893019);
+} catch (&sslFailure) {
+    print("PROBE_SSL_MODULE_TYPE", type(sslFailure));
+    print("PROBE_SSL_MODULE_VALUE", sslFailure);
+}
+
+try {
+    let relayed = new CatchingThrowConstructor();
+} catch (&constructorRelayFailure) {
+    print("PROBE_CONSTRUCTOR_RELAY_TYPE", type(constructorRelayFailure));
+    print("PROBE_CONSTRUCTOR_RELAY_VALUE", constructorRelayFailure);
+}

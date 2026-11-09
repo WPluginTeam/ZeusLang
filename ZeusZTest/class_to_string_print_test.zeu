@@ -1,0 +1,40 @@
+// print()/str() on class instances resolve the user toString through the
+// runtime registry in AOT, even when the program never calls toString
+// statically. Keep this green on both backends: the emitter must seed
+// toString for constructed classes when the program can print.
+class ToStringPoint {
+    using &this;
+    var x = 0;
+    func init(x) {
+        this.x = x;
+    }
+    func label() -> string {
+        return "pt";
+    }
+    func toString() -> string {
+        return this.label() + ":" + str(this.x);
+    }
+}
+
+class NoToStringValue {
+    using &this;
+    var v = 7;
+}
+
+let point = new ToStringPoint(3);
+let alias = point;
+let plain = new NoToStringValue();
+
+let direct = str(point);
+let via_alias = str(alias);
+
+if (direct != "pt:3") {
+    print("CLASS_TO_STRING_FAIL direct=" + direct);
+} else if (via_alias != "pt:3") {
+    print("CLASS_TO_STRING_FAIL alias=" + via_alias);
+} else {
+    print(point);
+    // No toString: the graceful <Type:#N> fallback must survive, not throw.
+    print(plain);
+    print("CLASS_TO_STRING_PASS");
+}

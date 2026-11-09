@@ -1,0 +1,87 @@
+import zeus.mem;
+import zeus.exception;
+import zeus.ctypes;
+
+// Calls a Windows system DLL with no Zeus-side implementation at all: a bare
+// module name resolves through the platform loader, a hand-built struct reaches
+// the callee by address, and a ten-argument entry point dispatches.
+
+@native("GetSystemTime", from="kernel32")
+decl func getSystemTime(t: ptr);
+
+@native("GetTickCount64", from="kernel32")
+decl func getTickCount64() -> int;
+
+@native("GetCurrentProcessId", from="kernel32")
+decl func getCurrentProcessId() -> int32;
+
+@native("GetCurrentProcessId", from="kernel32")
+decl func getCurrentProcessIdWide() -> u32;
+
+// CreateProcessW takes ten parameters, which a smaller dispatch limit could not
+// even express in a declaration.
+@native("CreateProcessW", from="kernel32")
+decl func createProcessW(
+    appName: ptr, cmdLine: ptr, procAttr: ptr, threadAttr: ptr,
+    inherit: int32, flags: int32, environment: ptr, currentDir: ptr,
+    startup: ptr, processInfo: ptr) -> int32;
+
+func assertTrue(condition, message: string) {
+    if (!condition) {
+        throw new Exception("system dll probe failed: " + message);
+    }
+}
+
+// 1. A bare system module name resolves through the platform loader rather
+//    than being turned into a path next to the importing source.
+let pid = getCurrentProcessId();
+assertTrue(pid > 0, "GetCurrentProcessId must return a live pid");
+
+// The same DWORD read through the new u32 spelling must agree exactly.
+let pidWide: u32 = getCurrentProcessIdWide();
+assertTrue(pidWide > 0, "u32 GetCurrentProcessId must return a live pid");
+assertTrue(pidWide == pid, "int32 and u32 reads of GetCurrentProcessId must agree");
+
+let first = getTickCount64();
+let second = getTickCount64();
+assertTrue(second >= first, "GetTickCount64 must be monotonic");
+
+// 2. A struct laid out by hand lands in native memory where the callee reads
+//    it. SYSTEMTIME is eight WORD fields: 2 bytes each, 16 bytes, no padding.
+let systemTime = malloc(16);
+getSystemTime(systemTime);
+let year = @faddr(systemTime + 0, 2) -> int;
+let month = @faddr(systemTime + 2, 2) -> int;
+let day = @faddr(systemTime + 4, 2) -> int;
+assertTrue(year >= 2020, "wYear must come back from the struct");
+assertTrue(year <= 2200, "wYear must be plausible");
+assertTrue(month >= 1, "wMonth must come back from the struct");
+assertTrue(month <= 12, "wMonth must be plausible");
+assertTrue(day >= 1, "wDay must come back from the struct");
+assertTrue(day <= 31, "wDay must be plausible");
+free(systemTime);
+
+// 3. A zeroed STARTUPINFOW reaches the real ten-argument entry point. The image
+//    is intentionally missing, so Windows returns failure without starting a child.
+let processInfo = new Buffer(24);
+let startup = new Buffer(104);
+startup.setI32(0, 104);   // cb = sizeof(STARTUPINFOW)
+startup.setI32(60, 1);    // STARTF_USESHOWWINDOW
+startup.setI16(64, 1);    // wShowWindow = SW_SHOWNORMAL
+let missingImage = new Buffer(128);
+missingImage.utf16(0, "zeus-native-import-no-such-image.exe");
+let launched = createProcessW(
+    0, missingImage.address, 0, 0,
+    0,         // bInheritHandles
+    0,               // dwCreationFlags
+    0,               // lpEnvironment
+    0,               // lpCurrentDirectory
+    startup.address, // lpStartupInformation
+    processInfo.address // lpProcessInformation
+);
+assertTrue(launched == 0, "CreateProcessW with no image must report failure");
+startup.release();
+processInfo.release();
+missingImage.release();
+
+print("SYSTEM_DLL_NATIVE_IMPORT_PASS", year, month, day);

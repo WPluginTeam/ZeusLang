@@ -1,0 +1,65 @@
+import zeus.thread;
+import zeus.time;
+
+func assertEventWait(condition, message: string) {
+    if (!condition) throw new Exception("thread event wait test failed: " + message);
+}
+
+var gate = new Event();
+
+class EventSetter {
+    using &this;
+
+    let delayMillis = 0;
+
+    func init(delay: int) {
+        this.delayMillis = delay;
+    }
+
+    func run() {
+        thread_sleep(this.delayMillis);
+        gate.set();
+    }
+}
+
+// 1. Nothing sets the event: the timeout is the only thing that can end the wait.
+let idleStart = monotonic_ns();
+let idleSignalled = gate.wait(60);
+let idleMillis = int((monotonic_ns() - idleStart) / 1000000);
+assertEventWait(!idleSignalled, "wait reports false when the timeout expires");
+assertEventWait(idleMillis >= 50, "wait keeps waiting until the timeout");
+assertEventWait(idleMillis < 2000, "wait returns once the timeout expires");
+print("EVENT_TIMEOUT_MS", idleMillis);
+
+// 2. A setter inside the window: wait reports true and returns before the deadline.
+let setter = new EventSetter(80);
+let worker = new Thread(setter.run);
+let signalledStart = monotonic_ns();
+worker.start();
+let signalled = gate.wait(5000);
+let signalledMillis = int((monotonic_ns() - signalledStart) / 1000000);
+worker.join();
+assertEventWait(signalled, "wait reports true when the event is set");
+assertEventWait(signalledMillis < 4000, "wait returns for the set, not the deadline");
+print("EVENT_SIGNALLED_MS", signalledMillis);
+
+// 3. clear() puts the event back to waiting, so the same object times out again.
+gate.clear();
+assertEventWait(!gate.wait(30), "a cleared event times out again");
+
+// 4. An unlimited wait still returns when the event is set.
+let unlimitedSetter = new EventSetter(40);
+let unlimitedWorker = new Thread(unlimitedSetter.run);
+unlimitedWorker.start();
+assertEventWait(gate.wait(-1), "an unlimited wait returns when the event is set");
+unlimitedWorker.join();
+
+// 5. nil means unlimited as well.
+gate.clear();
+let nilSetter = new EventSetter(40);
+let nilWorker = new Thread(nilSetter.run);
+nilWorker.start();
+assertEventWait(gate.wait(nil), "a nil timeout waits for the event");
+nilWorker.join();
+
+print("THREAD_EVENT_WAIT_PASS");

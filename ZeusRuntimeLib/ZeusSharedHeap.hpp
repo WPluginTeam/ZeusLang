@@ -40,30 +40,35 @@ namespace ZeusShared {
 
         // 读取（加锁，返回拷贝）
         ZeusType::UniversalVariant read() const {
+            std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
             std::lock_guard<std::recursive_mutex> lock(mutex);
             return value.read();
         }
 
         // 写入（加锁）
         void write(const ZeusType::UniversalVariant& v) {
+            std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
             std::lock_guard<std::recursive_mutex> lock(mutex);
             value.write(v);
         }
 
         template <typename Function>
         void withValue(Function&& function) {
+            std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
             std::lock_guard<std::recursive_mutex> lock(mutex);
             value.withVariant(std::forward<Function>(function));
         }
 
         template <typename Function>
         void withValue(Function&& function) const {
+            std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
             std::lock_guard<std::recursive_mutex> lock(mutex);
             value.withVariant(std::forward<Function>(function));
         }
 
         // 获取锁（用于复合操作）
         void lockWrite() {
+            ZeusGC::graphMutex().lock();
             mutex.lock();
             ++lockCount;
         }
@@ -72,16 +77,19 @@ namespace ZeusShared {
         void unlockWrite() {
             --lockCount;
             mutex.unlock();
+            ZeusGC::graphMutex().unlock();
         }
 
         // 获取锁（读写同一个锁）
         void lockRead() const {
+            ZeusGC::graphMutex().lock();
             mutex.lock();
         }
 
         // 释放锁
         void unlockRead() const {
             mutex.unlock();
+            ZeusGC::graphMutex().unlock();
         }
     };
 
@@ -197,6 +205,25 @@ namespace ZeusShared {
             return namedVars.find(name) != namedVars.end();
         }
 
+        // Visit every stored value. Used by the VM's conservative sweep so an
+        // object kept alive only by a shared binding (an ObjectHandle stored in
+        // the cell) is still treated as a root. The cell references are copied
+        // out under the heap lock, so the visitor never runs while holding it.
+        template <typename Visitor>
+        void visitValues(Visitor&& visitor) {
+            std::vector<std::shared_ptr<SharedCell>> cells;
+            {
+                std::lock_guard<std::recursive_mutex> lock(heapMutex);
+                cells.reserve(namedVars.size());
+                for (const auto& entry : namedVars) {
+                    cells.push_back(entry.second);
+                }
+            }
+            for (const auto& cell : cells) {
+                visitor(cell->read());
+            }
+        }
+
         // 获取所有共享变量名
         std::vector<std::string> getAllNames() {
             std::lock_guard<std::recursive_mutex> lock(heapMutex);
@@ -212,6 +239,18 @@ namespace ZeusShared {
         }
 
         // 清空堆（通常仅在进程退出时调用）
+        std::shared_ptr<SharedCell> takeNewest() {
+            std::lock_guard<std::recursive_mutex> lock(heapMutex);
+            if (namedVars.empty()) return nullptr;
+            auto newest = namedVars.begin();
+            for (auto it = namedVars.begin(); it != namedVars.end(); ++it) {
+                if (it->second->generation > newest->second->generation) newest = it;
+            }
+            auto cell = std::move(newest->second);
+            namedVars.erase(newest);
+            return cell;
+        }
+
         void clear() {
             std::lock_guard<std::recursive_mutex> lock(heapMutex);
             namedVars.clear();

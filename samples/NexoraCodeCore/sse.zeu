@@ -1,0 +1,98 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import zeus.requests;
+import zeus.string;
+
+// SSE 帧泵（S11）。对应 Python 侧 AgentLoop.stream_send 产出的事件流：
+//   data: {...}\n\n   一帧
+//   data: [DONE]\n\n 收尾
+//   : ...\n          心跳注释，丢弃
+//
+// `nexora_sse_next(stream, state, sliceMillis)` 每次最多阻塞一个 slice：
+//   nil                            -> 超时片，调用方 pump（可顺手检查 cancel）
+//   {"type": "event", "data": ...} -> 一帧（多行 data 按 SSE 规范用 \n 连接）
+//   {"type": "done"}               -> 收到 [DONE]，或对端干净关闭
+// 中途 EOF（块没收完连接先断）直接抛错，不吞半截帧。
+// event:/id:/retry: 等字段按 OpenAI 子集忽略，只取 data（已在注释写明）。
+
+// SSE 默认请求头；调用方给的字段覆盖默认值（比如自带 Authorization）。
+func __nexora_sse_headers(headers) {
+    let merged = {"Accept": "text/event-stream"};
+    if (type(headers) != "dict") return merged;
+    for (headers) [&name: &value] {
+        merged[name] = value;
+    }
+    return merged;
+}
+
+func nexora_sse_get(url: string, headers = nil, timeout = nil) {
+    return stream("GET", url, nil, __nexora_sse_headers(headers), nil, timeout);
+}
+
+// 带 JSON body 的流：聊天补全这类 POST + text/event-stream 响应。
+func nexora_sse_post(url: string, body = nil, headers = nil, timeout = nil) {
+    let merged = __nexora_sse_headers(headers);
+    merged["Content-Type"] = "application/json";
+    return stream("POST", url, nil, merged, body, timeout);
+}
+
+func nexora_sse_connect(url: string) {
+    return nexora_sse_get(url);
+}
+
+func __nexora_sse_pending(state) -> Array {
+    let pending = nil;
+    try {
+        pending = state.get("pending", nil);
+    } catch (&error) {
+        pending = nil;
+    }
+    if (type(pending) != "Array") {
+        pending = [];
+        try {
+            state["pending"] = pending;
+        } catch (&error) {}
+    }
+    return pending;
+}
+
+func __nexora_sse_join_lines(lines: Array) -> string {
+    return string_join(lines, "\n");
+}
+
+func nexora_sse_next(stream, state, sliceMillis: int = 1000) {
+    if (stream.finished) {
+        let pending = __nexora_sse_pending(state);
+        if (pending.length() > 0) {
+            throw new Exception("SSE 连接在事件块中间关闭");
+        }
+        return {"type": "done"};
+    }
+
+    let line = stream.readLineSlice(sliceMillis);
+    if (line == nil) return nil;
+
+    if (line == "") {
+        let pending = __nexora_sse_pending(state);
+        if (pending.length() == 0) return nil;
+        let data = __nexora_sse_join_lines(pending);
+        try {
+            state["pending"] = [];
+        } catch (&error) {}
+        if (data == "[DONE]") return {"type": "done"};
+        return {"type": "event", "data": data};
+    }
+
+    if (line.startswith(":")) return nil;
+    if (line.startswith("data:")) {
+        let value = line.slice(5, line.length());
+        if (value.startswith(" ")) value = value.slice(1, value.length());
+        let pending = __nexora_sse_pending(state);
+        pending.append(value);
+        try {
+            state["pending"] = pending;
+        } catch (&error) {}
+    }
+    return nil;
+}

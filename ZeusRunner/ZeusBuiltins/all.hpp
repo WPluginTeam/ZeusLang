@@ -26,17 +26,15 @@
 #include "object.hpp"
 #include "allocation.hpp"
 
-// Socket 网络操作
-#include "socket.hpp"
+// Network protocol glue. Sockets themselves are not here: zeus.socket loads the
+// platform library at run time, so nothing in the runtime carries a socket
+// implementation.
 #include "crypto.hpp"
 #include "websocket.hpp"
 #include "NativeInjectionRegistry.hpp"
 
 // 线程和同步
 #include "thread.hpp"
-
-// 时间函数
-#include "time.hpp"
 
 // 调试和统计
 #include "debug.hpp"
@@ -62,15 +60,9 @@ namespace ZeusBuiltins {
         
         // 对象和全局变量
         registerObjectBuiltins();
-        
-        // Socket
-        registerSocketBuiltins();
 
         // 线程和同步
         registerThreadBuiltins();
-        
-        // 时间函数
-        registerTimeBuiltins();
         
         // 调试
         registerDebugBuiltins();

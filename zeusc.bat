@@ -6,7 +6,9 @@ set "ZEUSC_INPUT="
 set "ZEUSC_OUTPUT="
 set "ZEUSC_LINK_INPUTS="
 set "ZEUSC_KEEP_TEMPS=0"
-set "ZEUSC_OPT_LEVEL=0"
+set "ZEUSC_OPT_LEVEL=s"
+set "ZEUSC_ONEFILE=0"
+set "ZEUSC_LINK_RESOURCES="
 set "ZEUSC_WORK="
 set "ZEUSC_RUNTIME_DEBUG_FLAGS="
 if /i "%ZEUS_RUNTIME_DEBUG_DETAILS%"=="1" set "ZEUSC_RUNTIME_DEBUG_FLAGS=/DZEUS_RUNTIME_DEBUG_DETAILS=1"
@@ -17,6 +19,11 @@ if /i "%~1"=="--help" goto :usage
 if /i "%~1"=="-h" goto :usage
 if /i "%~1"=="--keep-temps" (
   set "ZEUSC_KEEP_TEMPS=1"
+  shift
+  goto :parse_args
+)
+if /i "%~1"=="--onefile" (
+  set "ZEUSC_ONEFILE=1"
   shift
   goto :parse_args
 )
@@ -98,6 +105,9 @@ if errorlevel 1 (
 call :initialize_msvc
 if errorlevel 1 exit /b 1
 
+call "%ZEUSC_ROOT%ZeusNativeRuntime\build_native_runtime.bat"
+if errorlevel 1 exit /b 1
+
 where clang.exe >nul 2>nul
 if errorlevel 1 if exist "%ProgramFiles%\LLVM\bin\clang.exe" set "PATH=%ProgramFiles%\LLVM\bin;%PATH%"
 where clang.exe >nul 2>nul
@@ -106,10 +116,10 @@ if errorlevel 1 (
   exit /b 1
 )
 
-if exist "%ZEUSC_ROOT%Zeus.exe" goto :compiler_ready
-echo [zeusc] Zeus.exe was not found; building the compiler first.
+if exist "%ZEUSC_ROOT%ZeusCompiler.exe" goto :compiler_ready
+echo [zeusc] ZeusCompiler.exe was not found; building the compiler first.
 pushd "%ZEUSC_ROOT%"
-call build.bat
+call "ZeusCLI\build_compiler.bat"
 set "ZEUSC_RC=%ERRORLEVEL%"
 popd
 if not "%ZEUSC_RC%"=="0" (
@@ -118,8 +128,14 @@ if not "%ZEUSC_RC%"=="0" (
 )
 :compiler_ready
 
-set "ZEUSC_TEMP_ROOT=%TEMP%"
-for %%I in ("%ZEUSC_TEMP_ROOT%") do set "ZEUSC_TEMP_ROOT=%%~fI"
+set "ZEUSC_TEMP_ROOT=%ZEUSC_ROOT%ZeusCLI\.build"
+if not exist "%ZEUSC_TEMP_ROOT%" (
+  mkdir "%ZEUSC_TEMP_ROOT%"
+  if errorlevel 1 (
+    echo [zeusc] Could not create temporary build directory: "%ZEUSC_TEMP_ROOT%"
+    exit /b 1
+  )
+)
 :make_work_dir
 set "ZEUSC_WORK=%ZEUSC_TEMP_ROOT%\zeusc-%RANDOM%-%RANDOM%"
 if exist "%ZEUSC_WORK%" goto :make_work_dir
@@ -131,7 +147,7 @@ if errorlevel 1 (
 for %%I in ("%ZEUSC_WORK%") do set "ZEUSC_WORK=%%~fI"
 
 echo [zeusc] Emitting LLVM IR...
-"%ZEUSC_ROOT%Zeus.exe" --emit-llvm "%ZEUSC_INPUT%" "%ZEUSC_WORK%\program.ll"
+"%ZEUSC_ROOT%ZeusCompiler.exe" --emit-llvm "%ZEUSC_INPUT%" "%ZEUSC_WORK%\program.ll"
 if errorlevel 1 goto :failed
 
 echo [zeusc] Compiling LLVM IR...
@@ -139,57 +155,78 @@ clang.exe -O%ZEUSC_OPT_LEVEL% -Wno-override-module -c "%ZEUSC_WORK%\program.ll" 
 if errorlevel 1 goto :failed
 
 echo [zeusc] Building the Zeus runtime...
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusAOT\runtime\zeus_rt.cpp" /Fo"%ZEUSC_WORK%\zeus_rt.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusAOT\runtime\zeus_rt.cpp" /Fo"%ZEUSC_WORK%\zeus_rt.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 %ZEUSC_RUNTIME_DEBUG_FLAGS% "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusABI.cpp" /Fo"%ZEUSC_WORK%\zeus_abi.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 %ZEUSC_RUNTIME_DEBUG_FLAGS% "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusABI.cpp" /Fo"%ZEUSC_WORK%\zeus_abi.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusNativeABI.cpp" /Fo"%ZEUSC_WORK%\zeus_native_abi.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusNativeABI.cpp" /Fo"%ZEUSC_WORK%\zeus_native_abi.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusStringNativeABI.cpp" /Fo"%ZEUSC_WORK%\zeus_string_native_abi.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusStringNativeABI.cpp" /Fo"%ZEUSC_WORK%\zeus_string_native_abi.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusMemoryABI.cpp" /Fo"%ZEUSC_WORK%\zeus_memory_abi.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusMemoryABI.cpp" /Fo"%ZEUSC_WORK%\zeus_memory_abi.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusLValueABI.cpp" /Fo"%ZEUSC_WORK%\zeus_lvalue_abi.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusLValueABI.cpp" /Fo"%ZEUSC_WORK%\zeus_lvalue_abi.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusDynamicABI.cpp" /Fo"%ZEUSC_WORK%\zeus_dynamic_abi.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusDynamicABI.cpp" /Fo"%ZEUSC_WORK%\zeus_dynamic_abi.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusDynamicBinaryABI.cpp" /Fo"%ZEUSC_WORK%\zeus_dynamic_binary_abi.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusDynamicBinaryABI.cpp" /Fo"%ZEUSC_WORK%\zeus_dynamic_binary_abi.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusDynamicMemberABI.cpp" /Fo"%ZEUSC_WORK%\zeus_dynamic_member_abi.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusDynamicMemberABI.cpp" /Fo"%ZEUSC_WORK%\zeus_dynamic_member_abi.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusRangeCheckABI.cpp" /Fo"%ZEUSC_WORK%\zeus_range_check_abi.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusRangeCheckABI.cpp" /Fo"%ZEUSC_WORK%\zeus_range_check_abi.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusClosureABI.cpp" /Fo"%ZEUSC_WORK%\zeus_closure_abi.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusClosureABI.cpp" /Fo"%ZEUSC_WORK%\zeus_closure_abi.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusGCABI.cpp" /Fo"%ZEUSC_WORK%\zeus_gc_abi.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusGCABI.cpp" /Fo"%ZEUSC_WORK%\zeus_gc_abi.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusObjectLifetime.cpp" /Fo"%ZEUSC_WORK%\zeus_object_lifetime.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusObjectLifetime.cpp" /Fo"%ZEUSC_WORK%\zeus_object_lifetime.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusThreadABI.cpp" /Fo"%ZEUSC_WORK%\zeus_thread_abi.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusThreadABI.cpp" /Fo"%ZEUSC_WORK%\zeus_thread_abi.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusThreadClosureABI.cpp" /Fo"%ZEUSC_WORK%\zeus_thread_closure_abi.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusProcessCaptureABI.cpp" /Fo"%ZEUSC_WORK%\zeus_process_capture_abi.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusSocketABI.cpp" /Fo"%ZEUSC_WORK%\zeus_socket_abi.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusThreadClosureABI.cpp" /Fo"%ZEUSC_WORK%\zeus_thread_closure_abi.obj"
 if errorlevel 1 goto :failed
-cl.exe /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 %ZEUSC_RUNTIME_DEBUG_FLAGS% "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusRuntimeDebug.cpp" /Fo"%ZEUSC_WORK%\zeus_runtime_debug.obj"
+cl.exe /c /MT /O2 /EHs /Gy /nologo /utf-8 /std:c++17 %ZEUSC_RUNTIME_DEBUG_FLAGS% "%ZEUSC_ROOT%ZeusRuntimeLib\ZeusRuntimeDebug.cpp" /Fo"%ZEUSC_WORK%\zeus_runtime_debug.obj"
 if errorlevel 1 goto :failed
-lib.exe "%ZEUSC_WORK%\zeus_rt.obj" "%ZEUSC_WORK%\zeus_abi.obj" "%ZEUSC_WORK%\zeus_native_abi.obj" "%ZEUSC_WORK%\zeus_string_native_abi.obj" "%ZEUSC_WORK%\zeus_memory_abi.obj" "%ZEUSC_WORK%\zeus_lvalue_abi.obj" "%ZEUSC_WORK%\zeus_dynamic_abi.obj" "%ZEUSC_WORK%\zeus_dynamic_binary_abi.obj" "%ZEUSC_WORK%\zeus_dynamic_member_abi.obj" "%ZEUSC_WORK%\zeus_range_check_abi.obj" "%ZEUSC_WORK%\zeus_closure_abi.obj" "%ZEUSC_WORK%\zeus_gc_abi.obj" "%ZEUSC_WORK%\zeus_object_lifetime.obj" "%ZEUSC_WORK%\zeus_thread_abi.obj" "%ZEUSC_WORK%\zeus_thread_closure_abi.obj" "%ZEUSC_WORK%\zeus_socket_abi.obj" "%ZEUSC_WORK%\zeus_runtime_debug.obj" /OUT:"%ZEUSC_WORK%\libzeus_rt.lib" /NOLOGO
+lib.exe "%ZEUSC_WORK%\zeus_rt.obj" "%ZEUSC_WORK%\zeus_abi.obj" "%ZEUSC_WORK%\zeus_native_abi.obj" "%ZEUSC_WORK%\zeus_string_native_abi.obj" "%ZEUSC_WORK%\zeus_memory_abi.obj" "%ZEUSC_WORK%\zeus_lvalue_abi.obj" "%ZEUSC_WORK%\zeus_dynamic_abi.obj" "%ZEUSC_WORK%\zeus_dynamic_binary_abi.obj" "%ZEUSC_WORK%\zeus_dynamic_member_abi.obj" "%ZEUSC_WORK%\zeus_range_check_abi.obj" "%ZEUSC_WORK%\zeus_closure_abi.obj" "%ZEUSC_WORK%\zeus_gc_abi.obj" "%ZEUSC_WORK%\zeus_object_lifetime.obj" "%ZEUSC_WORK%\zeus_thread_abi.obj" "%ZEUSC_WORK%\zeus_process_capture_abi.obj" "%ZEUSC_WORK%\zeus_thread_closure_abi.obj" "%ZEUSC_WORK%\zeus_runtime_debug.obj" /OUT:"%ZEUSC_WORK%\libzeus_rt.lib" /NOLOGO
 if errorlevel 1 goto :failed
 
+if not "%ZEUSC_ONEFILE%"=="1" goto :skip_embedded_resource
+pushd "%ZEUSC_ROOT%"
+if errorlevel 1 goto :failed
+> "%ZEUSC_WORK%\zeus_native_runtime.rc" echo 0x5A55 RCDATA "ZeusNativeRuntime.dll"
+rc.exe /nologo /fo "%ZEUSC_WORK%\zeus_native_runtime.res" "%ZEUSC_WORK%\zeus_native_runtime.rc"
+set "ZEUSC_RC=%ERRORLEVEL%"
+popd
+if not "%ZEUSC_RC%"=="0" goto :failed_with_code
+set ZEUSC_LINK_RESOURCES="%ZEUSC_WORK%\zeus_native_runtime.res"
+:skip_embedded_resource
+
 echo [zeusc] Linking executable...
-link.exe "%ZEUSC_WORK%\program.obj" %ZEUSC_LINK_INPUTS% "%ZEUSC_WORK%\libzeus_rt.lib" libcmt.lib kernel32.lib ws2_32.lib /NOLOGO /SUBSYSTEM:CONSOLE /INCREMENTAL:NO /OUT:"%ZEUSC_OUTPUT%"
+rem Native libraries such as ws2_32 are intentionally NOT linked here.
+rem Socket/thread/etc. access goes through @native("sym", from="dll") dynamic
+rem loading, so linking ws2_32.lib unconditionally only bloats every binary.
+link.exe "%ZEUSC_WORK%\program.obj" %ZEUSC_LINK_INPUTS% %ZEUSC_LINK_RESOURCES% "%ZEUSC_WORK%\libzeus_rt.lib" libcmt.lib kernel32.lib /NOLOGO /SUBSYSTEM:CONSOLE /INCREMENTAL:NO /OPT:REF /OUT:"%ZEUSC_OUTPUT%"
 if errorlevel 1 goto :failed
 if not exist "%ZEUSC_OUTPUT%" (
   echo [zeusc] Linker returned success but did not create the output file.
   goto :failed
 )
 
+if "%ZEUSC_ONEFILE%"=="1" goto :runtime_embedded
+if /i not "%ZEUSC_OUTDIR%"=="%ZEUSC_ROOT%" (
+  copy /y "%ZEUSC_ROOT%ZeusNativeRuntime.dll" "%ZEUSC_OUTDIR%ZeusNativeRuntime.dll" >nul
+  if errorlevel 1 goto :failed
+)
+:runtime_embedded
+
 echo [zeusc] Created "%ZEUSC_OUTPUT%"
 if "%ZEUSC_KEEP_TEMPS%"=="1" (
   echo [zeusc] Build files kept in "%ZEUSC_WORK%"
   exit /b 0
 )
-del /q "%ZEUSC_WORK%\program.ll" "%ZEUSC_WORK%\program.obj" "%ZEUSC_WORK%\zeus_rt.obj" "%ZEUSC_WORK%\zeus_abi.obj" "%ZEUSC_WORK%\zeus_native_abi.obj" "%ZEUSC_WORK%\zeus_string_native_abi.obj" "%ZEUSC_WORK%\zeus_memory_abi.obj" "%ZEUSC_WORK%\zeus_lvalue_abi.obj" "%ZEUSC_WORK%\zeus_dynamic_abi.obj" "%ZEUSC_WORK%\zeus_dynamic_binary_abi.obj" "%ZEUSC_WORK%\zeus_dynamic_member_abi.obj" "%ZEUSC_WORK%\zeus_range_check_abi.obj" "%ZEUSC_WORK%\zeus_closure_abi.obj" "%ZEUSC_WORK%\zeus_gc_abi.obj" "%ZEUSC_WORK%\zeus_object_lifetime.obj" "%ZEUSC_WORK%\zeus_thread_abi.obj" "%ZEUSC_WORK%\zeus_thread_closure_abi.obj" "%ZEUSC_WORK%\zeus_socket_abi.obj" "%ZEUSC_WORK%\zeus_runtime_debug.obj" "%ZEUSC_WORK%\libzeus_rt.lib" 2>nul
+del /q "%ZEUSC_WORK%\program.ll" "%ZEUSC_WORK%\program.obj" "%ZEUSC_WORK%\zeus_rt.obj" "%ZEUSC_WORK%\zeus_abi.obj" "%ZEUSC_WORK%\zeus_native_abi.obj" "%ZEUSC_WORK%\zeus_string_native_abi.obj" "%ZEUSC_WORK%\zeus_memory_abi.obj" "%ZEUSC_WORK%\zeus_lvalue_abi.obj" "%ZEUSC_WORK%\zeus_dynamic_abi.obj" "%ZEUSC_WORK%\zeus_dynamic_binary_abi.obj" "%ZEUSC_WORK%\zeus_dynamic_member_abi.obj" "%ZEUSC_WORK%\zeus_range_check_abi.obj" "%ZEUSC_WORK%\zeus_closure_abi.obj" "%ZEUSC_WORK%\zeus_gc_abi.obj" "%ZEUSC_WORK%\zeus_object_lifetime.obj" "%ZEUSC_WORK%\zeus_thread_abi.obj" "%ZEUSC_WORK%\zeus_process_capture_abi.obj" "%ZEUSC_WORK%\zeus_thread_closure_abi.obj" "%ZEUSC_WORK%\zeus_runtime_debug.obj" "%ZEUSC_WORK%\libzeus_rt.lib" "%ZEUSC_WORK%\zeus_native_runtime.rc" "%ZEUSC_WORK%\zeus_native_runtime.res" 2>nul
 rd "%ZEUSC_WORK%" 2>nul
 exit /b 0
 
@@ -241,6 +278,8 @@ exit /b 0
 
 :failed
 set "ZEUSC_RC=%ERRORLEVEL%"
+:failed_with_code
+if "%ZEUSC_RC%"=="0" set "ZEUSC_RC=1"
 echo [zeusc] Build failed with exit code %ZEUSC_RC%.
 if defined ZEUSC_WORK echo [zeusc] Intermediate files were kept in "%ZEUSC_WORK%"
 exit /b %ZEUSC_RC%
@@ -254,10 +293,11 @@ call :print_usage
 exit /b 0
 
 :print_usage
-echo Usage: zeusc ^<input.zeu^> [-o ^<output.exe^>] [--opt-level 0^|1^|2^|3^|s^|z] [--link ^<file.obj^|file.lib^>]... [--keep-temps]
+echo Usage: zeusc ^<input.zeu^> [-o ^<output.exe^>] [--opt-level 0^|1^|2^|3^|s^|z] [--onefile] [--link ^<file.obj^|file.lib^>]... [--keep-temps]
 echo.
 echo Compiles a Zeus source file to a standalone Windows console executable.
 echo --link adds a native object file or import/static library for @native symbols.
-echo --opt-level selects LLVM optimization; the default is 0.
-echo Requires Zeus.exe, clang, and the MSVC x64 C++ build tools.
+echo --opt-level selects LLVM optimization; the default is s.
+echo --onefile embeds ZeusNativeRuntime.dll in the output executable.
+echo Requires ZeusCompiler.exe, clang, and the MSVC x64 C++ build tools.
 exit /b 0

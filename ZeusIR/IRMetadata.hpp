@@ -124,6 +124,7 @@ namespace IRType {
         std::string operatorSymbol;
         std::string nativeSymbol;
         std::string nativeReferenceABI = "raw";
+        std::string nativeLibraryPath;
         std::string moduleName;
         int captureCount = 0;
         bool hasCaptureCount = false;
@@ -149,7 +150,8 @@ namespace IRType {
             std::vector<std::string> names = {},
             std::vector<bool> byReference = {},
             bool inlineFunction = false,
-            bool noSafepoint = false
+            bool noSafepoint = false,
+            std::string nativeSymbol = {}
         ) {
             IRMetadata result;
             result.kind = IRMetadataKind::FunctionSignature;
@@ -166,6 +168,9 @@ namespace IRType {
             result.isStaticMethod = staticMethod;
             result.isInline = inlineFunction;
             result.isNoSafepoint = noSafepoint;
+            // `@native func` 定义：有 C 链接符号名，但仍然是函数定义（要发射
+            // 函数体）。声明侧走 externalFunctionSignature，另有 isExternal。
+            result.nativeSymbol = std::move(nativeSymbol);
             return result;
         }
 
@@ -176,7 +181,8 @@ namespace IRType {
             std::string nativeSymbol = {},
             std::vector<std::string> names = {},
             std::vector<bool> byReference = {},
-            std::string nativeReferenceABI = "raw"
+            std::string nativeReferenceABI = "raw",
+            std::string nativeLibraryPath = {}
         ) {
             IRMetadata result = functionSignature(
                 name, returnType, 0, std::move(parameterTypes), {}, {}, false,
@@ -186,6 +192,7 @@ namespace IRType {
             result.tag = "external_function_signature";
             result.nativeSymbol = std::move(nativeSymbol);
             result.nativeReferenceABI = std::move(nativeReferenceABI);
+            result.nativeLibraryPath = std::move(nativeLibraryPath);
             return result;
         }
 
@@ -346,7 +353,8 @@ namespace IRType {
             std::string* native = nullptr,
             std::vector<std::string>* names = nullptr,
             std::vector<bool>* byReference = nullptr,
-            std::string* nativeRefABI = nullptr
+            std::string* nativeRefABI = nullptr,
+            std::string* nativeLibrary = nullptr
         ) const {
             if ((kind != IRMetadataKind::FunctionSignature &&
                  kind != IRMetadataKind::ExternalFunctionSignature) ||
@@ -366,6 +374,7 @@ namespace IRType {
             if (op) *op = operatorSymbol;
             if (native) *native = nativeSymbol;
             if (nativeRefABI) *nativeRefABI = nativeReferenceABI;
+            if (nativeLibrary) *nativeLibrary = nativeLibraryPath;
             return true;
         }
 

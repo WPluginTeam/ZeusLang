@@ -1,0 +1,71 @@
+// Test module-level conditional compilation
+using windows {
+    let platformGreeting: string = "Hello Windows";
+    let platformCode: int = 1;
+
+    func getPlatformTag() -> string {
+        return "WIN";
+    }
+}
+
+using linux {
+    let platformGreeting: string = "Hello Linux";
+    let platformCode: int = 2;
+
+    func getPlatformTag() -> string {
+        return "LNX";
+    }
+}
+
+using darwin {
+    let platformGreeting: string = "Hello macOS";
+    let platformCode: int = 3;
+
+    func getPlatformTag() -> string {
+        return "MAC";
+    }
+}
+
+print(platformGreeting);
+print(platformCode);
+print(getPlatformTag());
+
+// Test function-level conditional compilation
+func describeOs() -> string {
+    using windows {
+        return "OS: Windows";
+    }
+    using linux {
+        return "OS: Linux";
+    }
+    using darwin {
+        return "OS: Darwin";
+    }
+}
+
+print(describeOs());
+
+// Test class-level conditional compilation
+class PlatformAdapter {
+    using &this;
+
+    using windows {
+        var bufferSize: int = 4096;
+        func getDriver() -> string {
+            return "WinSock";
+        }
+    }
+
+    using linux {
+        var bufferSize: int = 8192;
+        func getDriver() -> string {
+            return "epoll";
+        }
+    }
+}
+
+let adapter: PlatformAdapter = new PlatformAdapter();
+print(adapter.bufferSize);
+print(adapter.getDriver());
+
+print("USING_PLATFORM_TEST_PASS");

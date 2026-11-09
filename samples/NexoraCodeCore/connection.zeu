@@ -1,0 +1,218 @@
+﻿import zeus.exception;
+import zeus.string;
+import zeus.thread;
+import zeus.time;
+import samples.NexoraCodeCore.core;
+import samples.NexoraCodeCore.task_events;
+
+// 帧钩子。S4 的 RPC 分发和 S5 的任务流订阅各自填充；没填的类型直接忽略。
+class NexoraCoreHandlers {
+    using &this;
+
+    let onRpc = nil;
+    let onTaskSubscribe = nil;
+    let onTaskUnsubscribe = nil;
+}
+
+func __nexora_since_millis(mark: int) -> int {
+    return int((monotonic_ns() - mark) / 1000000);
+}
+
+func __nexora_frame_type(frame) -> string {
+    for (frame) [&key: &value] {
+        if (key == "type") {
+            if (value == nil) return "";
+            return str(value);
+        }
+    }
+    return "";
+}
+
+// 长期存活的远程连接：认证、心跳、上行生命周期帧、软超时收帧、指数退避重连。
+// 停止只用 Event 通知，收发循环靠 receive 的超时醒来，因此不需要跨线程关 socket。
+class NexoraCoreClient {
+    using &this;
+
+    let serverUrl = "";
+    let deviceId = "";
+    let deviceToken = "";
+    let sslContext = nil;
+    let buffer = nil;
+    let handlers = nil;
+
+    // 连接工厂：nil 用真实实现，测试可替换成假工厂。
+    let connectFn = nil;
+
+    let stop = new Event();
+    let worker = nil;
+    let online = false;
+    let lastError = "";
+    let attempts = 0;
+
+    let heartbeatMillis = 15000;
+    let receiveMillis = 2000;
+    let backoffMillis = 1000;
+    let backoffStartMillis = 1000;
+    let backoffCapMillis = 30000;
+
+    func init(
+        serverUrlValue: string,
+        deviceIdValue: string,
+        deviceTokenValue: string,
+        sslContextValue,
+        bufferValue,
+        handlersValue = nil
+    ) {
+        this.serverUrl = serverUrlValue;
+        this.deviceId = deviceIdValue;
+        this.deviceToken = deviceTokenValue;
+        this.sslContext = sslContextValue;
+        this.buffer = bufferValue;
+        this.handlers = handlersValue;
+    }
+
+    // 绑定这个对象时保持同一实例：默认的类赋值会复制标量字段，而状态机把
+    // online / attempts / lastError 写在 worker 线程里，复制品上写的状态没人看得见。
+    func operator[@=]() -> &NexoraCoreClient {
+        return this;
+    }
+
+    func start() {
+        if (this.worker != nil) {
+            throw new Exception("Nexora remote connection is already running");
+        }
+        this.stop.clear();
+        this.worker = new Thread(this._serve);
+        this.worker.start();
+    }
+
+    func requestStop() {
+        this.stop.set();
+    }
+
+    func join() {
+        if (this.worker == nil) return;
+        this.worker.join();
+        this.worker = nil;
+    }
+
+    func isOnline() -> bool {
+        return this.online;
+    }
+
+    func getAttempts() -> int {
+        return this.attempts;
+    }
+
+    func status() {
+        let snapshot = {
+            "online": this.online,
+            "error": this.lastError,
+            "attempts": this.attempts
+        };
+        return snapshot;
+    }
+
+    func _openConnection() {
+        let opener = this.connectFn;
+        if (opener != nil) {
+            return opener(this.serverUrl, this.deviceId, this.deviceToken, this.sslContext);
+        }
+        return nexora_core_connect(
+            this.serverUrl, this.deviceId, this.deviceToken, this.sslContext);
+    }
+
+    func _serve() {
+        for (!this.stop.isSet()) {
+            this.attempts = this.attempts + 1;
+            let connection = nil;
+
+            try {
+                connection = this._openConnection();
+                this.online = true;
+                this.lastError = "";
+                this.backoffMillis = this.backoffStartMillis;
+                this._session(connection);
+            } catch (&error) {
+                this.lastError = str(error);
+            }
+
+            this.online = false;
+            // 只有正常停止才值得发关闭帧：出错时这条连接已经不可写，再 close 会
+            // 在 schannel 里失败，交给析构回收即可。
+            if (this.stop.isSet() and connection != nil) {
+                try {
+                    nexora_core_close(connection);
+                } catch (&closeError) {}
+            }
+
+            if (this.stop.isSet()) break;
+
+            this.stop.wait(this.backoffMillis);
+            let next = this.backoffMillis * 2;
+            if (next > this.backoffCapMillis) next = this.backoffCapMillis;
+            this.backoffMillis = next;
+        }
+
+        this.online = false;
+    }
+
+    // 一次连接内的循环：心跳、上行生命周期帧、收帧。软超时只表示这条连接上暂时
+    // 没有消息，循环继续；其它异常（对端关闭、写失败）交给 _serve 重连。
+    func _session(connection) {
+        let lastPing = monotonic_ns();
+
+        for (!this.stop.isSet()) {
+            if (__nexora_since_millis(lastPing) >= this.heartbeatMillis) {
+                nexora_core_send_ping(connection);
+                lastPing = monotonic_ns();
+            }
+
+            if (this.buffer != nil) {
+                nexora_core_flush_task_events(connection, this.buffer);
+            }
+
+            let frame = nil;
+            let timedOut = false;
+            try {
+                frame = nexora_core_receive_frame(connection, this.receiveMillis);
+            } catch (&error) {
+                if (type(error) != "WebSocketTimeout") throw error;
+                timedOut = true;
+            }
+
+            // 软超时只表示这段时间没有帧；nil 才是对端关闭。
+            if (!timedOut) {
+                if (frame == nil) {
+                    if (this.stop.isSet()) break;
+                    throw new Exception("Nexora server closed the connection");
+                }
+
+                this._dispatch(frame, connection);
+            }
+        }
+    }
+
+    // 钩子拿到帧和连接：RPC 要回 rpc_result，任务订阅要往同一条连接推流，
+    // 都需要连接本身，而客户端只在 _session 里持有它。
+    func _dispatch(frame, connection) {
+        if (this.handlers == nil) return;
+
+        let frameType = __nexora_frame_type(frame);
+
+        if (frameType == "rpc") {
+            let handler = this.handlers.onRpc;
+            if (handler != nil) handler(frame, connection);
+            return;
+        }
+        if (frameType == "task_subscribe") {
+            let subscribe = this.handlers.onTaskSubscribe;
+            if (subscribe != nil) subscribe(frame, connection);
+            return;
+        }
+        if (frameType == "task_unsubscribe") {
+            let unsubscribe = this.handlers.onTaskUnsubscribe;
+            if (unsubscribe != nil) unsubscribe(frame, connection);
+        }
+    }
+}

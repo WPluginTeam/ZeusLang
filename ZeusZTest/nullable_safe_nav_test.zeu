@@ -1,0 +1,66 @@
+// Nullable types (`T?`) and safe navigation (`?.`).
+//
+// A nullable binding accepts nil. A bare method call on it is a compile
+// error; `?.` short-circuits the call to nil instead. `?.` chains
+// propagate nil past every later link. Arguments are evaluated eagerly,
+// like `&&` operands.
+class Node {
+    using &this;
+    var value: int = 0;
+    func get() -> int { return this.value + 1; }
+    func add(x: int) -> int { return this.value + x; }
+    func self() -> Node { return this; }
+}
+
+func take(n: Node?) -> int {
+    return 1;
+}
+
+func withDefault(params: dict? = nil) -> int {
+    if (params != nil) {
+        return params["key"];
+    }
+    return -1;
+}
+
+func takeNode(n: Node?) -> int {
+    if (n != nil) {
+        return n.get();
+    }
+    return -1;
+}
+
+func guard(x: int?) -> int {
+    if (x == nil) {
+        return -1;
+    }
+    return x + 1;
+}
+
+func main() {
+    let a: Node? = nil;
+    print(a?.get());
+    print(a?.value);
+    print(take(nil));
+    print(take(a));
+
+    let b: Node? = new Node();
+    b.value = 41;
+    print(b?.get());
+    print(b?.value);
+    print(b?.add(1));
+    print(a?.add(1));
+    b?.get();
+    print(b?.self()?.get());
+
+    let s: string? = nil;
+    print(s?.length());
+
+    print(withDefault({"key": 7}));
+    print(withDefault());
+    print(takeNode(b));
+    print(takeNode(nil));
+    print(guard(4));
+    print(guard(nil));
+}
+main();

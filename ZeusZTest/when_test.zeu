@@ -1,0 +1,273 @@
+import zeus.exception;
+
+func assertTrue(cond: bool, msg: string) {
+    if (!cond) {
+        print("FAIL: ", msg);
+        throw new Exception("Assertion failed: " + msg);
+    }
+}
+
+// 1. 基本值匹配与语句块 (使用冒号 : 风格)
+func testBasicStatement() {
+    let output = "";
+    let status = 1;
+    when (status) {
+        0: {
+            output = "zero";
+        }
+        1: {
+            output = "one";
+        }
+        else: {
+            output = "other";
+        }
+    }
+    assertTrue(output == "one", "testBasicStatement: status 1 should match 'one'");
+
+    status = 99;
+    when (status) {
+        0: { output = "zero"; }
+        1: { output = "one"; }
+        else: { output = "other"; }
+    }
+    assertTrue(output == "other", "testBasicStatement: status 99 should match 'other'");
+}
+
+// 2. 单表达式语句（分号与逗号结尾，冒号风格与兼容箭头）
+func testSingleExprAndColon() {
+    let out = 0;
+    let code = 200;
+    when (code) {
+        200: out = 1,
+        404: out = 2,
+        else: out = 3
+    }
+    assertTrue(out == 1, "testSingleExprAndColon: 200: 1");
+
+    code = 404;
+    when (code) {
+        200: out = 1;
+        404: out = 2;
+        else: out = 3;
+    }
+    assertTrue(out == 2, "testSingleExprAndColon: 404: 2");
+
+    code = 500;
+    when (code) {
+        200: out = 1;
+        404: out = 2;
+        else: out = 3;
+    }
+    assertTrue(out == 3, "testSingleExprAndColon: 500: 3");
+
+    // 兼容现有箭头 ->
+    code = 200;
+    when (code) {
+        200 -> out = 10,
+        else -> out = 20
+    }
+    assertTrue(out == 10, "testSingleExprAndColon: compat ->");
+}
+
+// 3. 多值逗号匹配 (1, 2, 3: ...)
+func testMultiValue() {
+    let category = "";
+    let n = 2;
+    when (n) {
+        1, 2, 3: category = "small",
+        4, 5, 6: category = "medium",
+        else:    category = "large"
+    }
+    assertTrue(category == "small", "testMultiValue: 2 is small");
+
+    n = 5;
+    when (n) {
+        1, 2, 3: category = "small",
+        4, 5, 6: category = "medium",
+        else:    category = "large"
+    }
+    assertTrue(category == "medium", "testMultiValue: 5 is medium");
+
+    n = 100;
+    when (n) {
+        1, 2, 3: category = "small",
+        4, 5, 6: category = "medium",
+        else:    category = "large"
+    }
+    assertTrue(category == "large", "testMultiValue: 100 is large");
+}
+
+// 4. 类型匹配 (is string / is int / is Array / is dict)
+func helperCheckType(val) {
+    let res = "";
+    when (val) {
+        is string: res = "string",
+        is int:    res = "int",
+        is float:  res = "float",
+        is Array:  res = "Array",
+        is dict:   res = "dict",
+        else:      res = "unknown"
+    }
+    return res;
+}
+
+func testTypeMatching() {
+    assertTrue(helperCheckType("hello") == "string", "testTypeMatching: string");
+    assertTrue(helperCheckType(123) == "int", "testTypeMatching: int");
+    assertTrue(helperCheckType(3.14) == "float", "testTypeMatching: float");
+    assertTrue(helperCheckType([1, 2, 3]) == "Array", "testTypeMatching: Array");
+    assertTrue(helperCheckType({"a": 1}) == "dict", "testTypeMatching: dict");
+}
+
+// 5. 范围匹配 (in start..end 以及 start..end)
+func helperCheckGrade(score) {
+    return when (score) {
+        90..100: "A",
+        80..89:  "B",
+        in 70..79: "C",
+        in 60..69: "D",
+        else: "F"
+    };
+}
+
+func testRangeMatching() {
+    assertTrue(helperCheckGrade(95) == "A", "testRangeMatching: 95 is A");
+    assertTrue(helperCheckGrade(90) == "A", "testRangeMatching: 90 is A");
+    assertTrue(helperCheckGrade(85) == "B", "testRangeMatching: 85 is B");
+    assertTrue(helperCheckGrade(75) == "C", "testRangeMatching: 75 is C");
+    assertTrue(helperCheckGrade(60) == "D", "testRangeMatching: 60 is D");
+    assertTrue(helperCheckGrade(59) == "F", "testRangeMatching: 59 is F");
+}
+
+// 6. 无目标表达式模式 (Condition Mode: when { cond: body })
+func testConditionMode() {
+    let a = 10;
+    let b = 20;
+    let max = when {
+        a > b: a,
+        b > a: b,
+        else: 0
+    };
+    assertTrue(max == 20, "testConditionMode: max should be 20");
+
+    let val = -5;
+    let sign = "";
+    when {
+        val > 0: sign = "positive",
+        val < 0: sign = "negative",
+        else:    sign = "zero"
+    }
+    assertTrue(sign == "negative", "testConditionMode: sign should be negative");
+}
+
+// 7. 赋值表达式模式 (let x = when (...) { ... })
+func testAssignmentMode() {
+    let x = 3;
+    let name = when (x) {
+        1: "one",
+        2: "two",
+        3: "three",
+        else: "many"
+    };
+    assertTrue(name == "three", "testAssignmentMode: name should be 'three'");
+
+    // 块级求值赋给变量
+    let computed = when (x) {
+        3: {
+            let step1 = x * 2;
+            let step2 = step1 + 4;
+            step2;
+        }
+        else: 0
+    };
+    assertTrue(computed == 10, "testAssignmentMode: block computed should be 10");
+}
+
+// 8. return 表达式模式 (return when (...) { ... })
+func testReturnModeHelper(val) {
+    return when (val) {
+        true: "YES",
+        false: "NO",
+        else: "MAYBE"
+    };
+}
+
+func testReturnMode() {
+    assertTrue(testReturnModeHelper(true) == "YES", "testReturnMode: true");
+    assertTrue(testReturnModeHelper(false) == "NO", "testReturnMode: false");
+    assertTrue(testReturnModeHelper(nil) == "MAYBE", "testReturnMode: nil");
+}
+
+// 9. 循环内的控制流（break / continue 能够穿透 when 块）
+func testLoopControlFlow() {
+    let numbers = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    let evenSum = 0;
+    let stopAt = 0;
+
+    for (numbers) [&n] {
+        when (n) {
+            7: {
+                stopAt = n;
+                break;
+            }
+            1, 3, 5: {
+                continue;
+            }
+            else: {
+                evenSum = evenSum + n;
+            }
+        }
+    }
+
+    // 1 -> continue
+    // 2 -> evenSum = 2
+    // 3 -> continue
+    // 4 -> evenSum = 6
+    // 5 -> continue
+    // 6 -> evenSum = 12
+    // 7 -> break
+    assertTrue(stopAt == 7, "testLoopControlFlow: break stopped at 7");
+    assertTrue(evenSum == 12, "testLoopControlFlow: even sum before 7 should be 12");
+}
+
+// 10. 嵌套 when 表达式
+func testNestedWhen() {
+    let outer = 1;
+    let inner = 2;
+    let res = when (outer) {
+        1: when (inner) {
+            1: "1-1",
+            2: "1-2",
+            else: "1-other"
+        },
+        else: "other"
+    };
+    assertTrue(res == "1-2", "testNestedWhen: should match '1-2'");
+}
+
+// 11. 字典字面量作为分支体
+func testDictLiteralInWhen() {
+    let key = "success";
+    let payload = when (key) {
+        "success": { "code": 200, "status": "ok" },
+        "error": { "code": 500, "status": "fail" },
+        else: {}
+    };
+    assertTrue(payload["code"] == 200, "testDictLiteralInWhen: code should be 200");
+    assertTrue(payload["status"] == "ok", "testDictLiteralInWhen: status should be ok");
+}
+
+// 执行所有测试
+testBasicStatement();
+testSingleExprAndColon();
+testMultiValue();
+testTypeMatching();
+testRangeMatching();
+testConditionMode();
+testAssignmentMode();
+testReturnMode();
+testLoopControlFlow();
+testNestedWhen();
+testDictLiteralInWhen();
+
+print("[PASS] All when tests passed successfully with ':' syntax!");

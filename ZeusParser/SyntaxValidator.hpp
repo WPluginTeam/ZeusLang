@@ -1,4 +1,4 @@
-#ifndef ZEUS_PARSER_SYNTAX_VALIDATOR_HPP
+﻿#ifndef ZEUS_PARSER_SYNTAX_VALIDATOR_HPP
 #define ZEUS_PARSER_SYNTAX_VALIDATOR_HPP
 
 #include <algorithm>
@@ -11,6 +11,7 @@
 #include "TreeParser.hpp"
 #include "../ZeusDiagnostics.hpp"
 #include "../ZeusBuiltins/BuiltinRegistry.hpp"
+#include "../ZeusBuiltins/NativeTypeABI.hpp"
 
 namespace ZeusParser {
 
@@ -19,12 +20,17 @@ inline bool isSyntaxOperator(const LexerType::Token& token, const std::string& s
            std::get<LexerType::Operator>(token).symbol == symbol;
 }
 
+inline bool isSyntaxKeyword(const LexerType::Token& token, const std::string& name) {
+    return std::holds_alternative<LexerType::Keyword>(token) &&
+           std::get<LexerType::Keyword>(token).name == name;
+}
+
 inline bool isSyntaxIdentifier(const LexerType::Token& token) {
     if (!std::holds_alternative<LexerType::Keyword>(token)) return false;
     const std::string& name = std::get<LexerType::Keyword>(token).name;
     static const std::vector<std::string> reserved = {
         "var", "let", "const", "shared", "if", "else", "for", "func", "class", "interface", "impl",
-        "return", "break", "continue", "delete", "throw", "try", "catch", "with",
+        "return", "break", "continue", "delete", "throw", "try", "catch", "with", "when",
         "import", "using", "original", "decl", "static", "new", "true", "false", "nil"
     };
     for (const auto& keyword : reserved) {
@@ -871,6 +877,14 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
             continue;
         }
 
+        if (i + 2 < tokens.size() &&
+            isSyntaxOperator(tokens[i], "@") &&
+            isSyntaxKeyword(tokens[i + 1], "static") &&
+            isSyntaxOperator(tokens[i + 2], ";")) {
+            i += 2;
+            continue;
+        }
+
         const std::vector<LexerType::Token> suffix(tokens.begin() + i, tokens.end());
         const auto prefix = parseFunctionPrefix(suffix);
         if (!prefix.valid || prefix.decorators.empty()) {
@@ -895,6 +909,21 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
         const bool isClassDeclaration = classKeywordIndex < tokens.size() &&
             std::holds_alternative<LexerType::Keyword>(tokens[classKeywordIndex]) &&
             std::get<LexerType::Keyword>(tokens[classKeywordIndex]).name == "class";
+        const bool isImportDeclaration = declarationIndex < tokens.size() &&
+            std::holds_alternative<LexerType::Keyword>(tokens[declarationIndex]) &&
+            std::get<LexerType::Keyword>(tokens[declarationIndex]).name == "import";
+        if (isImportDeclaration) {
+            const bool validNativeImport = prefix.decorators.size() == 1 &&
+                prefix.decorators[0].name == "native" &&
+                prefix.decorators[0].hasArgument &&
+                !prefix.decorators[0].argument.empty();
+            if (!validNativeImport) {
+                addDiagnostic("P0038", "only @native(\"header_path\") may decorate an import statement", tokens[i]);
+            }
+            i = declarationIndex;
+            continue;
+        }
+
         const bool isFunctionDeclaration = declarationIndex < tokens.size() &&
             std::holds_alternative<LexerType::Keyword>(tokens[declarationIndex]) &&
             std::get<LexerType::Keyword>(tokens[declarationIndex]).name == "func";
@@ -934,16 +963,36 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
         bool sawTypeParameter = false;
         for (const auto& decorator : prefix.decorators) {
             if (decorator.name == "native") {
-                if (sawNative || !decorator.hasArgument || decorator.argument.empty() ||
-                    (decorator.hasSecondaryArgument &&
-                     decorator.secondaryArgument != "raw" &&
-                     decorator.secondaryArgument != "slot")) {
+                // `@native("sym") decl func ...` = 声明一个 C 函数；
+                // `@native func ...` / `@native("sym") func ...` = 定义并导出
+                // 一个 C 链接函数（不改名）。定义侧允许省略符号名，默认取
+                // 函数自己的名字；库路径 from="..." 只对声明有意义。
+                const bool decoratesDefinition = !isForwardDeclaration;
+                const bool hasSymbol = decorator.hasArgument && !decorator.argument.empty();
+                if (sawNative) {
+                    addDiagnostic("P0038", "@native may only appear once", tokens[i]);
+                } else if (!hasSymbol && !decoratesDefinition) {
                     addDiagnostic("P0038",
-                                  "@native requires a symbol and optional reference ABI 'raw' or 'slot'",
+                                  "@native requires a symbol and optional reference ABI 'raw' or 'slot', or a library path via from=\"...\"",
+                                  tokens[i]);
+                } else if (decorator.hasArgument && decorator.argument.empty()) {
+                    addDiagnostic("P0038", "@native symbol must not be empty", tokens[i]);
+                }
+                if (decorator.hasSecondaryArgument &&
+                    ((decorator.secondaryArgumentName.empty() &&
+                      decorator.secondaryArgument != "raw" &&
+                      decorator.secondaryArgument != "slot") ||
+                     (decorator.secondaryArgumentName == "from" &&
+                      decorator.secondaryArgument.empty()) ||
+                     (!decorator.secondaryArgumentName.empty() &&
+                      decorator.secondaryArgumentName != "from"))) {
+                    addDiagnostic("P0038",
+                                  "@native requires a symbol and optional reference ABI 'raw' or 'slot', or a library path via from=\"...\"",
                                   tokens[i]);
                 }
-                if (!isForwardDeclaration) {
-                    addDiagnostic("P0038", "@native must decorate a 'decl func' declaration",
+                if (decoratesDefinition && decorator.hasSecondaryArgument) {
+                    addDiagnostic("P0038",
+                                  "@native on a function definition cannot use a reference ABI or a library path",
                                   tokens[i]);
                 }
                 sawNative = true;
@@ -1004,6 +1053,14 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
             !std::holds_alternative<LexerType::Keyword>(tokens[i]) ||
             std::get<LexerType::Keyword>(tokens[i]).name != "inline" ||
             (i > 0 && isSyntaxOperator(tokens[i - 1], "@"))) {
+            continue;
+        }
+
+        if (i + 2 < tokens.size() &&
+            isSyntaxOperator(tokens[i], "@") &&
+            isSyntaxKeyword(tokens[i + 1], "static") &&
+            isSyntaxOperator(tokens[i + 2], ";")) {
+            i += 2;
             continue;
         }
 
@@ -1085,9 +1142,53 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
                    (std::get<LexerType::Keyword>(tokens[i + 1]).name == "LLVM" ||
                     std::get<LexerType::Keyword>(tokens[i + 1]).name == "llvm" ||
                     std::get<LexerType::Keyword>(tokens[i + 1]).name == "VM" ||
-                    std::get<LexerType::Keyword>(tokens[i + 1]).name == "vm") &&
+                    std::get<LexerType::Keyword>(tokens[i + 1]).name == "vm" ||
+                    std::get<LexerType::Keyword>(tokens[i + 1]).name == "windows" ||
+                    std::get<LexerType::Keyword>(tokens[i + 1]).name == "win32" ||
+                    std::get<LexerType::Keyword>(tokens[i + 1]).name == "linux" ||
+                    std::get<LexerType::Keyword>(tokens[i + 1]).name == "darwin" ||
+                    std::get<LexerType::Keyword>(tokens[i + 1]).name == "macos" ||
+                    std::get<LexerType::Keyword>(tokens[i + 1]).name == "posix") &&
                    isSyntaxOperator(tokens[i + 2], "{")) {
-            // `using LLVM/VM { ... }` selects a compile-target implementation block.
+            // `using LLVM/VM/platform { ... }` selects a compile-target implementation block.
+        } else if (i + 1 < tokens.size() && isSyntaxOperator(tokens[i + 1], "{")) {
+            const size_t close = matchingSyntaxDelimiter(tokens, i + 1);
+            if (close == tokens.size()) {
+                addDiagnostic("P0030", "expected '}' after module export list", tokens[i + 1]);
+                continue;
+            }
+
+            size_t cursor = i + 2;
+            bool expectName = true;
+            bool hasName = false;
+            std::vector<std::string> names;
+            while (cursor < close) {
+                if (expectName) {
+                    if (!isSyntaxIdentifier(tokens[cursor])) {
+                        addDiagnostic("P0030", "expected an exported name in 'using' list", tokens[cursor]);
+                    } else {
+                        const std::string& name = std::get<LexerType::Keyword>(tokens[cursor]).name;
+                        if (std::find(names.begin(), names.end(), name) != names.end()) {
+                            addDiagnostic("P0030", "duplicate name in module export list", tokens[cursor]);
+                        } else {
+                            names.push_back(name);
+                        }
+                        hasName = true;
+                        expectName = false;
+                    }
+                } else if (isSyntaxOperator(tokens[cursor], ",")) {
+                    expectName = true;
+                } else {
+                    addDiagnostic("P0030", "expected ',' between exported names", tokens[cursor]);
+                }
+                ++cursor;
+            }
+            if (hasName && expectName) {
+                addDiagnostic("P0030", "module export list cannot end with ','", tokens[close]);
+            }
+            if (close + 1 >= tokens.size() || !isSyntaxOperator(tokens[close + 1], ";")) {
+                addDiagnostic("P0030", "expected ';' after module export list", tokens[close]);
+            }
         } else if (i + 2 >= tokens.size() || !isSyntaxOperator(tokens[i + 1], "&") ||
                    !isSyntaxIdentifier(tokens[i + 2])) {
             addDiagnostic("P0030", "expected 'original' or '&name' after 'using'", tokens[i]);
@@ -1107,12 +1208,18 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateUnsupportedSyntax(
 }
 
 inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
-    const std::vector<TreeParser::NodeAndBlock>& ast
+    const std::vector<TreeParser::NodeAndBlock>& ast,
+    std::vector<ZeusDiagnostics::Diagnostic>* warnings = nullptr
 ) {
     std::vector<ZeusDiagnostics::Diagnostic> diagnostics;
     auto addDiagnostic = [&](const std::string& code, const std::string& message,
                              int line, int column) {
         diagnostics.push_back({ code, message, line, column });
+    };
+    auto addWarning = [&](const std::string& code, const std::string& message,
+                           int line, int column) {
+        if (warnings == nullptr) return;
+        warnings->push_back({ code, message, line, column });
     };
     const auto validateExpression = [&](const std::vector<LexerType::Token>& expression) {
         if (!expression.empty()) {
@@ -1162,12 +1269,21 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
             std::get<LexerType::Keyword>(tokens[close + 3]).name == "bytes";
         return simpleType || rawBytesRangeType;
     };
-    const auto isThisLValue = [](const std::vector<LexerType::Token>& tokens) {
-        return tokens.size() == 2 && isSyntaxOperator(tokens[0], "@") &&
-            std::holds_alternative<LexerType::Keyword>(tokens[1]) &&
-            std::get<LexerType::Keyword>(tokens[1]).name == "this";
+    const auto isThisLValue = [](const std::vector<LexerType::Token>& tokens,
+                                 const std::string& receiverAlias) {
+        if (tokens.size() == 2 && isSyntaxOperator(tokens[0], "@") &&
+            std::holds_alternative<LexerType::Keyword>(tokens[1])) {
+            const auto& name = std::get<LexerType::Keyword>(tokens[1]).name;
+            return name == "this" || (!receiverAlias.empty() && name == receiverAlias);
+        }
+        if (tokens.size() == 1 && std::holds_alternative<LexerType::Keyword>(tokens[0])) {
+            const auto& name = std::get<LexerType::Keyword>(tokens[0]).name;
+            return name == "this" || (!receiverAlias.empty() && name == receiverAlias);
+        }
+        return false;
     };
 
+    bool sawTopLevelExportList = false;
     const auto visit = [&](const auto& self,
                            const std::vector<TreeParser::NodeAndBlock>& elements,
                            bool parentIsTry,
@@ -1206,7 +1322,7 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                     } else if (assignment != node.tokens.size()) {
                         const std::vector<LexerType::Token> left(node.tokens.begin(), node.tokens.begin() + assignment);
                         bool validLValue = (left.size() == 1 && isSyntaxIdentifier(left[0])) ||
-                            isThisLValue(left);
+                            isThisLValue(left, parentReceiverAlias);
                         if (!validLValue && isFaddrLValue(left)) {
                             validateExpression(left);
                             validLValue = true;
@@ -1231,7 +1347,7 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                             validLValue = true;
                         }
                         if (!validLValue) {
-                            addDiagnostic("P0025", "left side of assignment must be a variable, member, index, or @this",
+                            addDiagnostic("P0025", "left side of assignment must be a variable, member, index, or this",
                                           node.sourceLine, node.sourceColumn);
                         }
                     }
@@ -1265,6 +1381,8 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                     }
                 } else if (node.type == NodeType::BREAK_STMT && node.tokens.size() != 1) {
                     addDiagnostic("P0027", "'break' does not take arguments", node.sourceLine, node.sourceColumn);
+                } else if (node.type == NodeType::CONTINUE_STMT && node.tokens.size() != 1) {
+                    addDiagnostic("P0027", "'continue' does not take arguments", node.sourceLine, node.sourceColumn);
                 } else if (node.type == NodeType::DELETE_STMT) {
                     bool expectName = true;
                     for (size_t i = 1; i < node.tokens.size(); ++i) {
@@ -1286,7 +1404,15 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                                       node.sourceLine, node.sourceColumn);
                     }
                 } else if (node.type == NodeType::IMPORT_STMT) {
-                    size_t position = 1;
+                    size_t position = 0;
+                    if (position < node.tokens.size() && isSyntaxOperator(node.tokens[position], "@")) {
+                        while (position < node.tokens.size() && !isSyntaxKeyword(node.tokens[position], "import")) {
+                            ++position;
+                        }
+                    }
+                    if (position < node.tokens.size() && isSyntaxKeyword(node.tokens[position], "import")) {
+                        ++position;
+                    }
                     if (position >= node.tokens.size() ||
                         !isSyntaxPackageIdentifier(node.tokens[position])) {
                         addDiagnostic("P0029", "expected a package name after 'import'",
@@ -1341,6 +1467,16 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                     if (!validUsingOriginal) {
                         addDiagnostic("P0030", "expected 'using original'", node.sourceLine, node.sourceColumn);
                     }
+                } else if (node.type == NodeType::USING_EXPORTS_STMT) {
+                    if (!parentIsTopLevel) {
+                        addDiagnostic("P0042", "module export lists must appear at module scope",
+                                      node.sourceLine, node.sourceColumn);
+                    } else if (sawTopLevelExportList) {
+                        addDiagnostic("P0042", "a module can have only one export list",
+                                      node.sourceLine, node.sourceColumn);
+                    } else {
+                        sawTopLevelExportList = true;
+                    }
                 } else if (node.type == NodeType::FUNC_FWD_DECL_STMT) {
                     bool hasDeclFunc = false;
                     for (size_t i = 0; i + 1 < node.tokens.size(); ++i) {
@@ -1354,6 +1490,51 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                     }
                     if (!hasDeclFunc) {
                         addDiagnostic("P0023", "expected 'decl func name(...)'", node.sourceLine, node.sourceColumn);
+                    } else {
+                        const auto signature = parseForwardFunctionSignature(node.tokens);
+                        if (signature.valid && !signature.nativeLibraryPath.empty()) {
+                            auto isInteger = [](const std::string& type) {
+                                return type == "int" || type == "int32" || type == "int64" ||
+                                    ZeusBuiltins::findNativeIntegerABI(type) != nullptr;
+                            };
+                            auto isFloatingPoint = [](const std::string& type) {
+                                return ZeusBuiltins::isNativeFloatingPointType(type);
+                            };
+                            // Raw addresses share the integer argument register.
+                            auto isPointer = [](const std::string& type) {
+                                return ZeusBuiltins::isNativePointerTypeName(type);
+                            };
+                            bool supported = signature.parameters.size() <=
+                                    ZeusBuiltins::kDynamicNativeMaxParameters &&
+                                !signature.hasVariadicArgs &&
+                                !signature.hasVariadicKwargs;
+                            for (const auto& parameter : signature.parameters) {
+                                supported = supported && !parameter.isReference &&
+                                    (isInteger(parameter.typeName) ||
+                                     isFloatingPoint(parameter.typeName) ||
+                                     isPointer(parameter.typeName) ||
+                                     parameter.typeName == "bool" ||
+                                     parameter.typeName == "string");
+            }
+                            supported = supported &&
+                                (isInteger(signature.returnTypeName) ||
+                                 isFloatingPoint(signature.returnTypeName) ||
+                                 isPointer(signature.returnTypeName) ||
+                                 signature.returnTypeName == "bool" ||
+                                 signature.returnTypeName == "string" ||
+                                 signature.returnTypeName == "nil");
+                            if (!supported) {
+                                addDiagnostic(
+                                    "P0038",
+                                    "@native from imports support up to " +
+                                        std::to_string(
+                                            ZeusBuiltins::kDynamicNativeMaxParameters) +
+                                        " integer/ptr/float/bool/string parameters, no variadic parameters, "
+                                        "and integer/ptr/float/bool/string/nil returns",
+                                    node.sourceLine,
+                                    node.sourceColumn);
+                            }
+                        }
                     }
                 } else if (node.type == NodeType::INTERFACE_METHOD_DECL_STMT) {
                     const auto signature = parseForwardFunctionSignature(node.tokens);
@@ -1381,7 +1562,8 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                            node.type == NodeType::WITH_DECL_STMT ||
                            node.type == NodeType::USING_BLOCK_STMT ||
                            node.type == NodeType::USING_LLVM_BLOCK_STMT ||
-                           node.type == NodeType::USING_VM_BLOCK_STMT) {
+                           node.type == NodeType::USING_VM_BLOCK_STMT ||
+                           node.type == NodeType::USING_PLATFORM_BLOCK_STMT) {
                     addDiagnostic("P0032", "expected a block for this declaration",
                                   node.sourceLine, node.sourceColumn);
                 }
@@ -1401,6 +1583,10 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
             }
             if (block.type == CodeBlockType::CATCH && !parentIsTry) {
                 addDiagnostic("P0031", "'catch' block must follow a 'try' block",
+                              block.sourceLine, block.sourceColumn);
+            }
+            if (block.type == CodeBlockType::FIN && !parentIsTry) {
+                addDiagnostic("P0031", "'fin' block must follow a 'try' block",
                               block.sourceLine, block.sourceColumn);
             }
             if (block.type == CodeBlockType::FUNC && block.isClassMethod &&
@@ -1464,6 +1650,61 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                         addDiagnostic("P0032", "impl blocks may only contain function declarations",
                                       method->sourceLine, method->sourceColumn);
                     }
+                }
+            }
+            if (block.type == CodeBlockType::IMPL || block.type == CodeBlockType::CLASS) {
+                const bool isImpl = block.type == CodeBlockType::IMPL;
+                for (const auto& member : block.nodes) {
+                    if (!std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(member)) {
+                        continue;
+                    }
+                    const auto& method =
+                        std::get<std::unique_ptr<TreeParser::CodeBlock>>(member);
+                    if (!method || !method->staticByMissingReceiverAlias) {
+                        continue;
+                    }
+                    addWarning("P0044",
+                        "method '" + method->funcName + "' has no receiver, because the " +
+                        (isImpl ? "impl" : "class") +
+                        " block declares no 'using &alias;', so it is compiled as a "
+                        "static function",
+                        method->sourceLine, method->sourceColumn);
+                }
+            }
+            if (block.type == CodeBlockType::CLASS) {
+                // 只要类声明了 operator[~]，它就必须说明「拷贝意味着什么」。
+                // 默认值语义下连「读字段」都会复制一份，副本析构会把同一个资源
+                // 释放两次（double free，或关掉别人还在用的句柄）。显式写一个
+                // operator[@=] 即可：-> &T 表示绑定同一实例，-> T 表示显式拷贝。
+                bool hasDestructor = false;
+                bool hasCopyHook = false;
+                int destructorLine = 0;
+                int destructorColumn = 0;
+                for (const auto& member : block.nodes) {
+                    if (!std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(member)) {
+                        continue;
+                    }
+                    const auto& method =
+                        std::get<std::unique_ptr<TreeParser::CodeBlock>>(member);
+                    if (!method || !method->isOperatorOverload) continue;
+                    for (const auto& symbol : method->overloadedOps) {
+                        if (symbol == "[~]" || symbol == "~") {
+                            hasDestructor = true;
+                            destructorLine = method->sourceLine;
+                            destructorColumn = method->sourceColumn;
+                        } else if (symbol == "[@=]" || symbol == "@=") {
+                            hasCopyHook = true;
+                        }
+                    }
+                }
+                if (hasDestructor && !hasCopyHook) {
+                    addWarning("P0045",
+                        "class '" + block.className +
+                        "' declares operator[~] but no operator[@=]: every copy of this "
+                        "object runs the destructor, so the same resource is released twice. "
+                        "Declare operator[@=]() -> &" + block.className + " to bind one owner, "
+                        "or -> " + block.className + " to copy explicitly",
+                        destructorLine, destructorColumn);
                 }
             }
             if (block.type == CodeBlockType::INTERFACE) {
@@ -1534,26 +1775,74 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
                 }
             } else if (block.type == CodeBlockType::TRY) {
                 bool hasCatch = false;
+                bool hasFin = false;
+                bool sawFin = false;
                 for (const auto& child : block.nodes) {
                     if (std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(child)) {
                         const auto& childBlock = std::get<std::unique_ptr<TreeParser::CodeBlock>>(child);
-                        hasCatch = hasCatch || (childBlock && childBlock->type == CodeBlockType::CATCH);
+                        if (!childBlock) continue;
+                        if (childBlock->type == CodeBlockType::CATCH) {
+                            if (sawFin) {
+                                addDiagnostic("P0017", "'catch' must appear before 'fin'",
+                                              childBlock->sourceLine, childBlock->sourceColumn);
+                            }
+                            if (hasCatch) {
+                                addDiagnostic("P0017", "'try' may contain only one 'catch' block",
+                                              childBlock->sourceLine, childBlock->sourceColumn);
+                            }
+                            hasCatch = true;
+                        } else if (childBlock->type == CodeBlockType::FIN) {
+                            if (hasFin) {
+                                addDiagnostic("P0017", "'try' may contain only one 'fin' block",
+                                              childBlock->sourceLine, childBlock->sourceColumn);
+                            }
+                            hasFin = true;
+                            sawFin = true;
+                        }
                     }
                 }
-                if (!hasCatch) {
-                    addDiagnostic("P0017", "'try' block requires a following 'catch' block",
+                if (!hasCatch && !hasFin) {
+                    addDiagnostic("P0017", "'try' block requires a following 'catch' or 'fin' block",
                                   block.sourceLine, block.sourceColumn);
                 }
+            } else if (block.type == CodeBlockType::FIN) {
+                auto checkFinControl = [&](auto&& self, const std::vector<TreeParser::NodeAndBlock>& nodes) -> void {
+                    for (const auto& element : nodes) {
+                        if (std::holds_alternative<TreeParser::Node>(element)) {
+                            const auto& node = std::get<TreeParser::Node>(element);
+                            if (node.type == NodeType::RETURN_STMT ||
+                                node.type == NodeType::BREAK_STMT ||
+                                node.type == NodeType::CONTINUE_STMT) {
+                                addDiagnostic("P0017", "'fin' block cannot contain return, break, or continue",
+                                              node.sourceLine, node.sourceColumn);
+                            }
+                        } else {
+                            const auto& nested = std::get<std::unique_ptr<TreeParser::CodeBlock>>(element);
+                            if (nested && nested->type != CodeBlockType::FUNC) {
+                                self(self, nested->nodes);
+                            }
+                        }
+                    }
+                };
+                checkFinControl(checkFinControl, block.nodes);
+            }
+            std::string receiverAliasToPass;
+            if (block.type == CodeBlockType::CLASS ||
+                block.type == CodeBlockType::INTERFACE ||
+                block.type == CodeBlockType::IMPL) {
+                receiverAliasToPass = block.classDefaultAlias;
+            } else if (block.type == CodeBlockType::FUNC && block.isClassMethod && !block.isStaticMethod) {
+                receiverAliasToPass = !block.inferredInstanceAlias.empty()
+                    ? block.inferredInstanceAlias : parentReceiverAlias;
+            } else if (block.type != CodeBlockType::FUNC) {
+                receiverAliasToPass = parentReceiverAlias;
             }
             self(self, block.nodes,
                  block.type == CodeBlockType::TRY,
                  block.type == CodeBlockType::CLASS ||
                     block.type == CodeBlockType::INTERFACE ||
                     block.type == CodeBlockType::IMPL,
-                 (block.type == CodeBlockType::CLASS ||
-                    block.type == CodeBlockType::INTERFACE ||
-                    block.type == CodeBlockType::IMPL)
-                     ? block.classDefaultAlias : std::string(),
+                 receiverAliasToPass,
                  block.type == CodeBlockType::INTERFACE,
                  false);
         }

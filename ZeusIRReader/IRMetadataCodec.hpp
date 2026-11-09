@@ -165,6 +165,7 @@ namespace IRMetadataCodec {
             !metadata.fieldInitializerNames.empty() ||
             !metadata.ownerType.empty() || !metadata.operatorSymbol.empty() ||
             !metadata.nativeSymbol.empty() || metadata.nativeReferenceABI != "raw" ||
+            !metadata.nativeLibraryPath.empty() ||
             !metadata.moduleName.empty() || metadata.captureCount != 0 ||
             metadata.hasCaptureCount || metadata.isStaticMethod || metadata.isInline ||
             metadata.isNoSafepoint || !isDefault(metadata.subscriptWritebackTarget) ||
@@ -220,6 +221,7 @@ namespace IRMetadataCodec {
             writeString(stream, metadata.operatorSymbol) &&
             writeString(stream, metadata.nativeSymbol) &&
             writeString(stream, metadata.nativeReferenceABI) &&
+            writeString(stream, metadata.nativeLibraryPath) &&
             writeString(stream, metadata.moduleName) &&
             writeInt32(stream, static_cast<int32_t>(metadata.captureCount)) &&
             writeUint8(stream, metadata.hasCaptureCount ? 1 : 0) &&
@@ -311,8 +313,14 @@ namespace IRMetadataCodec {
         if (!readString(stream, metadata.ownerType) ||
             !readString(stream, metadata.operatorSymbol) ||
             !readString(stream, metadata.nativeSymbol) ||
-            !readString(stream, metadata.nativeReferenceABI) ||
-            !readString(stream, metadata.moduleName) ||
+            !readString(stream, metadata.nativeReferenceABI)) {
+            return false;
+        }
+        metadata.nativeLibraryPath.clear();
+        if (version >= 10 && !readString(stream, metadata.nativeLibraryPath)) {
+            return false;
+        }
+        if (!readString(stream, metadata.moduleName) ||
             !readInt32(stream, captureCount)) {
             return false;
         }

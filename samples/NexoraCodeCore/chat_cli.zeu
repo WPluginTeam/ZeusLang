@@ -1,0 +1,93 @@
+import zeus.exception;
+import zeus.json;
+import zeus.requests;
+import zeus.string;
+
+import samples.NexoraCodeCore.context;
+import samples.NexoraCodeCore.provider_config;
+
+// 最小 CLI 烟囱：读 NexoraCode 的 providers.json，用指定供应商
+// 以非流式 POST 问一句话，打印回答。上下文管理只走阈值内直发路径；
+// 需要压缩时直接报错（压缩执行是后续切片）。
+//
+// 运行器把四个占位换成一次性值：
+//   __PROVIDERS__  providers.json 绝对路径
+//   __PROVIDER__   供应商名（如 USST）
+//   __SYSTEM__     system 提示词
+//   __QUESTION__   用户问题
+var const PROVIDERS_PATH = "__PROVIDERS__";
+var const PROVIDER_NAME = "__PROVIDER__";
+var const SYSTEM_PROMPT = "__SYSTEM__";
+var const QUESTION = "__QUESTION__";
+
+func chatFail(message: string) {
+    print("NEXORA_CHAT_ERROR " + message);
+    throw new Exception(message);
+}
+
+let providersDoc = nexora_load_providers(PROVIDERS_PATH);
+let provider = nexora_find_provider(providersDoc, PROVIDER_NAME);
+if (provider == nil) {
+    chatFail("找不到供应商 " + PROVIDER_NAME);
+}
+
+let model = str(provider.get("model", ""));
+if (model == "") chatFail("供应商缺少 model");
+let window = provider.get("context_window", 0);
+if (type(window) != "int") window = 0;
+let configured = provider.get("max_tokens", 4096);
+if (type(configured) != "int") configured = 4096;
+let temperature = provider.get("temperature", 0.7);
+if (type(temperature) != "int" and type(temperature) != "float") temperature = 0.7;
+
+let history: Array = [{"role": "user", "content": QUESTION}];
+let messages = nexora_build_request_messages(SYSTEM_PROMPT, history, 0, "");
+let basis = nexora_estimate_tokens({"messages": messages});
+let outputLimit = nexora_request_output_limit(window, configured, basis);
+let decision = nexora_prepare_decision(window, configured, basis);
+if (decision != "direct") {
+    chatFail("输入超出直发预算，需要压缩（后续切片）：estimate=" + str(basis));
+}
+
+print("NEXORA_CHAT_REQUEST model=" + model + " input_estimate=" + str(basis) +
+    " output_limit=" + str(outputLimit));
+
+let payload = {"model": model,
+    "messages": messages,
+    "stream": false,
+    "temperature": temperature,
+    "max_tokens": outputLimit};
+let endpoint = nexora_completions_url(str(provider.get("base_url", "")));
+let headers = nexora_provider_headers(str(provider.get("api_key", "")));
+let timeoutSeconds = __nexora_ceil_nonneg(provider.get("timeout_seconds", 120));
+if (timeoutSeconds < 1) timeoutSeconds = 1;
+
+let response = post(endpoint, nil, headers, payload, timeoutSeconds);
+if (response.status_code < 200 or response.status_code >= 300) {
+    chatFail("模型服务返回 " + str(response.status_code) + ": " +
+        response.text().slice(0, 300));
+}
+
+let reply = JSON.parse(response.text());
+let choices = reply.get("choices", nil);
+// 注意：`or` 两边都会求值，nil.length() 会抛；必须嵌套判断。
+if (type(choices) != "Array") {
+    chatFail("模型回复缺少 choices");
+}
+if (choices.length() == 0) {
+    chatFail("模型回复 choices 为空");
+}
+let first = choices[0];
+if (type(first) != "dict") chatFail("模型回复首选项格式不对");
+let message = first.get("message", nil);
+if (type(message) != "dict") chatFail("模型回复缺少 message");
+let content = message.get("content", nil);
+if (type(content) != "string") chatFail("模型回复缺少 content");
+
+let usage = reply.get("usage", nil);
+if (type(usage) == "dict") {
+    print("NEXORA_CHAT_USAGE prompt=" + str(usage.get("prompt_tokens", 0)) +
+        " completion=" + str(usage.get("completion_tokens", 0)));
+}
+print("NEXORA_CHAT_REPLY " + content);
+print("NEXORA_CHAT_CLI_PASS");

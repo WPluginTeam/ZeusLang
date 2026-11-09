@@ -265,6 +265,9 @@ namespace ZeusVMSlots {
                 }
 
                 if (entry.reveal) {
+                    // Prune on this path too. Otherwise a program that only ever
+                    // reveals values never clears out its own history.
+                    pruneExpiredSlots();
                     if (shared) {
                         if (!ZeusVMAddress::address(shared.get(), true, out, error)) return false;
                     } else if (!ZeusVMAddress::address(entry.cell, true, out, error)) return false;
@@ -294,7 +297,23 @@ namespace ZeusVMSlots {
             void pruneExpiredSlots() {
                 for (auto slot = slots.begin(); slot != slots.end();) {
                     if (slot->second.reveal) {
-                        ++slot;
+                        // A revealed entry describes storage, not a cell. The
+                        // cell it was taken from routinely dies while the
+                        // storage lives on - a method that returns its own
+                        // receiver is the ordinary case - so cell liveness says
+                        // nothing here. Ask the allocator instead, and drop the
+                        // entry only once it no longer knows the block. That
+                        // stops the registry growing without bound without
+                        // cutting aliases that are still in use.
+                        const auto base = slot->second.revealedBase;
+                        const auto size = slot->second.revealedSize;
+                        if (size == 0 ||
+                            zeus_memory_find_allocation(
+                                reinterpret_cast<void*>(base), size)) {
+                            ++slot;
+                            continue;
+                        }
+                        slot = slots.erase(slot);
                         continue;
                     }
                     std::shared_ptr<ZeusShared::SharedCell> shared;
@@ -410,6 +429,7 @@ namespace ZeusVMSlots {
                 }
                 if (size == 0 && !checkedAddress) return true;
                 bool interiorSlot = false;
+                std::string expiredRevealedSlotError;
                 for (auto& item : slots) {
                     auto& entry = item.second;
                     if (!entry.reveal) {
@@ -425,8 +445,14 @@ namespace ZeusVMSlots {
                         if (within(checkedAddress, size,
                                    reinterpret_cast<void*>(entry.revealedBase),
                                    entry.revealedSize)) {
-                            error = resolveError;
-                            return false;
+                            // A dead revealed value can leave a stale range in
+                            // this registry after its allocator has reused the
+                            // same address for a live Zeus malloc block. Defer
+                            // the stale-slot error until tracked allocations
+                            // have had a chance to validate the current owner.
+                            if (expiredRevealedSlotError.empty()) {
+                                expiredRevealedSlotError = std::move(resolveError);
+                            }
                         }
                         continue;
                     }
@@ -485,9 +511,20 @@ namespace ZeusVMSlots {
                     error = "VM @faddr cannot access an interior or mismatched typed slot";
                     return false;
                 }
-                if (zeus_memory_find_allocation(checkedAddress, size)) {
-                    return true;
+                if (!expiredRevealedSlotError.empty()) {
+                    // A dead revealed value can leave a stale range in this
+                    // registry after its allocator has reused the same address
+                    // for a live Zeus malloc block. Ignore that stale range
+                    // only when the allocation registry confirms the complete
+                    // access is inside the current allocation. The logical
+                    // typed-slot check above still takes precedence.
+                    if (zeus_memory_find_allocation(checkedAddress, size)) {
+                        return true;
+                    }
+                    error = std::move(expiredRevealedSlotError);
+                    return false;
                 }
+                if (zeus_memory_find_allocation(checkedAddress, size)) return true;
                 error = "VM @faddr address has no live typed slot, revealed storage, or tracked allocation";
                 return false;
             }

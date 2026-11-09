@@ -1,0 +1,28 @@
+import zeus.dict;
+import zeus.exception;
+
+// `impl dict` 让字面量能直接调方法：`{"a": 1}.get("a")`。
+// 缺键回 fallback，与自由函数 dict_get 同口径。
+func assertDictGet(condition, message: string) {
+    if (!condition) throw new Exception("dict get test failed: " + message);
+}
+
+let direct = {"a": 1};
+assertDictGet(direct.get("a") == 1, "literal variable get");
+assertDictGet(direct.get("missing") == nil, "missing key returns nil");
+assertDictGet(direct.get("missing", 42) == 42, "missing key returns fallback");
+assertDictGet({"x": 7}.get("x") == 7, "inline literal get");
+assertDictGet({}.get("k", "fb") == "fb", "empty literal get with fallback");
+
+func readThrough(m) {
+    return m.get("k", "fb");
+}
+assertDictGet(readThrough({"k": "v"}) == "v", "dict through untyped param");
+assertDictGet(readThrough({}) == "fb", "empty dict through untyped param");
+
+func typedRead(m: dict) {
+    return m.get("k", "none");
+}
+assertDictGet(typedRead({"k": "v"}) == "v", "dict through typed param");
+
+print("DICT_GET_PASS");

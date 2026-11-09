@@ -1,0 +1,49 @@
+import zeus.exception;
+
+var cleanupTotal = 0;
+
+func cleanupScratch(value: int) -> int {
+    let a = value + 1;
+    let b = a + 1;
+    let c = b + 1;
+    let d = c + 1;
+    let e = d + 1;
+    return e;
+}
+
+class ReentrantCleanupProbe {
+    using &this;
+    let identity = 0;
+    func init(identity: int) { this.identity = identity; }
+    func operator[~]() {
+        let scratch = cleanupScratch(this.identity);
+        cleanupTotal = cleanupTotal + scratch - 5;
+    }
+}
+
+func leaveScope() {
+    let first = new ReentrantCleanupProbe(1);
+    let second = new ReentrantCleanupProbe(2);
+    let third = new ReentrantCleanupProbe(3);
+}
+
+func throwFromScope() {
+    let first = new ReentrantCleanupProbe(1);
+    let second = new ReentrantCleanupProbe(2);
+    let third = new ReentrantCleanupProbe(3);
+    throw new Exception("cleanup unwind probe");
+}
+
+func main() {
+    for (0 .. 100) [index] { leaveScope(); }
+    if (cleanupTotal != 600) throw new Exception("normal cleanup missed or repeated a destructor");
+    let caught = 0;
+    for (0 .. 100) [index] {
+        try { throwFromScope(); }
+        catch (&error) { caught = caught + 1; }
+    }
+    if (caught != 100) throw new Exception("exception cleanup failed to restore caller environment");
+    __gc_collect();
+    print("VM_REENTRANT_ENV_CLEANUP_PASS");
+}
+main();

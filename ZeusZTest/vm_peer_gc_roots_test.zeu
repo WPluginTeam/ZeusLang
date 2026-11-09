@@ -1,0 +1,116 @@
+import zeus.thread;
+import zeus.exception;
+
+var shared ready: Event = new Event();
+var shared resume: Event = new Event();
+var shared workerDestructions = 0;
+var shared mainDestructions = 0;
+var shared workerReadSucceeded = false;
+var shared workerCollected = false;
+var shared handoffReleased = false;
+var shared handoffCollected = false;
+var shared handoffDestructions = 0;
+
+class PeerOwnedProbe {
+    using &this;
+    let identity = 0;
+    func init(identity: int) { this.identity = identity; }
+    func read() -> int { return this.identity; }
+    func operator[~]() {
+        if (this.identity == 1) workerDestructions = workerDestructions + 1;
+        if (this.identity == 2) mainDestructions = mainDestructions + 1;
+        if (this.identity == 3) handoffDestructions = handoffDestructions + 1;
+    }
+}
+
+func assertTrue(condition, message: string) {
+    if (!condition) throw new Exception("peer GC roots test failed: " + message);
+}
+
+func holdWorkerLocal() {
+    let onlyWorkerOwns = new PeerOwnedProbe(1);
+    ready.set();
+    // Event.wait repeatedly suspends in a native sleep. A collector must be
+    // able to run while this VM waits and preserve its private local object.
+    resume.wait();
+    workerReadSucceeded = onlyWorkerOwns.read() == 1;
+}
+
+func collectFromWorker() {
+    __gc_collect();
+    workerCollected = true;
+}
+
+class PeerHandoffRunner {
+    using &this;
+    func collectWhenReleased() {
+        // Pure Zeus polling avoids adding a native rendezvous publication.
+        for (true) { if (handoffReleased) break; }
+        __gc_collect();
+        handoffCollected = true;
+    }
+}
+
+func checkHandoffWindow(round: int) {
+    handoffReleased = false;
+    handoffCollected = false;
+    let actor = new PeerHandoffRunner();
+    let worker = new Thread(actor.collectWhenReleased);
+    worker.start();
+    // This instance did not exist in the forced thread-start snapshot. The
+    // pending-peer lease must make allocation/retain barriers publish it even
+    // if the child has not registered its shared object-table domain yet.
+    let createdAfterStart = new PeerOwnedProbe(3);
+    handoffReleased = true;
+    let spin = 0;
+    for (0 .. 1000) [index] { spin = spin + index; }
+    assertTrue(createdAfterStart.read() == 3 and handoffDestructions == round,
+        "new parent local survives collection in the thread-start window");
+    worker.join();
+    assertTrue(handoffCollected and createdAfterStart.read() == 3,
+        "bound worker collected while the new parent local stayed alive");
+    assertTrue(handoffDestructions == round,
+        "handoff collection did not prematurely destroy the new parent local");
+    delete createdAfterStart;
+    assertTrue(handoffDestructions == round + 1,
+        "handoff local is destroyed exactly once after explicit delete");
+    delete worker;
+    delete actor;
+}
+
+func main() {
+    let waitingWorker = new Thread(holdWorkerLocal);
+    waitingWorker.start();
+    ready.wait();
+    __gc_collect();
+    assertTrue(workerDestructions == 0, "main collection keeps worker local alive");
+    resume.set();
+    waitingWorker.join();
+    assertTrue(workerReadSucceeded, "worker local remains usable after main collection");
+    assertTrue(workerDestructions == 1, "worker teardown destroys its local exactly once");
+    delete waitingWorker;
+    print("MAIN_GC_PRESERVES_WORKER_PASS");
+
+    let onlyMainOwns = new PeerOwnedProbe(2);
+    let collectingWorker = new Thread(collectFromWorker);
+    collectingWorker.start();
+    // Join blocks in native code while the worker collects the shared table.
+    collectingWorker.join();
+    assertTrue(workerCollected, "worker collection completed during main native join");
+    assertTrue(mainDestructions == 0 and onlyMainOwns.read() == 2,
+        "worker collection keeps main local alive");
+    delete collectingWorker;
+    assertTrue(mainDestructions == 0, "nested delete collection keeps caller local alive");
+    delete onlyMainOwns;
+    assertTrue(mainDestructions == 1, "main object is destroyed exactly once");
+    __gc_collect();
+    assertTrue(workerDestructions == 1 and mainDestructions == 1,
+        "later collections never repeat object destruction");
+    print("WORKER_GC_PRESERVES_MAIN_PASS");
+    for (0 .. 64) [round] { checkHandoffWindow(round); }
+    assertTrue(handoffDestructions == 64, "all handoff locals were destroyed exactly once");
+    print("PENDING_PEER_HANDOFF_PASS");
+    print("VM_PEER_GC_ROOTS_PASS");
+}
+
+main();

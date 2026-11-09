@@ -1,0 +1,175 @@
+import zeus.exception;
+import zeus.thread;
+
+var shared destructionCount = 0;
+var shared workerCalls = 0;
+var shared rootOnlyDestructionCount = 0;
+
+class RootOnlyIdentityProbe {
+    using &this;
+    var value = 71;
+
+    func operator[~]() {
+        rootOnlyDestructionCount = rootOnlyDestructionCount + 1;
+    }
+}
+
+var shared soleRoot = nil;
+
+class IdentityProbe {
+    using &this;
+    var identity = 0;
+    var value = 0;
+
+    func init(identity: int, value: int) {
+        this.identity = identity;
+        this.value = value;
+    }
+
+    func get() -> int { return this.value; }
+    func set(value: int) { this.value = value; }
+
+    func operator[~]() {
+        destructionCount = destructionCount + 1;
+    }
+}
+
+var shared sharedProbe: IdentityProbe = new IdentityProbe(1, 10);
+
+func assertTrue(condition, message: string) {
+    if (!condition) throw new Exception("shared identity test failed: " + message);
+}
+
+class IdentityWorker {
+    using &this;
+
+    func run() {
+        sharedProbe.value = sharedProbe.value + 1;
+        workerCalls = workerCalls + 1;
+    }
+}
+
+func runWorker() {
+    // A bound method works in VM and AOT; AOT does not yet accept a named
+    // free-function reference directly as a constructor argument.
+    let context = new IdentityWorker();
+    let handler = context.run;
+    let worker = new Thread(handler);
+    worker.start();
+    worker.join();
+    delete worker;
+    delete context;
+}
+
+func verifySoleSharedRootRelease() {
+    soleRoot = new RootOnlyIdentityProbe();
+    __gc_collect();
+    assertTrue(rootOnlyDestructionCount == 0, "sole shared root survives GC");
+    soleRoot = nil;
+    assertTrue(rootOnlyDestructionCount == 1, "rebind nil releases sole shared owner once");
+    __gc_collect();
+    assertTrue(rootOnlyDestructionCount == 1, "released sole root is not destroyed twice");
+}
+
+func collectInsideNestedCall() {
+    __gc_collect();
+}
+
+func verifySharedInitializationFromExisting() {
+    let before = rootOnlyDestructionCount;
+    let existing = new RootOnlyIdentityProbe();
+    var shared fromExisting: RootOnlyIdentityProbe = existing;
+    fromExisting.value = 72;
+    assertTrue(existing.value == 72, "shared initialization keeps existing instance");
+    existing.value = 73;
+    assertTrue(fromExisting.value == 73, "existing alias writes reach initialized shared slot");
+    __gc_collect();
+    assertTrue(rootOnlyDestructionCount == before, "shared initialization does not clone or destroy");
+    delete fromExisting;
+    assertTrue(rootOnlyDestructionCount == before + 1, "initialized shared instance destroys once");
+}
+
+func verifySavedCallerRoots() {
+    let callerObject = new RootOnlyIdentityProbe();
+    let before = rootOnlyDestructionCount;
+    collectInsideNestedCall();
+    assertTrue(callerObject.value == 71, "nested GC retains suspended caller locals");
+    assertTrue(rootOnlyDestructionCount == before, "nested GC does not destroy caller root");
+    delete callerObject;
+    assertTrue(rootOnlyDestructionCount == before + 1, "caller root is released by explicit delete");
+}
+
+func main() {
+    // No ordinary alias exists yet: this instance is rooted only by sharedProbe.
+    __gc_collect();
+    assertTrue(destructionCount == 0, "shared slot alone roots its instance");
+    sharedProbe = sharedProbe;
+    assertTrue(sharedProbe.identity == 1 and sharedProbe.value == 10,
+        "shared self assignment preserves instance");
+    assertTrue(destructionCount == 0, "shared self assignment does not destroy instance");
+    verifySoleSharedRootRelease();
+    verifySharedInitializationFromExisting();
+    verifySavedCallerRoots();
+    let firstAlias = sharedProbe;
+    firstAlias.value = 11;
+    assertTrue(sharedProbe.get() == 11, "alias field writes reach shared instance");
+    sharedProbe.set(12);
+    assertTrue(firstAlias.value == 12, "shared method writes reach alias");
+    __gc_collect();
+    assertTrue(destructionCount == 0, "live shared alias survives explicit GC");
+
+    let assigned = new IdentityProbe(2, 20);
+    sharedProbe = assigned;
+    sharedProbe = assigned;
+    assigned.value = 21;
+    assertTrue(sharedProbe.value == 21, "shared slot assignment preserves instance");
+    sharedProbe.value = 22;
+    assertTrue(assigned.value == 22, "assignment alias sees shared slot field writes");
+    assertTrue(firstAlias.identity == 1 and firstAlias.value == 12,
+        "rebinding shared slot leaves old alias attached to its old object");
+    __gc_collect();
+    assertTrue(destructionCount == 0, "rebinding does not destroy retained old alias");
+
+    runWorker();
+    assertTrue(workerCalls == 1 and assigned.value == 23,
+        "worker VM uses the same shared instance");
+    __gc_collect();
+    assertTrue(destructionCount == 0, "worker teardown keeps main aliases alive");
+
+    sharedProbe = new IdentityProbe(3, 30);
+    let currentAlias = sharedProbe;
+    runWorker();
+    assertTrue(workerCalls == 2 and currentAlias.value == 31,
+        "worker observes current shared slot after rebind");
+    assertTrue(assigned.identity == 2 and assigned.value == 23,
+        "second rebind retains the previous object through its alias");
+    __gc_collect();
+    assertTrue(destructionCount == 0, "all three retained instances remain alive");
+
+    // Existing explicit-delete semantics invalidate every alias to that object.
+    delete firstAlias;
+    assertTrue(destructionCount == 1, "explicit delete destroys first object once");
+    let oldAliasRejected = false;
+    try {
+        firstAlias.get();
+    } catch (&error) {
+        oldAliasRejected = true;
+    }
+    assertTrue(oldAliasRejected, "explicitly deleted alias is invalid");
+    delete assigned;
+    assertTrue(destructionCount == 2, "second object is destroyed once");
+    delete sharedProbe;
+    let currentAliasRejected = false;
+    try {
+        currentAlias.get();
+    } catch (&error) {
+        currentAliasRejected = true;
+    }
+    assertTrue(currentAliasRejected, "deleting shared slot invalidates object aliases");
+    assertTrue(destructionCount == 3, "three original instances destroyed exactly once");
+    __gc_collect();
+    assertTrue(destructionCount == 3, "GC does not repeat explicit destruction");
+    print("SHARED_INSTANCE_IDENTITY_PASS");
+}
+
+main();

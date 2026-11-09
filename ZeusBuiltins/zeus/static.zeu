@@ -114,7 +114,7 @@ decl func __zeus_object_clone(value);
 
     func clear() -> StaticArray {
         using LLVM {
-            var index = 0;
+            let index = 0;
             for (true) {
                 if (index >= this.countValue) break;
                 @faddr(this.dataAddress + index * sizeof(T), slot_clear) -> T;
@@ -133,7 +133,7 @@ decl func __zeus_object_clone(value);
     func operator[@=]() -> StaticArray {
         let result = new StaticArray<T>(this.capacityValue);
         try {
-            var index = 0;
+            let index = 0;
             for (true) {
                 if (index >= this.countValue) break;
                 using LLVM {
@@ -195,7 +195,7 @@ class StaticDict {
             }
             this.dataAddress = allocation;
 
-            var slot = 0;
+            let slot = 0;
             for (true) {
                 if (slot >= capacity) break;
                 @faddr(allocation + slot * 24, 8) -> int = 0;
@@ -220,9 +220,9 @@ class StaticDict {
     @no_safepoint
     inline func findSlot(key: int) -> int {
         using LLVM {
-            var slot = key % this.capacityValue;
+            let slot = key % this.capacityValue;
             if (slot < 0) slot = slot + this.capacityValue;
-            var probes = 0;
+            let probes = 0;
             for (true) {
                 let entryAddress = this.dataAddress + slot * 24;
                 let occupied = @faddr(entryAddress, 8) -> int;
@@ -319,7 +319,7 @@ class StaticDict {
 
     func clear() -> StaticDict {
         using LLVM {
-            var slot = 0;
+            let slot = 0;
             for (true) {
                 if (slot >= this.capacityValue) break;
                 @faddr(this.dataAddress + slot * 24, 8) -> int = 0;
@@ -337,7 +337,7 @@ class StaticDict {
         let result = new StaticDict(this.capacityValue);
         try {
             using LLVM {
-                var slot = 0;
+                let slot = 0;
                 for (true) {
                     if (slot >= this.capacityValue) break;
                     let entryAddress = this.dataAddress + slot * 24;

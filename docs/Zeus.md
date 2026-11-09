@@ -15,6 +15,56 @@ Zeus will compile code into ZeusIR, then using Zeus VM to execute it. It sounds 
 print("Hello world!");
 ```
 
+###### conditional expressions
+
+```zeus
+let label = ready ? "ready" : "waiting";
+let count = maybeCount ?: 0;
+```
+
+`condition ? whenTrue : whenFalse` evaluates only the selected branch. Elvis,
+`value ?: fallback`, uses `fallback` only when `value` is `nil`; it evaluates
+`value` once and keeps values such as `false`, `0`, and `""`. Safe navigation
+remains `object?.member`.
+
+###### when pattern matching
+
+```zeus
+// Target matching mode (colon separator)
+let grade = when (score) {
+    90..100: "A",
+    80..89:  "B",
+    60, 70:  "Pass",
+    else:    "Fail"
+};
+
+// Type pattern matching
+when (item) {
+    is string: print("string:", item);
+    is int:    print("integer:", item);
+    else:      print("unknown type");
+}
+
+// Condition mode (argument-free)
+when {
+    x > 0: print("Positive");
+    x < 0: print("Negative");
+    else:  print("Zero");
+}
+```
+
+`when` supports statement mode, assignment mode (`let x = when ...`), and return mode (`return when ...`).
+Key features:
+- Branch separator: uses intuitive `:` syntax (`pattern: body`), consistent with C/JS switch-case and Zeus dictionaries
+- Multi-value patterns: comma-separated values (`1, 2, 3: ...`)
+- Type matching: `is TypeName: ...`
+- Range patterns: `start..end: ...` or `in start..end: ...`
+- Condition guards: `when { cond: ... }`
+- Flexible branch bodies: single expressions, dictionary literals, or block bodies `{ ... }`
+- Fallback: `else: ...` branch
+- Non-local control flow: `break`, `continue`, and `return` are preserved naturally
+- Zero VM overhead: desugared directly into sequential `let` and `if / else if / else` statements at parse time
+
 ###### var decl
 
 ```
@@ -103,6 +153,27 @@ In Zeus, there's two way to call a backward-declaration function:
    ```
 
 that will provide a safer way to use backward-declaration function, avoiding undef or confusing questions about backward-declaration functions.
+
+###### importing a native DLL/SO
+
+Use `@native` with a `from` path to load an exported C function from a shared
+library. Relative paths are resolved from the `.zeu` file that declares the
+function.
+
+```zeus
+@native("library_add", from="../native/math.dll")
+decl func add(left: int, right: int) -> int;
+
+print(add(20, 22));
+```
+
+The first implementation supports up to four by-value parameters of type
+`int`, `bool`, or `string`, and return types `int`, `bool`, `string`, or no
+return annotation for a C `void` function. `int` uses signed 64-bit values;
+strings cross the C boundary as NUL-terminated UTF-8 `const char*` values, and
+string results are copied into Zeus-managed storage. The library must export the
+named symbol with a C ABI (`extern "C"` in C++). Reference, byte-buffer, float,
+and class parameters are not supported by this first version.
 
 ###### heap object create/del
 

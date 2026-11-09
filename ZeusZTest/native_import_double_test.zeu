@@ -1,0 +1,111 @@
+@native decl Double = 1;
+@native decl Int8 = 4;
+@native decl LongLong = 2;
+@native decl Float = 11;
+@native decl Int16 = 12;
+@native decl UInt8 = 13;
+@native decl UInt16 = 14;
+@native decl UInt32 = 15;
+@native decl UInt64 = 16;
+
+@native("zeus_test_add_double", from="native_import_test.dll")
+decl func nativeAddDouble(left: Double, right: Double) -> Double;
+
+@native("zeus_test_mixed_double", from="native_import_test.dll")
+decl func nativeMixedDouble(
+    first: Double,
+    second: LongLong,
+    third: Double,
+    fourth: LongLong,
+    fifth: Double,
+    sixth: LongLong
+) -> Double;
+
+@native("zeus_test_native_int8", from="native_import_test.dll")
+decl func nativeInt8(value: Int8) -> Int8;
+
+@native("zeus_test_native_int8_call_count", from="native_import_test.dll")
+decl func nativeInt8CallCount() -> int;
+
+@native("zeus_test_native_float", from="native_import_test.dll")
+decl func nativeFloat(value: Float) -> Float;
+
+@native("zeus_test_identity_float", from="native_import_test.dll")
+decl func nativeIdentityFloat(value: Float) -> Float;
+
+@native("zeus_test_mixed_float", from="native_import_test.dll")
+decl func nativeMixedFloat(
+    first: Float,
+    second: Int16,
+    third: UInt64,
+    fourth: Float,
+    fifth: UInt8
+) -> Float;
+
+@native("zeus_test_native_int16", from="native_import_test.dll")
+decl func nativeInt16(value: Int16) -> Int16;
+
+@native("zeus_test_native_uint8", from="native_import_test.dll")
+decl func nativeUInt8(value: UInt8) -> UInt8;
+
+@native("zeus_test_native_uint16", from="native_import_test.dll")
+decl func nativeUInt16(value: UInt16) -> UInt16;
+
+@native("zeus_test_native_uint32", from="native_import_test.dll")
+decl func nativeUInt32(value: UInt32) -> UInt32;
+
+@native("zeus_test_native_uint64", from="native_import_test.dll")
+decl func nativeUInt64(value: UInt64) -> UInt64;
+
+func uint64RoundTrip(value: UInt64) -> UInt64 {
+    return value;
+}
+
+func floatRoundTrip(value: Float) -> Float {
+    return value;
+}
+
+if (nativeAddDouble(1, 2.5) != 3.5) throw "native double argument conversion";
+if (nativeFloat(2.5) != 3.75) throw "native float32 argument and return conversion";
+if (nativeFloat(2) != 3) throw "BigInt to native float32 conversion";
+var roundedFloat: Float = 0.1;
+if (roundedFloat != nativeIdentityFloat(0.1)) {
+    throw "float32 storage and native call must use the same rounded value";
+}
+var sumRoundedFloat: Float = roundedFloat + 0.5;
+if (sumRoundedFloat != nativeIdentityFloat(0.6)) {
+    throw "float32 assignment must round arithmetic results to binary32";
+}
+if (nativeMixedDouble(1.25, 2, 3.5, 4, 5.75, 6) != 661871.25) {
+    throw "mixed integer/double x64 ABI registers and stack arguments";
+}
+if (nativeMixedFloat(1.25, -2, 3, 0.5, 4) != 40781.25) {
+    throw "mixed float32, signed, unsigned, and stack arguments";
+}
+if (nativeInt16(-32768) != -32768) throw "native int16 conversion";
+if (nativeUInt8(255) != 255) throw "native uint8 conversion";
+if (nativeUInt16(65535) != 65535) throw "native uint16 conversion";
+if (nativeUInt32(4294967295) != 4294967295) throw "native uint32 conversion";
+if (nativeUInt64(18446744073709551615) != 18446744073709551615) {
+    throw "native uint64 conversion must preserve values above int64 max";
+}
+if (uint64RoundTrip(18446744073709551615) != 18446744073709551615) {
+    throw "Zeus uint64 parameter and return must preserve UINT64_MAX";
+}
+if (floatRoundTrip(0.1) != nativeIdentityFloat(0.1)) {
+    throw "Zeus float32 parameter and return normalization";
+}
+if (nativeInt8(127.0) != 127) throw "exact BigDecimal to native integer conversion";
+
+let callsBeforeFraction = nativeInt8CallCount();
+let caughtFraction = false;
+try {
+    nativeInt8(1.5);
+} catch (&error) {
+    caughtFraction = true;
+}
+if (!caughtFraction or nativeInt8CallCount() != callsBeforeFraction) {
+    throw "fractional BigDecimal reached the native integer function";
+}
+
+print("PASS dynamic native scalar imports");

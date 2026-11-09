@@ -1,6 +1,12 @@
 
 // I/O functions for Zeus
 
+@native("zeus_native_io_write", from="ZeusNativeRuntime")
+decl func _write(text: string);
+
+@native("zeus_native_io_flush", from="ZeusNativeRuntime")
+decl func _flush();
+
 // Helper function to convert value to native string
 func _toStr(val) {
     using original {
@@ -13,7 +19,7 @@ func _toStr(val) {
                 if (type(converted) == "string") return converted;
                 return __builtin_str(converted);
             } catch (e) {
-                return str(val);
+                return __builtin_str(val);
             }
         }
     }
@@ -48,10 +54,9 @@ func print(*args, **kwargs) {
 
     if (kwargs_type == "dict" || kwargs_type == "object") {
         for (kwargs) [const &key : ... value] {
-            if (key == "sep") {
-                sep = _toStr(value);
-            } else if (key == "end") {
-                end = _toStr(value);
+            when (key) {
+                "sep": sep = _toStr(value);
+                "end": end = _toStr(value);
             }
         }
     }
@@ -65,5 +70,17 @@ func print(*args, **kwargs) {
 
     _write(output + end);
 
+    return nil;
+}
+
+// Flush text written without a trailing newline, such as an interactive prompt
+// or a streamed response fragment.
+func flush() {
+    _flush();
+    return nil;
+}
+
+func flushOutput() {
+    _flush();
     return nil;
 }

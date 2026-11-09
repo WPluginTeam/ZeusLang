@@ -1,0 +1,24 @@
+import zeus.exception;
+
+@native("zeus_test_add", from="native_import_test.so")
+decl func nativeAdd(left: int, right: int) -> int;
+
+@native("zeus_test_bool", from="native_import_test.so")
+decl func nativeBool(value: bool) -> bool;
+
+@native("zeus_test_greeting", from="native_import_test.so")
+decl func nativeGreeting(name: string) -> string;
+
+@native("zeus_test_noop", from="native_import_test.so")
+decl func nativeNoop();
+
+func assertNative(condition, message: string) {
+    if (!condition) throw new Exception("native import test failed: " + message);
+}
+
+assertNative(nativeAdd(39, 3) == 42, "int arguments and return");
+assertNative(nativeBool(false), "bool arguments and return");
+assertNative(nativeGreeting("Zeus") == "Hello, Zeus", "C string conversion");
+nativeNoop();
+
+print("PASS dynamic native imports");

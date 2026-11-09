@@ -1,0 +1,100 @@
+import zeus.file [&file];
+import zeus.path;
+
+// Runner 把 base 换成一次性目录，跑完连同内容一起删掉。
+let base = "__GROUND__";
+let root = base + "/paths";
+
+func writeText(path, text) {
+    let handle = file.open(path, "w");
+    handle.write(text);
+    handle.close();
+}
+
+func readText(path) {
+    let handle = file.open(path, "r");
+    let text = handle.read();
+    handle.close();
+    return text;
+}
+
+func hasEntry(entries, name) -> bool {
+    for (entries) [entry] {
+        if (entry == name) return true;
+    }
+    return false;
+}
+
+// 多级创建，且可以重复调用。
+file.mkdirs(root + "/nested/deep");
+if (!file.exists(root)) throw new Exception("mkdirs 没有创建根目录");
+if (!file.isDirectory(root + "/nested/deep")) throw new Exception("mkdirs 没有创建嵌套层");
+let canonicalRoot = Path.normalize(file.realPath(root)).lower();
+let canonicalDeep = Path.normalize(file.realPath(root + "/nested/deep")).lower();
+if (!canonicalDeep.startswith(canonicalRoot + "/")) {
+    throw new Exception("realPath 没有返回根目录内的规范路径");
+}
+file.mkdirs(root + "/nested");
+file.mkdir(root + "/nested");
+
+// 不存在的路径是询问，不是错误。
+if (file.exists(root + "/nope")) throw new Exception("exists 把不存在的路径报了 true");
+if (file.isDirectory(root + "/nope")) throw new Exception("isDirectory 把不存在的路径报了 true");
+
+writeText(root + "/nested/a.txt", "alpha");
+if (!file.exists(root + "/nested/a.txt")) throw new Exception("文件没有落盘");
+if (file.isDirectory(root + "/nested/a.txt")) throw new Exception("文件被当成目录");
+let canonicalFile = Path.normalize(file.realPath(root + "/nested/a.txt")).lower();
+if (!canonicalFile.startswith(canonicalRoot + "/")) {
+    throw new Exception("realPath 没有返回根目录内的规范文件路径");
+}
+
+writeText(root + "/nested/deep/b.txt", "beta");
+
+let entries = file.listDir(root + "/nested");
+if (!hasEntry(entries, "a.txt")) throw new Exception("listDir 漏了 a.txt");
+if (!hasEntry(entries, "deep")) throw new Exception("listDir 漏了子目录 deep");
+if (hasEntry(entries, ".") or hasEntry(entries, "..")) {
+    throw new Exception("listDir 不应该返回 . 和 ..");
+}
+if (entries.length() != 2) throw new Exception("listDir 条目数不对: " + str(entries.length()));
+
+// 改名之后内容不变。
+file.rename(root + "/nested/a.txt", root + "/nested/c.txt");
+if (file.exists(root + "/nested/a.txt")) throw new Exception("改名后旧名字还在");
+if (!file.exists(root + "/nested/c.txt")) throw new Exception("改名后新名字不存在");
+if (readText(root + "/nested/c.txt") != "alpha") throw new Exception("改名丢了内容");
+
+// 目标已存在时替换，不报错。
+writeText(root + "/nested/target.txt", "old");
+file.rename(root + "/nested/c.txt", root + "/nested/target.txt");
+if (readText(root + "/nested/target.txt") != "alpha") {
+    throw new Exception("覆盖式改名没有替换目标");
+}
+
+file.removeFile(root + "/nested/target.txt");
+if (file.exists(root + "/nested/target.txt")) throw new Exception("removeFile 没删掉");
+
+// 非空目录删不掉，空目录可以删。
+var refused = false;
+try {
+    file.removeDir(root + "/nested");
+} catch (&blocked) {
+    refused = true;
+}
+if (!refused) throw new Exception("removeDir 不应该能删非空目录");
+
+file.removeFile(root + "/nested/deep/b.txt");
+file.removeDir(root + "/nested/deep");
+if (file.exists(root + "/nested/deep")) throw new Exception("removeDir 没删掉空目录");
+
+// 列举不存在的目录要报错。
+var missing = false;
+try {
+    file.listDir(root + "/nope");
+} catch (&blocked) {
+    missing = true;
+}
+if (!missing) throw new Exception("listDir 对不存在的目录应该报错");
+
+print("FILE_PATH_TEST_PASS");

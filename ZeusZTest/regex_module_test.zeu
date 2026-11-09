@@ -1,0 +1,72 @@
+import zeus.re [&re];
+
+let expression = re.compile("([a-z]+)-([0-9]+)");
+if (expression.pattern != "([a-z]+)-([0-9]+)" or expression.flags != 0 or
+    expression.groups != 2) {
+    throw new Exception("compiled pattern properties mismatch");
+}
+let found = expression.search("id abc-42 end");
+if (found == nil) throw new Exception("search did not find a match");
+if (found.group() != "abc-42") throw new Exception("group zero mismatch");
+if (found.group(1) != "abc") throw new Exception("group one mismatch");
+if (found.group(2) != "42") throw new Exception("group two mismatch");
+if (found.start() != 3 or found.end() != 9) throw new Exception("match range mismatch");
+if (found.span(1)[0] != 3 or found.span(1)[1] != 6) throw new Exception("group span mismatch");
+if (found.groups()[0] != "abc" or found.groups()[1] != "42") {
+    throw new Exception("groups result mismatch");
+}
+
+if (re.match("abc", "abcdef") == nil) throw new Exception("match should be anchored");
+if (re.match("bc", "abcdef") != nil) throw new Exception("match was not anchored");
+if (re.fullmatch("abc", "abcdef") != nil) throw new Exception("fullmatch accepted a suffix");
+if (re.fullmatch("abc", "abc") == nil) throw new Exception("fullmatch rejected exact text");
+if (re.search("cat", "CAT", 2) == nil) throw new Exception("IGNORECASE failed");
+if (re.search("a.b", "a\nb", 16) == nil) throw new Exception("DOTALL failed");
+using VM {
+    if (re.I != 2 or re.S != 16) throw new Exception("flag constants mismatch");
+}
+let invalidPatternCaught = 0;
+try {
+    re.compile("[");
+} catch (&error) {
+    invalidPatternCaught = 1;
+}
+if (invalidPatternCaught != 1) throw new Exception("invalid pattern was accepted");
+
+let all = re.findall("([a-z]+)-([0-9]+)", "a-1 b-22");
+if (all.length() != 2 or all[0][0] != "a" or all[0][1] != "1" or
+    all[1][0] != "b" or all[1][1] != "22") {
+    throw new Exception("findall capture result mismatch");
+}
+let unmatched = re.findall("(a)?b", "b ab");
+if (unmatched.length() != 2 or unmatched[0] != "" or unmatched[1] != "a") {
+    throw new Exception("findall unmatched capture mismatch");
+}
+if (expression.findall("x-7")[0][1] != "7" or expression.sub("v", "x-7") != "v") {
+    throw new Exception("compiled pattern findall or sub mismatch");
+}
+let iterator = re.finditer("[0-9]+", "a12b3");
+if (iterator.length() != 2 or iterator[0].group() != "12" or
+    iterator[1].start() != 4) {
+    throw new Exception("finditer result mismatch");
+}
+
+let pieces = re.split("([,;])", "a,b;c");
+if (pieces.length() != 5 or pieces[0] != "a" or pieces[1] != "," or
+    pieces[2] != "b" or pieces[3] != ";" or pieces[4] != "c") {
+    throw new Exception("split capture result mismatch");
+}
+let limitedPieces = re.compile(",").split("a,b,c", 1);
+if (limitedPieces.length() != 2 or limitedPieces[0] != "a" or limitedPieces[1] != "b,c") {
+    throw new Exception("split maxsplit result mismatch");
+}
+if (re.sub("([a-z]+)-([0-9]+)", "\\2:\\1", "id abc-42") != "id 42:abc") {
+    throw new Exception("sub backreference result mismatch");
+}
+let substitution = re.subn("[0-9]+", "x", "a1b2", 1);
+if (substitution[0] != "axb2" or substitution[1] != 1) {
+    throw new Exception("subn result mismatch");
+}
+if (re.escape("a+b") != "a\\+b") throw new Exception("escape result mismatch");
+
+print("REGEX_MODULE_PASS");

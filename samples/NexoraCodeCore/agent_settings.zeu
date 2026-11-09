@@ -1,0 +1,230 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.json;
+
+import samples.NexoraCodeCore.storage;
+import samples.NexoraCodeCore.text_utils;
+
+let NEXORA_AGENT_SETTINGS_MAX_PROMPT_CHARS = 8000;
+let NEXORA_AGENT_SETTINGS_MAX_RETRY_COUNT = 10;
+let NEXORA_AGENT_SETTINGS_DEFAULT_RETRY_COUNT = 5;
+let NEXORA_AGENT_SETTINGS_DEFAULT_EMPTY_RETRY_COUNT = 2;
+
+func nexora_agent_settings_truthy(value) -> bool {
+    if (value == nil) return false;
+    let valueType = type(value);
+    if (valueType == "bool") return value;
+    if (valueType == "int" or valueType == "float") return value != 0;
+    if (valueType == "string" or valueType == "Array") return value.length() > 0;
+    if (valueType == "dict") {
+        for (value) [&key: &entry] {
+            return true;
+        }
+        return false;
+    }
+    return true;
+}
+
+func nexora_default_agent_settings() -> dict {
+    return {
+        "local_username": "local",
+        "local_custom_system_prompt": "",
+        "local_read_agents_md": true,
+        "local_tool_auto_expand": true,
+        "local_telemetry_enabled": true,
+        "local_tool_permission_mode": "confirm",
+        "local_tool_approval_model_id": "",
+        "local_theme": "system",
+        "local_auto_retry_count": NEXORA_AGENT_SETTINGS_DEFAULT_RETRY_COUNT,
+        "local_empty_response_retry_count":
+            NEXORA_AGENT_SETTINGS_DEFAULT_EMPTY_RETRY_COUNT
+    };
+}
+
+func nexora_agent_settings_stored_prompt(value) -> string {
+    if (!nexora_agent_settings_truthy(value)) return "";
+    return nexora_text_truncate_utf8_chars(str(value),
+        NEXORA_AGENT_SETTINGS_MAX_PROMPT_CHARS);
+}
+
+func nexora_agent_settings_config_prompt(value) -> string {
+    if (!nexora_agent_settings_truthy(value)) return "";
+    return str(value);
+}
+
+func nexora_agent_settings_normalize_retry_count(value) -> int {
+    let count = 0;
+    if (type(value) == "int") {
+        count = value;
+    } else if (type(value) == "string") {
+        let text = value.strip();
+        let raw: bytes = bytes(text);
+        if (raw.length() == 0) {
+            throw new Exception("retry count must be an integer from 0 to 10");
+        }
+        for (0..raw.length()) [const &index] {
+            let digit = raw.get(index);
+            if (digit < 48 or digit > 57) {
+                throw new Exception("retry count must be an integer from 0 to 10");
+            }
+        }
+        count = int(text);
+    } else {
+        throw new Exception("retry count must be an integer from 0 to 10");
+    }
+
+    if (count < 0 or count > NEXORA_AGENT_SETTINGS_MAX_RETRY_COUNT) {
+        throw new Exception("retry count must be an integer from 0 to 10");
+    }
+    return count;
+}
+
+func nexora_agent_settings_normalize_theme(value) -> string {
+    let theme = "";
+    if (nexora_agent_settings_truthy(value)) theme = str(value).strip().lower();
+    if (theme == "light" or theme == "dark" or theme == "system") return theme;
+    return "system";
+}
+
+func nexora_agent_settings_theme_valid(value) -> bool {
+    let theme = "";
+    if (nexora_agent_settings_truthy(value)) theme = str(value).strip().lower();
+    return theme == "light" or theme == "dark" or theme == "system";
+}
+
+func nexora_agent_settings_from_config(config: dict) -> dict {
+    let username = dict_get(config, "local_username", "local");
+    if (!nexora_agent_settings_truthy(username)) username = "local";
+    let permissionMode = str(dict_get(config,
+        "local_tool_permission_mode", "confirm")).strip().lower();
+    if (permissionMode == "") permissionMode = "confirm";
+    return {
+        "local_username": str(username),
+        "local_custom_system_prompt": nexora_agent_settings_config_prompt(
+            dict_get(config, "local_custom_system_prompt", "")),
+        "local_read_agents_md": nexora_agent_settings_truthy(
+            dict_get(config, "local_read_agents_md", true)),
+        "local_tool_auto_expand": nexora_agent_settings_truthy(
+            dict_get(config, "local_tool_auto_expand", true)),
+        "local_telemetry_enabled": nexora_agent_settings_truthy(
+            dict_get(config, "local_telemetry_enabled", true)),
+        "local_tool_permission_mode": permissionMode,
+        "local_tool_approval_model_id": str(dict_get(config,
+            "local_tool_approval_model_id", "")).strip(),
+        "local_theme": nexora_agent_settings_normalize_theme(
+            dict_get(config, "local_theme", "system")),
+        "local_auto_retry_count": dict_get(config, "local_auto_retry_count",
+            NEXORA_AGENT_SETTINGS_DEFAULT_RETRY_COUNT),
+        "local_empty_response_retry_count": dict_get(config,
+            "local_empty_response_retry_count",
+            NEXORA_AGENT_SETTINGS_DEFAULT_EMPTY_RETRY_COUNT)
+    };
+}
+
+// Load local general settings used by the backend. Provider credentials remain
+// in providers.json and are never copied into this object.
+func nexora_load_agent_settings(path: string) -> dict {
+    if (!file.exists(path)) return nexora_default_agent_settings();
+
+    let config = JSON.parse(nexora_core_read_text(path));
+    if (type(config) != "dict") {
+        throw new Exception("local config file top level must be an object");
+    }
+    return nexora_agent_settings_from_config(config);
+}
+
+func nexora_agent_settings_injection_prompt(settings: dict) -> string {
+    let prompt = str(settings.get("local_custom_system_prompt", "")).strip();
+    return nexora_text_truncate_utf8_chars(prompt,
+        NEXORA_AGENT_SETTINGS_MAX_PROMPT_CHARS);
+}
+
+func nexora_agent_settings_prepare_update(general: dict) -> dict {
+    let updates = {};
+    for (general) [&key: &value] {
+        if (key == "username") {
+            let username = "";
+            if (nexora_agent_settings_truthy(value)) username = str(value).strip();
+            if (username != "") dict_set(updates, "local_username", username);
+        } else if (key == "custom_system_prompt") {
+            dict_set(updates, "local_custom_system_prompt", value);
+        } else if (key == "read_agents_md") {
+            dict_set(updates, "local_read_agents_md", value);
+        } else if (key == "tool_auto_expand") {
+            if (type(value) != "bool") {
+                return {"ok": false,
+                    "message": "tool_auto_expand must be a boolean"};
+            }
+            dict_set(updates, "local_tool_auto_expand", value);
+        } else if (key == "telemetry_enabled") {
+            if (type(value) != "bool") {
+                return {"ok": false,
+                    "message": "telemetry_enabled must be a boolean"};
+            }
+            dict_set(updates, "local_telemetry_enabled", value);
+        } else if (key == "theme") {
+            if (!nexora_agent_settings_theme_valid(value)) {
+                return {"ok": false,
+                    "message": "theme must be light, dark, or system"};
+            }
+            dict_set(updates, "local_theme",
+                nexora_agent_settings_normalize_theme(value));
+        } else if (key == "auto_retry_count") {
+            let count = 0;
+            try {
+                count = nexora_agent_settings_normalize_retry_count(value);
+            } catch (&invalidCount) {
+                return {"ok": false,
+                    "message": "auto_retry_count must be an integer from 0 to 10"};
+            }
+            dict_set(updates, "local_auto_retry_count", count);
+        } else if (key == "empty_response_retry_count") {
+            let count = 0;
+            try {
+                count = nexora_agent_settings_normalize_retry_count(value);
+            } catch (&invalidCount) {
+                return {"ok": false,
+                    "message": "empty_response_retry_count must be an integer from 0 to 10"};
+            }
+            dict_set(updates, "local_empty_response_retry_count", count);
+        }
+    }
+    return {"ok": true, "updates": updates};
+}
+
+// Persist just the agent fields while carrying every unrelated config key
+// through the atomic rewrite unchanged.
+func nexora_update_agent_settings(path: string, updates: dict) -> dict {
+    let config = {};
+    if (file.exists(path)) {
+        config = JSON.parse(nexora_core_read_text(path));
+        if (type(config) != "dict") {
+            throw new Exception("local config file top level must be an object");
+        }
+    }
+
+    for (updates) [&key: &value] {
+        let normalizedValue = value;
+        if (key == "local_custom_system_prompt") {
+            normalizedValue = nexora_agent_settings_stored_prompt(value);
+        } else if (key == "local_read_agents_md") {
+            normalizedValue = nexora_agent_settings_truthy(value);
+        } else if (key == "local_tool_auto_expand" or
+                key == "local_telemetry_enabled") {
+            normalizedValue = value == true;
+        } else if (key == "local_auto_retry_count" or
+                key == "local_empty_response_retry_count") {
+            normalizedValue = nexora_agent_settings_normalize_retry_count(value);
+        } else if (key == "local_tool_permission_mode") {
+            normalizedValue = str(value).strip().lower();
+        } else if (key == "local_tool_approval_model_id") {
+            normalizedValue = str(value).strip();
+        }
+        dict_set(config, key, normalizedValue);
+    }
+
+    let settings = nexora_agent_settings_from_config(config);
+    nexora_core_write_json_atomic(path, config);
+    return settings;
+}

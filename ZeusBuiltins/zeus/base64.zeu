@@ -1,0 +1,21 @@
+// Base64 helpers for byte payloads and UTF-8 text.
+
+import zeus.crypto;
+
+class Base64 {
+    func static encode(data: bytes) -> string {
+        return Crypto.base64Encode(data);
+    }
+
+    func static decode(text: string) -> bytes {
+        return Crypto.base64Decode(text);
+    }
+
+    func static encodeText(text: string) -> string {
+        return Base64.encode(bytes(text));
+    }
+
+    func static decodeText(text: string) -> string {
+        return Base64.decode(text).decode("utf-8");
+    }
+}

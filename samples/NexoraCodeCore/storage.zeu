@@ -1,0 +1,116 @@
+import zeus.exception;
+import zeus.file [&file];
+import zeus.json;
+import zeus.string;
+import zeus.uuid;
+
+// 本地持久化的小工具层（S6/S7 共用）：原子写、读 JSON、文件名清洗。
+//
+// 基线的 write_json_atomic 用 os.replace 换名，这里同样是"同目录临时文件 +
+// rename"。两点差异写在这里，避免以后当成 bug：
+//   - 序列化用紧凑 JSON（基线是 indent=2）：读回来等价，只是不再给人工看；
+//   - 落盘只到 flush（基线还 fsync）：Windows 上 rename 之后的内容对读方可见，
+//     但没有 fsync 就不能保证断电不丢最后一段。
+
+func nexora_core_read_text(path: string) -> string {
+    let handle = file.open(path, "r");
+    let text = "";
+    try {
+        text = handle.read();
+    } catch (&error) {
+        handle.close();
+        throw error;
+    }
+    handle.close();
+    return text;
+}
+
+func nexora_core_write_text_atomic(path: string, text: string) {
+    let temporary = path + ".tmp";
+    let handle = file.open(temporary, "w");
+    try {
+        handle.write(text);
+        handle.flush();
+    } catch (&error) {
+        handle.close();
+        throw error;
+    }
+    handle.close();
+    file.rename(temporary, path);
+}
+
+func nexora_core_read_json(path: string) {
+    if (!file.exists(path)) return nil;
+    try {
+        return JSON.parse(nexora_core_read_text(path));
+    } catch (&error) {
+        return nil; // 坏文件当成不存在：调用方按缺失处理
+    }
+}
+
+func nexora_core_write_json_atomic(path: string, value) {
+    nexora_core_write_text_atomic(path, JSON.stringify(value));
+}
+
+func nexora_core_is_space(letter: string) -> bool {
+    return letter == " " or letter == "\t" or letter == "\n" or letter == "\r";
+}
+
+// 时间戳这类"可能是整数、可能是浮点、也可能缺字段"的数值。
+func nexora_core_number(value) {
+    if (type(value) == "int" or type(value) == "float") return value;
+    return 0;
+}
+
+// 32 位小写十六进制随机串（UUID v4 去掉连字符）。
+func nexora_core_uuid_hex() -> string {
+    return UUID.v4().replace("-", "");
+}
+
+func nexora_core_join(parts) -> string {
+    return string_join(parts);
+}
+
+// 文件名里不能出现的字符：基线的 [\\/:*?"<>|]。
+let NEXORA_INVALID_FILE_LETTERS = ["\\", "/", ":", "*", "?", "\"", "<", ">", "|"];
+
+func nexora_core_join_with(parts, separator: string) -> string {
+    return string_join(parts, separator);
+}
+
+// 把空白折叠成给定分隔符。逐字符扫描 + 切片在老 VM 上会撞"借用接收者"的
+// 生命周期问题，这里改成 split/join，全部走原生字符串方法。
+func nexora_core_collapse_runs(value: string, separator: string) -> string {
+    let normalized = value.replace("\t", " ").replace("\n", " ").replace("\r", " ");
+    let parts = [];
+    for (normalized.split(" ")) [word] {
+        if (word == "") continue;
+        parts.append(word);
+    }
+    return nexora_core_join_with(parts, separator);
+}
+
+// 会话号来自调用方，可能带路径分隔符或空白：清洗成安全的文件名片段。
+// 非法字符逐个替换，连续空白折叠成一个下划线，最后按基线截断到 60 个字符。
+func nexora_core_sanitize_file_name(value: string) -> string {
+    let sanitized = value.strip();
+    for (NEXORA_INVALID_FILE_LETTERS) [letter] {
+        let replaced = sanitized.replace(letter, "_");
+        sanitized = replaced;
+    }
+    sanitized = nexora_core_collapse_runs(sanitized, "_");
+    return nexora_core_truncate(sanitized, 60);
+}
+
+// 截断到 limit 个字符：切片在形参上做，避开局部变量当接收者的借用路径。
+func nexora_core_truncate(text: string, limit: int) -> string {
+    if (limit <= 0) return "";
+    if (text.length() <= limit) return text;
+    return text.slice(0, limit);
+}
+
+// 折叠换行与连续空白，用于标题这类单行文本。
+func nexora_core_collapse_whitespace(value: string) -> string {
+    return nexora_core_collapse_runs(value, " ");
+}
+

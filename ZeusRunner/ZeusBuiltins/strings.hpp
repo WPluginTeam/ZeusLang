@@ -424,6 +424,33 @@ namespace ZeusBuiltins {
         return ZeusType::UniversalVariant(ZeusType::BigInteger(count));
     }
 
+    // __str_compare(left, right): 字典序比较，返回 -1 / 0 / 1
+    inline ZeusType::UniversalVariant builtin_str_compare(const std::vector<ZeusType::UniversalVariant>& args) {
+        if (args.size() != 2) throw std::runtime_error("__str_compare expects 2 arguments");
+
+        const auto readString = [](const ZeusType::UniversalVariant& value) -> const std::string* {
+            if (const std::string* sp = std::get_if<std::string>(&value)) {
+                return sp;
+            }
+            if (const LexerType::Value* vp = std::get_if<LexerType::Value>(&value)) {
+                if (std::holds_alternative<std::string>(vp->data)) {
+                    return &std::get<std::string>(vp->data);
+                }
+            }
+            return nullptr;
+        };
+
+        const std::string* left = readString(args[0]);
+        if (!left) throw std::runtime_error("__str_compare: first argument must be string");
+        const std::string* right = readString(args[1]);
+        if (!right) throw std::runtime_error("__str_compare: second argument must be string");
+
+        // std::string::compare 就是按字节的字典序，前缀短的更小。
+        const int order = left->compare(*right);
+        const int result = order < 0 ? -1 : (order > 0 ? 1 : 0);
+        return ZeusType::UniversalVariant(ZeusType::BigInteger(result));
+    }
+
     // ===== 注册函数 =====
     inline void registerStringBuiltins() {
         registerBuiltin("__str_length", builtin_str_length, 1, 1);
@@ -438,6 +465,7 @@ namespace ZeusBuiltins {
         registerBuiltin("__str_lower", builtin_str_lower, 1, 1);
         registerBuiltin("__str_upper", builtin_str_upper, 1, 1);
         registerBuiltin("__str_count", builtin_str_count, 2, 2);
+        registerBuiltin("__str_compare", builtin_str_compare, 2, 2);
     }
 
 }  // namespace ZeusBuiltins

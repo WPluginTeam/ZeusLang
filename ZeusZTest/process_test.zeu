@@ -1,0 +1,174 @@
+import zeus.process;
+import zeus.dict;
+import zeus.time;
+import zeus.exception;
+
+// Covers the process lifecycle end to end: spawn, wait, exit code, captured
+// output, polling, termination and cleanup. Every child here exits promptly so
+// the case cannot hang.
+
+func assertTrue(condition, message: string) {
+    if (!condition) {
+        throw new Exception("process test failed: " + message);
+    }
+}
+
+// 0. A Process that was never started must start from its declared field
+// values, not from whatever is in memory.
+//
+// Process is declared in zeus.process, so this also guards class field defaults
+// for a class that lives in an imported package. The guard in start() reads
+// processHandle to reject a second start, which silently breaks if that field's
+// declared default is lost.
+let fresh = new Process();
+assertTrue(fresh.processHandle == 0, "a fresh Process must have no process handle");
+assertTrue(fresh.processId == 0, "a fresh Process must have no process id");
+assertTrue(fresh.exitCodeOf() == -1, "a fresh Process must report no exit code yet");
+assertTrue(!fresh.running(), "a fresh Process must not report running");
+let freshOutputSize = fresh.outputSize();
+assertTrue(freshOutputSize == 0, "a fresh Process must have no capture file");
+
+// 1. A child that runs and exits normally.
+let quick = Process.run("cmd.exe /c exit 7");
+assertTrue(quick.processId > 0, "the child must have a process id");
+assertTrue(quick.threadId > 0, "the child must have a thread id");
+assertTrue(quick.processHandle > 0, "the child must hand back a process handle");
+let quickFinished = quick.wait();
+assertTrue(quickFinished, "the child must finish");
+assertTrue(quick.exitCodeOf() == 7, "exit code must be 7");
+quick.close();
+
+// 2. Standard output and standard error share one capture file.
+let noisy = Process.run("cmd.exe /c echo hello-from-child");
+let noisyFinished = noisy.wait();
+assertTrue(noisyFinished, "the noisy child must finish");
+let spoken = noisy.output();
+assertTrue(spoken.length() > 0, "the child must have produced output");
+let spokenIndex = spoken.index("hello-from-child");
+assertTrue(spokenIndex >= 0,
+    "the captured output must contain what the child wrote");
+noisy.close();
+
+// 3. Output written to standard error is captured too.
+let toError = Process.run("cmd.exe /c echo oops 1>&2");
+let errorFinished = toError.wait();
+assertTrue(errorFinished, "the child must finish");
+let errorOutput = toError.output();
+let errorIndex = errorOutput.index("oops");
+assertTrue(errorIndex >= 0, "standard error must land in the same capture");
+toError.close();
+
+// 4. Polling reports completion without blocking forever.
+let polled = Process.run("cmd.exe /c ping -n 3 127.0.0.1 > nul");
+var waitedMillis = 0;
+var done = false;
+for (true) {
+    if (polled.finished()) {
+        done = true;
+        break;
+    }
+    if (waitedMillis >= 5000) break;
+    sleep(0.01);
+    waitedMillis = waitedMillis + 10;
+}
+assertTrue(done, "a polled child must eventually report completion");
+polled.terminate();
+polled.wait();
+polled.close();
+
+// 5. Terminating a running child makes it finish.
+let stubborn = Process.run("cmd.exe /c ping -n 30 127.0.0.1 > nul");
+assertTrue(stubborn.running(), "a fresh child must report running");
+assertTrue(stubborn.terminate(9), "terminate must be accepted");
+assertTrue(stubborn.wait(5000), "a terminated child must finish");
+assertTrue(!stubborn.running(), "a terminated child must not report running");
+stubborn.close();
+
+// 6. Everything the child wrote is readable in one pass at the end.
+let streaming = Process.run("cmd.exe /c echo first && echo second");
+let streamingFinished = streaming.wait();
+assertTrue(streamingFinished, "the streaming child must finish");
+let whole = streaming.output();
+let firstLineIndex = whole.index("first");
+let secondLineIndex = whole.index("second");
+let streamingOutputSize = streaming.outputSize();
+assertTrue(firstLineIndex >= 0, "first line must be present");
+assertTrue(secondLineIndex >= 0, "second line must be present");
+assertTrue(streamingOutputSize > 0, "the capture file must have content");
+streaming.close();
+
+// 7. A command that does not exist must surface the failure, not a fake child.
+let missingFailed = false;
+var missingMessage = "";
+try {
+    Process.run("this-program-does-not-exist-zeus-test.exe");
+} catch (&e) {
+    missingFailed = true;
+    missingMessage = e.getMessage();
+}
+assertTrue(missingFailed, "spawning a missing image must report an error");
+assertTrue(missingMessage.index("CreateProcessW failed with error") >= 0,
+    "the spawn error must retain the Win32 diagnostic");
+
+// 8. A closed Process can be reused without exposing the previous exit code.
+let reused = new Process();
+reused.start("cmd.exe /c exit 7", false);
+assertTrue(reused.wait(), "the first reused child must finish");
+assertTrue(reused.exitCodeOf() == 7, "the first reused child must report exit code 7");
+reused.close();
+reused.start("cmd.exe /c exit 9", false);
+assertTrue(reused.processId > 0, "the reused Process must start a new child");
+assertTrue(reused.exitCode == STILL_ACTIVE,
+    "a restarted Process must start in the running state");
+let restartedExitCode = reused.exitCodeOf();
+assertTrue(restartedExitCode != STILL_OPEN,
+    "a restarted Process must not expose the previous unopened state");
+assertTrue(reused.wait(), "the second reused child must finish");
+assertTrue(reused.exitCodeOf() == 9, "the second reused child must report exit code 9");
+reused.close();
+
+// 9. Bounded capture keeps draining a large child while retaining only the
+// newest bytes and making any unread loss visible to the caller.
+let boundedLimit = 200000;
+let bounded = Process.run(
+    "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Out.Write(('x' * 400000))\"",
+    true, "", boundedLimit);
+assertTrue(bounded.wait(10000), "the bounded-capture child must finish");
+var boundedDone = false;
+var boundedWaitedMillis = 0;
+for (true) {
+    let probe = bounded.outputChunk(0, 0);
+    if (dict_get(probe, "done", false)) {
+        boundedDone = true;
+        break;
+    }
+    if (boundedWaitedMillis >= 5000) break;
+    sleep(0.01);
+    boundedWaitedMillis = boundedWaitedMillis + 10;
+}
+assertTrue(boundedDone, "the output pump must reach pipe EOF");
+assertTrue(bounded.outputSize() >= 400000,
+    "bounded capture must count the full child output");
+let boundedFirst = bounded.outputChunk(0, 8000);
+let boundedFirstStart = int(dict_get(boundedFirst, "buffer_start", 0));
+let boundedFirstNext = int(dict_get(boundedFirst, "next_offset", 0));
+let boundedFirstEnd = int(dict_get(boundedFirst, "buffer_end", 0));
+assertTrue(dict_get(boundedFirst, "truncated", false),
+    "a cursor older than the ring must report truncation");
+assertTrue(boundedFirstStart > 0,
+    "the retained buffer must begin after the discarded prefix");
+assertTrue(int(dict_get(boundedFirst, "buffer_bytes", boundedLimit)) <= boundedLimit,
+    "the retained ring must stay within its configured byte limit");
+assertTrue(boundedFirstEnd >= 400000,
+    "the retained buffer end must report the total output offset");
+assertTrue(boundedFirstNext == boundedFirstStart + 8000,
+    "the first byte cursor must advance by the decoded ASCII bytes");
+let boundedSecond = bounded.outputChunk(boundedFirstNext, 8000);
+let boundedSecondNext = int(dict_get(boundedSecond, "next_offset", 0));
+assertTrue(boundedSecondNext > boundedFirstNext,
+    "the next bounded read must advance without replaying a chunk");
+assertTrue(!dict_get(boundedSecond, "output_lost", true),
+    "a cursor within the retained ring must not report additional loss");
+bounded.close();
+
+print("PROCESS_TEST_PASS");

@@ -43,15 +43,29 @@ namespace ZeusBuiltins {
             const auto& objHandle = std::get<ZeusType::ObjectHandle>(v);
             std::string className = "object";
 
-            if (g_vmObjects && g_vmClasses && objHandle.id >= 0 && objHandle.id < (int)g_vmObjects->size()) {
-                const auto& obj = (*g_vmObjects)[objHandle.id];
+            if (const auto* obj = getValidObject(objHandle); obj && g_vmClasses) {
 
-                if (obj.classId >= 0 && obj.classId < (int)g_vmClasses->size()) {
-                    className = (*g_vmClasses)[obj.classId].name;
+                if (obj->classId < (int)g_vmClasses->size()) {
+                    className = (*g_vmClasses)[obj->classId].name;
                 }
             }
 
             std::cout << "<" << className << ":#" << objHandle.id << ">";
+        }
+        else if (std::holds_alternative<ZeusType::ClassHandle>(v)) {
+            std::cout << formatClassHandle(std::get<ZeusType::ClassHandle>(v));
+        }
+        else if (std::holds_alternative<ZeusType::LLVMClassHandle>(v)) {
+            // Native class values (bytes, sockets, ...) print like object
+            // handles: toString() stays a Zeus-protocol trigger, not a print one.
+            const auto& classHandle = std::get<ZeusType::LLVMClassHandle>(v);
+            std::string className = "object";
+            uint64_t debugId = 0;
+            if (classHandle.state) {
+                if (!classHandle.state->typeName.empty()) className = classHandle.state->typeName;
+                debugId = classHandle.state->debugId;
+            }
+            std::cout << "<" << className << ":#" << debugId << ">";
         }
         else if (std::holds_alternative<ZeusType::Variant>(v)) {
             const auto& variant = std::get<ZeusType::Variant>(v);
@@ -233,43 +247,6 @@ namespace ZeusBuiltins {
         return ZeusType::UniversalVariant(LexerType::Value(0));
     }
 
-    // _write: 直接输出字符串，不添加任何格式（用于print函数内部）
-    inline ZeusType::UniversalVariant builtin_write(const std::vector<ZeusType::UniversalVariant>& args) {
-        for (size_t i = 0; i < args.size(); ++i) {
-            const auto &v = args[i];
-
-            if (const std::string* sp = std::get_if<std::string>(&v)) {
-                std::cout << *sp;
-            }
-            else if (const LexerType::Value* vp = std::get_if<LexerType::Value>(&v)) {
-                if (std::holds_alternative<std::string>(vp->data)) {
-                    std::cout << std::get<std::string>(vp->data);
-                } else {
-                    std::cout << ZeusVMUtils::valueToDebugString(v);
-                }
-            } else {
-                std::cout << ZeusVMUtils::valueToDebugString(v);
-            }
-        }
-
-        return ZeusType::UniversalVariant(LexerType::Value(ZeusType::BigInteger(0)));
-    }
-
-    // input: 从标准输入读取一行
-    inline ZeusType::UniversalVariant builtin_input(const std::vector<ZeusType::UniversalVariant>& args) {
-        if (args.size() != 0) {
-            throw std::runtime_error("input expects no arguments");
-        }
-
-        std::string line;
-
-        if (std::getline(std::cin, line)) {
-            return ZeusType::UniversalVariant(line);
-        }
-        
-        return ZeusType::UniversalVariant(std::string(""));
-    }
-
     // =====================================================================
     // 注册函数
     // =====================================================================
@@ -277,9 +254,7 @@ namespace ZeusBuiltins {
     inline void registerIOBuiltins() {
         registerBuiltin("__builtin_print", builtin_raw_print, 0, -1);
         registerBuiltin("raw_print", builtin_print, 0, -1);
-        registerBuiltin("_write", builtin_write, 0, -1);
         registerBuiltin("delayPrint", builtin_delayPrint, 0, -1);
-        registerBuiltin("input", builtin_input, 0, 0);
     }
 
 }  // namespace ZeusBuiltins

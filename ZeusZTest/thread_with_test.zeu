@@ -1,0 +1,78 @@
+import zeus.thread [&];
+
+class BoundThreadTarget {
+    using &this;
+    let calls = 0;
+
+    func run() {
+        this.calls = this.calls + 1;
+    }
+}
+
+func assertThreadWith(condition: bool, message: string) {
+    if (!condition) {
+        print("THREAD_WITH_ASSERT_FAIL", message);
+        throw "with(Thread) failed: " + message;
+    }
+}
+
+func runLocalFunctionTarget() -> bool {
+    var calls = 0;
+    var bodyRan = false;
+    var workerAliveDuringBody = false;
+    let workerReady = new Event();
+    let allowWorkerExit = new Event();
+
+    func localWorker() [&workerReady, &allowWorkerExit, &calls] {
+        workerReady.set();
+        allowWorkerExit.wait();
+        calls = calls + 1;
+    }
+
+    with (new Thread(localWorker)) [&worker] {
+        bodyRan = workerReady.wait(1000);
+        workerAliveDuringBody = worker.isAlive();
+        allowWorkerExit.set();
+    }
+
+    return bodyRan and workerAliveDuringBody and calls == 1;
+}
+
+func runThrowingBodyWaitsForWorker() -> bool {
+    var workerDone = false;
+    var bodyCaught = false;
+
+    func localWorker() [&workerDone] {
+        thread_sleep(30);
+        workerDone = true;
+    }
+
+    try {
+        with (new Thread(localWorker)) {
+            throw "thread-with-body";
+        }
+    } catch (&error) {
+        bodyCaught = error == "thread-with-body";
+    }
+
+    return bodyCaught and workerDone;
+}
+
+func runThreadWithTest() -> bool {
+    assertThreadWith(runLocalFunctionTarget(),
+        "a local function name starts asynchronously and its closure is retained");
+    assertThreadWith(runThrowingBodyWaitsForWorker(),
+        "a throwing body still joins before the outer catch runs");
+
+    let target = new BoundThreadTarget();
+    with (new Thread(target.run)) {
+        thread_sleep(1);
+    }
+    assertThreadWith(target.calls == 1,
+        "a class-bound method still runs and the with exit waits");
+
+    print("THREAD_WITH_PASS");
+    return true;
+}
+
+runThreadWithTest();

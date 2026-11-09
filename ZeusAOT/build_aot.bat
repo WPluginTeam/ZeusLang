@@ -7,6 +7,11 @@ REM Always enter the x64 toolchain: a stale x86 cl in PATH would silently
 REM produce x86 objects, conflicting with clang's x64 output (LNK4272).
 call "F:\Code\Env\VisualStudio2022\VC\Auxiliary\Build\vcvars64.bat" >nul
 
+call "%~dp0..\ZeusNativeRuntime\build_native_runtime.bat"
+if errorlevel 1 exit /b 1
+copy /y "%~dp0..\ZeusNativeRuntime.dll" "%~dp0demo\ZeusNativeRuntime.dll" >nul
+if errorlevel 1 exit /b 1
+
 set "ZEUS_RUNTIME_DEBUG_FLAGS="
 if /i "%ZEUS_RUNTIME_DEBUG_DETAILS%"=="1" set "ZEUS_RUNTIME_DEBUG_FLAGS=/DZEUS_RUNTIME_DEBUG_DETAILS=1"
 
@@ -60,13 +65,10 @@ if errorlevel 1 exit /b 1
 cl /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusObjectLifetime.cpp /Fozeus_object_lifetime.obj
 if errorlevel 1 exit /b 1
 
-cl /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 ..\..\ZeusRuntimeLib\ZeusSocketABI.cpp /Fozeus_socket_abi.obj
-if errorlevel 1 exit /b 1
-
 cl /c /MT /O2 /EHs /nologo /utf-8 /std:c++17 %ZEUS_RUNTIME_DEBUG_FLAGS% ..\..\ZeusRuntimeLib\ZeusRuntimeDebug.cpp /Fozeus_runtime_debug.obj
 if errorlevel 1 exit /b 1
 
-lib zeus_rt.obj zeus_abi.obj zeus_native_abi.obj zeus_string_native_abi.obj zeus_memory_abi.obj zeus_dynamic_abi.obj zeus_dynamic_binary_abi.obj zeus_dynamic_member_abi.obj zeus_range_check_abi.obj zeus_closure_abi.obj zeus_gc_abi.obj zeus_object_lifetime.obj zeus_socket_abi.obj zeus_runtime_debug.obj /OUT:libzeus_rt.lib /NOLOGO
+lib zeus_rt.obj zeus_abi.obj zeus_native_abi.obj zeus_string_native_abi.obj zeus_memory_abi.obj zeus_dynamic_abi.obj zeus_dynamic_binary_abi.obj zeus_dynamic_member_abi.obj zeus_range_check_abi.obj zeus_closure_abi.obj zeus_gc_abi.obj zeus_object_lifetime.obj zeus_runtime_debug.obj /OUT:libzeus_rt.lib /NOLOGO
 if errorlevel 1 exit /b 1
 
 REM ---- demo 1: print("hello") ----
@@ -94,14 +96,14 @@ echo [AOT] exit code: %errorlevel%
 if errorlevel 1 exit /b 1
 
 REM ---- emitter round-trip: .zeu -> .ll -> .exe (needs fresh Zeus.exe) ----
-if not exist ..\..\Zeus.exe (
-  echo [AOT] skip emitter round-trip: build Zeus.exe first ^(build.bat^)
+if not exist ..\..\ZeusCompiler.exe (
+  echo [AOT] skip emitter round-trip: build ZeusCompiler.exe first ^(build.bat^)
   exit /b 0
 )
 
 pushd "%~dp0..\.."
 if errorlevel 1 exit /b 1
-Zeus.exe --emit-llvm ZeusAOT\demo\hello.zeu ZeusAOT\demo\hello_gen.ll
+ZeusCompiler.exe --emit-llvm ZeusAOT\demo\hello.zeu ZeusAOT\demo\hello_gen.ll
 if errorlevel 1 (
   popd
   exit /b 1
@@ -121,7 +123,7 @@ if errorlevel 1 exit /b 1
 
 pushd "%~dp0..\.."
 if errorlevel 1 exit /b 1
-Zeus.exe --emit-llvm ZeusAOT\demo\add.zeu ZeusAOT\demo\add_gen.ll
+ZeusCompiler.exe --emit-llvm ZeusAOT\demo\add.zeu ZeusAOT\demo\add_gen.ll
 if errorlevel 1 (
   popd
   exit /b 1
@@ -142,7 +144,7 @@ if errorlevel 1 exit /b 1
 REM ---- emitter demo 3: for-loop benchmark, PK vs interpreter (~92ms in ben.exe) ----
 pushd "%~dp0..\.."
 if errorlevel 1 exit /b 1
-Zeus.exe --emit-llvm ZeusAOT\demo\loop.zeu ZeusAOT\demo\loop_gen.ll
+ZeusCompiler.exe --emit-llvm ZeusAOT\demo\loop.zeu ZeusAOT\demo\loop_gen.ll
 if errorlevel 1 (
   popd
   exit /b 1

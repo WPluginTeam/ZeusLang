@@ -1,0 +1,78 @@
+import zeus.byte;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.path;
+import samples.NexoraCodeCore.project_instructions;
+import samples.NexoraCodeCore.system_prompt;
+
+func __nexora_project_instructions_assert(value: bool, message: string) {
+    if (!value) throw new Exception("project instructions test: " + message);
+}
+
+func __nexora_project_instructions_write(path: string, content: string) {
+    let handle = file.open(path, "w");
+    handle.write(content);
+    handle.close();
+}
+
+func testNexoraProjectInstructions(rootValue: string) {
+    let root = Path.join(rootValue, "project-instructions-test");
+    file.mkdirs(Path.join(root, ".nexora"));
+
+    __nexora_project_instructions_write(Path.join(root, "AGENTS.md"), "  \n\t");
+    __nexora_project_instructions_write(Path.join(root, "NEXORA.md"),
+        "NEXORA candidate");
+    __nexora_project_instructions_write(
+        Path.join(root, ".nexora/AGENTS.md"), "nested candidate");
+    __nexora_project_instructions_assert(
+        nexora_read_project_instructions(root) == "NEXORA candidate",
+        "an empty first candidate must allow the next documented candidate");
+
+    __nexora_project_instructions_write(Path.join(root, "AGENTS.md"),
+        "root candidate");
+    __nexora_project_instructions_assert(
+        nexora_read_project_instructions(root) == "root candidate",
+        "AGENTS.md must have the highest candidate priority");
+
+    file.removeFile(Path.join(root, "AGENTS.md"));
+    file.removeFile(Path.join(root, "NEXORA.md"));
+    __nexora_project_instructions_assert(
+        nexora_read_project_instructions(root) == "nested candidate",
+        "the .nexora candidate must be read when earlier files are absent");
+    __nexora_project_instructions_assert(
+        nexora_read_project_instructions(Path.join(root, "missing")) == "",
+        "a missing workspace must not produce project instructions");
+
+    let invalidUtf8Root = Path.join(rootValue, "invalid-utf8-fixture");
+    __nexora_project_instructions_assert(
+        nexora_read_project_instructions(invalidUtf8Root) == "A�B�",
+        "invalid UTF-8 must use Python's replacement decoding behavior");
+
+    let longText = "";
+    for (0..8001) [const &index] {
+        longText = longText + "界";
+    }
+    __nexora_project_instructions_write(Path.join(root, "AGENTS.md"), longText);
+    let limited = nexora_read_project_instructions(root);
+    let limitedBytes: bytes = bytes(limited);
+    __nexora_project_instructions_assert(limitedBytes.length() == 8000 * 3,
+        "the 8000-character limit must preserve full UTF-8 characters");
+
+    __nexora_project_instructions_assert(
+        __nexora_project_instruction_is_within(root, Path.join(root, ".nexora/AGENTS.md")),
+        "a nested instruction path must remain inside the workspace");
+    __nexora_project_instructions_assert(
+        !__nexora_project_instruction_is_within(root, root + "-other/AGENTS.md"),
+        "a sibling path sharing the root prefix must be rejected");
+
+    let prompt = nexora_build_default_system_prompt(root);
+    __nexora_project_instructions_assert(prompt.index("NexoraCode") >= 0,
+        "the stable system head must identify the local coding assistant");
+    __nexora_project_instructions_assert(prompt.index("local_file_list") >= 0,
+        "the stable system head must explain workspace discovery");
+    __nexora_project_instructions_assert(
+        prompt.index(Path.normalize(file.realPath(root))) >= 0,
+        "the stable system head must include the resolved workspace root");
+
+    print("NEXORA_PROJECT_INSTRUCTIONS_TESTS_PASS");
+}

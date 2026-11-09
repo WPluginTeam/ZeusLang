@@ -5,6 +5,7 @@
 #include "ZeusDynamicMemberABI.hpp"
 #include "ZeusSharedHeap.hpp"
 #include "ZeusVMUtils.hpp"
+#include "ZeusNativeScalarMemory.hpp"
 #include <cstring>
 #include <atomic>
 #include <algorithm>
@@ -202,6 +203,7 @@ std::string lvalueType(const char* type) {
     return result;
 }
 uint64_t rawValueSize(const std::string& type) {
+    if (const auto* scalar = ZeusNativeScalarMemory::type(type)) return scalar->bits / 8;
     if (type == "&bytes") return sizeof(ZeusType::RawBytesRange);
     if (type == "int" || type == "float") return 8;
     if (type == "int32") return 4;
@@ -401,7 +403,8 @@ extern "C" void zeus_lvalue_load(ZeusValue* out, void* address, const char* expe
     if (slot.abi == 1) {
         const auto* value = static_cast<const ZeusValue*>(storage);
         zeus_value_validate_argument_type(value, "@faddr", 0, type.c_str());
-        zeus_value_clone(out, value); return;
+        if (!ZeusNativeScalarMemory::normalize(out, value, type)) zeus_value_clone(out, value);
+        return;
     }
     if (slot.abi == 3) {
         auto cell = slot.shared.lock();
@@ -421,9 +424,10 @@ extern "C" void zeus_lvalue_load(ZeusValue* out, void* address, const char* expe
         }
         return;
     }
+    if (ZeusNativeScalarMemory::load(out, storage, type)) return;
     if (type == "int") { int64_t value; std::memcpy(&value,storage,8); zeus_value_init_i64(out,value); }
     else if (type == "int32") { int32_t value; std::memcpy(&value,storage,4); zeus_value_init_i64(out,value); }
-    else if (type == "float") { double value; std::memcpy(&value,storage,8); ZeusBox boxed; boxed.assignVariant(ZeusType::BigDecimal(value)); zeus_value_from_box(out,&boxed); }
+    else if (type == "float") { double value; std::memcpy(&value,storage,8); zeus_value_init_double(out,value); }
     else if (type == "bool") { uint8_t value; std::memcpy(&value,storage,1); zeus_value_init_bool(out,value!=0); }
     else if (type == "string") {
         ZeusNativeString value = nullptr;
@@ -452,6 +456,11 @@ extern "C" void zeus_lvalue_store(void* address, const char* expected_type, cons
     zeus_value_validate_argument_type(value,"@faddr",0,type.c_str());
     if (slot.abi == 1) {
         ZeusValue replacement{};
+        if (ZeusNativeScalarMemory::normalize(&replacement, value, type)) {
+            zeus_value_slot_store(static_cast<ZeusValue*>(storage), &replacement);
+            zeus_value_release(&replacement);
+            return;
+        }
         if(zeus_value_slot_is_gc_edge(static_cast<ZeusValue*>(storage))) zeus_value_clone_internal(&replacement,value);
         else zeus_value_clone(&replacement,value);
         zeus_lvalue_unregister_revealed(storage);
@@ -460,7 +469,11 @@ extern "C" void zeus_lvalue_store(void* address, const char* expected_type, cons
     }
     if (slot.abi == 3) {
         auto cell=slot.shared.lock(); if(!cell) throw std::runtime_error("@faddr shared slot is no longer alive");
+        ZeusValue normalized{};
+        const bool normalizedScalar = ZeusNativeScalarMemory::normalize(&normalized, value, type);
+        if (normalizedScalar) value = &normalized;
         std::unique_ptr<ZeusBox,decltype(&zeus_box_release)> boxed(zeus_value_to_box(value),&zeus_box_release);
+        if (normalizedScalar) zeus_value_release(&normalized);
         zeus_lvalue_unregister_revealed(cell.get());
         cell->write(boxed->v); return;
     }
@@ -477,13 +490,17 @@ extern "C" void zeus_lvalue_store(void* address, const char* expected_type, cons
         return;
     }
     if (slot.abi == 0) zeus_lvalue_unregister_revealed(storage);
+    if (ZeusNativeScalarMemory::store(storage, value, type)) return;
     if(type=="int") { int64_t v=zeus_value_require_i64(value); std::memcpy(storage,&v,8); }
     else if(type=="int32") { int32_t v=static_cast<int32_t>(zeus_value_require_i64(value)); std::memcpy(storage,&v,4); }
     else if(type=="float") { std::unique_ptr<ZeusBox,decltype(&zeus_box_release)> boxed(zeus_value_to_box(value),&zeus_box_release); ZeusType::BigDecimal decimal; if(!ZeusVMUtils::extractNumber(boxed->v,decimal)) throw std::runtime_error("expected float slot value"); double v=decimal.toDouble(); std::memcpy(storage,&v,8); }
     else if(type=="bool") { uint8_t v=zeus_value_require_bool(value)!=0; std::memcpy(storage,&v,1); }
     else if(type=="string") {
-        const ZeusNativeString nativeString = zeus_value_intern_string(value);
-        std::memcpy(storage, &nativeString, sizeof(nativeString));
+        const ZeusNativeString nativeString = zeus_value_to_native_string(value);
+        std::unique_ptr<const char, decltype(&zeus_string_release)> ownedString(
+            nativeString, &zeus_string_release);
+        zeus_string_store_slot(
+            static_cast<ZeusNativeString*>(storage), nativeString);
         zeus_global_sync_native_string_slot(storage);
     } else if(type=="bytes") {
         if (slot.abi == 2) {

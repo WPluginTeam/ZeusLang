@@ -7,7 +7,9 @@
 #include "ZeusVariant.hpp"
 
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -103,9 +105,20 @@ inline void releaseContainerClassEdge(
 inline void releaseContainerClassEdgeNoexcept(
     const ZeusType::UniversalVariant& value
 ) noexcept {
+    void* object = containerClassObject(value);
     try {
         releaseContainerClassEdge(value);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr,
+            "[ZeusRuntime] fatal container class edge release object=%p reason=%s\n",
+            object, error.what());
+        std::fflush(stderr);
+        std::abort();
     } catch (...) {
+        std::fprintf(stderr,
+            "[ZeusRuntime] fatal container class edge release object=%p reason=<non-standard exception>\n",
+            object);
+        std::fflush(stderr);
         std::abort();
     }
 }

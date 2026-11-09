@@ -57,6 +57,22 @@ decl func __str_upper(value: string) -> string;
 @native("zeus_native_string_count")
 decl func __str_count(value: string, substring: string) -> int;
 
+@native("zeus_string_join_values")
+decl func __str_join_values(values: Array, separator: string) -> string;
+
+func string_join(values: Array, separator: string = "") -> string {
+    return __str_join_values(values, separator);
+}
+
+@native("zeus_string_compare")
+decl func __str_compare(left: string, right: string) -> int;
+
+// 空白判定给 strip/lstrip/rstrip 用：Python 的 str.strip() 默认也只算这四种。
+func __str_space_at(value: string, index: int) -> bool {
+    let letter = value.get(index);
+    return letter == " " or letter == "\t" or letter == "\r" or letter == "\n";
+}
+
 // String literals and all methods use the native `string` representation.
 impl string {
     using &this;
@@ -106,6 +122,44 @@ impl string {
         }
     }
 
+    // Python 的 str.strip / lstrip / rstrip：去掉两端的空白（空格、\t、\r、\n）。
+    // 之前只有 split/startswith 这些，想裁掉用户输入两端的空白得自己写循环。
+    func strip() -> string {
+        let start = 0;
+        let end = this.length();
+        for (true) {
+            if (start >= end) break;
+            if (!__str_space_at(this, start)) break;
+            start = start + 1;
+        }
+        for (true) {
+            if (end <= start) break;
+            if (!__str_space_at(this, end - 1)) break;
+            end = end - 1;
+        }
+        return this.slice(start, end);
+    }
+
+    func lstrip() -> string {
+        let start = 0;
+        for (true) {
+            if (start >= this.length()) break;
+            if (!__str_space_at(this, start)) break;
+            start = start + 1;
+        }
+        return this.slice(start, this.length());
+    }
+
+    func rstrip() -> string {
+        let end = this.length();
+        for (true) {
+            if (end <= 0) break;
+            if (!__str_space_at(this, end - 1)) break;
+            end = end - 1;
+        }
+        return this.slice(0, end);
+    }
+
     func clone() -> string {
         return this;
     }
@@ -114,12 +168,40 @@ impl string {
         return __str_get(this, index);
     }
 
+    // 下标读取：s[i] 返回单字符字符串。写入一直由下面的 operator[[]=] 负责，
+    // 读取以前没有对应实现，`s[i]` 会报 "subscript on non-container"。
+    func operator[[]](index: int) -> string {
+        return __str_get(this, index);
+    }
+
+    // 字典序比较：逐字节比，前缀短的更小。字符串的 <,<=,>,>= 以前不是字典序，
+    // 所以这里给出真正的排序语义。
+    func compare(other: string) -> int {
+        return __str_compare(this, other);
+    }
+
+    func operator[<](other) -> bool {
+        return this.compare(other) < 0;
+    }
+
+    func operator[<=](other) -> bool {
+        return this.compare(other) <= 0;
+    }
+
+    func operator[>](other) -> bool {
+        return this.compare(other) > 0;
+    }
+
+    func operator[>=](other) -> bool {
+        return this.compare(other) >= 0;
+    }
+
     func slice(start: int, end: int) -> string {
         return __str_slice(this, start, end);
     }
 
     func operator[[]=](index: int, value: string) -> string {
-        var textLength = 0;
+        let textLength = 0;
         using LLVM {
             let textDataAddress = @reveal(this);
             textLength = @faddr(textDataAddress - 8, 8) -> int;
@@ -128,7 +210,7 @@ impl string {
             textLength = __str_length(this);
         }
 
-        var valueLength = 0;
+        let valueLength = 0;
         using LLVM {
             let valueDataAddress = @reveal(value);
             valueLength = @faddr(valueDataAddress - 8, 8) -> int;
@@ -178,7 +260,7 @@ impl string {
             }
             @faddr(outputAddress + textLength, 1) -> int = 0;
 
-            var result: string = "";
+            let result: string = "";
             try {
                 result = __str_from_address(outputAddress, textLength);
             } catch (&error) {
@@ -196,45 +278,7 @@ impl string {
 
     @no_safepoint inline func index(substring: string) -> int {
         using LLVM {
-            let textData = @reveal(this);
-            let needleData = @reveal(substring);
-            let textAddress = textData;
-            let needleAddress = needleData;
-            let textLength = @faddr(textData - 8, 8) -> int;
-            let needleLength = @faddr(needleData - 8, 8) -> int;
-
-            if (needleLength == 0) return 0;
-            if (needleLength > textLength) return -1;
-
-            let firstByte = @faddr(needleAddress, 1) -> int;
-            let scan = 0;
-            for (scan <= textLength - needleLength) {
-                if (@faddr(textAddress + scan, 1) -> int == firstByte) {
-                    let matched = 1;
-                    let offset = 1;
-                    for (offset <= needleLength - 8) {
-                        if (@faddr(textAddress + scan + offset, 8) -> int !=
-                            @faddr(needleAddress + offset, 8) -> int) {
-                            matched = 0;
-                            break;
-                        }
-                        offset = offset + 8;
-                    }
-                    if (matched == 1) {
-                        for (offset < needleLength) {
-                            if (@faddr(textAddress + scan + offset, 1) -> int !=
-                                @faddr(needleAddress + offset, 1) -> int) {
-                                matched = 0;
-                                break;
-                            }
-                            offset = offset + 1;
-                        }
-                    }
-                    if (matched == 1) return scan;
-                }
-                scan = scan + 1;
-            }
-            return -1;
+            return __str_index(this, substring);
         }
         using VM {
             return __str_index(this, substring);
@@ -243,45 +287,7 @@ impl string {
 
     @no_safepoint inline func rindex(substring: string) -> int {
         using LLVM {
-            let textData = @reveal(this);
-            let needleData = @reveal(substring);
-            let textAddress = textData;
-            let needleAddress = needleData;
-            let textLength = @faddr(textData - 8, 8) -> int;
-            let needleLength = @faddr(needleData - 8, 8) -> int;
-
-            if (needleLength == 0) return textLength;
-            if (needleLength > textLength) return -1;
-
-            let firstByte = @faddr(needleAddress, 1) -> int;
-            let scan = textLength - needleLength;
-            for (scan >= 0) {
-                if (@faddr(textAddress + scan, 1) -> int == firstByte) {
-                    let matched = 1;
-                    let offset = 1;
-                    for (offset <= needleLength - 8) {
-                        if (@faddr(textAddress + scan + offset, 8) -> int !=
-                            @faddr(needleAddress + offset, 8) -> int) {
-                            matched = 0;
-                            break;
-                        }
-                        offset = offset + 8;
-                    }
-                    if (matched == 1) {
-                        for (offset < needleLength) {
-                            if (@faddr(textAddress + scan + offset, 1) -> int !=
-                                @faddr(needleAddress + offset, 1) -> int) {
-                                matched = 0;
-                                break;
-                            }
-                            offset = offset + 1;
-                        }
-                    }
-                    if (matched == 1) return scan;
-                }
-                scan = scan - 1;
-            }
-            return -1;
+            return __str_rindex(this, substring);
         }
         using VM {
             return __str_rindex(this, substring);
@@ -417,7 +423,7 @@ impl string {
             }
             @faddr(outputAddress + outputLength, 1) -> int = 0;
 
-            var result: string = "";
+            let result: string = "";
             try {
                 result = __str_from_address(outputAddress, outputLength);
             } catch (&error) {
@@ -438,49 +444,7 @@ impl string {
 
     @no_safepoint inline func startswith(prefix: string) -> bool {
         using LLVM {
-            let textData = @reveal(this);
-            let prefixData = @reveal(prefix);
-            let textAddress = textData;
-            let prefixAddress = prefixData;
-            let textLength = @faddr(textData - 8, 8) -> int;
-            let prefixLength = @faddr(prefixData - 8, 8) -> int;
-
-            if (prefixLength > textLength) return false;
-            let offset = 0;
-            for (offset <= prefixLength - 32) {
-                if (@faddr(textAddress + offset, 8) -> int !=
-                    @faddr(prefixAddress + offset, 8) -> int) {
-                    return false;
-                }
-                if (@faddr(textAddress + offset + 8, 8) -> int !=
-                    @faddr(prefixAddress + offset + 8, 8) -> int) {
-                    return false;
-                }
-                if (@faddr(textAddress + offset + 16, 8) -> int !=
-                    @faddr(prefixAddress + offset + 16, 8) -> int) {
-                    return false;
-                }
-                if (@faddr(textAddress + offset + 24, 8) -> int !=
-                    @faddr(prefixAddress + offset + 24, 8) -> int) {
-                    return false;
-                }
-                offset = offset + 32;
-            }
-            for (offset <= prefixLength - 8) {
-                if (@faddr(textAddress + offset, 8) -> int !=
-                    @faddr(prefixAddress + offset, 8) -> int) {
-                    return false;
-                }
-                offset = offset + 8;
-            }
-            for (offset < prefixLength) {
-                if (@faddr(textAddress + offset, 1) -> int !=
-                    @faddr(prefixAddress + offset, 1) -> int) {
-                    return false;
-                }
-                offset = offset + 1;
-            }
-            return true;
+            return __str_startswith(this, prefix);
         }
         using VM {
             return __str_startswith(this, prefix);
@@ -489,50 +453,7 @@ impl string {
 
     @no_safepoint inline func endswith(suffix: string) -> bool {
         using LLVM {
-            let textData = @reveal(this);
-            let suffixData = @reveal(suffix);
-            let textAddress = textData;
-            let suffixAddress = suffixData;
-            let textLength = @faddr(textData - 8, 8) -> int;
-            let suffixLength = @faddr(suffixData - 8, 8) -> int;
-
-            if (suffixLength > textLength) return false;
-            let offset = 0;
-            let start = textLength - suffixLength;
-            for (offset <= suffixLength - 32) {
-                if (@faddr(textAddress + start + offset, 8) -> int !=
-                    @faddr(suffixAddress + offset, 8) -> int) {
-                    return false;
-                }
-                if (@faddr(textAddress + start + offset + 8, 8) -> int !=
-                    @faddr(suffixAddress + offset + 8, 8) -> int) {
-                    return false;
-                }
-                if (@faddr(textAddress + start + offset + 16, 8) -> int !=
-                    @faddr(suffixAddress + offset + 16, 8) -> int) {
-                    return false;
-                }
-                if (@faddr(textAddress + start + offset + 24, 8) -> int !=
-                    @faddr(suffixAddress + offset + 24, 8) -> int) {
-                    return false;
-                }
-                offset = offset + 32;
-            }
-            for (offset <= suffixLength - 8) {
-                if (@faddr(textAddress + start + offset, 8) -> int !=
-                    @faddr(suffixAddress + offset, 8) -> int) {
-                    return false;
-                }
-                offset = offset + 8;
-            }
-            for (offset < suffixLength) {
-                if (@faddr(textAddress + start + offset, 1) -> int !=
-                    @faddr(suffixAddress + offset, 1) -> int) {
-                    return false;
-                }
-                offset = offset + 1;
-            }
-            return true;
+            return __str_endswith(this, suffix);
         }
         using VM {
             return __str_endswith(this, suffix);
@@ -549,35 +470,7 @@ impl string {
 
     @no_safepoint inline func count(substring: string) -> int {
         using LLVM {
-            let textData = @reveal(this);
-            let needleData = @reveal(substring);
-            let textAddress: int = textData;
-            let needleAddress: int = needleData;
-            let textLength: int = @faddr(textData - 8, 8) -> int;
-            let needleLength: int = @faddr(needleData - 8, 8) -> int;
-
-            if (needleLength == 0) return 0;
-            if (needleLength > textLength) return 0;
-
-            let result: int = 0;
-            let scan: int = 0;
-            for (scan <= textLength - needleLength) {
-                let matched: int = 0;
-                for (matched < needleLength) {
-                    if (@faddr(textAddress + scan + matched, 1) -> int !=
-                        @faddr(needleAddress + matched, 1) -> int) {
-                        break;
-                    }
-                    matched = matched + 1;
-                }
-                if (matched == needleLength) {
-                    result = result + 1;
-                    scan = scan + needleLength;
-                } else {
-                    scan = scan + 1;
-                }
-            }
-            return result;
+            return __str_count(this, substring);
         }
         using VM {
             return __str_count(this, substring);
@@ -602,4 +495,8 @@ func str(obj) -> string {
     } catch (e) {
         return __builtin_str(obj);
     }
+}
+
+// Expose the built-in string type as a runtime class value.
+class string {
 }

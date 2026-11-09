@@ -1,0 +1,81 @@
+import zeus.exception;
+import zeus.json;
+
+@native("zeus_bytes_decode")
+decl func __bytes_decode(data: bytes, encoding: string) -> string;
+
+func assertJSON(condition, message: string) {
+    if (!condition) throw new Exception("JSON test failed: " + message);
+}
+
+func expectJSONError(source: string) {
+    let caught = false;
+    try {
+        JSON.parse(source);
+    } catch (&error) {
+        caught = true;
+    }
+    assertJSON(caught, "invalid input should throw: " + source);
+}
+
+let parsed = JSON.parse(
+    "{\"name\":\"Zeus\",\"number\":-12.5e1,\"enabled\":true," +
+    "\"empty\":null,\"items\":[0,\"line\\nfeed\",{\"key\":\"value\"}]}");
+assertJSON(parsed["name"] == "Zeus", "object string lookup");
+assertJSON(parsed["number"] == -125, "decimal exponent parsing");
+assertJSON(parsed["enabled"] == true, "boolean parsing");
+assertJSON(parsed["empty"] == nil, "null parsing");
+assertJSON(parsed["items"][1] == "line\nfeed", "array and escaped newline parsing");
+assertJSON(parsed["items"][2]["key"] == "value", "nested object parsing");
+assertJSON(JSON.parse(JSON.stringify(parsed))["name"] == "Zeus",
+    "nested object serialization");
+let parsedOnce = JSON.stringify(parsed);
+let parsedTwice = JSON.stringify(parsed);
+assertJSON(parsedOnce == parsedTwice, "repeatable serialization");
+
+let exponentNumbers = JSON.parseValue("[1e2,1e-2]");
+assertJSON(exponentNumbers[0] == 100 and exponentNumbers[1] == 0.01,
+    "positive and negative exponent parsing");
+
+let rocket = JSON.parse("\"\\uD83D\\uDE80\"");
+assertJSON(rocket == "🚀", "surrogate pair decoding");
+assertJSON(JSON.stringify(rocket) == "\"🚀\"", "Unicode serialization");
+let rawUnicode = JSON.parse("\"雪🚀\"");
+assertJSON(JSON.parse(JSON.stringify(rawUnicode)) == rawUnicode,
+    "raw UTF-8 string round trip");
+
+let escaped = "quote: \" slash: \\ tab: \t newline: \n";
+let escapedJSON = JSON.stringify(escaped);
+assertJSON(JSON.parse(escapedJSON) == escaped, "string escape round trip");
+
+let plain = {"ok": true, "items": [1, nil, "x"]};
+let plainJSON = JSON.stringify(plain);
+let plainRoundTrip = JSON.parse(plainJSON);
+assertJSON(plainRoundTrip["ok"] == true, "native dictionary serialization");
+assertJSON(plainRoundTrip["items"][0] == 1 and
+    plainRoundTrip["items"][1] == nil and
+    plainRoundTrip["items"][2] == "x", "native array serialization");
+
+parsed["added"] = 9;
+assertJSON(parsed["added"] == 9, "parsed object assignment");
+
+let rootArray = JSON.parse("[1,2]");
+assertJSON(rootArray[1] == 2, "root array lookup");
+rootArray[0] = 3;
+assertJSON(JSON.stringify(rootArray) == "[3,2]", "root array assignment and serialization");
+assertJSON(JSON.parseValue("false") == false, "raw parseValue helper");
+assertJSON(JSON.stringify(nil) == "null", "root null serialization");
+assertJSON(JSON.parse("null") == nil, "root null parse");
+
+expectJSONError("01");
+expectJSONError("1e+");
+expectJSONError("[1,]");
+expectJSONError("{\"key\" 1}");
+expectJSONError("\"\\q\"");
+expectJSONError("\"\\uD800\"");
+expectJSONError("true false");
+
+let controlBytes = bytes([34, 1, 34]);
+expectJSONError(__bytes_decode(controlBytes, "utf-8"));
+
+print("JSON_BUILTIN_TEST_PASS");

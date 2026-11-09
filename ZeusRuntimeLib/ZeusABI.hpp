@@ -43,9 +43,9 @@ typedef struct ZeusBox ZeusBox;
 
 // Stable, C-compatible dynamic value exchanged at the LLVM/runtime boundary.
 // Scalars are inline, strings/bytes own a [u64 length][data] allocation,
-// BigInteger/BigDecimal own typed native payloads, other managed values own a
-// ZeusBox, and scalar references carry a borrowed address. Do not copy owned
-// values bytewise.
+// BigInteger/BigDecimal own typed native payloads; ObjectHandle carries an
+// inline, non-owning {id, generation} pair. Other tags follow their declared
+// ownership rules. Do not copy owned values bytewise.
 #define ZEUS_DYNAMIC_VALUE_ABI 4
 
 typedef enum ZeusValueTag {
@@ -60,8 +60,21 @@ typedef enum ZeusValueTag {
     ZEUS_VALUE_TAG_DELETED = 8,
     ZEUS_VALUE_TAG_BYTES = 9,
     ZEUS_VALUE_TAG_CHAR = 10,
+    // Class instance handles. The payload packs {uint32 id, uint32 generation}
+    // from the VM object table. A handle names an existing slot; it never owns
+    // the instance, so it is non-owning exactly like REF_INT64/REF_BOOL and the
+    // instance lifetime stays entirely with the reference count.
+    ZEUS_VALUE_TAG_OBJECT = 11,
     ZEUS_VALUE_TAG_BOXED = 255
 } ZeusValueTag;
+
+// Payload layout of ZEUS_VALUE_TAG_OBJECT. generation mirrors the VM table's
+// slot generation so a handle to a recycled slot stays detectable; the handle
+// itself carries no ownership flag.
+typedef struct ZeusObjectHandle {
+    uint32_t id;
+    uint32_t generation;
+} ZeusObjectHandle;
 
 enum {
     ZEUS_VALUE_FLAG_OWNS_BOX = 1u,
@@ -199,13 +212,22 @@ typedef void (*ZeusValueVariadicFunction)(
 // push/store consume the source and reset it to nil; pop/load initialize output.
 // Arithmetic wrappers borrow inputs and write an independently owned result.
 void zeus_value_init_nil(ZeusValue* out);
+bool zeus_value_is_nil(const ZeusValue* value);
 void zeus_value_init_i64(ZeusValue* out, int64_t value);
+void zeus_value_init_unsigned_integer(ZeusValue* out, uint64_t value, int32_t bits);
+void zeus_value_init_float(ZeusValue* out, float value);
+uint64_t zeus_global_load_unsigned_integer(int index, int32_t bits);
+void zeus_global_store_unsigned_integer(int index, uint64_t value, int32_t bits);
+float zeus_global_load_float(int index);
+void zeus_global_store_float(int index, float value);
 void zeus_value_init_bool(ZeusValue* out, int32_t value);
 void zeus_value_from_i64_ptr(ZeusValue* out, void* value);
 void zeus_value_from_bool_ptr(ZeusValue* out, void* value);
 void zeus_value_clone(ZeusValue* out, const ZeusValue* value);
 void zeus_value_from_box(ZeusValue* out, const ZeusBox* box);
 void zeus_value_from_class_handle(ZeusValue* out, int32_t class_id);
+void zeus_value_from_named_class_handle(
+    ZeusValue* out, int32_t class_id, const char* class_name);
 int32_t zeus_value_require_class_handle(
     const ZeusValue* value, int32_t class_count);
 // Managed LLVM class handles share one lifetime lease. Explicit delete still
@@ -254,6 +276,15 @@ void zeus_value_slot_validate_argument_type(
     const char* expected_type
 ) noexcept(false);
 int64_t zeus_value_require_i64(const ZeusValue* value);
+int64_t zeus_checked_signed_integer(int64_t value, int32_t bits);
+int64_t zeus_value_require_signed_integer(const ZeusValue* value, int32_t bits);
+uint64_t zeus_checked_unsigned_integer(uint64_t value, int32_t bits);
+uint64_t zeus_value_require_unsigned_integer(const ZeusValue* value, int32_t bits);
+uint64_t zeus_signed_require_unsigned_integer(int64_t value, int32_t bits);
+int64_t zeus_unsigned_require_signed_integer(uint64_t value, int32_t bits);
+uint64_t zeus_double_require_unsigned_integer(double value, int32_t bits);
+float zeus_value_require_float(const ZeusValue* value);
+float zeus_double_require_float(double value);
 int32_t zeus_value_require_bool(const ZeusValue* value);
 int64_t zeus_value_require_argument_i64(
     const ZeusValue* value,
@@ -291,10 +322,23 @@ void zeus_value_dict_delete_normalized(
     const ZeusValue* dict,
     const ZeusValue* normalized_key
 );
+// Legacy spelling retained for ABI compatibility; returns one owned reference.
 ZeusNativeString zeus_value_intern_string(const ZeusValue* value);
+// Returns a native string with one owned reference. The caller must release it
+// with zeus_string_release or transfer the reference to another owner.
+ZeusNativeString zeus_value_to_native_string(const ZeusValue* value);
 void* zeus_value_native_address(const ZeusValue* value, int32_t reveal);
 ZeusNativeString zeus_string_intern(ZeusNativeString view);
+ZeusNativeString zeus_string_literal_from_data(const char* data, int64_t length);
 ZeusNativeString zeus_string_from_data(const char* data, int64_t length);
+ZeusNativeString zeus_string_retain(ZeusNativeString value);
+void zeus_string_release(ZeusNativeString value);
+ZeusNativeString zeus_string_clone(ZeusNativeString value);
+void zeus_string_store_slot(ZeusNativeString* slot, ZeusNativeString value);
+// Copy a NUL-terminated C string into Zeus-owned native string storage.
+ZeusNativeString zeus_string_from_cstr(const char* data);
+// Resolve a function from a DLL/SO loaded by an @native(..., from="...") thunk.
+void* zeus_native_library_symbol(const char* library_path, const char* symbol);
 ZeusNativeString zeus_string_from_address(int64_t data_address, int64_t length);
 ZeusNativeString zeus_string_copy_from_data(const char* data, int64_t length);
 void zeus_native_string_validate(ZeusNativeString value);
@@ -316,6 +360,10 @@ int64_t zeus_raw_bytes_range_get(int64_t address, int64_t length, int64_t index)
 void zeus_raw_bytes_range_set(int64_t address, int64_t length, int64_t index, int64_t value);
 int64_t zeus_bytes_data_address(ZeusNativeBytes bytes) noexcept(false);
 void* zeus_value_require_i64_ptr(const ZeusValue* value);
+// Reads the {id, generation} pair from a validated non-owning object value.
+// Object lifetime remains with the VM reference count.
+//
+ZeusObjectHandle zeus_value_require_object_handle(const ZeusValue* value);
 void* zeus_value_require_bool_ptr(const ZeusValue* value);
 ZeusBox* zeus_value_to_box(const ZeusValue* value);
 void zeus_value_release(ZeusValue* value);
@@ -350,6 +398,10 @@ int64_t zeus_string_length(ZeusNativeString value);
 ZeusNativeString zeus_native_string_concat(
     ZeusNativeString left,
     ZeusNativeString right
+);
+ZeusNativeString zeus_string_join_values(
+    const ZeusValue* values,
+    ZeusNativeString separator
 );
 bool zeus_native_string_equal(
     ZeusNativeString left,
@@ -428,6 +480,8 @@ void zeus_shared_value_assign_bool(const char* name, int32_t value);
 int32_t zeus_shared_value_load_bool(const char* name);
 void* zeus_shared_value_native_address(const char* name, int32_t reveal);
 int32_t zeus_shared_value_delete(const char* name);
+// Standalone AOT entry cleanup only; workers and VM instances do not own this heap.
+void zeus_shared_values_release(void);
 // Scalar fast path for the same global slots. A top-level loop that bumps a
 // scalar global uses these instead of boxing a ZeusValue per access; a type
 // mismatch aborts rather than reinterpreting the stored value.
@@ -436,7 +490,9 @@ int64_t zeus_global_load_i64(int idx);
 void zeus_global_store_bool(int idx, int32_t value);
 int32_t zeus_global_load_bool(int idx);
 void zeus_global_store_string(int idx, ZeusNativeString value);
+// Returns a caller-owned reference; release it after the loaded value expires.
 ZeusNativeString zeus_global_load_string(int idx);
+// Returns the writable global slot. The slot retains its own reference.
 ZeusNativeString* zeus_global_string_slot(int idx);
 void zeus_global_sync_native_string_slot(void* slot);
 void zeus_global_store_bytes(int idx, ZeusNativeBytes value);

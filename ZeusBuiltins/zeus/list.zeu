@@ -36,12 +36,19 @@ impl Array {
         return this;
     }
 
+    // 原地删除指定下标（后面的元素前移），返回 nil。
+    // 旧实现返回新数组，调用方写成 `arr = arr.remove(0)` 才正确，容易漏掉赋值；
+    // 与 Python 的 list.pop(index) 一样改自身，原地语义不需要再回填。
     func remove(index) {
-        let result = [];
-        for (0..this.length()) [const &i] {
-            if (i != index) result.append(this[i]);
+        let count = this.length();
+        if (index < 0 or index >= count) return nil;
+        let cursor = index;
+        for (cursor < count - 1) {
+            this[cursor] = this[cursor + 1];
+            cursor = cursor + 1;
         }
-        return result;
+        __array_pop(this);
+        return nil;
     }
 
     func pop() {
@@ -119,4 +126,42 @@ impl Array {
         }
         return result;
     }
+}
+
+// 构造连续数字序列数组。当只传一个参数时默认从 0 开始。
+// 支持正负 step 以及包含式 (inclusive=true) 参数。
+func range(start, end=nil, step=1, inclusive=false) {
+    if (end == nil) {
+        end = start;
+        start = 0;
+    }
+    let result = [];
+    if (step > 0) {
+        let cur = start;
+        if (inclusive) {
+            for (cur <= end) {
+                result.append(cur);
+                cur = cur + step;
+            }
+        } else {
+            for (cur < end) {
+                result.append(cur);
+                cur = cur + step;
+            }
+        }
+    } else if (step < 0) {
+        let cur = start;
+        if (inclusive) {
+            for (cur >= end) {
+                result.append(cur);
+                cur = cur + step;
+            }
+        } else {
+            for (cur > end) {
+                result.append(cur);
+                cur = cur + step;
+            }
+        }
+    }
+    return result;
 }

@@ -42,7 +42,7 @@ dict_lit     ::= "{" [expr ":" expr {"," expr ":" expr} [","]] "}" ;
 
 ```text
 + - * / % = == != > < >= <= ! and or ||
-. , : ; ( ) [ ] { } &
+. , : ; ( ) [ ] { } & ?
 ```
 
 `and` / `or` 在词法后被当作操作符处理。
@@ -202,9 +202,24 @@ static_function ::= "@static" func_block ;
 no_safepoint_function ::= "@no_safepoint" func_block ;
 inline_function ::= "inline" func_block ;
 native_function ::= "@native" "(" string_lit ")" func_fwd_decl ;
+native_definition ::= "@native" [ "(" string_lit ")" ] func_block ;
 ```
 
 当前支持 `@static`、`@no_safepoint` 函数定义，`inline func` 内联请求，以及 `@native("symbol") decl func ...;` 原生函数声明。修饰符必须紧邻对应函数声明；未知修饰符、错误参数和不匹配的声明形式会产生语法诊断。
+
+`@native` 也能修饰函数**定义**，此时该函数按 C 链接约定导出、名字不做改写，供 C 代码调用（例如 `app_main`、`setup`/`loop`）：
+
+```zeus
+@native("pinMode")
+decl func pinMode(pin: int32, mode: int32) -> void;   // 声明 C 函数
+
+@native
+func setup() {                                        // 定义为 C 链接函数 `setup`
+    pinMode(2, 1);
+}
+```
+
+符号名取 `@native("...")` 的参数；省略参数时取函数自己的名字。定义上不允许 `from=` 库路径或 `raw`/`slot` 引用 ABI。返回类型：写 `-> void` 表示 C 的 `void`；不写返回类型时同样按 `void` 导出（不产生 ZeusValue 出参）；写具体类型则按该类型的 C ABI 返回。
 
 ## 5. 类与对象
 
@@ -291,15 +306,27 @@ type_path ::= identifier { "." identifier } ;
 
 `impl T` 使用与类相同的方法和运算符表，但不创建新类、不声明字段。写 `using &alias;` 后，未标记 `static` 的方法会以 `alias: T` 为接收者；没有声明接收者别名时，未标记 `static` 的方法按静态方法处理。`operator[new]` 始终是静态工厂。`impl` 可扩展原生类型和已有类；已有类会把这些方法并入它的类方法表。
 
+类型实现的静态方法可以用类型名调用：
+
+```
+impl int {
+    static func twice(value: int) -> int { return value * 2; }
+}
+
+int.twice(3)        // 调用 int 实现的静态方法
+```
+
+只有当类型名没有绑定到变量、类或其它值时才按类型名解析；否则同名绑定优先。静态方法不接收隐式接收者，参数全部由调用方给出。
+
 `operator[new]` 是静态工厂运算符，不接收隐式 `this`。`new T(args...)` 会调用 `T` 上登记的 `operator[new]` 并把它的返回值作为表达式结果；未定义工厂时，普通类仍按字段分配和 `init(...)` 构造。`impl T` 可以为原生类型登记工厂，例如 `impl string`。
 
 ### 5.1.3 原位替换实例状态
 
 ```ebnf
-this_assignment ::= "@this" "=" expr ;
+this_assignment ::= ( "this" | receiver_alias | "@this" ) "=" expr ;
 ```
 
-`@this = value` 只允许在实例方法中使用，且 `value` 必须与当前接收者属于同一个类。它会把 `value` 的字段状态复制到当前实例，同时保留当前实例的身份和地址；已经指向当前实例的其他变量也会看到更新。VM 对动态类型在运行时检查，LLVM 对静态类型在编译时检查。
+`this = value`（以及当前类声明的接收者别名 `self = value`，或兼容旧写法的 `@this = value`）只允许在实例方法中使用，且 `value` 必须与当前接收者属于同一个类。它会把 `value` 的字段状态复制到当前实例，同时保留当前实例的身份和地址；已经指向当前实例的其他变量也会看到更新。VM 对动态类型在运行时检查，LLVM 对静态类型在编译时检查。
 
 ```zeus
 class Test {
@@ -307,7 +334,7 @@ class Test {
     var value = 0;
 
     func reset() {
-        @this = new Test();
+        this = new Test(); // 原位重置当前实例字段状态，也可写作 self = ...（当 using &self）或 @this = ...
     }
 }
 
@@ -315,6 +342,37 @@ let a: Test = new Test();
 let b: Test = a;
 a.reset();
 print(b); // 仍是同一个 Test 实例，但字段已重置
+```
+
+### 5.1.4 可空类型与安全导航
+
+```ebnf
+nullable_type ::= type_name "?" ;
+safe_nav      ::= expr "?." identifier [ type_args ] [ "(" [arg_list] ")" ] ;
+```
+
+规则：
+
+- `T?` 表示可空类型：nil 只能赋给 `?` 注释的位置（变量、参数、字段、返回值）。
+- 对 `T?` 接收者的裸 `.` 调用是编译错误；必须先判空（`if (x != nil)`）或使用 `?.`。
+- `a?.foo(args)`：`a` 为 nil 时整个调用短路为 nil，否则按普通调用派发。参数始终求值（与 `&&` 操作数一致）。
+- 链中出现一个 `?.` 后，后续 `.` 按 `?.` 处理（nil 向后传播）：`a?.b.c` 等价于 `a?.b?.c`。
+- `?.` 的结果始终是动态值。`?.` 写在非可空静态类型上是编译错误。
+- 实现阶段一：可空值一律装箱为动态 `ZeusValue`；内联可空表示（类引用可空指针、值类型 `{低载, 标记}`槽）是后续优化。
+
+```zeus
+class Node {
+    using &this;
+    func get() -> int { return 1; }
+}
+func main() {
+    let a: Node? = nil;
+    print(a?.get());   // nil：短路，不调用
+    let b: Node? = new Node();
+    print(b?.get());   // 1
+    print(a?.get());   // nil
+}
+main();
 ```
 
 ### 5.2 对象创建
@@ -327,6 +385,30 @@ class_expr ::= identifier { "." identifier } ;
 当前实现支持 `new T(args...)`。若 `T` 定义 `operator[new]`，该工厂优先执行；否则类类型按字段分配，并在定义了 `init` 时调用它。原生类型通过 `impl T` 提供工厂。
 
 内置 `String` 是原生 `string` 的别名，没有独立包装对象；`new string(value)` 和 `new String(value)` 都调用 `impl string` 中的工厂并返回原生字符串。
+
+### 5.3 定宽原生类型
+
+```ebnf
+fixed_width_type ::= "i8" | "i16" | "i32" | "i64"
+                   | "u8" | "u16" | "u32" | "u64"
+                   | "f32" | "f64" ;
+```
+
+定宽拼写直接对应 C ABI 宽度，可用于变量注解、参数、返回值、`@faddr -> T` 与 `@native(..., from=...) decl func` 的签名。解析期统一规范化为 `@native.int32` 这类规范名，因此大小写别名（`@native decl Int32 = ctypes.INT32`）与新拼写是同一类型。
+
+- `i8/i16/i32`（有符号）、`u8/u16/u32/u64`（无符号）、`f32/f64`：LLVM 值类型即 `i8…f64`，跨 DLL 传参按宽度截断/扩展，不再依赖调用约定巧合。
+- `int32` 已回收为真 32 位（以前是 `int` 的别名，即 64 位）；`int64` 仍是 `int` 的别名。`int` 本体不动，仍是语言整数（64 位槽）。
+- `int8_t` 系列暂不引入；`double` 拼写暂不引入，用 `f64`。
+- `@native decl TypeName = ctypes.XXX` 机制保留（用户自定义原生别名的唯一入口），但标准宽度不再需要它。
+
+转换规则（升/降级的完整语义以后再定，当前行为）：
+
+- 字面量可直接传给窄形参（`add32(x, 1)`），超界字面量在编译期报错；
+- `int` 变量不能隐式传给窄形参，需先落到窄槽（`let v: i32 = intVar` 会按 checked 转换处理，超界在 VM 报范围错误）；
+- 窄整数运算在 VM 是 checked（溢出报错），在 AOT 按 C 语义回绕（已知 VM/AOT 差异）；
+- AOT 下窄宽度运算不是零开销：`i32` 先 `sext` 到 `i64` 做 checked 调用再 `trunc` 回来，外加一次 GC safepoint；`f32` 只有一条 `fadd` 加 safepoint。热路径以实测 IR 为准。
+
+Win32 声明按真实类型书写：`DWORD`/`UINT`/`u_long`/`WORD` 用 `u32`/`u16`，`BOOL`/`LONG`/`int` 用 `int32`。例外是模块自己的 `-1` 哨兵约定（如 `WaitForSingleObject` 的 `INFINITE`），这类保持 `int32` 并在声明处注释。
 
 ## 6. 运算符重载
 
@@ -362,20 +444,24 @@ package_path ::= identifier { "." identifier } ;
 using_stmt  ::= "using" "original" ;
 using_block ::= "using" "original" block
              | "using" "LLVM" block
-             | "using" "VM" block ;
+             | "using" "VM" block
+             | "using" platform_id block ;
+platform_id ::= "windows" | "win32" | "linux" | "darwin" | "macos" | "posix" ;
 llvm_intrinsic ::= "@addr" "(" expr ")"
                  | "@reveal" "(" expr ")"
                  | "@faddr" "(" expr ")" "->" llvm_value_type
                  | "@faddr" "(" expr "," expr ")" "->" llvm_value_type ;
 llvm_faddr_assignment ::= "@faddr" "(" expr ")" "->" llvm_value_type "=" expr
                           | "@faddr" "(" expr "," expr ")" "->" llvm_value_type "=" expr ;
-this_assignment ::= "@this" "=" expr ;
+this_assignment ::= ( "this" | receiver_alias | "@this" ) "=" expr ;
 llvm_value_type ::= identifier ;
 ```
 
 另：类内 `using &alias;` 属于类语义，不是 `using original` 语义。
 
 using LLVM 和 using VM 是按作用域顺序配对的目标块。AOT 只编译 LLVM 块，VM 只编译 VM 块，缺少配对时跳过并警告。
+
+`using windows { ... }`、`using linux { ... }`、`using darwin { ... }`（以及 `using posix { ... }`）是平台条件编译块。在 AST 构建阶段，编译器自动匹配目标操作系统：匹配平台的块内容会被就地解包（splice）展开到当前作用域中；不匹配平台的块将被完全剔除。非目标平台内部的 `@native` 声明、常量及函数不会进入符号表，也不会尝试加载非目标平台的动态库。可用于顶层声明、类体内字段/方法定义以及函数体内的分支逻辑。
 
 `@addr(value)` 只接受命名左值并返回 int 地址。AOT 下它指向变量存储槽；VM 下它返回关联到变量 Cell 的地址句柄。两者都用于读写变量槽，string/bytes 的原始数据地址由 `@reveal` 返回。对 shared 变量取址时地址关联到 SharedCell 的值槽，不持有互斥锁，调用方负责并发；共享值被替换或从共享堆删除后，旧地址可能失效。
 
@@ -385,7 +471,7 @@ AOT 原生 `string` 和动态 ZeusValue 中的 string 都使用 `[u64 字节长�
 
 `@addr(string/bytes)` 指向变量槽位，`@reveal(value)` 才返回数据首地址；`@faddr(@addr(value)) -> string/bytes` 读写的是完整变量值，带长度的 `@faddr` 则用于显式原始字节范围。bytes 的长度头与数据一起分配，替换槽位会更新该槽持有的完整值。bigint、float、容器和对象的布局尚未定义为跨后端稳定 ABI。原始地址访问只在动态位于 `try` 区域内时（包括 try 中代码调用到的函数）检查已登记的槽位或存活内存范围：越界、类型不符或对只读存储的写入会抛出可捕获异常；`try` 区域之外跳过这些检查，按地址直接读写，错误地址即野指针行为。指针仍不携带类型，不能用它推断未登记内存的布局。
 
-`inline func` 为函数请求 LLVM 内联；用 `zeusc --opt-level 2` 等选项启用 LLVM 优化，默认等级为 `0`。`@no_safepoint` 让 LLVM 后端不在该函数体的循环回边和返回点插入 GC 检查；函数调用到的运行时或其他函数仍可能执行自己的检查。长时间运行且产生垃圾的循环应自行安排回收时机，避免延迟回收。
+`inline func` 为函数请求 LLVM 内联；`zeusc --opt-level` 可调整 LLVM 优化等级，默认等级为 `s`。`@no_safepoint` 让 LLVM 后端不在该函数体的循环回边和返回点插入 GC 检查；函数调用到的运行时或其他函数仍可能执行自己的检查。长时间运行且产生垃圾的循环应自行安排回收时机，避免延迟回收。
 
 ## 8. 异常与 with
 
@@ -411,7 +497,7 @@ default_expr  ::= expr ;
 operator_symbol ::= <operator token or keyword token in operator[...]> ;
 ```
 
-1. 后缀：调用 `()`, 成员 `.`, 下标 `[]`
+1. 后缀：调用 `()`, `?.`, 成员 `.`, 下标 `[]`
 2. 一元：`+x`, `-x`, `!x`
 3. 乘除模：`* / %`
 4. 加减：`+ -`

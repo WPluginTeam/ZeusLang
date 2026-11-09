@@ -1,0 +1,7 @@
+import native_import_package;
+
+if (wrappedNativeAdd(18, 24) != 42) {
+    throw "package dynamic native import failed";
+}
+
+print("PASS package dynamic native import");

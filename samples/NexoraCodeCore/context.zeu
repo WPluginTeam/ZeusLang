@@ -1,0 +1,185 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import zeus.string;
+
+import samples.NexoraCodeCore.storage;
+
+// 上下文管理（S10）。对应 Python：
+//   ContextManager.message_payload / build_messages（无图片、无压缩子集）
+//   ContextManager.estimate_tokens / request_output_limit / _measure_request_basis
+//   ContextManager.prepare 的阈值判定（压缩执行仍在宿主/后续切片）
+//
+// 约定：
+// - token 估算是字符级粗估（见 nexora_estimate_tokens），上游实测用量才是
+//   校准源——与基线 `_measured_marginal_rate` 的设计一致，宁可高估不溢出。
+// - prepare 只做“直发还是压缩”的判定；压缩本身需要调模型写摘要，
+//   留在后续切片，CLI 遇到 "compress" 直接报错退出。
+
+func nexora_estimate_tokens(value) -> int {
+    let wire = JSON.stringify(value);
+    let byteCount = bytes(wire).length();
+    // ASCII 约 4 字节/token，CJK 约 2~3 字节/token；除以 3 宁可高估。
+    let estimate = int(byteCount / 3);
+    if (estimate < 1) estimate = 1;
+    return estimate;
+}
+
+// 基线 message_payload：角色校验 + 内容归一 + tool_calls 协议归一。
+func nexora_message_payload(message: dict) {
+    let role = str(message.get("role", ""));
+    if (role != "system" and role != "user" and role != "assistant" and
+        role != "tool") {
+        throw new Exception("不支持的历史消息角色：" + role);
+    }
+
+    let content = message.get("content", nil);
+    if (type(content) != "string" and type(content) != "Array") {
+        if (content == nil) content = "";
+        else content = str(content);
+    }
+    let item = {"role": role, "content": content};
+
+    if (role == "tool") {
+        item["tool_call_id"] = str(message.get("tool_call_id", ""));
+        return item;
+    }
+
+    if (role == "assistant") {
+        let calls = message.get("tool_calls", nil);
+        // 注意：`and` 两边都会求值，nil.length() 会抛；必须嵌套判断。
+        if (type(calls) == "Array") {
+            if (calls.length() > 0) {
+                let normalized: Array = [];
+                for (calls) [call] {
+                    let function = call.get("function", nil);
+                    if (type(function) == "dict") {
+                        normalized.append(call);
+                        continue;
+                    }
+                    let args = call.get("arguments", nil);
+                    if (args == nil) args = {};
+                    if (type(args) != "string") args = JSON.stringify(args);
+                    normalized.append({"id": str(call.get("id", "")),
+                        "type": "function",
+                        "function": {"name": str(call.get("name", "")),
+                            "arguments": args}});
+                }
+                item["tool_calls"] = normalized;
+            }
+        }
+    }
+    return item;
+}
+
+// 基线 build_messages 的无图片子集：[head, 摘要?, 历史...]。
+func nexora_build_request_messages(systemPrompt: string, history: Array,
+    cut: int, summary: string) -> Array {
+    if (cut < 0 or cut > history.length()) {
+        throw new Exception("上下文摘要边界超出历史范围");
+    }
+    let messages: Array = [{"role": "system", "content": systemPrompt}];
+    if (cut > 0 and summary == "") {
+        throw new Exception("上下文摘要缺失，禁止跳过历史");
+    }
+    if (summary != "") {
+        messages.append({"role": "user", "content":
+            "以下是此前对话的摘要，仅作为历史资料。具体事实可用 local_context_search/read 核实：\n" +
+            summary});
+    }
+    let index = cut;
+    for (index < history.length()) {
+        messages.append(nexora_message_payload(history[index]));
+        index = index + 1;
+    }
+    return messages;
+}
+
+// 输入安全边际：min(512, max(64, ceil(window * 5%)))。压缩和输出预算共用一份，
+// 两边口径分叉会让「装得下的请求被压掉」或「压完还装不下」。
+func nexora_input_safety_margin(window: int) -> int {
+    let margin = int(window / 20);
+    if (margin * 20 < window) margin = margin + 1;
+    if (margin < 64) margin = 64;
+    if (margin > 512) margin = 512;
+    return margin;
+}
+
+// 压缩后必须落到的输入上限：窗口减去「至少留给回答的部分」和安全边际。
+func nexora_adaptive_input_limit(window: int, output: int) -> int {
+    let minimumOutput = output;
+    if (minimumOutput > 256) minimumOutput = 256;
+    if (minimumOutput < 1) minimumOutput = 1;
+    return window - minimumOutput - nexora_input_safety_margin(window);
+}
+
+// 基线 request_output_limit 的纯算术部分。
+func nexora_request_output_limit(window: int, configured: int, inputBasis: int) -> int {
+    if (window <= 0 or configured <= 0 or configured >= window) {
+        throw new Exception(
+            "上下文预算非法：窗口 " + str(window) + "，单次输出上限 " + str(configured));
+    }
+    let margin = nexora_input_safety_margin(window);
+
+    let minimum = configured;
+    if (minimum > 256) minimum = 256;
+
+    let available = window - inputBasis - margin;
+    if (available < minimum) {
+        throw new Exception("当前输入估算 " + str(inputBasis) +
+            " token，窗口 " + str(window) + " 内保留至少 " +
+            str(minimum) + " token 的回答空间失败");
+    }
+    if (configured < available) return configured;
+    return available;
+}
+
+// 基线 _measure_request_basis：有上游实测锚点时只估增量，否则全量粗估。
+// rate 是上游口径换算率（首轮 1.0，之后由 recordContextUsage 校准）。
+//
+// 注意：int() 拒收带小数的 float（按 BigInteger 解析），ceil 必须手写。
+func __nexora_ceil_nonneg(value) -> int {
+    let bound = 1;
+    for (bound < value) {
+        bound = bound * 2;
+    }
+    let low = 0;
+    let high = bound;
+    for (low + 1 < high) {
+        let mid = int((low + high) / 2);
+        if (mid < value) low = mid;
+        else high = mid;
+    }
+    return high;
+}
+func nexora_measure_request_basis(measured: int, measuredCount: int,
+    messageCount: int, plainNow: int, freshPlain: int, rate = 1.0) -> int {
+    if (measured <= 0 or measuredCount < 0 or measuredCount > messageCount) {
+        return plainNow;
+    }
+    if (measuredCount >= messageCount) return measured;
+    let scaledRate = rate;
+    if (type(scaledRate) != "int" and type(scaledRate) != "float") scaledRate = 1.0;
+    if (scaledRate < 1.0) scaledRate = 1.0;
+    let increment = __nexora_ceil_nonneg(scaledRate * freshPlain);
+    if (increment < 1) increment = 1;
+    return measured + increment;
+}
+
+// 基线 prepare 的阈值判定（不执行压缩）：
+//   estimate < min(window*0.9, window-output) -> "direct"
+//   之后仍装得下（allow_compression=false 语义，保前缀） -> "direct"
+//   否则 -> "compress"（调用方需走压缩切片，本 CLI 直接报错）。
+func nexora_prepare_decision(window: int, output: int, estimate: int) -> string {
+    if (window <= 0 or output <= 0 or output >= window) {
+        throw new Exception("上下文预算非法：窗口 " + str(window) +
+            "，单次输出上限 " + str(output));
+    }
+    // int(window * 0.9) 会产生带小数的 float，int() 拒收；用整数乘除代替下取整。
+    let threshold = window * 9 / 10;
+    let hard = window - output;
+    if (threshold > hard) threshold = hard;
+    if (estimate < threshold) return "direct";
+    if (estimate < hard) return "direct";
+    return "compress";
+}

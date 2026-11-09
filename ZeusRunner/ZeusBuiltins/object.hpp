@@ -20,7 +20,7 @@ namespace ZeusBuiltins {
             throw std::runtime_error("getattr: first argument must be object");
         }
 
-        int objId = std::get<ZeusType::ObjectHandle>(args[0]).id;
+        const auto& objectHandle = std::get<ZeusType::ObjectHandle>(args[0]);
 
         // 第二个参数必须是字符串（属性名）
         std::string attrName;
@@ -37,11 +37,12 @@ namespace ZeusBuiltins {
             throw std::runtime_error("getattr: attribute name must be string");
         }
 
-        if (!g_vmObjects || objId < 0 || objId >= (int)g_vmObjects->size()) {
-            throw std::runtime_error("getattr: invalid object id");
+        const auto* object = getValidObject(objectHandle);
+        if (!object) {
+            throw std::runtime_error("getattr: invalid or stale object handle");
         }
 
-        const auto& obj = (*g_vmObjects)[objId];
+        const auto& obj = *object;
         const bool hasClassInfo = g_vmClasses && obj.classId >= 0 &&
             obj.classId < static_cast<int>(g_vmClasses->size());
         const auto extension = obj.extensionValues.find(attrName);
@@ -74,7 +75,7 @@ namespace ZeusBuiltins {
             throw std::runtime_error("setattr: first argument must be object");
         }
 
-        int objId = std::get<ZeusType::ObjectHandle>(args[0]).id;
+        const auto& objectHandle = std::get<ZeusType::ObjectHandle>(args[0]);
 
         // 第二个参数必须是字符串（属性名）
         std::string attrName;
@@ -91,11 +92,12 @@ namespace ZeusBuiltins {
             throw std::runtime_error("setattr: attribute name must be string");
         }
 
-        if (!g_vmObjects || objId < 0 || objId >= (int)g_vmObjects->size()) {
-            throw std::runtime_error("setattr: invalid object id");
+        auto* object = getValidObject(objectHandle);
+        if (!object) {
+            throw std::runtime_error("setattr: invalid or stale object handle");
         }
 
-        auto& obj = (*g_vmObjects)[objId];
+        auto& obj = *object;
         if (g_vmClasses && obj.classId >= 0 && obj.classId < static_cast<int>(g_vmClasses->size())) {
             ZeusType::writeObjectField(obj, (*g_vmClasses)[obj.classId], attrName, args[2]);
         } else {

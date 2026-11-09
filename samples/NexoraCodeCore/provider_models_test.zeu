@@ -1,0 +1,219 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.http;
+import zeus.json;
+
+import samples.NexoraCodeCore.backend_api;
+import samples.NexoraCodeCore.conversation_store;
+import samples.NexoraCodeCore.journal;
+import samples.NexoraCodeCore.provider_models;
+import samples.NexoraCodeCore.stream_runtime;
+
+func __nexora_provider_models_assert(value: bool, message: string) {
+    if (!value) throw new Exception("provider models test: " + message);
+}
+
+func __nexora_provider_models_status(result, expected: int, message: string) {
+    __nexora_provider_models_assert(
+        dict_get(result, "status", 0) == expected, message);
+}
+
+class NexoraProviderModelsFakeGet {
+    using &this;
+
+    let statusCode = 200;
+    let payload = {"data": []};
+    let payloadValid = true;
+    let fail = false;
+    let calls = 0;
+    let lastUrl = "";
+    let lastHeaders = {};
+    let lastTimeout = 0;
+
+    func get(url: string, headers: dict, timeoutSeconds: int) {
+        this.calls = this.calls + 1;
+        this.lastUrl = url;
+        this.lastHeaders = headers;
+        this.lastTimeout = timeoutSeconds;
+        if (this.fail) throw new Exception("synthetic provider network error");
+        return {"status_code": this.statusCode, "payload": this.payload,
+            "payload_valid": this.payloadValid};
+    }
+}
+
+func __nexora_provider_models_body(result) {
+    return dict_get(result, "body", {});
+}
+
+func testNexoraProviderModels(root: string) {
+    let current = {"providers": [
+        {"id": "saved-openai", "template_id": "openai",
+            "base_url": "https://api.openai.com/v1/chat/completions",
+            "api_key": "synthetic-openai-key"},
+        {"id": "saved-custom", "template_id": "custom",
+            "base_url": "https://saved.example/v1",
+            "api_key": "synthetic-custom-key"}
+    ]};
+    let fake = new NexoraProviderModelsFakeGet();
+    fake.payload = {"data": [
+        {"id": "zeta"}, {"id": "alpha", "name": "Alpha"},
+        {"id": "zeta"}, {"id": ""}, nil
+    ]};
+
+    let custom = nexora_provider_models_discover(current, {
+        "template_id": "custom", "base_url": "http://127.12.3.4:11434/v1"
+    }, fake.get);
+    __nexora_provider_models_status(custom, 200,
+        "a custom loopback catalog should be queried");
+    __nexora_provider_models_assert(
+        fake.lastUrl == "http://127.12.3.4:11434/v1/models" and
+        fake.lastTimeout == 20 and
+        dict_get(fake.lastHeaders, "Authorization", "") == "",
+        "custom discovery must derive the endpoint, use a bounded timeout, and omit an empty key");
+    let customModels = dict_get(__nexora_provider_models_body(custom), "models", []);
+    __nexora_provider_models_assert(customModels.length() == 2 and
+        dict_get(customModels[0], "id", "") == "alpha" and
+        dict_get(customModels[1], "id", "") == "zeta" and
+        dict_get(customModels[1], "name", "") == "zeta",
+        "model rows must skip invalid and duplicate IDs and sort by display name");
+    __nexora_provider_models_assert(
+        JSON.stringify(custom).index("synthetic-") < 0,
+        "provider credentials must never appear in the discovery response");
+
+    let customSavedKey = nexora_provider_models_discover(current, {
+        "template_id": "custom", "base_url": "https://saved.example/v1/",
+        "key_source_id": "saved-custom"
+    }, fake.get);
+    __nexora_provider_models_status(customSavedKey, 200,
+        "a saved custom key should be reusable for its matching endpoint");
+    __nexora_provider_models_assert(
+        dict_get(fake.lastHeaders, "Authorization", "") ==
+            "Bearer synthetic-custom-key",
+        "custom keys must remain bound to their normalized base URL");
+
+    let callsBeforeRejectedUrl = fake.calls;
+    let remoteHttp = nexora_provider_models_discover(current, {
+        "template_id": "custom", "base_url": "http://example.com/v1"
+    }, fake.get);
+    __nexora_provider_models_status(remoteHttp, 500,
+        "remote custom HTTP catalogs must be rejected");
+    __nexora_provider_models_assert(fake.calls == callsBeforeRejectedUrl,
+        "an invalid catalog URL must be rejected before the network callback");
+
+    fake.payload = {"data": [{"id": "gpt-test"}]};
+    let openai = nexora_provider_models_discover(current, {
+        "template_id": "openai", "provider_id": "saved-openai",
+        "base_url": "https://attacker.example/v1"
+    }, fake.get);
+    __nexora_provider_models_status(openai, 200,
+        "a matching saved preset key should authorize model discovery");
+    __nexora_provider_models_assert(
+        fake.lastUrl == "https://api.openai.com/v1/models" and
+        dict_get(fake.lastHeaders, "Authorization", "") ==
+            "Bearer synthetic-openai-key",
+        "preset endpoint and key must come from the selected template and matching provider");
+
+    let siliconFlow = nexora_provider_models_discover(current, {
+        "template_id": "siliconflow", "api_key": "synthetic-siliconflow-key"
+    }, fake.get);
+    __nexora_provider_models_status(siliconFlow, 200,
+        "SiliconFlow's fixed chat-only query must be accepted");
+    __nexora_provider_models_assert(
+        fake.lastUrl == "https://api.siliconflow.cn/v1/models?sub_type=chat",
+        "SiliconFlow must keep its canonical chat catalog URL");
+
+    let callsBeforeUnsupportedTemplate = fake.calls;
+    let unsupportedCatalog = nexora_provider_models_discover(current, {
+        "template_id": "zai", "api_key": "synthetic-zai-key"
+    }, fake.get);
+    __nexora_provider_models_status(unsupportedCatalog, 400,
+        "templates without a verified catalog endpoint must return their hint");
+    __nexora_provider_models_assert(fake.calls == callsBeforeUnsupportedTemplate,
+        "unsupported templates must fail before making a network request");
+
+    let wrongKeySource = nexora_provider_models_discover(current, {
+        "template_id": "deepseek", "provider_id": "saved-openai"
+    }, fake.get);
+    __nexora_provider_models_status(wrongKeySource, 400,
+        "a saved key must not cross provider templates");
+
+    fake.payload = {"data": [
+        {"id": "glm-5.3", "name": "GLM"},
+        {"id": "responses-only"}
+    ]};
+    let openCode = nexora_provider_models_discover(current, {
+        "template_id": "opencode_go", "api_key": "synthetic-opencode-key"
+    }, fake.get);
+    __nexora_provider_models_status(openCode, 200,
+        "OpenCode model catalog should be filtered using the reviewed allowlist");
+    let openCodeModels = dict_get(__nexora_provider_models_body(openCode), "models", []);
+    __nexora_provider_models_assert(openCodeModels.length() == 1 and
+        dict_get(openCodeModels[0], "id", "") == "glm-5.3",
+        "OpenCode must omit models outside its Chat Completions allowlist");
+
+    fake.payload = {"data": [
+        {"id": "vision-only", "architecture": {
+            "input_modalities": ["image"], "output_modalities": ["text"]}},
+        {"id": "text-model", "architecture": {
+            "input_modalities": ["text"], "output_modalities": ["text"]}}
+    ]};
+    let openRouter = nexora_provider_models_discover(current, {
+        "template_id": "openrouter", "api_key": "synthetic-openrouter-key"
+    }, fake.get);
+    __nexora_provider_models_status(openRouter, 200,
+        "OpenRouter should return only models with text input and output");
+    let openRouterModels = dict_get(__nexora_provider_models_body(openRouter), "models", []);
+    __nexora_provider_models_assert(openRouterModels.length() == 1 and
+        dict_get(openRouterModels[0], "id", "") == "text-model",
+        "OpenRouter modality filtering must retain text-capable models");
+
+    fake.statusCode = 302;
+    let redirect = nexora_provider_models_discover(current, {
+        "template_id": "custom", "base_url": "https://provider.example/v1"
+    }, fake.get);
+    __nexora_provider_models_status(redirect, 502,
+        "catalog redirects must stop without following Location");
+    fake.statusCode = 401;
+    __nexora_provider_models_status(nexora_provider_models_discover(current, {
+        "template_id": "custom", "base_url": "https://provider.example/v1"
+    }, fake.get), 401, "authentication failures should map to HTTP 401");
+    fake.statusCode = 404;
+    __nexora_provider_models_status(nexora_provider_models_discover(current, {
+        "template_id": "custom", "base_url": "https://provider.example/v1"
+    }, fake.get), 404, "missing catalog endpoints should map to HTTP 404");
+    fake.statusCode = 429;
+    __nexora_provider_models_status(nexora_provider_models_discover(current, {
+        "template_id": "custom", "base_url": "https://provider.example/v1"
+    }, fake.get), 429, "rate limits should map to HTTP 429");
+    fake.statusCode = 200;
+    fake.payloadValid = false;
+    __nexora_provider_models_status(nexora_provider_models_discover(current, {
+        "template_id": "custom", "base_url": "https://provider.example/v1"
+    }, fake.get), 502, "invalid JSON should be reported as an upstream format error");
+    fake.payloadValid = true;
+    fake.fail = true;
+    __nexora_provider_models_status(nexora_provider_models_discover(current, {
+        "template_id": "custom", "base_url": "https://provider.example/v1"
+    }, fake.get), 502, "network errors should be reported as upstream failures");
+
+    let apiRoot = root + "/provider_models_origin";
+    let store = new NexoraCoreConversationStore(apiRoot + "/conversations");
+    let runtime = new NexoraCoreStreamRuntime(
+        new NexoraCoreTaskJournal(apiRoot + "/tasks"), 16, 4);
+    let api = new NexoraCoreBackendApi(store, runtime, current, root,
+        nil, "", "", fake.get);
+    let foreignRequest = new HTTPRequest();
+    foreignRequest.method = "POST";
+    foreignRequest.path = "/api/local/provider-models";
+    foreignRequest.rawHeaders = "POST /api/local/provider-models HTTP/1.1\r\n" +
+        "Host: 127.0.0.1:8765\r\nOrigin: https://foreign.example\r\n\r\n";
+    foreignRequest.body = bytes(JSON.stringify({
+        "template_id": "custom", "base_url": "https://provider.example/v1"
+    }));
+    let callsBeforeOriginCheck = fake.calls;
+    let foreignResponse: HTTPResponse = api.handleRequest(foreignRequest);
+    __nexora_provider_models_assert(foreignResponse.status == 403 and
+        fake.calls == callsBeforeOriginCheck,
+        "cross-origin browser requests must be rejected before catalog access");
+}

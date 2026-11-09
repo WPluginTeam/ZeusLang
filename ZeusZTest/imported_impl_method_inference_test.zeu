@@ -1,0 +1,15 @@
+import zeus.string;
+
+func lastByte(text: string) -> int {
+    let byteCount = text.length();
+    let textAddress: int = text.dataAddress();
+    using LLVM {
+        return @faddr(textAddress + byteCount - 1, 1) -> int;
+    }
+    using VM {
+        return byteCount;
+    }
+}
+
+if (lastByte("Az") != 122) throw "imported impl method return type was not inferred";
+print("IMPORTED_IMPL_METHOD_INFERENCE_PASS");

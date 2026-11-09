@@ -1,0 +1,75 @@
+import zeus.byte;
+import zeus.file [&file];
+import zeus.path;
+
+import samples.NexoraCodeCore.text_utils;
+
+let NEXORA_PROJECT_INSTRUCTIONS_MAX_CHARS = 8000;
+let NEXORA_PROJECT_INSTRUCTIONS_CANDIDATES = [
+    "AGENTS.md",
+    "NEXORA.md",
+    ".nexora/AGENTS.md"
+];
+
+func __nexora_project_instruction_is_within(rootValue: string,
+        targetValue: string) -> bool {
+    let root = Path.normalize(rootValue).lower();
+    let target = Path.normalize(targetValue).lower();
+    let prefix = root;
+    if (!prefix.endswith("/")) prefix = prefix + "/";
+    return target != root and target.startswith(prefix);
+}
+
+// Read only the established project-level instruction filenames. Resolve both
+// root and candidate first so a symlink cannot import instructions from outside
+// the configured workspace.
+func nexora_read_project_instructions(workRootValue: string) -> string {
+    let cleanRoot = str(workRootValue).strip();
+    if (cleanRoot == "") return "";
+
+    let root = "";
+    try {
+        root = Path.normalize(file.realPath(cleanRoot));
+    } catch (&invalidRoot) {
+        return "";
+    }
+
+    for (NEXORA_PROJECT_INSTRUCTIONS_CANDIDATES) [relative] {
+        let candidate = Path.join(root, relative);
+        if (!file.exists(candidate)) continue;
+
+        let resolved = "";
+        try {
+            resolved = Path.normalize(file.realPath(candidate));
+        } catch (&unreadablePath) {
+            continue;
+        }
+        if (!__nexora_project_instruction_is_within(root, resolved)) continue;
+        if (file.isDirectory(resolved)) continue;
+
+        let handle = nil;
+        let content = "";
+        let failed = false;
+        try {
+            handle = file.open(resolved, "rb");
+            let raw: bytes = handle.read();
+            content = nexora_text_decode_utf8_replace(raw);
+        } catch (&readError) {
+            failed = true;
+        }
+        if (handle != nil) {
+            try {
+                handle.close();
+            } catch (&closeError) {
+                failed = true;
+            }
+        }
+        if (failed) continue;
+
+        content = content.strip();
+        if (content == "") continue;
+        return nexora_text_truncate_utf8_chars(
+            content, NEXORA_PROJECT_INSTRUCTIONS_MAX_CHARS);
+    }
+    return "";
+}

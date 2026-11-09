@@ -1,0 +1,87 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+
+import samples.NexoraCodeCore.tool_approval_store;
+import samples.NexoraCodeCore.tool_permissions;
+
+func __nexora_approval_test_assert(value: bool, message: string) {
+    if (!value) throw new Exception("tool approval test: " + message);
+}
+
+func testNexoraToolApproval() {
+    __nexora_approval_test_assert(nexora_tool_permission_mode_valid("confirm"),
+        "confirm must be a supported permission mode");
+    __nexora_approval_test_assert(nexora_tool_permission_mode_valid("auto"),
+        "auto must be a supported permission mode");
+    __nexora_approval_test_assert(
+        nexora_tool_permission_decision("confirm", "read") == "allow" and
+        nexora_tool_permission_decision("confirm", "write") == "confirm",
+        "confirm mode must allow reads and request write approval");
+    __nexora_approval_test_assert(
+        nexora_tool_permission_decision("read_only", "write") == "deny" and
+        nexora_tool_permission_decision("full", "write") == "allow",
+        "read_only and full modes must keep distinct write behavior");
+    __nexora_approval_test_assert(
+        nexora_tool_permission_decision("full", "command") == "allow" and
+        nexora_tool_permission_decision("confirm", "command") == "confirm" and
+        nexora_tool_permission_decision("auto", "command") == "auto" and
+        nexora_tool_permission_decision("auto", "read") == "allow" and
+        nexora_tool_permission_decision("full", "unknown") == "deny",
+        "known side effects must follow the selected mode and unknown classes must be denied");
+    let terminalRunSummary = nexora_tool_approval_summary({
+        "name": "local_terminal",
+        "arguments": {"action": "run", "command": "echo approval fixture"}
+    }, "command");
+    let terminalStopSummary = nexora_tool_approval_summary({
+        "name": "local_terminal",
+        "arguments": {"action": "terminate", "terminal_id": "terminal-7-1"}
+    }, "command");
+    __nexora_approval_test_assert(
+        terminalRunSummary.index("echo approval fixture") >= 0 and
+        terminalStopSummary.index("terminal-7-1") >= 0,
+        "terminal approvals must summarize the command or session id");
+
+    let approvals = new NexoraCoreToolApprovalStore();
+    let call = {"id": "call_write", "name": "local_file_write",
+        "arguments": {"path": "draft.txt", "content": "private body"}};
+    let created = approvals.create("stream-1", "conversation-1", "mock",
+        "confirm", "write", call);
+    let approvalId = str(dict_get(created, "approval_id", ""));
+    __nexora_approval_test_assert(approvalId.length() == 32,
+        "approval id must be an opaque random token");
+    let publicJson = JSON.stringify(created);
+    __nexora_approval_test_assert(publicJson.index("private body") < 0 and
+        publicJson.index("arguments") < 0,
+        "the event-facing approval descriptor must not include tool arguments");
+    let publicPending = approvals.publicPending("stream-1");
+    __nexora_approval_test_assert(dict_get(publicPending, "approval_id", "") == approvalId and
+        JSON.stringify(publicPending).index("private body") < 0,
+        "task polling must expose only the safe pending approval descriptor");
+
+    let wrongStream = approvals.beginResolve("stream-2", approvalId, "approve");
+    __nexora_approval_test_assert(dict_get(wrongStream, "status", "") == "not_found",
+        "approval token must be bound to its originating stream");
+    let claimed = approvals.beginResolve("stream-1", approvalId, "approve");
+    __nexora_approval_test_assert(dict_get(claimed, "status", "") == "pending",
+        "a valid decision must claim the pending request once");
+    let serverRequest = dict_get(dict_get(claimed, "request", {}), "call", {});
+    __nexora_approval_test_assert(
+        dict_get(dict_get(serverRequest, "arguments", {}), "content", "") == "private body",
+        "the original arguments must stay in the server-side approval record");
+
+    let concurrent = approvals.beginResolve("stream-1", approvalId, "approve");
+    __nexora_approval_test_assert(dict_get(concurrent, "status", "") == "resolving",
+        "concurrent approval requests must not claim the tool twice");
+    let response = {"status": 202, "body": {"continuation_stream_id": "child-1"}};
+    __nexora_approval_test_assert(approvals.completeResolve(approvalId, response),
+        "resolved request must retain an idempotent response");
+    let replay = approvals.beginResolve("stream-1", approvalId, "approve");
+    __nexora_approval_test_assert(dict_get(replay, "status", "") == "resolved" and
+        dict_get(dict_get(dict_get(replay, "response", {}), "body", {}),
+            "continuation_stream_id", "") == "child-1",
+        "retry must return the first continuation without executing again");
+    let changedDecision = approvals.beginResolve("stream-1", approvalId, "deny");
+    __nexora_approval_test_assert(dict_get(changedDecision, "status", "") == "conflict",
+        "a resolved approval cannot be changed to a different decision");
+}

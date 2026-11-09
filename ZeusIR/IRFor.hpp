@@ -38,6 +38,18 @@ namespace IRFor {
         }
     }
 
+    // 回填循环体中的 LOOP_CONTINUE 占位符
+    // continueIndex: 下一轮开始的位置（列表/计次循环是步进，条件循环是条件重判）
+    inline void patchContinuePlaceholders(std::vector<IRType::IRInstr>& ir, size_t bodyStartIndex, size_t continueIndex) {
+        for (size_t i = bodyStartIndex; i < ir.size(); ++i) {
+            if (ir[i].op == VMOperator::LOOP_CONTINUE) {
+                int offset = static_cast<int>(continueIndex) - static_cast<int>(i) - 1;
+                ir[i].op = VMOperator::JUMP;
+                ir[i].args[0] = LexerType::Value(offset);
+            }
+        }
+    }
+
     struct ForBuildInput {
         const TreeParser::CodeBlock& block;
         std::vector<IRType::IRInstr> bodyIR;
@@ -121,6 +133,9 @@ namespace IRFor {
         // 5.3 插入 body IR
         out.insert(out.end(), in.bodyIR.begin(), in.bodyIR.end());
 
+        // continue 跳到 index++ 处
+        size_t continueTargetIndex = out.size();
+
         // 5.4 index++
         {
             out.push_back(IRUtils::makeLoadLocal(idxSlot));
@@ -146,8 +161,9 @@ namespace IRFor {
         int skip = static_cast<int>(out.size() - (jfalseIndex + 1));
         out[jfalseIndex].args[0] = LexerType::Value(skip);
 
-        // 回填 body 中的 LOOP_BREAK 占位符
+        // 回填 body 中的 LOOP_BREAK / LOOP_CONTINUE 占位符
         patchBreakPlaceholders(out, bodyStartIndex, loopEndIndex);
+        patchContinuePlaceholders(out, bodyStartIndex, continueTargetIndex);
 
         return out;
     }
@@ -251,6 +267,9 @@ namespace IRFor {
         // 10. body
         out.insert(out.end(), in.bodyIR.begin(), in.bodyIR.end());
 
+        // continue 跳到 index++ 处
+        size_t continueTargetIndex = out.size();
+
         // 11. idx++
         out.push_back(IRUtils::makeLoadLocal(idxSlot));
         out.push_back(IRUtils::makePushInt(1));
@@ -269,8 +288,9 @@ namespace IRFor {
         int skip = static_cast<int>(out.size() - (jfalseIndex + 1));
         out[jfalseIndex].args[0] = LexerType::Value(skip);
 
-        // 回填 body 中的 LOOP_BREAK 占位符
+        // 回填 body 中的 LOOP_BREAK / LOOP_CONTINUE 占位符
         patchBreakPlaceholders(out, bodyStartIndex, loopEndIndex);
+        patchContinuePlaceholders(out, bodyStartIndex, continueTargetIndex);
 
         return out;
     }
@@ -476,6 +496,9 @@ namespace IRFor {
 
         out.insert(out.end(), in.bodyIR.begin(), in.bodyIR.end());
 
+        // continue 跳到 idx += step 处
+        size_t continueTargetIndex = out.size();
+
         // idx = idx + step
         {
             out.push_back(IRUtils::makeLoadLocal(idxSlot));
@@ -499,8 +522,9 @@ namespace IRFor {
         out[exitJumpIndex].args[0] = LexerType::Value(skip);
     }
 
-        // 回填 body 中的 LOOP_BREAK 占位符
+        // 回填 body 中的 LOOP_BREAK / LOOP_CONTINUE 占位符
         patchBreakPlaceholders(out, bodyStartIndex, loopEndIndex);
+        patchContinuePlaceholders(out, bodyStartIndex, continueTargetIndex);
 
         return out;
     }
@@ -530,6 +554,9 @@ namespace IRFor {
         // body
         out.insert(out.end(), in.bodyIR.begin(), in.bodyIR.end());
 
+        // continue 跳到条件重判（即下面这条回跳）
+        size_t continueTargetIndex = out.size();
+
         // 回跳到循环开始（loopStartIndex）
         // VM中JUMP执行: pc = pc + 1 + off
         // 我们希望跳到loopStartIndex，所以: loopStartIndex = pc + 1 + off
@@ -549,8 +576,9 @@ namespace IRFor {
         int skip = static_cast<int>(out.size() - (jfalseIndex + 1));
         out[jfalseIndex].args[0] = LexerType::Value(skip);
 
-        // 回填 body 中的 LOOP_BREAK 占位符
+        // 回填 body 中的 LOOP_BREAK / LOOP_CONTINUE 占位符
         patchBreakPlaceholders(out, bodyStartIndex, loopEndIndex);
+        patchContinuePlaceholders(out, bodyStartIndex, continueTargetIndex);
 
         return out;
     }

@@ -2,20 +2,56 @@ import zeus.string;
 
 @native("zeus_string_copy_from_data")
 decl func copyNativeStringData(data: string, length: int) -> string;
+@native("zeus_runtime_debug_native_string_live_bytes")
+decl func nativeStringLiveBytes() -> int;
 
 class TextHolder {
     using &this;
     var value: string = "default";
     func init(value: string) { this.value = value; }
     func get() -> string { return this.value; }
+    func set(value: string) { this.value = value; }
 }
 
 func passText(value: string) -> string { return value; }
 func produceText() -> string { return "return"; }
 func dynamicIdentity(value) { return value; }
 func typedFromDynamic(value: string) -> string { return dynamicIdentity(value); }
-func dataFromFunctionLocal() -> int {
-    let local: string = "lifetime";
+func appendBorrowedText(&value: string) {
+    value = value + "!";
+}
+func borrowedStringRoundTrip() -> string {
+    var localText = "borrowed";
+    appendBorrowedText(localText);
+    return localText;
+}
+func borrowedStringClosureRoundTrip() -> string {
+    var localText = "closure";
+    func append(&value: string) { value = value + "!"; }
+    let action = append;
+    action(localText);
+    return localText;
+}
+func churnNativeString(index: int) {
+    let transient = "transient-" + str(index);
+    if (transient.length() == 0) throw "native string churn produced empty text";
+}
+func throwAfterStringArgument(value: string) {
+    throw "intentional borrowed-string call failure";
+}
+func throwAfterStringReference(&value: string) {
+    throw "intentional borrowed-reference failure";
+}
+func borrowedStringSurvivesCaughtCall() -> string {
+    let local = "borrow-" + str(44);
+    try {
+        throwAfterStringReference(local);
+    } catch (&error) {
+    }
+    return local;
+}
+func dataFromFunctionLocal(seed: string) -> int {
+    let local: string = seed + "-temporary";
     return local.dataAddress();
 }
 
@@ -32,8 +68,13 @@ let returned = produceText();
 let passed = passText(explicitLocal);
 let dynamicBoundary = typedFromDynamic("boundary");
 let joined = inferredLocal + " world";
-let holder = new TextHolder("field");
+let holder = new TextHolder("field-" + str(1));
 let fieldCopy: string = holder.get();
+let holderCopy = holder;
+holder.set("updated");
+if (holder.get() != "updated" or holderCopy.get() != "field-1") {
+    throw "default class copy did not retain its native string field";
+}
 
 if (explicitGlobal != "typed-global" or inferredGlobal != "inferred-global" or
     reassignedGlobal != "after") throw "string globals lost native values";
@@ -41,7 +82,11 @@ if (explicitLocal.length() != 3 or inferredLocal.index("ell") != 1 or
     !inferredLocal.startswith("he")) throw "native string methods failed";
 if (returned != "return" or passed != "123" or
     dynamicBoundary != "boundary") throw "string parameter/return bridge failed";
-if (joined != "hello world" or fieldCopy != "field") throw "string concat/field path failed";
+if (borrowedStringRoundTrip() != "borrowed!" or
+    borrowedStringClosureRoundTrip() != "closure!") {
+    throw "borrowed string reference did not keep its owner slot alive";
+}
+if (joined != "hello world" or fieldCopy != "field-1") throw "string concat/field path failed";
 if (!emptyLocal.isEmpty() or emptyLocal.length() != 0) throw "empty string layout failed";
 if (embeddedZero.length() != 3 or embeddedZero.index("\0") != 1 or
     embeddedZero != "a\0b") throw "embedded NUL string layout failed";
@@ -73,8 +118,16 @@ var pointerSource: string = "lifetime";
 let data = pointerSource.dataAddress();
 if (@faddr(data, 1) -> int != 108) throw "string data pointer expired after return";
 using LLVM {
-    let returnedData = dataFromFunctionLocal();
-    if (@faddr(returnedData, 1) -> int != 108) throw "string pool range expired with its source slot";
+    let returnedData = dataFromFunctionLocal("life");
+    var expiredStringDataRejected = false;
+    try {
+        let expiredByte = @faddr(returnedData, 1) -> int;
+    } catch (&error) {
+        expiredStringDataRejected = true;
+    }
+    if (!expiredStringDataRejected) {
+        throw "string data address remained usable after its owner ended";
+    }
     var readonlyRejected = false;
     try {
         @faddr(data, 1) -> int = 65;
@@ -82,5 +135,34 @@ using LLVM {
         readonlyRejected = true;
     }
     if (!readonlyRejected) throw "interned string data accepted a raw write";
+}
+
+let liveStringBytesBeforeCaughtCall = nativeStringLiveBytes();
+try {
+    throwAfterStringArgument("temporary-" + str(321));
+} catch (&error) {
+}
+if (nativeStringLiveBytes() != liveStringBytesBeforeCaughtCall) {
+    throw "top-level catch leaked a borrowed NativeString argument";
+}
+let liveStringBytesBeforeNativeSymbolCall = nativeStringLiveBytes();
+try {
+    throwAfterStringArgument(
+        copyNativeStringData(explicitLocal, explicitLocal.length()));
+} catch (&error) {
+}
+if (nativeStringLiveBytes() != liveStringBytesBeforeNativeSymbolCall) {
+    throw "top-level catch leaked a NativeString returned by @native symbol";
+}
+if (borrowedStringSurvivesCaughtCall() != "borrow-44") {
+    throw "&string did not keep its caller slot alive through catch";
+}
+
+let liveStringBytesBeforeChurn = nativeStringLiveBytes();
+for (0..5000) [const &i] {
+    churnNativeString(i);
+}
+if (nativeStringLiveBytes() != liveStringBytesBeforeChurn) {
+    throw "temporary NativeString allocations were not reclaimed after function return";
 }
 print("NATIVE_STRING_LAYOUT_PASS");

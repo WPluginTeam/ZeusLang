@@ -1,0 +1,317 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.path;
+import zeus.string;
+
+import samples.NexoraCodeCore.storage;
+
+let NEXORA_CORE_SENSITIVE_PATH_PARTS = [
+    ".npmrc", ".pypirc", ".netrc", "authorized_keys", "known_hosts",
+    "credentials", "cookie", "id_rsa", "id_dsa", "id_ecdsa",
+    "id_ed25519", "password", "secret", "token"
+];
+let NEXORA_CORE_EXCLUDED_TREE_DIRS = ["node_modules", "__pycache__", ".git"];
+
+func __nexora_core_path_is_sensitive(relative: string) -> bool {
+    let normalized = Path.normalize(relative).lower();
+    for (normalized.split("/")) [segment] {
+        if (segment == ".env" or segment.startswith(".env.")) return true;
+        for (NEXORA_CORE_SENSITIVE_PATH_PARTS) [part] {
+            if (segment.index(part) >= 0) return true;
+        }
+    }
+    return false;
+}
+
+func __nexora_core_path_is_hidden(relative: string) -> bool {
+    for (Path.normalize(relative).split("/")) [segment] {
+        if (segment.startswith(".")) return true;
+    }
+    return false;
+}
+
+func __nexora_core_tree_dir_excluded(name: string) -> bool {
+    let normalized = name.lower();
+    for (NEXORA_CORE_EXCLUDED_TREE_DIRS) [excluded] {
+        if (normalized == excluded) return true;
+    }
+    return false;
+}
+
+func __nexora_core_glob_match(patternValue: string, textValue: string) -> bool {
+    let pattern = patternValue.lower();
+    let text = textValue.lower();
+    let patternIndex = 0;
+    let textIndex = 0;
+    let lastStar = -1;
+    let starTextIndex = 0;
+
+    for (true) {
+        if (textIndex >= text.length()) break;
+        if (patternIndex < pattern.length()) {
+            let current = pattern.slice(patternIndex, patternIndex + 1);
+            if (current == "?" or current == text.slice(textIndex, textIndex + 1)) {
+                patternIndex = patternIndex + 1;
+                textIndex = textIndex + 1;
+                continue;
+            }
+            if (current == "*") {
+                lastStar = patternIndex;
+                patternIndex = patternIndex + 1;
+                starTextIndex = textIndex;
+                continue;
+            }
+        }
+        if (lastStar < 0) return false;
+        patternIndex = lastStar + 1;
+        starTextIndex = starTextIndex + 1;
+        textIndex = starTextIndex;
+    }
+
+    for (patternIndex < pattern.length() and
+            pattern.slice(patternIndex, patternIndex + 1) == "*") {
+        patternIndex = patternIndex + 1;
+    }
+    return patternIndex == pattern.length();
+}
+
+func __nexora_core_tree_matches(pattern: string, relative: string, name: string) -> bool {
+    if (pattern == "" or pattern == "*") return true;
+    if (pattern.index("/") >= 0 or pattern.index("\\") >= 0) {
+        return __nexora_core_glob_match(pattern.replace("\\", "/"), relative);
+    }
+    return __nexora_core_glob_match(pattern, name);
+}
+
+func __nexora_core_join_lines(lines: Array) -> string {
+    return string_join(lines, "\n");
+}
+
+class NexoraCoreFileTools {
+    using &this;
+
+    let root = "";
+    let scannedEntries = 0;
+    let scanLimit = 0;
+    let treeTruncated = false;
+
+    func operator[@=]() -> &NexoraCoreFileTools {
+        return this;
+    }
+
+    func init(rootValue: string) {
+        this.root = Path.normalize(file.realPath(rootValue));
+    }
+
+    // Returns the canonical target only when it remains under the canonical
+    // workspace root. This follows symlinks before the containment check.
+    func resolve(relativeValue: string) -> string {
+        let relative = relativeValue.strip().replace("\\", "/");
+        if (relative.index(":") >= 0 or Path.isAbsolute(relative)) return "";
+        let normalized = Path.normalize(relative);
+        if (normalized == ".." or normalized.startswith("../")) return "";
+
+        let candidate = Path.join(this.root, normalized);
+        let canonical = "";
+        try {
+            canonical = Path.normalize(file.realPath(candidate));
+        } catch (&missing) {
+            return "";
+        }
+
+        let canonicalRoot = this.root.lower();
+        let canonicalTarget = canonical.lower();
+        let rootPrefix = canonicalRoot;
+        if (!rootPrefix.endswith("/")) rootPrefix = rootPrefix + "/";
+        if (canonicalTarget != canonicalRoot and !canonicalTarget.startswith(rootPrefix)) {
+            return "";
+        }
+        return canonical;
+    }
+
+    // New files resolve through their existing parent before the workspace check.
+    // Existing targets use resolve() so a file symlink cannot escape the root.
+    func resolveWrite(relativeValue: string) -> string {
+        let relative = relativeValue.strip().replace("\\", "/");
+        if (relative == "" or relative.index(":") >= 0 or Path.isAbsolute(relative)) return "";
+        let normalized = Path.normalize(relative);
+        if (normalized == "." or normalized == ".." or normalized.startswith("../")) return "";
+
+        let candidate = Path.join(this.root, normalized);
+        if (file.exists(candidate)) return this.resolve(normalized);
+
+        let parent = Path.join(this.root, Path.dirname(normalized));
+        let canonicalParent = "";
+        try {
+            canonicalParent = Path.normalize(file.realPath(parent));
+        } catch (&missing) {
+            return "";
+        }
+        let canonicalRoot = this.root.lower();
+        let canonicalDirectory = canonicalParent.lower();
+        let rootPrefix = canonicalRoot;
+        if (!rootPrefix.endswith("/")) rootPrefix = rootPrefix + "/";
+        if (canonicalDirectory != canonicalRoot and !canonicalDirectory.startswith(rootPrefix)) {
+            return "";
+        }
+        return Path.join(canonicalParent, Path.basename(normalized));
+    }
+
+    func readFile(args: dict) {
+        let relative = str(dict_get(args, "path", ""));
+        if (relative.strip() == "") return {"error": "path is required"};
+        if (__nexora_core_path_is_sensitive(relative)) {
+            return {"error": "Sensitive paths require the permission workflow, which is not enabled yet."};
+        }
+        let target = this.resolve(relative);
+        if (target == "") return {"error": "Path is missing or outside the configured workspace."};
+        if (file.isDirectory(target)) return {"error": "Path is a directory: " + relative};
+        try {
+            return {"content": nexora_core_read_text(target)};
+        } catch (&error) {
+            return {"error": "Could not read file: " + str(error)};
+        }
+    }
+
+    func writeFile(args: dict) {
+        let relative = str(dict_get(args, "path", ""));
+        let content = str(dict_get(args, "content", ""));
+        if (relative.strip() == "") return {"error": "path is required"};
+        if (__nexora_core_path_is_sensitive(relative)) {
+            return {"error": "Sensitive paths are blocked by the workspace policy."};
+        }
+        if (content.length() > 200000) {
+            return {"error": "File content exceeds the 200000 character limit."};
+        }
+        let target = this.resolveWrite(relative);
+        if (target == "") return {"error": "Path is missing or outside the configured workspace."};
+        if (file.exists(target) and file.isDirectory(target)) {
+            return {"error": "Path is a directory: " + relative};
+        }
+        try {
+            let handle = file.open(target, "w");
+            handle.write(content);
+            handle.flush();
+            handle.close();
+            return {"content": "Wrote " + str(content.length()) +
+                " characters to " + Path.normalize(relative) + "."};
+        } catch (&error) {
+            return {"error": "Could not write file: " + str(error)};
+        }
+    }
+
+    func listDirectory(args: dict) {
+        let relative = str(dict_get(args, "path", ""));
+        if (relative.strip() == "") return {"error": "path is required"};
+        let target = this.resolve(relative);
+        if (target == "") return {"error": "Path is missing or outside the configured workspace."};
+        if (!file.isDirectory(target)) return {"error": "Path is not a directory: " + relative};
+
+        let limit = int(dict_get(args, "max_entries", 200));
+        if (limit < 1) return {"error": "max_entries must be at least 1"};
+        if (limit > 500) limit = 500;
+        let names = file.listDir(target);
+        let lines: Array = [];
+        let count = 0;
+        let truncated = false;
+        for (names) [name] {
+            if (count >= limit) {
+                truncated = true;
+                break;
+            }
+            let childRelative = Path.join(relative, str(name));
+            let child = this.resolve(childRelative);
+            if (child == "") continue;
+            if (file.isDirectory(child)) {
+                lines.append("DIR  " + str(name) + "/");
+            } else {
+                lines.append("FILE " + str(name));
+            }
+            count = count + 1;
+        }
+        let content = __nexora_core_join_lines(lines);
+        if (content == "") content = "No entries found.";
+        if (truncated) content = content + "\n[entry limit reached]";
+        return {"content": content, "count": count, "truncated": truncated};
+    }
+
+    func appendTree(relative: string, depth: int, maxDepth: int, maxEntries: int,
+            pattern: string, includeFiles: bool, includeDirs: bool,
+            includeHidden: bool, output: Array) {
+        if (output.length() >= maxEntries or this.scannedEntries >= this.scanLimit) {
+            this.treeTruncated = true;
+            return;
+        }
+        let target = this.resolve(relative);
+        if (target == "" or !file.isDirectory(target)) return;
+
+        let names = file.listDir(target);
+        for (names) [nameValue] {
+            if (output.length() >= maxEntries or this.scannedEntries >= this.scanLimit) {
+                this.treeTruncated = true;
+                return;
+            }
+            this.scannedEntries = this.scannedEntries + 1;
+            let name = str(nameValue);
+            let childRelative = Path.join(relative, name);
+            if (!includeHidden and __nexora_core_path_is_hidden(childRelative)) continue;
+            if (__nexora_core_path_is_sensitive(childRelative)) continue;
+            if (__nexora_core_tree_dir_excluded(name)) continue;
+
+            let child = this.resolve(childRelative);
+            if (child == "") continue;
+            let isDirectory = file.isDirectory(child);
+            let childDepth = depth + 1;
+            if (isDirectory) {
+                if (includeDirs and __nexora_core_tree_matches(pattern, childRelative, name)) {
+                    output.append("DIR  " + childRelative + "/");
+                }
+                if (childDepth < maxDepth) {
+                    this.appendTree(childRelative, childDepth, maxDepth, maxEntries,
+                        pattern, includeFiles, includeDirs, includeHidden, output);
+                }
+            } else if (includeFiles and
+                    __nexora_core_tree_matches(pattern, childRelative, name)) {
+                output.append("FILE " + childRelative);
+            }
+        }
+    }
+
+    func searchTree(args: dict) {
+        let relative = str(dict_get(args, "path", ""));
+        if (relative.strip() == "") return {"error": "path is required"};
+        if (__nexora_core_path_is_sensitive(relative)) {
+            return {"error": "Sensitive paths require the permission workflow, which is not enabled yet."};
+        }
+        let target = this.resolve(relative);
+        if (target == "") return {"error": "Path is missing or outside the configured workspace."};
+        if (!file.isDirectory(target)) return {"error": "Path is not a directory: " + relative};
+
+        let maxDepth = int(dict_get(args, "max_depth", 3));
+        let maxEntries = int(dict_get(args, "max_entries", 200));
+        if (maxDepth < 0 or maxDepth > 8) {
+            return {"error": "max_depth must be between 0 and 8"};
+        }
+        if (maxEntries < 1) return {"error": "max_entries must be at least 1"};
+        if (maxEntries > 500) maxEntries = 500;
+
+        let pattern = str(dict_get(args, "pattern", "*"));
+        let includeFiles = dict_get(args, "include_files", true);
+        let includeDirs = dict_get(args, "include_dirs", true);
+        let includeHidden = dict_get(args, "include_hidden", false);
+        this.scannedEntries = 0;
+        this.scanLimit = maxEntries * 20;
+        this.treeTruncated = false;
+        let output: Array = [];
+        if (maxDepth > 0) {
+            this.appendTree(relative, 0, maxDepth, maxEntries, pattern,
+                includeFiles, includeDirs, includeHidden, output);
+        }
+        let content = __nexora_core_join_lines(output);
+        if (content == "") content = "No matching entries found.";
+        if (this.treeTruncated) content = content + "\n[search limit reached]";
+        return {"content": content, "count": output.length(),
+            "truncated": this.treeTruncated, "scanned_entries": this.scannedEntries};
+    }
+}

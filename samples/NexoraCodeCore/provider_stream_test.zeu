@@ -1,0 +1,175 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import zeus.string;
+import samples.NexoraCodeCore.provider_stream;
+
+// 流式 chunk 折叠的离线测试：不发请求，只喂 chunk。
+
+func assertProviderStream(condition, message: string) {
+    if (!condition) throw new Exception("provider_stream 测试失败: " + message);
+}
+
+func __chunkText(text: string) {
+    return {"choices": [{"index": 0, "delta": {"content": text},
+        "finish_reason": nil}]};
+}
+
+func __chunkTool(slot: int, callId: string, name: string, fragment: string) {
+    return {"choices": [{"index": 0, "delta": {"tool_calls": [{
+        "index": slot,
+        "id": callId,
+        "type": "function",
+        "function": {"name": name, "arguments": fragment}}]},
+        "finish_reason": nil}]};
+}
+
+func __chunkFinish(reason: string) {
+    return {"choices": [{"index": 0, "delta": {}, "finish_reason": reason}]};
+}
+
+func testProviderStreamText() {
+    let state = nexora_chat_stream_state();
+    assertProviderStream(state.get("textParts", []).length() == 0, "初始 text 应为空");
+
+    let first = nexora_chat_stream_apply(state, __chunkText("Hel"));
+    assertProviderStream(first.length() == 1, "第一段应产出一个事件");
+    assertProviderStream(str(first[0]["type"]) == "text", "事件类型应为 text");
+    assertProviderStream(str(first[0]["text"]) == "Hel", "事件应带原文片段");
+
+    nexora_chat_stream_apply(state, __chunkText("lo"));
+    assertProviderStream(string_join(state["textParts"]) == "Hello", "增量应拼成完整文本");
+    assertProviderStream(int(state.get("chunks", 0)) == 2, "chunk 计数应累加");
+
+    let finishEvents = nexora_chat_stream_apply(state, __chunkFinish("stop"));
+    assertProviderStream(finishEvents.length() == 1, "finish 应产出一个事件");
+    assertProviderStream(str(finishEvents[0]["type"]) == "finish", "事件类型应为 finish");
+    assertProviderStream(str(state.get("finishReason", "")) == "stop", "应记录结束原因");
+
+    let message = nexora_chat_stream_message(state);
+    assertProviderStream(str(message["role"]) == "assistant", "消息角色应为 assistant");
+    assertProviderStream(str(message["content"]) == "Hello", "消息正文应为完整文本");
+    assertProviderStream(message.get("tool_calls", nil) == nil, "没有工具调用就不该带 tool_calls");
+}
+
+func testProviderStreamToolFragments() {
+    let state = nexora_chat_stream_state();
+
+    // 第一片只带 id 和 name，arguments 被切成两段。
+    nexora_chat_stream_apply(state, __chunkTool(0, "call_a", "read_file", "{\"pa"));
+    nexora_chat_stream_apply(state, __chunkTool(0, "", "", "th\": \"a.txt\"}"));
+
+    // 第二个调用交错出现，且第一次出现时没有 id。
+    nexora_chat_stream_apply(state, __chunkTool(1, "", "list_dir", "{\"dir\": \".\"}"));
+
+    let message = nexora_chat_stream_message(state);
+    let calls = message.get("tool_calls", nil);
+    assertProviderStream(type(calls) == "Array", "应产出 tool_calls 数组");
+    assertProviderStream(calls.length() == 2, "应合并成两个调用");
+
+    let first = calls[0];
+    assertProviderStream(str(first["id"]) == "call_a", "第一个调用应保留 id");
+    assertProviderStream(str(first["type"]) == "function", "调用类型应为 function");
+    assertProviderStream(str(first["function"]["name"]) == "read_file", "应保留工具名");
+    assertProviderStream(str(first["function"]["arguments"]) == "{\"path\": \"a.txt\"}",
+        "被切开的 arguments 应拼接还原");
+
+    let second = calls[1];
+    assertProviderStream(str(second["function"]["name"]) == "list_dir", "第二个工具名应保留");
+    assertProviderStream(str(second["id"]) != "", "缺 id 时应补一个占位 id");
+
+    let requests = nexora_chat_stream_tool_requests(message);
+    assertProviderStream(requests.length() == 2, "应拆出两个执行请求");
+    assertProviderStream(str(requests[0]["name"]) == "read_file", "执行请求应带工具名");
+    assertProviderStream(str(requests[0]["id"]) == "call_a", "执行请求应带调用 id");
+    assertProviderStream(type(requests[0]["arguments"]) == "dict", "参数应解析成字典");
+    assertProviderStream(str(requests[0]["arguments"]["path"]) == "a.txt", "参数内容应正确");
+    assertProviderStream(str(requests[0]["rawArguments"]) == "{\"path\": \"a.txt\"}",
+        "应同时保留原始参数文本");
+}
+
+func testProviderStreamBadArguments() {
+    let state = nexora_chat_stream_state();
+    nexora_chat_stream_apply(state, __chunkTool(0, "call_b", "broken", "{\"not json\""));
+
+    let requests = nexora_chat_stream_tool_requests(nexora_chat_stream_message(state));
+    assertProviderStream(requests.length() == 1, "参数解析失败也应保留这个调用");
+    assertProviderStream(type(requests[0]["arguments"]) == "dict", "失败时应给出字典占位");
+    assertProviderStream(requests[0]["arguments"].get("parse_error", nil) != nil,
+        "占位里应说明解析失败");
+    assertProviderStream(str(requests[0]["rawArguments"]) == "{\"not json\"",
+        "占位里应保留原文");
+}
+
+func testProviderStreamUsage() {
+    let state = nexora_chat_stream_state();
+    let chunk = {"choices": [], "usage": {"prompt_tokens": 25,
+        "completion_tokens": 20, "total_tokens": 45}};
+    let events = nexora_chat_stream_apply(state, chunk);
+
+    assertProviderStream(events.length() == 1, "usage 块应产出一个事件");
+    assertProviderStream(str(events[0]["type"]) == "usage", "事件类型应为 usage");
+    let usage = state.get("usage", nil);
+    assertProviderStream(type(usage) == "dict", "应记录 usage");
+    assertProviderStream(int(usage["prompt_tokens"]) == 25, "prompt_tokens 应保留");
+
+    // choices 为空不应产出文本事件。
+    assertProviderStream(state.get("textParts", []).length() == 0, "usage 块不该改正文");
+}
+
+func testProviderStreamReasoning() {
+    let state = nexora_chat_stream_state();
+    let first = nexora_chat_stream_apply(state, {"choices": [{"index": 0,
+        "delta": {"reasoning_content": "想"}, "finish_reason": nil}]});
+    assertProviderStream(first.length() == 1, "思考增量应产出一个事件");
+    assertProviderStream(str(first[0]["type"]) == "thinking", "事件类型应为 thinking");
+    assertProviderStream(str(string_join(state["reasoningParts"])) == "想", "应累计思考文本");
+    assertProviderStream(str(string_join(state["textParts"])) == "", "思考不应混进正文");
+
+    nexora_chat_stream_apply(state, {"choices": [{"index": 0,
+        "delta": {"reasoning_content": "了", "content": "答"}, "finish_reason": nil}]});
+    assertProviderStream(str(string_join(state["reasoningParts"])) == "想了", "思考应继续累计");
+    assertProviderStream(str(string_join(state["textParts"])) == "答", "正文单独累计");
+
+    let message = nexora_chat_stream_message(state);
+    assertProviderStream(message.get("reasoning_content", nil) == nil,
+        "思考不应回填进 assistant 消息（部分服务端会因此 400）");
+    assertProviderStream(str(message["content"]) == "答", "消息正文只含 content");
+}
+
+func testProviderStreamPayload() {
+    let messages = [{"role": "user", "content": "hi"}];
+
+    let plain = nexora_chat_stream_payload("m", messages);
+    assertProviderStream(plain["stream"] == true, "流式请求必须显式 stream=true");
+    assertProviderStream(plain.get("tools", nil) == nil, "没有工具就不应下发 tools");
+    assertProviderStream(type(plain.get("stream_options", nil)) == "dict",
+        "默认应索取 usage");
+    assertProviderStream(plain.get("temperature", nil) == nil, "未指定温度就不下发");
+    assertProviderStream(plain.get("max_tokens", nil) == nil, "未指定上限就不下发");
+
+    let emptyTools = nexora_chat_stream_payload("m", messages, [], nil, nil);
+    assertProviderStream(emptyTools.get("tools", nil) == nil, "空工具表不应下发");
+
+    let tools = [{"type": "function", "function": {"name": "noop"}}];
+    let full = nexora_chat_stream_payload("m", messages, tools, 0.2, 512, false);
+    assertProviderStream(type(full.get("tools", nil)) == "Array", "有工具时应下发 tools");
+    assertProviderStream(full["temperature"] == 0.2, "温度应原样下发");
+    assertProviderStream(int(full["max_tokens"]) == 512, "上限应原样下发");
+    assertProviderStream(full.get("stream_options", nil) == nil,
+        "includeUsage=false 时不应索取 usage");
+
+    let toolMessage = nexora_tool_result_message("call_a", "done");
+    assertProviderStream(str(toolMessage["role"]) == "tool", "工具消息角色应为 tool");
+    assertProviderStream(str(toolMessage["tool_call_id"]) == "call_a", "工具消息应带调用 id");
+    assertProviderStream(str(toolMessage["content"]) == "done", "工具消息应带输出");
+}
+
+func testProviderStream() {
+    testProviderStreamText();
+    testProviderStreamToolFragments();
+    testProviderStreamBadArguments();
+    testProviderStreamUsage();
+    testProviderStreamReasoning();
+    testProviderStreamPayload();
+}

@@ -1,5 +1,8 @@
 #pragma once
 
+#include "ZeusCallSetupScope.hpp"
+#include "Dispatch/ZeusVMDispatchConfig.hpp"
+
 #include <string>
 #include <stack>
 #include <variant>
@@ -17,6 +20,7 @@
 #include <limits>
 #include <cstring>
 #include <memory>
+#include <functional>
 
 // Windows Socket headers
 #ifdef _WIN32
@@ -48,6 +52,7 @@
 #include "ZeusVMAddress.hpp"
 #include "ZeusVMSlots.hpp"
 #include "ZeusVMCopy.hpp"
+#include "ZeusVMRoots.hpp"
 #include "../ZeusTyping/GenericTypeName.hpp"
 #include "ZeusHotspot.hpp"
 #include "../ZeusRuntimeLib/ZeusGC.hpp"
@@ -114,6 +119,11 @@ class VM {
     public:
         std::vector<ZeusType::UniversalVariant> data;
         std::vector<uint8_t> owner; // bit0: owns ObjectHandle, bit1: owns ClosureHandle
+        std::function<void(const ZeusType::UniversalVariant&)> temporaryRoot;
+
+        void pinTemporary(size_t index) {
+            if (owner[index] && temporaryRoot) temporaryRoot(data[index]);
+        }
 
         static uint8_t calcOwner(const ZeusType::UniversalVariant& v) {
             if (std::holds_alternative<ZeusType::ObjectHandle>(v)) return 0x1;
@@ -158,20 +168,24 @@ class VM {
             insert(idx, v);
         }
         void erase(size_t idx) {
+            pinTemporary(idx);
             data.erase(data.begin() + idx);
             owner.erase(owner.begin() + idx);
         }
         void pop_back() {
+            pinTemporary(data.size() - 1);
             data.pop_back();
             owner.pop_back();
         }
         uint8_t ownerFlag(size_t idx) const { return owner[idx]; }
         void setOwnerFlag(size_t idx, uint8_t f) { owner[idx] = f; }
         void set(size_t idx, const ZeusType::UniversalVariant& v) {
+            pinTemporary(idx);
             data[idx] = v;
             owner[idx] = calcOwner(v);
         }
         void set(size_t idx, ZeusType::UniversalVariant&& v) {
+            pinTemporary(idx);
             owner[idx] = calcOwner(v);
             data[idx] = std::move(v);
         }
@@ -185,6 +199,11 @@ class VM {
     
     // 子线程继承的资源边界（析构时跳过这些资源的释放）
     size_t inheritedGlobalSize = 0;       // 继承的 global 槽数
+    size_t packageGlobalCount = 0;        // 编译结果中的包全局槽位前缀
+    size_t mainGlobalStart = 0;           // 主程序槽位起点（namespace import 别名之后）
+    size_t mainGlobalEnd = 0;             // 合并包专属别名前的终点
+    size_t teardownLayoutGlobalCount = 0;
+    bool hasGlobalTeardownLayout = false;
     size_t inheritedClosuresSize = 0;     // 继承的 closures 数
 
     // 调用深度计数器：通过栈帧数量跟踪（不再受C++栈限制）
@@ -194,6 +213,15 @@ class VM {
     bool justPushedFrame = false;
 
     // 析构函数：清理所有分配的内存
+    VM() {
+        stack.temporaryRoot = [this](const ZeusType::UniversalVariant& value) {
+            pinVMTemporaryRoot(value);
+        };
+        ZeusVMRoots::Snapshot roots;
+        roots.objectTable = &objects;
+        ZeusVMRoots::Registry::publish(this, std::move(roots));
+    }
+
     ~VM() {
         ZEUS_DEBUG_PRINT("[~VM] Destructor: inheritedGlobalSize=%zu, global=%zu, local=%zu, upvalue=%zu",
             inheritedGlobalSize, global.size(), local.size(), upvalue.size());
@@ -203,29 +231,68 @@ class VM {
         shrinkStackWithRelease(0);
         stack.clear();
          
-        // 释放局部变量（通常在函数返回时已清理）
-        // 使用 releaseCellAndContent 确保 Cell 内的 ClosureHandle 也被释放
-        for (auto* cell : local) {
-            if (cell) releaseCellAndContent(cell);
-        }
-        local.clear();
-        
-        // 释放全局变量（跳过继承的槽位，只释放本 VM 新增的）
-        for (size_t i = inheritedGlobalSize; i < global.size(); ++i) {
-            if (global[i]) releaseCellAndContent(global[i]);
+        // Detach the environment before user destruction can re-enter the VM.
+        releaseCurrentFrameEnvironment();
+
+        auto releaseGlobalSlot = [&](size_t index) {
+            Cell* owned = global[index];
+            global[index] = nullptr;
+            if (owned) releaseCellAndContent(owned);
+        };
+
+        if (!hasGlobalTeardownLayout) {
+            for (size_t i = inheritedGlobalSize; i < global.size(); ++i) {
+                releaseGlobalSlot(i);
+            }
+        } else {
+            const size_t firstOwnedGlobal = std::min(inheritedGlobalSize, global.size());
+            const size_t layoutEnd = std::min(teardownLayoutGlobalCount, global.size());
+            const size_t packageGlobalEnd = std::min(packageGlobalCount, layoutEnd);
+            const size_t programGlobalStart = std::min(mainGlobalStart, layoutEnd);
+            const size_t programGlobalEnd = std::min(mainGlobalEnd, layoutEnd);
+            auto releaseLateProgramGlobals = [&]() {
+                for (size_t i = std::max(firstOwnedGlobal, teardownLayoutGlobalCount);
+                     i < global.size(); ++i) {
+                    releaseGlobalSlot(i);
+                }
+            };
+
+            // Release root program globals in their existing slot order while
+            // root namespace aliases and package globals remain available.
+            for (size_t i = std::max(firstOwnedGlobal, programGlobalStart);
+                 i < programGlobalEnd; ++i) {
+                releaseGlobalSlot(i);
+            }
+            releaseLateProgramGlobals();
+
+            // Namespace import aliases are pre-registered before root program
+            // globals. Release that prefix only after their finalizers finish.
+            for (size_t i = std::max(firstOwnedGlobal, packageGlobalEnd);
+                 i < programGlobalStart; ++i) {
+                releaseGlobalSlot(i);
+            }
+            releaseLateProgramGlobals();
+
+            for (size_t i = firstOwnedGlobal; i < packageGlobalEnd; ++i) {
+                releaseGlobalSlot(i);
+                releaseLateProgramGlobals();
+            }
+
+            // Package namespace aliases are appended after the root program
+            // globals and remain available until all package finalizers finish.
+            const size_t packageAliasStart = std::max(firstOwnedGlobal, programGlobalEnd);
+            for (size_t i = packageAliasStart; i < layoutEnd; ++i) {
+                releaseGlobalSlot(i);
+                releaseLateProgramGlobals();
+            }
         }
         global.clear();
-        
-        // 释放上值
-        for (auto* cell : upvalue) {
-            if (cell) releaseCellAndContent(cell);
-        }
-        upvalue.clear();
         
         // Detach all local closures before releasing captures. Captures may
         // contain a container that points back to this or another closure.
         std::vector<ClosureReleasePayload> closurePayloads;
         {
+            std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
             std::unique_lock<std::shared_mutex> lock(closuresMutex);
             for (size_t i = inheritedClosuresSize; i < closures.size(); ++i) {
                 auto& closure = closures[i];
@@ -243,6 +310,67 @@ class VM {
             releaseClosurePayload(payload);
         }
         closures.clear();
+        ZeusVMRoots::Registry::remove(this);
+    }
+
+    int signedIntegerBitsFor(const std::string& typeName) const {
+        const auto* abi = ZeusBuiltins::findNativeSignedIntegerABI(typeName);
+        return abi ? abi->integerBits : 0;
+    }
+
+    int unsignedIntegerBitsFor(const std::string& typeName) const {
+        const auto* abi = ZeusBuiltins::findNativeUnsignedIntegerABI(typeName);
+        return abi ? abi->integerBits : 0;
+    }
+
+    uint32_t nativeFloatingPointBitsFor(const std::string& typeName) const {
+        return ZeusBuiltins::nativeFloatingPointBits(typeName);
+    }
+
+    ZeusType::UniversalVariant normalizeNativeScalarValue(
+        const std::string& typeName,
+        const ZeusType::UniversalVariant& value
+    ) const {
+        if (const int bits = signedIntegerBitsFor(typeName)) {
+            return ZeusSignedInteger::normalize(value, bits);
+        }
+        if (const int bits = unsignedIntegerBitsFor(typeName)) {
+            return ZeusUnsignedInteger::normalize(value, bits);
+        }
+        if (nativeFloatingPointBitsFor(typeName) == 32) {
+            return ZeusNativeFloat::normalize(value);
+        }
+        if (nativeFloatingPointBitsFor(typeName) == 64) {
+            return ZeusNativeDouble::normalize(value);
+        }
+        return value;
+    }
+
+    void configureNativeScalarCell(Cell* cell, const std::string& typeName) const {
+        if (!cell) return;
+        cell->signedIntegerBits = signedIntegerBitsFor(typeName);
+        cell->unsignedIntegerBits = unsignedIntegerBitsFor(typeName);
+        cell->nativeFloatingPointBits = nativeFloatingPointBitsFor(typeName);
+    }
+
+    bool validateNativeScalarReturn(const std::vector<IRType::IRInstr>& code,
+                                    const IRType::IRInstr& returningInstruction) {
+        for (const auto& instruction : code) {
+            if (instruction.metadata.kind != IRType::IRMetadataKind::FunctionSignature) continue;
+            const std::string& returnType = instruction.metadata.typeName;
+            const bool nativeScalar = ZeusBuiltins::findNativeScalarCanonical(returnType) != nullptr;
+            try {
+                if (nativeScalar) {
+                    if (stack.empty()) throw std::runtime_error("Native integer function returned no value");
+                    stack.back() = normalizeNativeScalarValue(returnType, stack.back());
+                }
+            } catch (const std::exception& error) {
+                VMException::VMException(error.what(), __line, returningInstruction)._throw(vmstat, currentChunk);
+                return false;
+            }
+            return true;
+        }
+        return true;
     }
 
     Cell* newCell(const ZeusType::UniversalVariant& v, uint8_t flags = 0, const char* createdBy = "unknown") {
@@ -267,6 +395,9 @@ class VM {
         }
 
         Cell* c = new Cell{loadCellValue(src), src->flags, __nextCellId()};
+        c->signedIntegerBits = src->signedIntegerBits;
+        c->unsignedIntegerBits = src->unsignedIntegerBits;
+        c->nativeFloatingPointBits = src->nativeFloatingPointBits;
         c->createdAtMs = __getCurrentTimeMs();
         c->createdBy = createdBy;
         HeapStats::recordCreate();  // 修复：cloneCell 也需要记录创建
@@ -293,6 +424,7 @@ class VM {
         size_t calleeIndex = 0;          // callee 在栈中的起始索引
         int nativeId = -1;               // 内建函数的 id
         const ZeusBuiltins::NativeFuncDescriptor* desc = nullptr;
+        const ZeusBuiltins::DynamicNativeImportDescriptor* dynamicImport = nullptr;
         ZeusBuiltins::NativeFuncDescriptor injectedDescriptor;
     };
 
@@ -330,6 +462,15 @@ class VM {
                 injection->callback,
                 injection->minArity,
                 injection->maxArity};
+            ctx.desc = &ctx.injectedDescriptor;
+        } else if (const auto* dynamicImport =
+                       ZeusBuiltins::dynamicNativeImportFromHandle(ctx.nativeId)) {
+            ctx.dynamicImport = dynamicImport;
+            ctx.injectedDescriptor = ZeusBuiltins::NativeFuncDescriptor{
+                dynamicImport->declarationName,
+                nullptr,
+                static_cast<int>(dynamicImport->parameterTypes.size()),
+                static_cast<int>(dynamicImport->parameterTypes.size())};
             ctx.desc = &ctx.injectedDescriptor;
         }
 
@@ -395,7 +536,11 @@ class VM {
 
         try {
             // 特殊处理需要访问VM内部状态的内置函数
-            if (ctx.desc->name == "__getglobal") {
+            if (ctx.dynamicImport) {
+                publishVMRoots();
+                ret = ZeusBuiltins::invokeDynamicNativeImport(*ctx.dynamicImport, args);
+            }
+            else if (ctx.desc->name == "__getglobal") {
                 // __getglobal(index) -> value
                 if (args.size() != 1) {
                     throw std::runtime_error("__getglobal expects 1 argument");
@@ -698,10 +843,10 @@ class VM {
                 
                 if (std::holds_alternative<ZeusType::ObjectHandle>(args[0])) {
                     // ObjectHandle - 从 objects 数组获取
-                    int objId = std::get<ZeusType::ObjectHandle>(args[0]).id;
-                    auto* objPtr = getObject(objId);
+                    const auto& objectHandle = std::get<ZeusType::ObjectHandle>(args[0]);
+                    auto* objPtr = getValidObject(objectHandle);
                     if (!objPtr) {
-                        throw std::runtime_error("hasKey: invalid object id");
+                        throw std::runtime_error("hasKey: invalid or stale object handle");
                     }
                     const auto& obj = *objPtr;
                     exists = hasObjectField(obj, keyStr);
@@ -796,10 +941,10 @@ class VM {
                     throw std::runtime_error("getattr: first argument must be an object");
                 }
                 
-                int objId = std::get<ZeusType::ObjectHandle>(objVar).id;
-                auto* objPtr = getObject(objId);
+                const auto& objectHandle = std::get<ZeusType::ObjectHandle>(objVar);
+                auto* objPtr = getValidObject(objectHandle);
                 if (!objPtr) {
-                    throw std::runtime_error("getattr: invalid object id");
+                    throw std::runtime_error("getattr: invalid or stale object handle");
                 }
                 
                 auto& obj = *objPtr;
@@ -854,10 +999,10 @@ class VM {
                     throw std::runtime_error("__objget: first argument must be an object");
                 }
                 
-                int objId = std::get<ZeusType::ObjectHandle>(objVar).id;
-                auto* objPtr = getObject(objId);
+                const auto& objectHandle = std::get<ZeusType::ObjectHandle>(objVar);
+                auto* objPtr = getValidObject(objectHandle);
                 if (!objPtr) {
-                    throw std::runtime_error("__objget: invalid object id");
+                    throw std::runtime_error("__objget: invalid or stale object handle");
                 }
                 
                 auto& obj = *objPtr;
@@ -936,10 +1081,10 @@ class VM {
                     throw std::runtime_error("__objset: first argument must be an object");
                 }
                 
-                int objId = std::get<ZeusType::ObjectHandle>(objVar).id;
-                auto* objPtr = getObject(objId);
+                const auto& objectHandle = std::get<ZeusType::ObjectHandle>(objVar);
+                auto* objPtr = getValidObject(objectHandle);
                 if (!objPtr) {
-                    throw std::runtime_error("__objset: invalid object id");
+                    throw std::runtime_error("__objset: invalid or stale object handle");
                 }
                 
                 auto& obj = *objPtr;
@@ -996,10 +1141,10 @@ class VM {
                     throw std::runtime_error("setattr: first argument must be an object");
                 }
                 
-                int objId = std::get<ZeusType::ObjectHandle>(objVar).id;
-                auto* objPtr = getObject(objId);
+                const auto& objectHandle = std::get<ZeusType::ObjectHandle>(objVar);
+                auto* objPtr = getValidObject(objectHandle);
                 if (!objPtr) {
-                    throw std::runtime_error("setattr: invalid object id");
+                    throw std::runtime_error("setattr: invalid or stale object handle");
                 }
                 
                 auto& obj = *objPtr;
@@ -1033,6 +1178,7 @@ class VM {
             // 所有内置函数现在统一通过注册表调用
             else {
                 // 普通内置函数,调用注册的函数指针
+                publishVMRoots();
                 ret = ctx.desc->fn(args);
 
                 if (hasArrayArgumentSnapshot) {
@@ -1195,6 +1341,9 @@ class VM {
         const std::vector<IRType::IRInstr>* code;  // 当前代码块
         size_t stackBase;                  // 注册时的栈基址（用于恢复）
         size_t localSize;                  // 注册时的局部变量数（用于恢复）
+        // 注册时的 with 块深度：异常展开时要把超出的 with 块逐个退出，
+        // 否则块内的 operator[~with] 永远不会执行（线程不汇合、句柄不关闭）。
+        size_t withDepth = 0;
     };
     std::vector<ExceptionHandler> exceptionHandlers;  // 异常处理器栈
     ZeusType::UniversalVariant currentException;      // 当前捕获的异常
@@ -1259,6 +1408,22 @@ class VM {
         }
     }
 
+    void setGlobalTeardownLayout(
+        size_t packageCount,
+        size_t programStart,
+        size_t programEnd
+    ) {
+        if (packageCount > programStart || programStart > programEnd ||
+            programEnd > global.size()) {
+            throw std::invalid_argument("invalid VM global teardown layout");
+        }
+        packageGlobalCount = packageCount;
+        mainGlobalStart = programStart;
+        mainGlobalEnd = programEnd;
+        teardownLayoutGlobalCount = global.size();
+        hasGlobalTeardownLayout = true;
+    }
+
     void configureBreakpoints(
         const ZeusDebug::BreakpointConfig& config,
         const std::string& sourcePath
@@ -1305,22 +1470,18 @@ class VM {
     // 返回对象指针，如果 handle 无效则返回 nullptr
     ZeusType::ObjectInstance* getValidObject(const ZeusType::ObjectHandle& handle) {
         auto* obj = getObject(handle.id);
-        
+
         if (!obj) return nullptr;
-        
-        // 检查 generation 是否匹配（slot 复用后 generation 会递增）
-        if (obj->generation != handle.generation) {
-            ZEUS_DEBUG_PRINT("[GC] Stale object reference: handle.id=%d handle.gen=%d obj.gen=%d", 
+
+        // What counts as a live handle is decided in ZeusVMUtils, so the shared
+        // heap path and this one cannot drift apart. Only the reporting is
+        // local, because only this path can name the slot it looked in.
+        if (!ZeusVMUtils::isValidObjectHandle(*obj, handle)) {
+            ZEUS_DEBUG_PRINT("[GC] Stale object reference: handle.id=%d handle.gen=%d obj.gen=%d",
                              handle.id, handle.generation, obj->generation);
             return nullptr;
         }
-        
-        // 检查对象是否已标记删除
-        if (obj->markedForDeletion || obj->classId < 0) {
-            ZEUS_DEBUG_PRINT("[GC] Accessing deleted object: id=%d classId=%d", handle.id, obj->classId);
-            return nullptr;
-        }
-        
+
         return obj;
     }
     
@@ -1367,6 +1528,14 @@ class VM {
     ) {
         const auto* classInfo = getClass(object.classId);
         if (classInfo) {
+            const auto fieldType = classInfo->explicitFieldTypes.find(name);
+            if (fieldType != classInfo->explicitFieldTypes.end()) {
+                if (ZeusBuiltins::findNativeScalarCanonical(fieldType->second)) {
+                    ZeusType::writeObjectField(object, *classInfo, name,
+                        normalizeNativeScalarValue(fieldType->second, value));
+                    return;
+                }
+            }
             ZeusType::writeObjectField(object, *classInfo, name, value);
             return;
         }
@@ -1381,6 +1550,64 @@ class VM {
             object.extensionValues.begin(), object.extensionValues.end());
     }
 
+    // Turns a source-level field default into the runtime value a fresh
+    // instance starts with.
+    //
+    // The IR generator already classifies every literal default it can express,
+    // so the VM reads that description rather than re-deriving the value from
+    // the class object. The class object's copy is only trustworthy for a class
+    // compiled into the main chunk: a class arriving from an imported package
+    // carries unrelated values there, so relying on it silently produced
+    // garbage field values for every package class.
+    //
+    // Returns false for a default the generator could not classify, which
+    // includes every field that has an initializer function because those are
+    // computed at construction time. The caller then leaves the existing
+    // default in place.
+    static bool classFieldDefaultValue(
+        const IRType::ClassFieldDefault& declared,
+        ZeusType::UniversalVariant& out
+    ) {
+        switch (declared.kind) {
+            case IRType::ClassFieldDefaultKind::Integer:
+                out = LexerType::Value(
+                    ZeusType::BigInteger(declared.integerValue));
+                return true;
+            case IRType::ClassFieldDefaultKind::Boolean:
+                out = LexerType::Value(declared.booleanValue);
+                return true;
+            case IRType::ClassFieldDefaultKind::String:
+                out = LexerType::Value(declared.stringValue);
+                return true;
+            case IRType::ClassFieldDefaultKind::Bytes: {
+                ZeusType::Bytes bytes;
+                bytes.data.assign(
+                    declared.bytesValue.begin(), declared.bytesValue.end());
+                out = ZeusType::Variant(std::move(bytes));
+                return true;
+            }
+            case IRType::ClassFieldDefaultKind::Null:
+                out = ZeusType::Variant(ZeusType::Null());
+                return true;
+            case IRType::ClassFieldDefaultKind::EmptyArray: {
+                ZeusType::Array array;
+                array.impl = ZeusGC::makeArrayData();
+                out = ZeusType::Variant(std::move(array));
+                return true;
+            }
+            case IRType::ClassFieldDefaultKind::EmptyDict: {
+                ZeusType::Object dictionary;
+                dictionary.impl = ZeusGC::makeObjectData();
+                out = ZeusType::Variant(std::move(dictionary));
+                return true;
+            }
+            case IRType::ClassFieldDefaultKind::Zero:
+            case IRType::ClassFieldDefaultKind::Unsupported:
+                break;
+        }
+        return false;
+    }
+
     bool applyClassFieldTypeMetadata(
         const IRType::IRMetadata& metadata,
         const std::string& className,
@@ -1393,11 +1620,12 @@ class VM {
         std::vector<std::string> fieldNames;
         std::vector<std::string> fieldTypes;
         std::vector<bool> constFields;
+        std::vector<IRType::ClassFieldDefault> defaults;
         std::vector<std::string> initializerNames;
         std::vector<bool> explicitTypes;
         if (!metadata.readClassLayout(
                 metadataClassName, fieldNames, fieldTypes,
-                &constFields, nullptr, nullptr, &explicitTypes,
+                &constFields, &defaults, nullptr, &explicitTypes,
                 &initializerNames) ||
             metadataClassName != className) {
             error = "invalid field type metadata for class '" + className + "'";
@@ -1413,7 +1641,18 @@ class VM {
                 info.explicitFieldTypes[fieldNames[index]] = fieldTypes[index];
             }
 
-            if (!initializerNames.empty() && !initializerNames[index].empty()) {
+            // A field with an initializer function is filled in at construction
+            // time, so the literal default recorded beside it never applies.
+            const bool hasInitializer =
+                !initializerNames.empty() && !initializerNames[index].empty();
+            if (!hasInitializer && index < defaults.size()) {
+                ZeusType::UniversalVariant declaredDefault;
+                if (classFieldDefaultValue(defaults[index], declaredDefault)) {
+                    field.defaultValue = std::move(declaredDefault);
+                }
+            }
+
+            if (hasInitializer) {
                 const auto proto = functionNameToProtoId.find(initializerNames[index]);
                 if (proto == functionNameToProtoId.end()) {
                     error = "field initializer function '" + initializerNames[index] +
@@ -1523,7 +1762,7 @@ class VM {
         ZeusGC::releaseVariantDeep(*this, stored);
 
         if (sharedData) {
-            sharedData->setValue(fieldName, result.value);
+            sharedData->setValue(fieldName, readObjectField(*object, fieldName));
         }
         dropStackItem(result);
         return true;
@@ -1803,6 +2042,7 @@ class VM {
     // 创建新对象，返回 ObjectHandle（包含 id 和 generation）
     // 优先复用空闲槽位，复用时递增 generation 以检测悬空引用
     ZeusType::ObjectHandle allocObject(ZeusType::ObjectInstance&& obj) {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         if (auto* classInfo = getClass(obj.classId)) {
             if (classInfo->fieldIndices.size() != classInfo->fields.size() ||
                 classInfo->fieldOrder.size() != classInfo->fields.size()) {
@@ -1830,14 +2070,20 @@ class VM {
                 (*sharedObjects)[slot] = std::move(obj);
                 
                 ZEUS_DEBUG_PRINT("[GC] Reused shared object slot #%d (gen=%d)", slot, newGen);
-                return ZeusType::ObjectHandle{slot, newGen};
+                lock.unlock();
+                const ZeusType::ObjectHandle handle{slot, newGen};
+                pinVMObjectRoot(handle);
+                return handle;
             }
             
             int objId = (int)sharedObjects->size();
             obj.generation = 0;
             sharedObjects->push_back(std::move(obj));
             ZEUS_DEBUG_PRINT("[GC] Allocated shared object #%d", objId);
-            return ZeusType::ObjectHandle{objId, 0};
+            lock.unlock();
+                const ZeusType::ObjectHandle handle{objId, 0};
+                pinVMObjectRoot(handle);
+                return handle;
         }
         
         // 使用写锁保护 objects 的修改（包括槽位复用和新分配）
@@ -1855,14 +2101,20 @@ class VM {
             objects[slot] = std::move(obj);
             
             ZEUS_DEBUG_PRINT("[GC] Reused object slot #%d (gen=%d)", slot, newGen);
-            return ZeusType::ObjectHandle{slot, newGen};
+            lock.unlock();
+                const ZeusType::ObjectHandle handle{slot, newGen};
+                pinVMObjectRoot(handle);
+                return handle;
         }
         
         // 没有空闲槽位，分配新槽位
         int objId = (int)objects.size();
         obj.generation = 0;
         objects.push_back(std::move(obj));
-        return ZeusType::ObjectHandle{objId, 0};
+        lock.unlock();
+                const ZeusType::ObjectHandle handle{objId, 0};
+                pinVMObjectRoot(handle);
+                return handle;
     }
     
     // 释放 Cell 及其内容（如果内容是 ClosureHandle 或 ObjectHandle，也会释放）
@@ -1886,6 +2138,7 @@ class VM {
         ClosureReleasePayload& payload,
         bool force = false
     ) {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         std::unique_lock<std::shared_mutex> lock(closuresMutex);
         Closure* closure = getClosure(closureId);
         if (!closure || closure->isFreed()) return false;
@@ -1935,10 +2188,12 @@ class VM {
 
     // 增加对象引用计数
     void retainObject(int objId) {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         auto* obj = getMutableObject(objId);
         
         if (obj && !obj->markedForDeletion) {
             obj->retain();
+            pinVMObjectRoot(ZeusType::ObjectHandle{objId, obj->generation});
             ZEUS_DEBUG_PRINT("[GC] Object #%d retain -> refCount=%d", objId, obj->refCount);
             if (obj->classId == 20 || obj->classId == 17 || obj->classId == 18) {
                 ZEUS_DEBUG_PRINT("[GC][TRACE] classId=%d retain -> refCount=%d", obj->classId, obj->refCount);
@@ -1947,6 +2202,7 @@ class VM {
     }
 
     void retainObject(const ZeusType::ObjectHandle& handle) {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         auto* obj = getMutableObject(handle.id);
         if (!obj || obj->generation != handle.generation ||
             obj->markedForDeletion || obj->classId < 0) {
@@ -1955,6 +2211,7 @@ class VM {
             return;
         }
         obj->retain();
+        pinVMObjectRoot(handle);
         ZEUS_DEBUG_PRINT("[GC] Object #%d retain -> refCount=%d (gen=%d)",
             handle.id, obj->refCount, handle.generation);
     }
@@ -2011,6 +2268,7 @@ class VM {
         }
 
         const int closureId = allocClosure(std::move(closure));
+        const size_t stackBase = stack.size();
         stack.push_back(ZeusType::ClosureHandle{closureId});
         struct ThisHoldGuard {
             VM* vm;
@@ -2022,6 +2280,9 @@ class VM {
         retainObject(handle);
 
         const bool completed = executeClosureSync(closureId, 0);
+        if (stack.size() > stackBase) {
+            shrinkStackWithRelease(stackBase);
+        }
         if (thisCell) thisCell->release();
         releaseClosure(closureId);
         return completed;
@@ -2090,6 +2351,7 @@ class VM {
     
     // 便捷重载：从单个对象开始打断循环
     void forceBreakClosureCycles(const ZeusType::ObjectHandle& handle) {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         std::set<std::pair<int, int>> visited;
         PendingCycleBreakRelease pending;
         forceBreakClosureCycles(handle, visited, pending);
@@ -2130,6 +2392,7 @@ class VM {
 
     // 减少对象引用计数，必要时释放
     void releaseObject(int objId) {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         auto* obj = getMutableObject(objId);
 
         if (!obj) return;
@@ -2197,6 +2460,7 @@ class VM {
     
     // 创建新闭包，返回闭包 ID（优先复用空闲槽位，线程安全）
     void releaseObject(const ZeusType::ObjectHandle& handle) {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         auto* obj = getMutableObject(handle.id);
         if (!obj || obj->generation != handle.generation) {
             ZEUS_DEBUG_PRINT("[GC] Ignored stale object release: id=%d handle.gen=%d current.gen=%d",
@@ -2207,6 +2471,7 @@ class VM {
     }
 
     int allocClosure(Closure&& clo) {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         std::unique_lock<std::shared_mutex> lock(closuresMutex);
         clo.refCount = 1;
         
@@ -2216,6 +2481,7 @@ class VM {
             if (freeClosureSlotsCount > 0) freeClosureSlotsCount--;
             closures[slot] = std::move(clo);
             ZEUS_DEBUG_PRINT("[GC] Reused closure slot #%d", slot);
+            pinVMClosureRoot(slot);
             return slot;
         }
 
@@ -2223,6 +2489,7 @@ class VM {
         closures.push_back(std::move(clo));
         closuresCount++;
         ZEUS_DEBUG_PRINT("[GC] allocClosure: new closure id=%d protoId=%d", cloId, closures[cloId].protoId);
+        pinVMClosureRoot(cloId);
         return cloId;
     }    // 调试: 输出当前闭包列表的详情（用于内置的 __closure_details 调用）
     std::string dumpClosureDetails() const {
@@ -2240,7 +2507,9 @@ class VM {
                 } else if (oid >= 0 && oid < (int)objects.size()) {
                     obj = &objects[oid];
                 }
-                if (obj && obj->classId >= 0 && obj->classId < (int)classes.size()) {
+                if (obj && c.boundThis->generation == obj->generation &&
+                    !obj->markedForDeletion && obj->classId >= 0 &&
+                    obj->classId < (int)classes.size()) {
                     cname = classes[obj->classId].name;
                 }
                 oss << " boundThis=" << oid << ":" << cname;
@@ -2250,28 +2519,33 @@ class VM {
         return oss.str();
     }
 
+    #include "ZeusVMRootSnapshots.inl"
+
     // ========== Mark/Sweep GC (补充) ==========
     // 现有引用计数在一些路径下会留下“无根 refCount=1”的对象（例如栈/Cell 所有权不对称时）。
     // 这里提供一个保守的 mark-sweep，用于在安全点（RETURN/DELETE_VAR）回收真正不可达的对象/闭包。
     void collectGarbageSweep() {
         std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+        publishVMRoots();
+        auto& gcObjects = sharedObjects ? *sharedObjects : objects;
         // Mark vectors sized to current storage.
-        std::vector<uint8_t> markedObj(objects.size(), 0);
+        std::vector<uint8_t> markedObj(gcObjects.size(), 0);
         std::vector<int> objectGenerations;
-        objectGenerations.reserve(objects.size());
-        for (const auto& object : objects) objectGenerations.push_back(object.generation);
+        objectGenerations.reserve(gcObjects.size());
+        for (const auto& object : gcObjects) objectGenerations.push_back(object.generation);
         std::vector<uint8_t> markedClo(closures.size(), 0);
         std::unordered_set<const void*> markedNativeClo;
         std::unordered_set<const void*> markedContainers;
         std::vector<std::shared_ptr<void>> nativeClosureRoots;
 
-        auto markObject = [&](int objId, auto&& markObjectRef, auto&& markVariantRef) -> void {
-            if (objId < 0 || objId >= (int)objects.size()) return;
-            auto& obj = objects[(size_t)objId];
-            if (obj.classId < 0 || obj.markedForDeletion) return;
-            if (markedObj[(size_t)objId]) return;
-            markedObj[(size_t)objId] = 1;
-            const auto fields = snapshotObjectFields(obj);
+        auto markObject = [&](const ZeusType::ObjectHandle& objectHandle,
+                              auto&& markObjectRef, auto&& markVariantRef) -> void {
+            auto* object = ZeusVMUtils::getValidObject(gcObjects, objectHandle);
+            if (!object) return;
+            const size_t objId = static_cast<size_t>(objectHandle.id);
+            if (markedObj[objId]) return;
+            markedObj[objId] = 1;
+            const auto fields = snapshotObjectFields(*object);
             for (const auto& kv : fields) {
                 markVariantRef(kv.second, markVariantRef, markObjectRef);
             }
@@ -2292,14 +2566,14 @@ class VM {
             }
             // mark boundThis
             if (clo->boundThis.has_value()) {
-                markObjectRef(clo->boundThis->id, markObjectRef, markVariantRef);
+                markObjectRef(*clo->boundThis, markObjectRef, markVariantRef);
             }
         };
 
         auto markVariant = [&](const ZeusType::UniversalVariant& v, auto&& markVariantRef, auto&& markObjectRef) -> void {
             if (std::holds_alternative<ZeusType::ObjectHandle>(v)) {
-                int oid = std::get<ZeusType::ObjectHandle>(v).id;
-                markObjectRef(oid, markObjectRef, markVariantRef);
+                const auto& objectHandle = std::get<ZeusType::ObjectHandle>(v);
+                markObjectRef(objectHandle, markObjectRef, markVariantRef);
                 return;
             }
             if (std::holds_alternative<ZeusType::ClosureHandle>(v)) {
@@ -2354,25 +2628,64 @@ class VM {
             markVariant(stack[i], markVariant, markObject);
         }
 
-        // Roots: global/local/upvalue Cells
-        for (auto* cell : global) {
-            if (cell) {
+        auto markCells = [&](const std::vector<Cell*>& cells) {
+            for (auto* cell : cells) {
+                if (!cell) continue;
                 const auto value = cell->readValue();
                 markVariant(value, markVariant, markObject);
             }
-        }
-        for (auto* cell : local) {
-            if (cell) {
-                const auto value = cell->readValue();
-                markVariant(value, markVariant, markObject);
+        };
+        markCells(global);
+        markCells(local);
+        markCells(upvalue);
+
+        // Calling a function moves the caller's cells into its call frame.
+        // A collection inside that callee must keep suspended callers alive,
+        // including constructors whose result has not reached the stack yet.
+        for (const auto& frame : callFrames) {
+            markCells(frame.savedLocal);
+            markCells(frame.savedUpvalue);
+            if (frame.constructorResult) {
+                markObject(*frame.constructorResult, markObject, markVariant);
             }
         }
-        for (auto* cell : upvalue) {
-            if (cell) {
-                const auto value = cell->readValue();
+        markVariant(currentException, markVariant, markObject);
+
+        // Roots: shared heap bindings. A class instance referenced only by a
+        // shared variable lives in the shared object table; without this it
+        // would be reclaimed here and run operator[~] while other threads are
+        // still using it. Only object handles need marking, but the shared cell
+        // may also hold a container with nested handles, so reuse markVariant.
+        ZeusShared::getGlobalHeap().visitValues(
+            [&](const ZeusType::UniversalVariant& value) {
                 markVariant(value, markVariant, markObject);
-            }
-        }
+            });
+
+        // Peer VMs publish value snapshots at their own safe points. Allocation
+        // and retain barriers add transient roots in between publications.
+        // No peer execution vector or borrowed VM pointer is read here.
+        ZeusVMRoots::Registry::visit(objectTableIdentity(), this,
+            [&](const ZeusVMRoots::Snapshot& roots) {
+                for (const auto& entry : roots.objects) {
+                    markObject(entry, markObject, markVariant);
+                }
+                for (const auto& closure : roots.closures) {
+                    if (closure.first == &closures) {
+                        markClosure(closure.second, markClosure, markVariant, markObject);
+                    }
+                }
+                for (const auto& native : roots.nativeNodes) {
+                    if (auto owner = native.second.lock()) {
+                        if (markedNativeClo.insert(native.first).second) {
+                            ZeusGC::traceNodeValues(owner,
+                                [&](const ZeusType::UniversalVariant& captured) {
+                                    markVariant(captured, markVariant, markObject);
+                                });
+                            nativeClosureRoots.push_back(std::move(owner));
+                        }
+                    }
+                }
+            });
 
         // Detach unreachable closures before releasing their captured values.
         // A captured array/dictionary may hold a ClosureHandle back edge.
@@ -2390,7 +2703,7 @@ class VM {
 
         // Sweep objects (skip pinned Namespace; treat shared objects via isSharedObject)
         for (int oid = 0; oid < static_cast<int>(markedObj.size()); ++oid) {
-            auto& obj = objects[(size_t)oid];
+            auto& obj = gcObjects[(size_t)oid];
             // A destructor may allocate into a recycled slot while sweeping.
             // Such a new object was not part of this mark pass.
             if (obj.generation != objectGenerations[(size_t)oid]) continue;
@@ -2398,9 +2711,8 @@ class VM {
             if (markedObj[(size_t)oid]) continue;
 
             // 永久保留 Namespace 对象，避免全局命名空间被误释放
-            if (obj.classId >= 0 && obj.classId < (int)classes.size()) {
-                const auto& ci = classes[obj.classId];
-                if (ci.name == "Namespace") continue;
+            if (const auto* type = getClass(obj.classId)) {
+                if (type->name == "Namespace") continue;
             }
 
             // Let the common finalizer run user destruction and release fields
@@ -2419,10 +2731,12 @@ class VM {
     
     // 增加闭包引用计数（线程安全）
     void retainClosure(int cloId) {
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         std::unique_lock<std::shared_mutex> lock(closuresMutex);
         Closure* clo = getClosure(cloId);
         if (clo && !clo->isFreed()) {
             clo->retain();
+            pinVMClosureRoot(cloId);
             ZEUS_DEBUG_PRINT("[GC] Closure #%d retain -> refCount=%d", cloId, clo->refCount);
         }
     }
@@ -2574,6 +2888,24 @@ class VM {
         int protoCounter = 0;
         for (size_t i = 0; i < bytecodes.size(); ++i) {
             const auto& bc = bytecodes[i];
+            for (const auto& instruction : bc) {
+                if (instruction.metadata.kind !=
+                        IRType::IRMetadataKind::ExternalFunctionSignature ||
+                    instruction.metadata.nativeLibraryPath.empty()) {
+                    continue;
+                }
+                const auto& metadata = instruction.metadata;
+                ZeusBuiltins::registerDynamicNativeImport(
+                    ZeusBuiltins::DynamicNativeImportDescriptor{
+                        metadata.symbol.name,
+                        metadata.nativeSymbol,
+                        metadata.nativeLibraryPath,
+                        metadata.typeName,
+                        metadata.typeNames,
+                        metadata.parameterIsReference,
+                        metadata.nativeReferenceABI
+                    });
+            }
             bool isFuncBegin = (!bc.empty() && bc.front().op == VMOperator::FUNC_BEGIN);
             ZEUS_DEBUG_PRINT("[registerPrototypes] Chunk #%zu: %zu instructions, FUNC_BEGIN=%d", 
                 i, bc.size(), isFuncBegin ? 1 : 0);
@@ -2792,6 +3124,21 @@ class VM {
         stack.resize(newSize);
     }
 
+    void assignSharedCellValue(
+        const std::shared_ptr<ZeusShared::SharedCell>& cell,
+        const ZeusType::UniversalVariant& value
+    ) {
+        // All VM shared-slot access takes the graph lock before the cell lock.
+        // Publish before releasing: destruction may re-enter Zeus and read the
+        // binding, which must already name the replacement instance.
+        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+        std::lock_guard<std::recursive_mutex> lock(cell->mutex);
+        const auto previous = cell->read();
+        ZeusGC::retainVariantDeep(*this, value);
+        cell->write(value);
+        ZeusGC::releaseVariantDeep(*this, previous);
+    }
+
     struct StackItem {
         ZeusType::UniversalVariant value;
         uint8_t owner = 0;
@@ -2836,6 +3183,7 @@ class VM {
 
     void assignCellValue(Cell* cell, const ZeusType::UniversalVariant& newVal) {
         if (!cell) return;
+        cell->validateValue(newVal);
 
         const auto oldVal = cell->readValue();
         ZeusGC::releaseVariantDeep(*this, oldVal);
@@ -2921,11 +3269,7 @@ class VM {
                 static_cast<const ZeusShared::SharedCell*>(reference->address),
                 reference->generation);
             if (!shared) return ReferenceWriteResult::Invalid;
-            std::lock_guard<std::recursive_mutex> lock(shared->mutex);
-            ZeusGC::retainVariantDeep(*this, newValue);
-            auto oldValue = shared->read();
-            shared->write(newValue);
-            ZeusGC::releaseVariantDeep(*this, oldValue);
+            assignSharedCellValue(shared, newValue);
             return ReferenceWriteResult::Stored;
         }
         return ReferenceWriteResult::Invalid;
@@ -2994,11 +3338,25 @@ class VM {
     };
 
     void releaseCurrentFrameEnvironment() {
-        for (auto* cell : local) {
+        // A Zeus destructor replaces VM.local/upvalue while executing. Keep
+        // iterators in independent storage so nested execution cannot invalidate
+        // the environment being released.
+        auto releasingLocal = std::move(local);
+        auto releasingUpvalue = std::move(upvalue);
+        local.clear();
+        upvalue.clear();
+        ZeusVMRoots::InstructionScope teardownRoots(this);
+        {
+            std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+            RootSnapshotBuilder roots(*this, false, false);
+            roots.cells(releasingLocal);
+            roots.cells(releasingUpvalue);
+            ZeusVMRoots::Registry::pin(this, std::move(roots.snapshot));
+        }
+        for (auto* cell : releasingLocal) {
             if (cell) releaseCellAndContent(cell);
         }
-
-        for (auto* cell : upvalue) {
+        for (auto* cell : releasingUpvalue) {
             if (cell) releaseCellAndContent(cell);
         }
     }
@@ -3029,6 +3387,7 @@ class VM {
     void unwindFrameEnvironments(size_t targetDepth) {
         while (callFrames.size() > targetDepth) {
             CallFrame frame = std::move(callFrames.back());
+                pinVMFrameRoots(frame);
             callFrames.pop_back();
             if (frame.pendingObjectCloneId != 0) {
                 pendingObjectClones.erase(frame.pendingObjectCloneId);
@@ -3094,6 +3453,27 @@ class VM {
 
         const ExceptionHandler handler = exceptionHandlers.back();
         const size_t catchPc = handler.catchPc;
+
+        // 异常展开：块内的 operator[~with] 必须补跑，否则线程不会汇合、句柄
+        // 不会关闭。按注册时记录的深度把超出的 with 块逐个退出；这一路不能
+        // 再抛异常（已经在展开中），失败只记录不中断。
+        if (withContextStack.size() > handler.withDepth) {
+            const ZeusType::VMStatus savedStatus = vmstat;
+            // executeClosureSync 需要一个可运行状态；这里只是借用它执行析构式
+            // 调用，结束后立刻恢复到展开前的状态。
+            vmstat = ZeusType::VMStatus::Running;
+            while (withContextStack.size() > handler.withDepth) {
+                WithContext trapped = withContextStack.back();
+                withContextStack.pop_back();
+                IRType::IRInstr exitSite;
+                if (handler.code != nullptr && catchPc < handler.code->size()) {
+                    exitSite = handler.code->at(catchPc);
+                }
+                (void)invokeWithExit(trapped, exitSite);
+            }
+            vmstat = savedStatus;
+        }
+
         unwindFrameEnvironments(handler.callFrameDepth);
         shrinkStackWithRelease(handler.stackBase);
         while (local.size() > handler.localSize) {
@@ -3124,9 +3504,13 @@ class VM {
     }
 
     void runFrameLoop(const FrameLoopOptions& options, FrameLoopState* state = nullptr) {
+        syncVMRootDomain();
         const bool captureReturn = options.captureReturn && state != nullptr;
 
         while (callFrames.size() > options.stopFrameDepth) {
+            ZeusVMRoots::InstructionScope rootInstruction(this);
+            if (instructionsUntilRootSnapshot == 0) publishVMRoots();
+            --instructionsUntilRootSnapshot;
             CallFrame& frame = callFrames.back();
 
             if (vmstat != ZeusType::VMStatus::Running) {
@@ -3149,6 +3533,7 @@ class VM {
                 ZEUS_DEBUG_PRINT("%s Frame done (depth=%zu)", options.traceName, callFrames.size());
 
                 CallFrame finishedFrame = std::move(callFrames.back());
+                pinVMFrameRoots(finishedFrame);
                 callFrames.pop_back();
                 discardFrameExceptionHandlers(callFrames.size());
 
@@ -3241,9 +3626,11 @@ class VM {
             }
 
             if (ins.op == VMOperator::RETURN) {
+                if (!validateNativeScalarReturn(*frame.code, ins)) continue;
                 if (!applyClassAssignmentCopy(ins)) continue;
                 StackItem retItem;
                 CallFrame returningFrame = std::move(callFrames.back());
+                pinVMFrameRoots(returningFrame);
                 if (returningFrame.constructorResult) {
                     if (!stack.empty()) {
                         dropStackItem(popStackItem());
@@ -3459,7 +3846,18 @@ class VM {
             }
 
             justPushedFrame = false;
-            execute(ins);
+            try {
+                execute(ins);
+            } catch (const std::bad_alloc&) {
+                throw;
+            } catch (const std::exception& error) {
+                // Let the opcode unwind before entering the VM catch path.
+                if (vmstat == ZeusType::VMStatus::Running) {
+                    VMException::VMException(error.what(), __line, ins)
+                        ._throw(vmstat, currentChunk);
+                }
+                continue;
+            }
 
             if (justPushedFrame) {
                 justPushedFrame = false;
@@ -3470,7 +3868,9 @@ class VM {
     }
 
     // 同步调用闭包：在当前上下文中执行闭包并等待返回
-    // 用于 operator[.] 等需要同步获取返回值的场景
+    // 仅用于必须同步拿到返回值的 C++ 侧流程（字段初始化器求值、析构打断循环引用）。
+    // operator 分发不走这里：它在 execute() 内转成 CALL_CLOSURE 尾调用，
+    // 压栈执行而不递归 runFrameLoop，否则每层分发都要吃掉一整个 VM 栈帧。
     // 参数：closureId - 闭包ID，argc - 参数数量（栈上已有参数）
     // 返回：执行成功返回true，失败返回false
     bool executeClosureSync(int closureId, int argc) {
@@ -3542,26 +3942,36 @@ class VM {
         
         // 初始化新的 local 数组
         // 注意：当 boundThis 存在时，即使 paramCount=0，也需要为 this 分配空间
+        ZeusVMDetail::CallSetupScope callSetup([&]() {
+            releaseCurrentFrameEnvironment();
+            local = std::move(oldLocal);
+            upvalue = std::move(oldUpvalue);
+            shrinkStackWithRelease(calleeIndex);
+            __line = oldLine;
+        });
         local.clear();
+        upvalue.clear();
         int localSize = std::max(proto.paramCount, actualArgc);
         ZEUS_DEBUG_PRINT("[executeClosureSync] localSize=%d, actualArgc=%d", localSize, actualArgc);
         local.resize(localSize);
         for (int i = 0; i < localSize; ++i) {
             local[i] = newCell(LexerType::Value(0), 0, "CLOSURE_SYNC_local");
+            if (i < static_cast<int>(proto.paramTypes.size()) &&
+                (i >= static_cast<int>(proto.paramIsReference.size()) || !proto.paramIsReference[i])) {
+                configureNativeScalarCell(local[i], proto.paramTypes[i]);
+            }
         }
         
         // 设置 upvalue
-        std::vector<Cell*> callUpvalues;
-        callUpvalues.resize(clos.upvalues.size());
+        upvalue.resize(clos.upvalues.size());
         for (size_t ci = 0; ci < clos.upvalues.size(); ++ci) {
             if (clos.upvalues[ci]) {
-                callUpvalues[ci] = clos.upvalues[ci];
-                callUpvalues[ci]->retain();
+                upvalue[ci] = clos.upvalues[ci];
+                upvalue[ci]->retain();
             } else {
-                callUpvalues[ci] = newCell(LexerType::Value(0), 0, "CLOSURE_SYNC_upvalue");
+                upvalue[ci] = newCell(LexerType::Value(0), 0, "CLOSURE_SYNC_upvalue");
             }
         }
-        upvalue = callUpvalues;
         
         // 填充参数（包括可能的 this）
         ZEUS_DEBUG_PRINT("[executeClosureSync] filling params: localSize=%d, actualArgc=%d", localSize, actualArgc);
@@ -3601,6 +4011,7 @@ class VM {
             syncFrame.paramProvided[i] = true;
         }
         callFrames.push_back(syncFrame);
+        callSetup.commit();
         FrameLoopOptions frameOptions;
         frameOptions.stopFrameDepth = initialFrameDepth;
         frameOptions.captureReturn = true;
@@ -3816,8 +4227,16 @@ class VM {
         const std::string& expectedType
     ) {
         if (expectedType.empty()) return true;
+        // A nullable (`?`) expectation accepts nil; the `?` is erased
+        // before the ordinary compatibility check runs.
+        std::string expected = expectedType;
+        const bool expectedNullable = !expected.empty() && expected.back() == '?';
+        if (expectedNullable) {
+            expected.pop_back();
+            if (runtimeValueTypeName(value) == "nil") return true;
+        }
         return ZeusRuntimeType::isCompatible(
-            expectedType,
+            expected,
             runtimeValueTypeName(value)
         );
     }
@@ -3838,6 +4257,9 @@ class VM {
             actual.erase(actual.begin());
         }
 
+        if (ZeusBuiltins::findNativeScalarCanonical(expected)) {
+            return ZeusRuntimeType::isCompatible(expected, actual);
+        }
         expected = ZeusRuntimeType::canonicalTypeName(expected);
         actual = ZeusRuntimeType::canonicalTypeName(actual);
         if (std::find(typeParameters.begin(), typeParameters.end(), expected) !=
@@ -3856,7 +4278,12 @@ class VM {
             expected, expectedBase, expectedArguments);
         const bool actualGeneric = ZeusTypeInfer::decodeGenericSpecializationName(
             actual, actualBase, actualArguments);
-        if (!expectedGeneric || !actualGeneric) return expected == actual;
+        if (!expectedGeneric || !actualGeneric) {
+            // Mirror the isCompatible rule: a plain `object` accepts
+            // dictionaries. Both names are canonicalized above.
+            if (expected == "object" && actual == "dict") return true;
+            return expected == actual;
+        }
         if (ZeusRuntimeType::canonicalTypeName(expectedBase) !=
                 ZeusRuntimeType::canonicalTypeName(actualBase) ||
             expectedArguments.size() != actualArguments.size()) {
@@ -3954,9 +4381,21 @@ class VM {
         }
         if (parameterIndex < 0 ||
             parameterIndex >= static_cast<int>(proto.paramTypes.size()) ||
-            proto.paramTypes[parameterIndex].empty() ||
-            isValueCompatibleWithGenericType(
-                value, proto.paramTypes[parameterIndex], proto.typeParameters)) {
+            proto.paramTypes[parameterIndex].empty()) {
+            return true;
+        }
+        // A nullable (`?`) parameter accepts nil; the `?` is erased before
+        // the ordinary compatibility check runs.
+        std::string expectedTypeName = proto.paramTypes[parameterIndex];
+        if (!expectedTypeName.empty() && expectedTypeName.back() == '?' &&
+            runtimeValueTypeName(value) == "nil") {
+            return true;
+        }
+        if (!expectedTypeName.empty() && expectedTypeName.back() == '?') {
+            expectedTypeName.pop_back();
+        }
+        if (isValueCompatibleWithGenericType(
+                value, expectedTypeName, proto.typeParameters)) {
             return true;
         }
 
@@ -3985,7 +4424,8 @@ class VM {
         const std::string& operatorName,
         const ZeusType::UniversalVariant* const* arguments,
         size_t argumentCount,
-        const IRType::IRInstr& instr
+        const IRType::IRInstr& instr,
+        std::optional<IRType::IRInstr>& nextInstruction
     ) {
         if (instr.metadata.kind == IRType::IRMetadataKind::IntrinsicOperator ||
             arguments == nullptr || argumentCount == 0 || arguments[0] == nullptr ||
@@ -4009,11 +4449,9 @@ class VM {
             return true;
         }
 
-        Closure closure;
-        closure.protoId = op->second;
-        closure.autoRelease = true;
-        const int closureId = allocClosure(std::move(closure));
-        stack.push_back(ZeusType::ClosureHandle{closureId});
+        // Validate every argument before the closure reaches the stack: the
+        // prepared call below owns the pushed closure and retained arguments,
+        // and an error return never dispatches them.
         for (size_t i = 0; i < argumentCount; ++i) {
             if (arguments[i] == nullptr) {
                 VMException::VMException exp(
@@ -4022,18 +4460,26 @@ class VM {
                 exp._throw(vmstat, currentChunk);
                 return true;
             }
+        }
+
+        Closure closure;
+        closure.protoId = op->second;
+        closure.autoRelease = true;
+        const int closureId = allocClosure(std::move(closure));
+        stack.push_back(ZeusType::ClosureHandle{closureId});
+        for (size_t i = 0; i < argumentCount; ++i) {
             ZeusGC::retainVariantDeep(*this, *arguments[i]);
             stack.push_back(*arguments[i]);
         }
 
-        if (!executeClosureSync(closureId, static_cast<int>(argumentCount))) {
-            if (vmstat == ZeusType::VMStatus::Running) {
-                VMException::VMException exp(
-                    "[execute] type implementation operator dispatch failed",
-                    __line, instr);
-                exp._throw(vmstat, currentChunk);
-            }
-        }
+        // Only the call shape crosses over. Carrying the operator instruction
+        // metadata would re-run applyClassAssignmentCopy against the last
+        // pushed argument instead of the receiver.
+        nextInstruction.emplace();
+        nextInstruction->op = VMOperator::CALL_CLOSURE;
+        nextInstruction->line = instr.line;
+        nextInstruction->sourceFileId = instr.sourceFileId;
+        nextInstruction->args = {LexerType::Value(static_cast<int>(argumentCount))};
         return true;
     }
 
@@ -4195,6772 +4641,116 @@ class VM {
     // P1：按 const 引用接收指令，避免每次 dispatch 深拷贝
     // 整个 vector<IRArgs>（含 string/Value/Bytes）。实测前这是每条指令
     // 一次堆分配，是循环基准的最大头。
-    void execute(const IRType::IRInstr& initialInstruction) {
-        std::optional<IRType::IRInstr> methodCall;
-        const IRType::IRInstr* dispatchedInstruction = &initialInstruction;
-    dispatch_instruction:
-        const IRType::IRInstr& instr = *dispatchedInstruction;
-        // 从指令读取行号和源文件ID（如果有的话）
-        if (instr.line >= 0) {
-            __line = instr.line;
-        }
-        if (instr.sourceFileId >= 0) {
-            __sourceFileId = instr.sourceFileId;
-        }
-
-        if (vmstat != ZeusType::VMStatus::Running) {
-            return;
-        }
-
-        /* Computed-goto removed: use switch-based dispatch only */
-        if (vmstat == ZeusType::VMStatus::Error) {
-            return;
-        }
-
-        if (!applyClassAssignmentCopy(instr)) return;
-        
-        switch (instr.op) {
-            case VMOperator::LLVM_ADDR: {
-                if (instr.args.size() < 2 ||
-                    !std::holds_alternative<std::string>(instr.args[0]) ||
-                    !std::holds_alternative<LexerType::Value>(instr.args[1])) {
-                    VMException::VMException("invalid VM @addr locator", __line, instr)
-                        ._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                int64_t rawIndex = -1;
-                if (!ZeusVMUtils::tryGetInt64FromValue(
-                        std::get<LexerType::Value>(instr.args[1]), rawIndex) ||
-                    rawIndex < 0 || rawIndex > std::numeric_limits<int>::max()) {
-                    VMException::VMException("invalid VM @addr slot index", __line, instr)
-                        ._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                const int index = static_cast<int>(rawIndex);
-                const std::string& scope = std::get<std::string>(instr.args[0]);
-                Cell* cell = nullptr;
-                std::shared_ptr<ZeusShared::SharedCell> sharedCell;
-                if (scope == "shared") {
-                    if (instr.args.size() < 3 ||
-                        !std::holds_alternative<std::string>(instr.args[2])) {
-                        VMException::VMException(
-                            "VM @addr shared locator is missing its name", __line, instr)
-                            ._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    sharedCell = ZeusShared::getGlobalHeap().find(
-                        std::get<std::string>(instr.args[2]));
-                } else if (scope == "local" && index < static_cast<int>(local.size())) {
-                    cell = local[static_cast<size_t>(index)];
-                } else if (scope == "global" && index < static_cast<int>(global.size())) {
-                    cell = global[static_cast<size_t>(index)];
-                } else if (scope == "upvalue" && index < static_cast<int>(upvalue.size())) {
-                    cell = upvalue[static_cast<size_t>(index)];
-                } else {
-                    VMException::VMException(
-                        "VM @addr slot is outside its " + scope + " storage", __line, instr)
-                        ._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                if (scope == "shared" && !sharedCell) {
-                    VMException::VMException(
-                        "VM @addr shared variable is no longer present", __line, instr)
-                        ._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                const bool reveal = instr.args.size() > 3 &&
-                    std::holds_alternative<std::string>(instr.args[3]) &&
-                    std::get<std::string>(instr.args[3]) == "reveal";
-                void* nativeAddress = nullptr;
-                std::string error;
-                const bool addressed = scope == "shared"
-                    ? addressSlots.address(
-                        *this, sharedCell, std::get<std::string>(instr.args[2]),
-                        reveal, instr.metadata.symbol.isConst, nativeAddress, error)
-                    : addressSlots.address(
-                        *this, cell, reveal, instr.metadata.symbol.isConst,
-                        nativeAddress, error);
-                if (!addressed) {
-                    VMException::VMException(error, __line, instr)
-                        ._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                const uint64_t addressBits =
-                    static_cast<uint64_t>(reinterpret_cast<uintptr_t>(nativeAddress));
-                stack.push_back(LexerType::Value(static_cast<int64_t>(addressBits)));
-                break;
-            }
-            case VMOperator::LLVM_FADDR: {
-                std::string error;
-                int64_t addressBits = 0;
-                int64_t accessSize = -1;
-                std::string targetType;
-                if (instr.args.empty() ||
-                    !std::holds_alternative<std::string>(instr.args[0])) {
-                    error = "invalid VM @faddr type metadata";
-                } else {
-                    targetType = std::get<std::string>(instr.args[0]);
-                    constexpr const char* typeVariablePrefix = "__zeus_typevar:";
-                    if (targetType.rfind(typeVariablePrefix, 0) == 0) {
-                        constexpr const char* sourcePrefix = "__zeus_typevar_source:";
-                        int64_t sourceIndex = -1;
-                        if (instr.args.size() < 2 ||
-                            !std::holds_alternative<std::string>(instr.args[1]) ||
-                            std::get<std::string>(instr.args[1]).rfind(sourcePrefix, 0) != 0) {
-                            error = "VM generic @faddr read has no type source parameter";
-                        } else {
-                            const std::string& source = std::get<std::string>(instr.args[1]);
-                            const std::string digits = source.substr(std::char_traits<char>::length(sourcePrefix));
-                            try {
-                                size_t parsed = 0;
-                                sourceIndex = std::stoll(digits, &parsed);
-                                if (parsed != digits.size() || sourceIndex < 0) {
-                                    error = "invalid VM generic @faddr source parameter";
-                                }
-                            } catch (...) {
-                                error = "invalid VM generic @faddr source parameter";
-                            }
-                            if (error.empty() &&
-                                (static_cast<uint64_t>(sourceIndex) >= local.size() ||
-                                 local[static_cast<size_t>(sourceIndex)] == nullptr)) {
-                                error = "VM generic @faddr source parameter is unavailable";
-                            }
-                            if (error.empty()) {
-                                targetType = runtimeValueTypeName(
-                                    loadCellValue(local[static_cast<size_t>(sourceIndex)]));
-                                if (targetType.empty()) {
-                                    error = "VM cannot infer a native @faddr type from the generic parameter";
-                                }
-                            }
-                        }
-                    }
-                }
-                const bool hasByteLength = instr.args.size() > 1 &&
-                    std::holds_alternative<std::string>(instr.args[1]) &&
-                    (std::get<std::string>(instr.args[1]) == "length" ||
-                     std::get<std::string>(instr.args[1]) == "raw_range");
-                if (error.empty() && hasByteLength) {
-                    StackItem lengthItem = popStackItem();
-                    if (!ZeusVMUtils::tryGetInt64(lengthItem.value, accessSize)) {
-                        error = "VM @faddr length must be an int";
-                    } else if (accessSize < 0) {
-                        error = "VM @faddr length cannot be negative";
-                    }
-                    dropStackItem(lengthItem);
-                } else if (error.empty() && instr.args.size() > 1 &&
-                           std::holds_alternative<LexerType::Value>(instr.args[1])) {
-                    const auto& widthValue = std::get<LexerType::Value>(instr.args[1]);
-                    const auto* widthInteger =
-                        std::get_if<ZeusType::BigInteger>(&widthValue.data);
-                    if (!widthInteger || !widthInteger->tryToInt64(accessSize)) {
-                        error = "invalid VM @faddr width metadata";
-                    }
-                }
-                StackItem addressItem = popStackItem();
-                if (error.empty() &&
-                           !ZeusVMUtils::tryGetInt64(addressItem.value, addressBits)) {
-                    error = "VM @faddr requires an int address";
-                }
-
-                ZeusType::UniversalVariant loaded;
-                if (error.empty()) {
-                    void* nativeAddress = reinterpret_cast<void*>(
-                        static_cast<uintptr_t>(static_cast<uint64_t>(addressBits)));
-                    if (!addressSlots.fetch(
-                            *this, nativeAddress, targetType,
-                            loaded, error, accessSize)) {
-                        // The registered slot or tracked memory contract supplies the error.
-                    }
-                }
-                dropStackItem(addressItem);
-                if (!error.empty()) {
-                    VMException::VMException(error, __line, instr)
-                        ._throw(vmstat, currentChunk);
-                    break;
-                }
-                stack.push_back(std::move(loaded));
-                break;
-            }
-            case VMOperator::LLVM_FSTORE: {
-                StackItem valueItem = popStackItem();
-                std::string error;
-                int64_t addressBits = 0;
-                int64_t accessSize = -1;
-                const bool hasByteLength = instr.args.size() > 1 &&
-                    std::holds_alternative<std::string>(instr.args[1]) &&
-                    (std::get<std::string>(instr.args[1]) == "length" ||
-                     std::get<std::string>(instr.args[1]) == "raw_range");
-                if (hasByteLength) {
-                    StackItem lengthItem = popStackItem();
-                    if (!ZeusVMUtils::tryGetInt64(lengthItem.value, accessSize)) {
-                        error = "VM @faddr assignment length must be an int";
-                    } else if (accessSize < 0) {
-                        error = "VM @faddr assignment length cannot be negative";
-                    }
-                    dropStackItem(lengthItem);
-                } else if (instr.args.size() > 1 &&
-                    std::holds_alternative<LexerType::Value>(instr.args[1])) {
-                    const auto& widthValue = std::get<LexerType::Value>(instr.args[1]);
-                    const auto* widthInteger =
-                        std::get_if<ZeusType::BigInteger>(&widthValue.data);
-                    if (!widthInteger || !widthInteger->tryToInt64(accessSize)) {
-                        error = "invalid VM @faddr assignment width metadata";
-                    }
-                }
-                StackItem addressItem = popStackItem();
-                if (error.empty() && (instr.args.empty() ||
-                    !std::holds_alternative<std::string>(instr.args[0]))) {
-                    error = "invalid VM @faddr assignment type metadata";
-                } else if (error.empty() &&
-                           !ZeusVMUtils::tryGetInt64(addressItem.value, addressBits)) {
-                    error = "VM @faddr assignment requires an int address";
-                } else if (error.empty()) {
-                    void* nativeAddress = reinterpret_cast<void*>(
-                        static_cast<uintptr_t>(static_cast<uint64_t>(addressBits)));
-                    addressSlots.store(
-                        *this, nativeAddress, std::get<std::string>(instr.args[0]),
-                        valueItem.value, error, accessSize);
-                }
-                dropStackItem(valueItem);
-                dropStackItem(addressItem);
-                if (!error.empty()) {
-                    VMException::VMException(error, __line, instr)
-                        ._throw(vmstat, currentChunk);
-                }
-                break;
-            }
-
-            case VMOperator::TYPE_IMPL_BUILD: {
-                auto failImpl = [&](const std::string& message) {
-                    VMException::VMException exp(message, __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                };
-                if (instr.args.empty() ||
-                    !std::holds_alternative<std::string>(instr.args[0]) ||
-                    std::get<std::string>(instr.args[0]).empty()) {
-                    failImpl("TYPE_IMPL_BUILD requires a non-empty target type");
-                    break;
-                }
-
-                ZeusType::ClassInfo additions;
-                additions.name = std::get<std::string>(instr.args[0]);
-                size_t cursor = 1;
-                auto readMethodMap = [&](std::unordered_map<std::string, int>& methods) {
-                    if (cursor >= instr.args.size() ||
-                        !std::holds_alternative<LexerType::Value>(instr.args[cursor])) {
-                        return false;
-                    }
-                    const int count = VMHelpers::getIntFromValue(
-                        std::get<LexerType::Value>(instr.args[cursor++]));
-                    if (count < 0 || static_cast<size_t>(count) >
-                            (instr.args.size() - cursor) / 2) {
-                        return false;
-                    }
-                    for (int i = 0; i < count; ++i) {
-                        if (cursor + 1 >= instr.args.size() ||
-                            !std::holds_alternative<std::string>(instr.args[cursor]) ||
-                            !std::holds_alternative<LexerType::Value>(instr.args[cursor + 1])) {
-                            return false;
-                        }
-                        const std::string& name = std::get<std::string>(instr.args[cursor++]);
-                        const int protoId = VMHelpers::getIntFromValue(
-                            std::get<LexerType::Value>(instr.args[cursor++]));
-                        if (name.empty() || protoId < 0 || !getPrototype(protoId) ||
-                            !methods.emplace(name, protoId).second) {
-                            return false;
-                        }
-                    }
-                    return true;
-                };
-
-                if (!readMethodMap(additions.instanceMethods) ||
-                    !readMethodMap(additions.staticMethods) ||
-                    !readMethodMap(additions.operatorMethods) ||
-                    cursor != instr.args.size()) {
-                    failImpl("TYPE_IMPL_BUILD contains malformed or duplicate method metadata");
-                    break;
-                }
-
-                ZeusType::ClassInfo mergedType = additions;
-                auto existing = typeImplementations.find(additions.name);
-                if (existing != typeImplementations.end()) {
-                    mergedType = existing->second;
-                    std::string conflict;
-                    if (!mergeTypeImplementationMethods(mergedType, additions, conflict)) {
-                        failImpl("impl member '" + conflict +
-                                 "' is already registered for type '" + additions.name + "'");
-                        break;
-                    }
-                }
-
-                std::vector<std::pair<size_t, ZeusType::ClassInfo>> updatedClasses;
-                for (size_t i = 0; i < classes.size(); ++i) {
-                    if (classes[i].name != additions.name) continue;
-                    ZeusType::ClassInfo updated = classes[i];
-                    std::string conflict;
-                    if (!mergeTypeImplementationMethods(updated, additions, conflict)) {
-                        failImpl("impl member '" + conflict +
-                                 "' conflicts with class member on type '" + additions.name + "'");
-                        updatedClasses.clear();
-                        break;
-                    }
-                    updatedClasses.emplace_back(i, std::move(updated));
-                }
-                if (vmstat != ZeusType::VMStatus::Running) break;
-
-                std::vector<std::pair<size_t, ZeusType::ClassInfo>> updatedSharedClasses;
-                if (sharedClasses && sharedClasses != &classes) {
-                    for (size_t i = 0; i < sharedClasses->size(); ++i) {
-                        if ((*sharedClasses)[i].name != additions.name) continue;
-                        ZeusType::ClassInfo updated = (*sharedClasses)[i];
-                        std::string conflict;
-                        if (!mergeTypeImplementationMethods(updated, additions, conflict)) {
-                            failImpl("impl member '" + conflict +
-                                     "' conflicts with shared class member on type '" +
-                                     additions.name + "'");
-                            updatedSharedClasses.clear();
-                            break;
-                        }
-                        updatedSharedClasses.emplace_back(i, std::move(updated));
-                    }
-                }
-                if (vmstat != ZeusType::VMStatus::Running) break;
-
-                typeImplementations[additions.name] = std::move(mergedType);
-                for (auto& entry : updatedClasses) {
-                    classes[entry.first] = std::move(entry.second);
-                }
-                if (sharedClasses && sharedClasses != &classes) {
-                    for (auto& entry : updatedSharedClasses) {
-                        (*sharedClasses)[entry.first] = std::move(entry.second);
-                    }
-                }
-
-                auto sharedClassCell = ZeusShared::getGlobalHeap().find(
-                    "__class__" + additions.name);
-                if (sharedClassCell) {
-                    sharedClassCell->withValue([&](ZeusType::UniversalVariant& value) {
-                        auto* classVariant = std::get_if<ZeusType::Variant>(&value);
-                        auto* classObject = classVariant != nullptr
-                            ? std::get_if<ZeusType::Object>(classVariant)
-                            : nullptr;
-                        if (classObject == nullptr || !classObject->impl) return;
-                        for (const auto& entry : additions.staticMethods) {
-                            classObject->impl->setValue(
-                                "__static_" + entry.first,
-                                LexerType::Value(entry.second));
-                        }
-                        for (const auto& entry : additions.instanceMethods) {
-                            classObject->impl->setValue(
-                                "__inst_" + entry.first,
-                                LexerType::Value(entry.second));
-                        }
-                        for (const auto& entry : additions.operatorMethods) {
-                            classObject->impl->setValue(
-                                "__op_" + entry.first,
-                                LexerType::Value(entry.second));
-                        }
-                    });
-                }
-                break;
-            }
-
-            case VMOperator::CLASS_BUILD: {
-                std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                // 说明：栈布局 [ className, usingThisDefault, staticMethods(dict), instanceMethods(dict), operatorMethods(dict), fields(dict) ]
-                if (stack.size() < 6) {
-                    VMException::VMException exp("CLASS_BUILD stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                auto fieldsU   = stack.back();
-                stack.pop_back();
-
-                auto operatorMethU = stack.back();
-                stack.pop_back();
-
-                auto instMethU = stack.back();
-                stack.pop_back();
-
-                auto staticMethU = stack.back();
-                stack.pop_back();
-
-                auto usingThisU = stack.back();
-                stack.pop_back();
-
-                auto nameU     = stack.back();
-                stack.pop_back();
-
-                std::string className = "";
-                std::string usingThisAlias = "";
-
-                if (std::holds_alternative<std::string>(nameU)) {
-                    className = std::get<std::string>(nameU);
-                } else if (std::holds_alternative<LexerType::Value>(nameU) && std::holds_alternative<std::string>(std::get<LexerType::Value>(nameU).data)) {
-                    className = std::get<std::string>(std::get<LexerType::Value>(nameU).data);
-                } else {
-                    VMException::VMException exp("CLASS_BUILD className must be string", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // usingThisU is expected to be a string (alias) or empty string pushed as Value("")
-                if (std::holds_alternative<std::string>(usingThisU)) {
-                    usingThisAlias = std::get<std::string>(usingThisU);
-                } else if (std::holds_alternative<LexerType::Value>(usingThisU) && std::holds_alternative<std::string>(std::get<LexerType::Value>(usingThisU).data)) {
-                    usingThisAlias = std::get<std::string>(std::get<LexerType::Value>(usingThisU).data);
-                }
-
-                ZeusType::ClassInfo info;
-                info.name = className;
-                info.usingThisAlias = usingThisAlias;
-
-                // fields/staticMethods/instanceMethods/operatorMethods are provided as Variant (Object) values.
-                // Parse instanceMethods/staticMethods/operatorMethods dicts if present and populate info maps.
-                if (std::holds_alternative<ZeusType::Variant>(staticMethU)) {
-                    const ZeusType::Variant &v = std::get<ZeusType::Variant>(staticMethU);
-                    if (std::holds_alternative<ZeusType::Object>(v)) {
-                        const ZeusType::Object &obj = std::get<ZeusType::Object>(v);
-                        if (obj.impl) {
-                            for (const auto &kv : obj.impl->data) {
-                                // keys are method names, values expected to be integer protoId
-                                int pid = -1;
-                                const ZeusType::UniversalVariant &val = kv.second;
-                                if (std::holds_alternative<LexerType::Value>(val)) {
-                                    const auto &lv = std::get<LexerType::Value>(val);
-                                    if (std::holds_alternative<ZeusType::BigInteger>(lv.data)) pid = VMHelpers::getIntFromValue(lv);
-                                }
-                                if (pid >= 0) info.staticMethods[kv.first] = pid;
-                            }
-                        }
-                    }
-                }
-
-                if (std::holds_alternative<ZeusType::Variant>(instMethU)) {
-                    const ZeusType::Variant &v = std::get<ZeusType::Variant>(instMethU);
-                    if (std::holds_alternative<ZeusType::Object>(v)) {
-                        const ZeusType::Object &obj = std::get<ZeusType::Object>(v);
-                        if (obj.impl) {
-                            for (const auto &kv : obj.impl->data) {
-                                int pid = -1;
-                                const ZeusType::UniversalVariant &val = kv.second;
-                                if (std::holds_alternative<LexerType::Value>(val)) {
-                                    const auto &lv = std::get<LexerType::Value>(val);
-                                    if (std::holds_alternative<ZeusType::BigInteger>(lv.data)) pid = VMHelpers::getIntFromValue(lv);
-                                }
-                                if (pid >= 0) info.instanceMethods[kv.first] = pid;
-                            }
-                        }
-                    }
-                }
-
-                // operatorMethods: parse operator symbols -> protoId
-                if (std::holds_alternative<ZeusType::Variant>(operatorMethU)) {
-                    const ZeusType::Variant &v = std::get<ZeusType::Variant>(operatorMethU);
-                    if (std::holds_alternative<ZeusType::Object>(v)) {
-                        const ZeusType::Object &obj = std::get<ZeusType::Object>(v);
-                        if (obj.impl) {
-                            for (const auto &kv : obj.impl->data) {
-                                int pid = -1;
-                                const ZeusType::UniversalVariant &val = kv.second;
-                                if (std::holds_alternative<LexerType::Value>(val)) {
-                                    const auto &lv = std::get<LexerType::Value>(val);
-                                    if (std::holds_alternative<ZeusType::BigInteger>(lv.data)) pid = VMHelpers::getIntFromValue(lv);
-                                }
-                                if (pid >= 0) info.operatorMethods[kv.first] = pid;
-                            }
-                        }
-                    }
-                }
-
-                // fields: if provided, evaluate default values will have been pushed as Values/Variants
-                if (std::holds_alternative<ZeusType::Variant>(fieldsU)) {
-                    const ZeusType::Variant &v = std::get<ZeusType::Variant>(fieldsU);
-                    if (std::holds_alternative<ZeusType::Object>(v)) {
-                        const ZeusType::Object &obj = std::get<ZeusType::Object>(v);
-                        if (obj.impl) {
-                            auto addField = [&](const std::string& fieldName,
-                                                const ZeusType::UniversalVariant& value) {
-                                ZeusType::FieldDef fdef;
-                                fdef.defaultValue = value;
-                                fdef.isConst = false;
-                                if (info.fields.find(fieldName) == info.fields.end()) {
-                                    info.fieldOrder.push_back(fieldName);
-                                }
-                                info.fields[fieldName] = std::move(fdef);
-                            };
-                            for (const auto& fieldName : obj.impl->order) {
-                                if (!obj.impl->hasOrderKey(fieldName)) continue;
-                                const auto field = obj.impl->data.find(fieldName);
-                                if (field != obj.impl->data.end()) {
-                                    addField(fieldName, field->second);
-                                }
-                            }
-                            for (const auto &kv : obj.impl->data) {
-                                addField(kv.first, kv.second);
-                            }
-                        }
-                    }
-                }
-
-                std::string fieldMetadataError;
-                if (!applyClassFieldTypeMetadata(
-                        instr.metadata, className, info, fieldMetadataError)) {
-                    VMException::VMException exp(
-                        fieldMetadataError, __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                auto implementation = typeImplementations.find(className);
-                if (implementation != typeImplementations.end()) {
-                    ZeusType::ClassInfo merged = info;
-                    std::string conflict;
-                    if (!mergeTypeImplementationMethods(
-                            merged, implementation->second, conflict)) {
-                        VMException::VMException exp(
-                            "impl method '" + conflict +
-                            "' conflicts with class member on type '" + className + "'",
-                            __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    info = std::move(merged);
-                }
-
-                int classId = (int)classes.size();
-                classes.push_back(std::move(info));
-                nameToClass[className] = classId;
-
-                stack.push_back(ZeusType::ClassHandle{classId});
-                printStack();
-                break;
-            }
-
-            case VMOperator::CLASS_BUILD_SHARED: {
-                std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                // 说明：栈布局 [ className, usingThisDefault, staticMethods(dict), instanceMethods(dict), operatorMethods(dict), fields(dict) ]
-                // 与 CLASS_BUILD 类似，但类定义存储到共享堆上
-                if (stack.size() < 6) {
-                    VMException::VMException exp("CLASS_BUILD_SHARED stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                auto fieldsU       = stack.back(); stack.pop_back();
-                auto operatorMethU = stack.back(); stack.pop_back();
-                auto instMethU     = stack.back(); stack.pop_back();
-                auto staticMethU   = stack.back(); stack.pop_back();
-                auto usingThisU    = stack.back(); stack.pop_back();
-                auto nameU         = stack.back(); stack.pop_back();
-
-                std::string className = "";
-                std::string usingThisAlias = "";
-
-                if (std::holds_alternative<std::string>(nameU)) {
-                    className = std::get<std::string>(nameU);
-                } else if (std::holds_alternative<LexerType::Value>(nameU) && std::holds_alternative<std::string>(std::get<LexerType::Value>(nameU).data)) {
-                    className = std::get<std::string>(std::get<LexerType::Value>(nameU).data);
-                } else {
-                    VMException::VMException exp("CLASS_BUILD_SHARED className must be string", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                if (std::holds_alternative<std::string>(usingThisU)) {
-                    usingThisAlias = std::get<std::string>(usingThisU);
-                } else if (std::holds_alternative<LexerType::Value>(usingThisU) && std::holds_alternative<std::string>(std::get<LexerType::Value>(usingThisU).data)) {
-                    usingThisAlias = std::get<std::string>(std::get<LexerType::Value>(usingThisU).data);
-                }
-
-                ZeusType::ClassInfo info;
-                info.name = className;
-                info.usingThisAlias = usingThisAlias;
-
-                // 解析方法映射 (与 CLASS_BUILD 相同)
-                auto parseMethodDict = [](const ZeusType::UniversalVariant& dictU, std::unordered_map<std::string, int>& outMap) {
-                    if (std::holds_alternative<ZeusType::Variant>(dictU)) {
-                        const ZeusType::Variant& v = std::get<ZeusType::Variant>(dictU);
-                        if (std::holds_alternative<ZeusType::Object>(v)) {
-                            const ZeusType::Object& obj = std::get<ZeusType::Object>(v);
-                            if (obj.impl) {
-                                for (const auto& kv : obj.impl->data) {
-                                    int pid = -1;
-                                    const ZeusType::UniversalVariant& val = kv.second;
-                                    if (std::holds_alternative<LexerType::Value>(val)) {
-                                        const auto& lv = std::get<LexerType::Value>(val);
-                                        if (std::holds_alternative<ZeusType::BigInteger>(lv.data)) {
-                                            pid = VMHelpers::getIntFromValue(lv);
-                                        }
-                                    }
-                                    if (pid >= 0) outMap[kv.first] = pid;
-                                }
-                            }
-                        }
-                    }
-                };
-
-                parseMethodDict(staticMethU, info.staticMethods);
-                parseMethodDict(instMethU, info.instanceMethods);
-                parseMethodDict(operatorMethU, info.operatorMethods);
-
-                // 解析字段
-                if (std::holds_alternative<ZeusType::Variant>(fieldsU)) {
-                    const ZeusType::Variant& v = std::get<ZeusType::Variant>(fieldsU);
-                    if (std::holds_alternative<ZeusType::Object>(v)) {
-                        const ZeusType::Object& obj = std::get<ZeusType::Object>(v);
-                        if (obj.impl) {
-                            auto addField = [&](const std::string& fieldName,
-                                                const ZeusType::UniversalVariant& value) {
-                                ZeusType::FieldDef fdef;
-                                fdef.defaultValue = value;
-                                fdef.isConst = false;
-                                if (info.fields.find(fieldName) == info.fields.end()) {
-                                    info.fieldOrder.push_back(fieldName);
-                                }
-                                info.fields[fieldName] = std::move(fdef);
-                            };
-                            for (const auto& fieldName : obj.impl->order) {
-                                if (!obj.impl->hasOrderKey(fieldName)) continue;
-                                const auto field = obj.impl->data.find(fieldName);
-                                if (field != obj.impl->data.end()) {
-                                    addField(fieldName, field->second);
-                                }
-                            }
-                            for (const auto& kv : obj.impl->data) {
-                                addField(kv.first, kv.second);
-                            }
-                        }
-                    }
-                }
-
-                std::string fieldMetadataError;
-                if (!applyClassFieldTypeMetadata(
-                        instr.metadata, className, info, fieldMetadataError)) {
-                    VMException::VMException exp(
-                        fieldMetadataError, __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                auto implementation = typeImplementations.find(className);
-                if (implementation != typeImplementations.end()) {
-                    ZeusType::ClassInfo merged = info;
-                    std::string conflict;
-                    if (!mergeTypeImplementationMethods(
-                            merged, implementation->second, conflict)) {
-                        VMException::VMException exp(
-                            "impl method '" + conflict +
-                            "' conflicts with shared class member on type '" + className + "'",
-                            __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    info = std::move(merged);
-                }
-
-                // 同时存储到本地 classes 数组（用于本 VM 访问）
-                int classId = (int)classes.size();
-                classes.push_back(info);
-                nameToClass[className] = classId;
-
-                // 将 ClassInfo 序列化为 Object 存储到共享堆
-                // 为了跨 VM 访问，我们创建一个包含类信息的 ObjectData
-                auto classObjData = ZeusGC::makeObjectData();
-                classObjData->setValue("__class_id__", LexerType::Value(classId));
-                classObjData->setValue("__class_name__", LexerType::Value(className));
-                classObjData->setValue("__using_this__", LexerType::Value(usingThisAlias));
-                classObjData->setValue("__is_shared_class__", LexerType::Value(true));
-
-                // 存储方法信息
-                for (const auto& kv : info.staticMethods) {
-                    classObjData->setValue("__static_" + kv.first, LexerType::Value(kv.second));
-                }
-                for (const auto& kv : info.instanceMethods) {
-                    classObjData->setValue("__inst_" + kv.first, LexerType::Value(kv.second));
-                }
-                for (const auto& kv : info.operatorMethods) {
-                    classObjData->setValue("__op_" + kv.first, LexerType::Value(kv.second));
-                }
-                for (size_t index = 0; index < info.fieldOrder.size(); ++index) {
-                    classObjData->setValue(
-                        "__zeus_field_order_" + std::to_string(index),
-                        LexerType::Value(info.fieldOrder[index]));
-                }
-                for (const auto& kv : info.fields) {
-                    classObjData->setValue("__field_" + kv.first, kv.second.defaultValue);
-                }
-                for (const auto& initializer : info.fieldInitializerNames) {
-                    classObjData->setValue(
-                        "__zeus_field_initializer_" + initializer.first,
-                        LexerType::Value(initializer.second));
-                }
-                for (const auto& kv : info.explicitFieldTypes) {
-                    classObjData->setValue(
-                        "__field_type__" + kv.first,
-                        LexerType::Value(kv.second));
-                }
-
-                ZeusType::Object sharedClassObj;
-                sharedClassObj.impl = classObjData;
-
-                // 存储到共享堆
-                ZeusShared::getGlobalHeap().getOrCreate(
-                    "__class__" + className,
-                    ZeusType::Variant(sharedClassObj)
-                );
-
-                // 返回 SharedClassHandle
-                stack.push_back(ZeusType::SharedClassHandle{className});
-                printStack();
-                break;
-            }
-
-            case VMOperator::OBJ_BUILD: {
-                // 读取参数个数
-                int argc = 0;
-                if (!instr.args.empty() && std::holds_alternative<LexerType::Value>(instr.args[0])) {
-                    argc = VMHelpers::getIntFromValue(std::get<LexerType::Value>(instr.args[0]));
-                }
-
-                std::string nativeTargetType;
-                if (instr.args.size() > 1 &&
-                    std::holds_alternative<std::string>(instr.args[1])) {
-                    nativeTargetType = std::get<std::string>(instr.args[1]);
-                }
-                const bool hasNativeTarget = !nativeTargetType.empty();
-                
-                const size_t requiredStackItems = static_cast<size_t>(argc) +
-                    (hasNativeTarget ? 0u : 1u);
-                if (stack.size() < requiredStackItems) {
-                    VMException::VMException exp("OBJ_BUILD stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 保存构造函数参数（从栈中弹出，并转移“栈所有权”到本地临时列表）
-                // 重要：不能直接 stack.pop_back()，否则 Object/Closure 的引用计数不会对称释放，导致泄露或悬空引用。
-                std::vector<StackItem> ctorArgItems;
-                ctorArgItems.reserve(argc);
-                struct CtorArgGuard {
-                    VM* vm;
-                    std::vector<StackItem>* items;
-                    ~CtorArgGuard() {
-                        if (!vm || !items) return;
-                        for (auto& it : *items) {
-                            if (it.owner) vm->dropStackItem(it);
-                        }
-                    }
-                } ctorArgGuard{this, &ctorArgItems};
-
-                for (int i = 0; i < argc; ++i) {
-                    ctorArgItems.insert(ctorArgItems.begin(), popStackItem());
-                }
-
-                ZeusType::UniversalVariant clsU = LexerType::Value(nativeTargetType);
-                if (!hasNativeTarget) {
-                    StackItem clsItem = popStackItem();
-                    clsU = clsItem.value;
-                    dropStackItem(clsItem);
-                }
-
-                std::string genericClassName;
-                std::vector<std::string> genericTypeArguments;
-                std::string specializedClassName;
-                if (instr.metadata.readClassInstantiation(
-                        genericClassName, genericTypeArguments,
-                        &specializedClassName) &&
-                    !specializedClassName.empty()) {
-                    // A generic construction names its specialized class
-                    // directly; the popped class handle is only the source-level
-                    // class expression and may still refer to the template.
-                    clsU = LexerType::Value(specializedClassName);
-                }
-                
-                // DEBUG: 输出 clsU 的类型
-                ZEUS_DEBUG_PRINT("[OBJ_BUILD] clsU type: ClassHandle=%d, SharedClassHandle=%d, Value=%d", 
-                    std::holds_alternative<ZeusType::ClassHandle>(clsU),
-                    std::holds_alternative<ZeusType::SharedClassHandle>(clsU),
-                    std::holds_alternative<LexerType::Value>(clsU));
-                if (std::holds_alternative<LexerType::Value>(clsU)) {
-                    ZEUS_DEBUG_PRINT("[OBJ_BUILD] clsU value: %s", ZeusVMUtils::valueToDebugString(clsU).c_str());
-                }
-
-                int classId = -1;
-
-                auto invokeNewFactory = [&](int protoId) {
-                    const Prototype* proto = getPrototype(protoId);
-                    if (!proto) {
-                        VMException::VMException exp(
-                            "operator[new] has an invalid function prototype",
-                            __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        return false;
-                    }
-                    if (!proto->captures.empty()) {
-                        VMException::VMException exp(
-                            "operator[new] cannot capture variables",
-                            __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        return false;
-                    }
-
-                    Closure factory;
-                    factory.protoId = protoId;
-                    factory.autoRelease = true;
-                    const int closureId = allocClosure(std::move(factory));
-                    stack.push_back(ZeusType::ClosureHandle{closureId});
-                    for (auto& argument : ctorArgItems) {
-                        stack.push_back(argument.value);
-                        argument.owner = 0;
-                    }
-                    if (!executeClosureSync(closureId, argc)) {
-                        if (vmstat == ZeusType::VMStatus::Running) {
-                            VMException::VMException exp(
-                                "operator[new] dispatch failed", __line, instr);
-                            exp._throw(vmstat, currentChunk);
-                        }
-                        return false;
-                    }
-                    return true;
-                };
-
-                if (hasNativeTarget) {
-                    if (const auto* abi =
-                            ZeusBuiltins::findNativeTypeABI(nativeTargetType)) {
-                        nativeTargetType = std::string(abi->canonicalName);
-                    }
-                    const auto implementation = typeImplementations.find(nativeTargetType);
-                    if (implementation == typeImplementations.end()) {
-                        VMException::VMException exp(
-                            "OBJ_BUILD native type has no impl: " + nativeTargetType,
-                            __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    const auto factory =
-                        implementation->second.operatorMethods.find("[new]");
-                    if (factory == implementation->second.operatorMethods.end()) {
-                        VMException::VMException exp(
-                            "type '" + nativeTargetType +
-                            "' does not define operator[new]",
-                            __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    invokeNewFactory(factory->second);
-                    break;
-                }
-                
-                // 支持多种形式：ClassHandle、SharedClassHandle 或类名字符串
-                if (std::holds_alternative<ZeusType::ClassHandle>(clsU)) {
-                    classId = std::get<ZeusType::ClassHandle>(clsU).id;
-                } else if (std::holds_alternative<ZeusType::SharedClassHandle>(clsU)) {
-                    // SharedClassHandle：从共享堆获取类信息
-                    std::string className = std::get<ZeusType::SharedClassHandle>(clsU).name;
-                    
-                    // 先在本地 classes 中查找
-                    for (size_t i = 0; i < classes.size(); ++i) {
-                        if (classes[i].name == className) {
-                            classId = (int)i;
-                            break;
-                        }
-                    }
-                    
-                    // 如果本地没有，尝试从共享堆恢复类定义
-                    if (classId == -1) {
-                        auto cellPtr = ZeusShared::getGlobalHeap().find("__class__" + className);
-                        std::string sharedInitializerError;
-                        
-                        if (cellPtr) {
-                            const ZeusType::UniversalVariant uniVar = cellPtr->read();
-                            
-                            if (std::holds_alternative<ZeusType::Variant>(uniVar)) {
-                                const ZeusType::Variant& variant = std::get<ZeusType::Variant>(uniVar);
-                                
-                                if (std::holds_alternative<ZeusType::Object>(variant)) {
-                                    const ZeusType::Object& objWrapper = std::get<ZeusType::Object>(variant);
-                                    
-                                    if (objWrapper.impl) {
-                                        // 从共享堆恢复 ClassInfo
-                                        ZeusType::ClassInfo info;
-                                        info.name = className;
-                                        std::map<size_t, std::string> fieldOrderByIndex;
-                                        const std::string orderPrefix = "__zeus_field_order_";
-                                        const std::string initializerPrefix =
-                                            "__zeus_field_initializer_";
-                                        
-                                        for (const auto& kv : objWrapper.impl->data) {
-                                            const std::string& key = kv.first;
-                                            const ZeusType::UniversalVariant& val = kv.second;
-                                            
-                                            if (key == "__using_this__") {
-                                                if (std::holds_alternative<LexerType::Value>(val)) {
-                                                    const LexerType::Value& lv = std::get<LexerType::Value>(val);
-                                                    if (std::holds_alternative<std::string>(lv.data)) {
-                                                        info.usingThisAlias = std::get<std::string>(lv.data);
-                                                    }
-                                                }
-                                            } else if (key.rfind(orderPrefix, 0) == 0) {
-                                                try {
-                                                    const size_t index = static_cast<size_t>(
-                                                        std::stoull(key.substr(orderPrefix.size())));
-                                                    if (std::holds_alternative<LexerType::Value>(val)) {
-                                                        const auto& literal =
-                                                            std::get<LexerType::Value>(val);
-                                                        if (std::holds_alternative<std::string>(literal.data)) {
-                                                            fieldOrderByIndex[index] =
-                                                                std::get<std::string>(literal.data);
-                                                        }
-                                                    }
-                                                } catch (const std::exception&) {
-                                                    sharedInitializerError =
-                                                        "invalid shared class field-order metadata";
-                                                }
-                                            } else if (key.rfind(initializerPrefix, 0) == 0) {
-                                                const std::string fieldName =
-                                                    key.substr(initializerPrefix.size());
-                                                if (std::holds_alternative<LexerType::Value>(val)) {
-                                                    const auto& literal =
-                                                        std::get<LexerType::Value>(val);
-                                                    if (std::holds_alternative<std::string>(literal.data)) {
-                                                        const std::string initializerName =
-                                                            std::get<std::string>(literal.data);
-                                                        const auto proto =
-                                                            functionNameToProtoId.find(initializerName);
-                                                        if (proto == functionNameToProtoId.end() ||
-                                                            !getPrototype(proto->second) ||
-                                                            !getPrototype(proto->second)->captures.empty()) {
-                                                            sharedInitializerError =
-                                                                "shared class field initializer '" +
-                                                                initializerName + "' is unavailable";
-                                                        } else {
-                                                            info.fieldInitializerNames[fieldName] =
-                                                                initializerName;
-                                                        }
-                                                    }
-                                                }
-                                            } else if (key.rfind("__static_", 0) == 0) {
-                                                std::string methName = key.substr(9);
-                                                if (std::holds_alternative<LexerType::Value>(val)) {
-                                                    info.staticMethods[methName] = VMHelpers::getIntFromValue(std::get<LexerType::Value>(val));
-                                                }
-                                            } else if (key.rfind("__inst_", 0) == 0) {
-                                                std::string methName = key.substr(7);
-                                                if (std::holds_alternative<LexerType::Value>(val)) {
-                                                    info.instanceMethods[methName] = VMHelpers::getIntFromValue(std::get<LexerType::Value>(val));
-                                                }
-                                            } else if (key.rfind("__op_", 0) == 0) {
-                                                std::string opName = key.substr(5);
-                                                if (std::holds_alternative<LexerType::Value>(val)) {
-                                                    info.operatorMethods[opName] = VMHelpers::getIntFromValue(std::get<LexerType::Value>(val));
-                                                }
-                                            } else if (key.rfind("__field_type__", 0) == 0) {
-                                                const std::string fieldName = key.substr(14);
-                                                if (std::holds_alternative<LexerType::Value>(val)) {
-                                                    const auto& literal = std::get<LexerType::Value>(val);
-                                                    if (std::holds_alternative<std::string>(literal.data)) {
-                                                        info.explicitFieldTypes[fieldName] =
-                                                            std::get<std::string>(literal.data);
-                                                    }
-                                                }
-                                            } else if (key.rfind("__field_", 0) == 0) {
-                                                std::string fieldName = key.substr(8);
-                                                ZeusType::FieldDef fdef;
-                                                fdef.defaultValue = val;
-                                                fdef.isConst = false;
-                                                if (info.fields.find(fieldName) == info.fields.end()) {
-                                                    info.fieldOrder.push_back(fieldName);
-                                                }
-                                                info.fields[fieldName] = fdef;
-                                            }
-                                        }
-
-                                        for (const auto& initializer : info.fieldInitializerNames) {
-                                            const auto proto = functionNameToProtoId.find(
-                                                initializer.second);
-                                            if (proto == functionNameToProtoId.end() ||
-                                                !getPrototype(proto->second) ||
-                                                !getPrototype(proto->second)->captures.empty()) {
-                                                sharedInitializerError =
-                                                    "shared class field initializer '" +
-                                                    initializer.second + "' is unavailable";
-                                                break;
-                                            }
-                                            info.fields[initializer.first].initializerProtoId =
-                                                proto->second;
-                                        }
-
-                                        if (!fieldOrderByIndex.empty()) {
-                                            info.fieldOrder.clear();
-                                            for (const auto& ordered : fieldOrderByIndex) {
-                                                info.fieldOrder.push_back(ordered.second);
-                                            }
-                                        }
-                                        
-                                        if (sharedInitializerError.empty()) {
-                                            classId = (int)classes.size();
-                                            classes.push_back(info);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if (!sharedInitializerError.empty()) {
-                            VMException::VMException exp(
-                                sharedInitializerError, __line, instr);
-                            exp._throw(vmstat, currentChunk);
-                            break;
-                        }
-                    }
-                    
-                    if (classId == -1) {
-                        VMException::VMException exp("OBJ_BUILD SharedClassHandle not found in heap: " + className, __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                } else if (std::holds_alternative<std::string>(clsU)) {
-                    // 延迟解析：在 nameToClass 映射中查找类名
-                    std::string className = std::get<std::string>(clsU);
-                    
-                    // 优先在 nameToClass 映射中查找
-                    auto it = nameToClass.find(className);
-                    if (it != nameToClass.end()) {
-                        classId = it->second;
-                        vmMessage("[late-resolve] OBJ_BUILD resolved class '" + className + "' -> #" + std::to_string(classId));
-                    } else {
-                        // 回退：在全局变量槽中查找（兼容性）
-                        for (size_t i = 0; i < global.size(); ++i) {
-                            if (global[i]) {
-                                const auto value = global[i]->readValue();
-                                if (!std::holds_alternative<ZeusType::ClassHandle>(value)) continue;
-                                int cid = std::get<ZeusType::ClassHandle>(value).id;
-                                auto* classPtr = getClass(cid);
-                                if (classPtr && classPtr->name == className) {
-                                    classId = cid;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    
-                    if (classId == -1) {
-                        VMException::VMException exp("OBJ_BUILD class not found: " + className, __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                } else if (std::holds_alternative<LexerType::Value>(clsU)) {
-                    // 处理 LOAD_VALUE 发出的 Value 类型
-                    const auto& val = std::get<LexerType::Value>(clsU);
-                    if (std::holds_alternative<std::string>(val.data)) {
-                        std::string className = std::get<std::string>(val.data);
-                        
-                        // 优先在 nameToClass 映射中查找
-                        auto it = nameToClass.find(className);
-                        if (it != nameToClass.end()) {
-                            classId = it->second;
-                            vmMessage("[late-resolve] OBJ_BUILD resolved class '" + className + "' -> #" + std::to_string(classId));
-                        } else {
-                            // 回退：在全局变量槽中查找（兼容性）
-                            for (size_t i = 0; i < global.size(); ++i) {
-                                if (global[i]) {
-                                    const auto value = global[i]->readValue();
-                                    if (!std::holds_alternative<ZeusType::ClassHandle>(value)) continue;
-                                    int cid = std::get<ZeusType::ClassHandle>(value).id;
-                                    auto* classPtr = getClass(cid);
-                                    if (classPtr && classPtr->name == className) {
-                                        classId = cid;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        
-                        if (classId == -1) {
-                            VMException::VMException exp("OBJ_BUILD class not found: " + className, __line, instr);
-                            exp._throw(vmstat, currentChunk);
-                            break;
-                        }
-                    } else {
-                        VMException::VMException exp("OBJ_BUILD needs ClassHandle or className string/Value", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                } else {
-                    VMException::VMException exp("OBJ_BUILD needs ClassHandle or className string/Value", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                auto* classPtr = getClass(classId);
-                if (!classPtr) {
-                    VMException::VMException exp("OBJ_BUILD invalid class id", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                const auto factory = classPtr->operatorMethods.find("[new]");
-                if (factory != classPtr->operatorMethods.end()) {
-                    const bool hasFieldInitializer = std::any_of(
-                        classPtr->fields.begin(), classPtr->fields.end(),
-                        [](const auto& field) {
-                            return field.second.initializerProtoId >= 0;
-                        });
-                    if (hasFieldInitializer) {
-                        VMException::VMException exp(
-                            "operator[new] cannot be combined with field default initializers for class '" +
-                                classPtr->name + "'",
-                            __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    invokeNewFactory(factory->second);
-                    break;
-                }
-
-                ZeusType::ObjectInstance obj;
-                obj.classId = classId;
-
-                // initialize object fields from class info
-                const ZeusType::ClassInfo ci = *classPtr;
-                std::unordered_set<std::string> initializedFieldNames;
-                auto copyFieldDefault = [&](const std::string& fieldName) {
-                    const auto field = ci.fields.find(fieldName);
-                    if (field == ci.fields.end() ||
-                        !initializedFieldNames.insert(fieldName).second) {
-                        return;
-                    }
-                    obj.extensionValues[fieldName] = field->second.defaultValue;
-                    // The object now holds a reference to the default value, so it
-                    // has to be retained. Without this the instance owns a
-                    // reference it never took, and the first OBJ_STORE_ATTR on the
-                    // field releases the value out from under every other instance
-                    // that was initialised from the same default.
-                    ZeusGC::retainVariantDeep(*this, obj.extensionValues[fieldName]);
-                    obj.flags[fieldName] = field->second.isConst ? 0x1 : 0x0;
-                };
-                for (const auto& fieldName : ci.fieldOrder) {
-                    copyFieldDefault(fieldName);
-                }
-                for (const auto& field : ci.fields) {
-                    copyFieldDefault(field.first);
-                }
-
-                ZeusType::ObjectHandle objHandle = allocObject(std::move(obj));
-                int objId = objHandle.id;
-                // 保护构造过程中对象不被提前释放（调用结束后会对称释放一次）
-                retainObject(objHandle);
-                bool constructorFrameScheduled = false;
-
-                std::unordered_set<std::string> initializedDefaultsInOrder;
-                for (const auto& fieldName : ci.fieldOrder) {
-                    const auto field = ci.fields.find(fieldName);
-                    if (field == ci.fields.end()) continue;
-                    initializedDefaultsInOrder.insert(fieldName);
-                    if (field->second.initializerProtoId < 0) continue;
-                    std::string initializerError;
-                    if (!runFieldInitializer(
-                            field->second.initializerProtoId,
-                            classId,
-                            ZeusType::UniversalVariant(objHandle), objHandle,
-                            ci.name, fieldName, nullptr, initializerError)) {
-                        if (vmstat == ZeusType::VMStatus::Running) {
-                            VMException::VMException exp(
-                                initializerError, __line, instr);
-                            exp._throw(vmstat, currentChunk);
-                        }
-                        break;
-                    }
-                }
-
-                if (vmstat == ZeusType::VMStatus::Running) {
-                    for (const auto& field : ci.fields) {
-                        if (field.second.initializerProtoId >= 0 &&
-                            initializedDefaultsInOrder.find(field.first) ==
-                                initializedDefaultsInOrder.end()) {
-                            VMException::VMException exp(
-                                "field initializer has no declaration order metadata for '" +
-                                    ci.name + "." + field.first + "'",
-                                __line,
-                                instr);
-                            exp._throw(vmstat, currentChunk);
-                            break;
-                        }
-                    }
-                }
-
-                // 检查是否有 init 构造函数方法
-                if (vmstat == ZeusType::VMStatus::Running) {
-                ZEUS_DEBUG_PRINT("[VM] OBJ_BUILD: Looking for init in instanceMethods (size=%zu)", ci.instanceMethods.size());
-                for (const auto& kv : ci.instanceMethods) {
-                    ZEUS_DEBUG_PRINT("[VM]   - method '%s' -> protoId=%d", kv.first.c_str(), kv.second);
-                }
-                
-                auto initIt = ci.instanceMethods.find("init");
-                if (initIt != ci.instanceMethods.end()) {
-                    // 调用 init 方法
-                    int protoId = initIt->second;
-                    const Prototype* protoPtr = getPrototype(protoId);
-                    ZEUS_DEBUG_PRINT("[VM] Found init: protoId=%d, protoPtr=%p", protoId, (void*)protoPtr);
-                    if (protoPtr) {
-                        const Prototype& proto = *protoPtr;
-                        ZEUS_DEBUG_PRINT("[VM] Calling init constructor with %d args", argc);
-                        // 创建临时闭包
-                        Closure clo;
-                        clo.protoId = protoId;
-                        clo.autoRelease = true;
-                        int cloId = allocClosure(std::move(clo));
-
-                         stack.push_back(ZeusType::ClosureHandle{cloId});
-                         retainObject(objHandle); // stack will later release this slot in shrinkStackWithRelease
-                         stack.push_back(objHandle);  // 使用完整的 ObjectHandle（包含 generation）
-                         for (auto& argIt : ctorArgItems) {
-                             stack.push_back(argIt.value);
-                             // transfer ownership from ctorArgItems -> stack
-                             argIt.owner = 0;
-                         }
-                        
-                        // 保存oldLocal（但在OBJ_BUILD中，local应该是当前frame的）
-                        auto oldLocal = local;
-                        auto oldUpvalue = upvalue;
-                        
-                        // 设置init的参数（使用与CALL_CLOSURE相同的逻辑）
-                        int calleeIndex = stack.size() - (argc + 2);  // argc+1(this) + 1(closure)
-                        
-                        // 初始化local数组
-                        int regularParamCount = proto.paramCount;
-                        local.clear();
-                        local.resize(regularParamCount);
-                        std::vector<bool> paramProvided(regularParamCount, false);
-                        upvalue.clear();
-                        for (int i = 0; i < regularParamCount; ++i) {
-                            local[i] = newCell(LexerType::Value(0), 0, "CONSTRUCTOR_local");
-                        }
-                        
-                        // 扩展 local 以容纳 *args 和 **kwargs
-                        if (proto.hasVariadicArgs || proto.hasVariadicKwargs) {
-                            int extraSlots = 0;
-                            if (proto.hasVariadicArgs) extraSlots++;
-                            if (proto.hasVariadicKwargs) extraSlots++;
-                            
-                            int newLocalSize = regularParamCount + extraSlots;
-                            local.resize(newLocalSize);
-                            for (int idx = regularParamCount; idx < newLocalSize; ++idx) {
-                                local[idx] = newCell(LexerType::Value(0), 0, "CONSTRUCTOR_varargs");
-                            }
-                        }
-                        
-                        // 分离位置参数和命名参数
-                        std::map<std::string, ZeusType::UniversalVariant> namedArgs;
-                        std::vector<ZeusType::UniversalVariant> positionalArgs;
-                        
-                        // this是第一个参数
-                        positionalArgs.push_back(stack[calleeIndex + 1]);
-                        
-                        // 处理构造函数的其他参数
-                        for (int i = 0; i < argc; ++i) {
-                            auto& arg = stack[calleeIndex + 2 + i];  // +2因为有closure和this
-                            if (std::holds_alternative<std::shared_ptr<ZeusType::NamedArg>>(arg)) {
-                                auto namedArgPtr = std::get<std::shared_ptr<ZeusType::NamedArg>>(arg);
-                                namedArgs[namedArgPtr->name] = namedArgPtr->value;
-                            } else {
-                                positionalArgs.push_back(arg);
-                            }
-                        }
-                        
-                        int positionalCount = (int)positionalArgs.size();
-                        
-                        // 填充常规参数
-                        std::set<std::string> consumedNamedArgs;
-                        
-                        for (int i = 0; i < regularParamCount; ++i) {
-                            bool filled = false;
-                            
-                            // 优先使用位置参数
-                            if (i < positionalCount) {
-                                assignCellValue(local[i], positionalArgs[i]);
-                                paramProvided[i] = true;
-                                filled = true;
-                            }
-                            
-                            // 尝试从命名参数匹配
-                            if (!filled && i < (int)proto.paramNames.size()) {
-                                const std::string& paramName = proto.paramNames[i];
-                                auto it = namedArgs.find(paramName);
-                                if (it != namedArgs.end()) {
-                                    assignCellValue(local[i], it->second);
-                                    consumedNamedArgs.insert(paramName);
-                                    paramProvided[i] = true;
-                                    filled = true;
-                                }
-                            }
-
-                            if (!filled && !proto.hasRuntimeDefaultPrologue &&
-                                i < (int)proto.paramHasDefault.size() && proto.paramHasDefault[i] &&
-                                i < (int)proto.paramDefaultValues.size()) {
-                                assignCellValue(local[i], proto.paramDefaultValues[i]);
-                                filled = true;
-                            }
-                            
-                            // 最后用0初始化
-                            if (!filled) {
-                                assignCellValue(local[i], LexerType::Value(0));
-                            }
-                        }
-                        
-                        // 构建 *args 数组
-                        if (proto.hasVariadicArgs) {
-                            std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                            std::vector<ZeusType::UniversalVariant> argsVec;
-                            for (int i = regularParamCount; i < positionalCount; ++i) {
-                                argsVec.push_back(positionalArgs[i]);
-                            }
-                            
-                            auto arrayDataPtr = ZeusGC::makeArrayData();
-                            arrayDataPtr->valueRefCount.store(0, std::memory_order_relaxed);
-                            arrayDataPtr->data = argsVec;
-                            ZeusType::Array argsArray;
-                            argsArray.impl = arrayDataPtr;
-                            
-                            ZeusType::Variant variantArgsArray = argsArray;
-                            assignCellValue(local[regularParamCount], variantArgsArray);
-                        }
-                        
-                        // 构建 **kwargs 字典
-                        if (proto.hasVariadicKwargs) {
-                            std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                            auto objDataPtr = ZeusGC::makeObjectData();
-                            
-                            for (const auto& kv : namedArgs) {
-                                if (consumedNamedArgs.find(kv.first) == consumedNamedArgs.end()) {
-                                    objDataPtr->setValue(kv.first, kv.second);
-                                }
-                            }
-                            
-                            ZeusType::Object kwargsDict;
-                            kwargsDict.impl = objDataPtr;
-                            
-                            ZeusType::Variant variantKwargs = kwargsDict;
-                            int kwargsSlot = regularParamCount;
-                            if (proto.hasVariadicArgs) kwargsSlot++;
-                            assignCellValue(local[kwargsSlot], variantKwargs);
-                        }
-                        
-                        // Use the shared frame loop while retaining constructor argument binding.
-                        CallFrame constructorFrame;
-                        constructorFrame.code = &proto.body;
-                        constructorFrame.pc = 0;
-                        constructorFrame.savedLocal = oldLocal;
-                        constructorFrame.savedUpvalue = oldUpvalue;
-                        constructorFrame.stackBase = calleeIndex;
-                        constructorFrame.savedLine = __line;
-                        constructorFrame.paramProvided = std::move(paramProvided);
-                        constructorFrame.referenceParameterSlots = proto.paramIsReference;
-                        constructorFrame.constructorResult = objHandle;
-                        callFrames.push_back(std::move(constructorFrame));
-                        justPushedFrame = true;
-                        constructorFrameScheduled = true;
-                    }
-                }
-
-                // 释放构造保护 retain（创建时 +1）
-                }
-                releaseObject(objHandle);
-                if (vmstat != ZeusType::VMStatus::Running) {
-                    if (!constructorFrameScheduled) {
-                        releaseObject(objHandle); // no result is transferred to a frame or stack
-                    }
-                    break;
-                }
-                if (!constructorFrameScheduled) {
-                    stack.push_back(objHandle);  // 使用完整的 ObjectHandle（包含 generation）
-                }
-                printStack();
-                break;
-            }
-
-            case VMOperator::OBJ_BUILD_SHARED: {
-                std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                // OBJ_BUILD_SHARED "objName" argc
-                // 创建共享对象，存储到共享堆上
-                // 栈布局: [classHandle/className, arg1, arg2, ...]
-                
-                std::string objName = "";
-                int argc = 0;
-                
-                if (instr.args.size() >= 1 && std::holds_alternative<std::string>(instr.args[0])) {
-                    objName = std::get<std::string>(instr.args[0]);
-                }
-                if (instr.args.size() >= 2 && std::holds_alternative<LexerType::Value>(instr.args[1])) {
-                    argc = VMHelpers::getIntFromValue(std::get<LexerType::Value>(instr.args[1]));
-                }
-
-                if (objName.empty()) {
-                    VMException::VMException exp("OBJ_BUILD_SHARED requires object name", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                if (stack.size() < (size_t)(argc + 1)) {
-                    VMException::VMException exp("OBJ_BUILD_SHARED stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 保存构造函数参数
-                std::vector<ZeusType::UniversalVariant> ctorArgs;
-                for (int i = 0; i < argc; ++i) {
-                    ctorArgs.insert(ctorArgs.begin(), stack.back());
-                    stack.pop_back();
-                }
-
-                // 获取类
-                auto clsU = stack.back();
-                stack.pop_back();
-
-                int classId = -1;
-
-                if (std::holds_alternative<ZeusType::ClassHandle>(clsU)) {
-                    classId = std::get<ZeusType::ClassHandle>(clsU).id;
-                } else if (std::holds_alternative<ZeusType::SharedClassHandle>(clsU)) {
-                    // 共享类：需要从共享堆获取类信息
-                    std::string className = std::get<ZeusType::SharedClassHandle>(clsU).name;
-                    
-                    // 查找本地 classes 数组中是否已有该类
-                    for (size_t i = 0; i < classes.size(); ++i) {
-                        if (classes[i].name == className) {
-                            classId = (int)i;
-                            break;
-                        }
-                    }
-                    
-                    if (classId == -1) {
-                        VMException::VMException exp("OBJ_BUILD_SHARED: shared class not found locally: " + className, __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                } else if (std::holds_alternative<std::string>(clsU)) {
-                    std::string className = std::get<std::string>(clsU);
-                    for (size_t i = 0; i < classes.size(); ++i) {
-                        if (classes[i].name == className) {
-                            classId = (int)i;
-                            break;
-                        }
-                    }
-                    if (classId == -1) {
-                        VMException::VMException exp("OBJ_BUILD_SHARED class not found: " + className, __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                } else {
-                    VMException::VMException exp("OBJ_BUILD_SHARED needs ClassHandle or className", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                auto* classPtr = getClass(classId);
-                if (!classPtr) {
-                    VMException::VMException exp("OBJ_BUILD_SHARED invalid class id", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 创建对象实例（同时存储到本地和共享堆）
-                ZeusType::ObjectInstance obj;
-                obj.classId = classId;
-
-                const auto ci = *classPtr;
-                for (const auto& kv : ci.fields) {
-                    obj.extensionValues[kv.first] = kv.second.defaultValue;
-                    // Same ownership rule as OBJ_BUILD: the instance owns its
-                    // field values, so the shared default has to be retained.
-                    ZeusGC::retainVariantDeep(*this, obj.extensionValues[kv.first]);
-                    obj.flags[kv.first]  = kv.second.isConst ? 0x1 : 0x0;
-                }
-
-                ZeusType::ObjectHandle objHandle = allocObject(std::move(obj));
-                int objId = objHandle.id;
-
-                // 将对象序列化为 ObjectData 存储到共享堆
-                auto sharedObjData = ZeusGC::makeObjectData();
-                sharedObjData->setValue("__obj_id__", LexerType::Value(objId));
-                sharedObjData->setValue("__obj_generation__", LexerType::Value(objHandle.generation));
-                sharedObjData->setValue("__class_id__", LexerType::Value(classId));
-                sharedObjData->setValue("__class_name__", LexerType::Value(ci.name));
-                for (const auto& fieldType : ci.explicitFieldTypes) {
-                    sharedObjData->setValue(
-                        "__field_type__" + fieldType.first,
-                        LexerType::Value(fieldType.second));
-                }
-                
-                // 注意：这里需要重新获取对象引用，因为 allocObject 可能复用槽位
-                auto* objRef = getObject(objId);
-                if (objRef) {
-                    for (const auto& kv : snapshotObjectFields(*objRef)) {
-                        sharedObjData->setValue(kv.first, kv.second);
-                    }
-                }
-
-                ZeusType::Object sharedObj;
-                sharedObj.impl = sharedObjData;
-
-                auto sharedCell = ZeusShared::getGlobalHeap().getOrCreate(
-                    objName,
-                    ZeusType::Variant(sharedObj)
-                );
-
-                // Field initializers run only after the shared object is
-                // registered, so `this.field` reads the same live data that
-                // later initializers will observe.
-                const ZeusType::SharedObjectHandle sharedHandle{
-                    objName, sharedCell->generation};
-                std::unordered_set<std::string> initializedFields;
-                for (const auto& fieldName : ci.fieldOrder) {
-                    const auto field = ci.fields.find(fieldName);
-                    if (field == ci.fields.end()) continue;
-                    initializedFields.insert(fieldName);
-                    if (field->second.initializerProtoId < 0) continue;
-
-                    std::string initializerError;
-                    if (!runFieldInitializer(
-                            field->second.initializerProtoId,
-                            classId,
-                            ZeusType::UniversalVariant(sharedHandle),
-                            objHandle,
-                            ci.name,
-                            fieldName,
-                            sharedObjData,
-                            initializerError)) {
-                        if (vmstat == ZeusType::VMStatus::Running) {
-                            VMException::VMException exp(
-                                initializerError, __line, instr);
-                            exp._throw(vmstat, currentChunk);
-                        }
-                        break;
-                    }
-                }
-
-                if (vmstat == ZeusType::VMStatus::Running) {
-                    for (const auto& field : ci.fields) {
-                        if (field.second.initializerProtoId >= 0 &&
-                            initializedFields.find(field.first) ==
-                                initializedFields.end()) {
-                            VMException::VMException exp(
-                                "field initializer has no declaration order metadata for '" +
-                                    ci.name + "." + field.first + "'",
-                                __line,
-                                instr);
-                            exp._throw(vmstat, currentChunk);
-                            break;
-                        }
-                    }
-                }
-
-                if (vmstat != ZeusType::VMStatus::Running) {
-                    break;
-                }
-
-                // 调用 init 构造函数（如果存在）
-                auto initIt = ci.instanceMethods.find("init");
-                if (initIt != ci.instanceMethods.end() && getPrototype(initIt->second)) {
-                    // 简化处理：不调用 init，让用户自己调用
-                    // 或者之后扩展支持
-                }
-
-                // 返回 SharedObjectHandle
-                stack.push_back(sharedHandle);
-                printStack();
-                break;
-            }
-
-            case VMOperator::OBJ_LOAD_ATTR: {
-                if (instr.args.empty() || !std::holds_alternative<std::string>(instr.args[0])) {
-                    VMException::VMException exp("OBJ_LOAD_ATTR missing attrName", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                if (stack.empty()) {
-                    VMException::VMException exp("OBJ_LOAD_ATTR stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                std::string attr = std::get<std::string>(instr.args[0]);
-
-                StackItem objItem = popStackItem();
-                auto objU = objItem.value;
-                struct DropObj {
-                    VM* vm;
-                    StackItem* it;
-                    ~DropObj() { if (vm && it) vm->dropStackItem(*it); }
-                } dropObj{this, &objItem};
-
-                // 特殊处理：如果是ModuleProxy，将属性访问映射到全局变量
-                if (std::holds_alternative<ZeusType::ModuleProxy>(objU)) {
-                    const auto& proxy = std::get<ZeusType::ModuleProxy>(objU);
-                    std::string fullName = proxy.modulePath + "." + attr;
-                    
-                    // 从globalNames查找索引
-                    int index = -1;
-                    for (size_t i = 0; i < globalNames.size(); ++i) {
-                        if (globalNames[i] == fullName) {
-                            index = (int)i;
-                            break;
-                        }
-                    }
-                    
-                    if (index < 0) {
-                        VMException::VMException exp("Module '" + proxy.modulePath + "' has no attribute '" + attr + "'", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    if ((size_t)index >= global.size()) {
-                        VMException::VMException exp("Module attribute index out of range: " + fullName, __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    if (!global[index]) {
-                        VMException::VMException exp("Module attribute not initialized: " + fullName, __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    // 压入全局变量的值（为栈建立所有权引用）
-                    auto value = global[index]->readValue();
-                    ZeusGC::retainVariantDeep(*this, value);
-                    stack.push_back(std::move(value));
-                    break;
-                }
-
-                // 处理 SharedObjectHandle：从共享堆读取属性
-                if (std::holds_alternative<ZeusType::SharedObjectHandle>(objU)) {
-                    const auto sharedHandle = std::get<ZeusType::SharedObjectHandle>(objU);
-                    const std::string& sharedName = sharedHandle.name;
-                    
-                    auto cell = ZeusShared::getGlobalHeap().find(
-                        sharedName, sharedHandle.generation);
-                    if (!cell) {
-                        VMException::VMException exp("OBJ_LOAD_ATTR: undefined shared object '" + sharedName + "'", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    ZeusType::UniversalVariant sharedVal = cell->read();
-                    
-                    // 检查是否是 Variant 中的 Object
-                    if (!std::holds_alternative<ZeusType::Variant>(sharedVal)) {
-                        VMException::VMException exp("OBJ_LOAD_ATTR: shared variable is not an object", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    auto& variantVal = std::get<ZeusType::Variant>(sharedVal);
-                    if (!std::holds_alternative<ZeusType::Object>(variantVal)) {
-                        VMException::VMException exp("OBJ_LOAD_ATTR: shared variable is not an object", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    auto& obj = std::get<ZeusType::Object>(variantVal);
-                    if (!obj.impl) {
-                        VMException::VMException exp("OBJ_LOAD_ATTR: shared object has null impl", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    auto attrIt = obj.impl->data.find(attr);
-                    if (attrIt == obj.impl->data.end()) {
-                        VMException::VMException exp("OBJ_LOAD_ATTR: shared object has no attribute '" + attr + "'", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    ZeusGC::retainVariantDeep(*this, attrIt->second);
-                    stack.push_back(attrIt->second);
-                    ZEUS_DEBUG_PRINT("[VM] OBJ_LOAD_ATTR: shared object '%s', attr='%s'", sharedName.c_str(), attr.c_str());
-                    break;
-                }
-
-                if (!std::holds_alternative<ZeusType::ObjectHandle>(objU)) {
-                    // 检查是否是ClassHandle（试图访问类的静态方法-MODIFIED）
-                    std::string actualType = "unknown";
-                    if (std::holds_alternative<ZeusType::ClassHandle>(objU)) {
-                        int cid = std::get<ZeusType::ClassHandle>(objU).id;
-                        auto* classPtr = getClass(cid);
-                        if (!classPtr) {
-                            VMException::VMException exp("OBJ_LOAD_ATTR invalid class id", __line, instr);
-                            exp._throw(vmstat, currentChunk);
-                            break;
-                        }
-                        std::string className = classPtr->name;
-                        
-                        // 尝试加载静态方法
-                        auto itStatic = classPtr->staticMethods.find(attr);
-                        if (itStatic != classPtr->staticMethods.end()) {
-                            // 找到静态方法，创建闭包并压栈
-                            int protoId = itStatic->second;
-                            if (!getPrototype(protoId)) {
-                                VMException::VMException exp("OBJ_LOAD_ATTR invalid static method protoId", __line, instr);
-                                exp._throw(vmstat, currentChunk);
-                                break;
-                            }
-                            Closure clo;
-                            clo.protoId = protoId;
-                            // 如果下一个指令是 CALL_CLOSURE 则视为临时调用并自动释放
-                            // We execute this closure synchronously; mark as autoRelease
-                            clo.autoRelease = true;
-                            int cloId = allocClosure(std::move(clo));
-                            stack.push_back(ZeusType::ClosureHandle{cloId});
-                            break;
-                        }
-                        
-                        // 没找到静态方法，报错
-                        auto exp = VMException::VMException(
-                            VMException::ErrorCode::E1600_ATTRIBUTE_NOT_FOUND,
-                            VMException::ErrorCategory::ATTRIBUTE_ERROR,
-                            "Cannot find static member '" + attr + "' on class '" + className + "'",
-                            __line, instr
-                        );
-                        exp.setDetails("Class '" + className + "' does not have a static method or static variable named '" + attr + "'");
-                        exp.setSuggestion(
-                            "Check if the member name is correct, or if it should be an instance member: 'let obj = new " + 
-                            className + "(...); obj." + attr + "'"
-                        );
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    } else if (std::holds_alternative<LexerType::Value>(objU)) {
-                        actualType = "primitive value";
-                    } else if (std::holds_alternative<ZeusType::ClosureHandle>(objU)) {
-                        actualType = "function";
-                    }
-                    
-                    auto exp = VMException::typeError_ExpectedObject(
-                        "Attribute access", actualType, __line, instr
-                    );
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 获取 ObjectHandle 并验证 generation
-                ZeusType::ObjectHandle objHandle = std::get<ZeusType::ObjectHandle>(objU);
-                auto* objPtr = getValidObject(objHandle);
-                
-                if (!objPtr) {
-                    // 对象已被释放或 slot 已被复用
-                    // 提供更详细的错误信息
-                    std::string detailMsg = "OBJ_LOAD_ATTR: object has been freed or reused (stale reference)";
-                    auto* rawObj = getObject(objHandle.id);
-                    if (!rawObj) {
-                        detailMsg += " [object not found: id=" + std::to_string(objHandle.id) + "]";
-                    } else if (rawObj->generation != objHandle.generation) {
-                        detailMsg += " [generation mismatch: handle.gen=" + std::to_string(objHandle.generation) 
-                                   + " obj.gen=" + std::to_string(rawObj->generation) + "]";
-                    } else if (rawObj->markedForDeletion) {
-                        detailMsg += " [object marked for deletion]";
-                    } else if (rawObj->classId < 0) {
-                        detailMsg += " [object cleared, classId=" + std::to_string(rawObj->classId) + "]";
-                    }
-                    VMException::VMException exp(detailMsg, __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                auto& obj = *objPtr;
-                
-                // 首先检查是否有 operator[.] 重载
-                int classId = obj.classId;
-                auto* classPtr = getClass(classId);
-                
-                ZEUS_DEBUG_PRINT("[VM] OBJ_LOAD_ATTR: obj.classId=%d, attr='%s', classCount=%zu", 
-                    classId, attr.c_str(), getClassCount());
-                
-                if (classPtr) {
-                    const auto& ci = *classPtr;
-                    ZEUS_DEBUG_PRINT("[VM]   class='%s', operatorMethods.size()=%zu", 
-                        ci.name.c_str(), ci.operatorMethods.size());
-                    
-                    for (const auto& kv : ci.operatorMethods) {
-                        ZEUS_DEBUG_PRINT("[VM]     operator '%s' -> protoId=%d", kv.first.c_str(), kv.second);
-                    }
-                    
-                    auto opIt = ci.operatorMethods.find("[.]");
-                    
-                    if (opIt != ci.operatorMethods.end()) {
-                        // 有 operator[.] 重载,调用它
-                        int protoId = opIt->second;
-                        ZEUS_DEBUG_PRINT("[VM] Found operator[.]! protoId=%d, getPrototype=%p)", 
-                            protoId, (void*)getPrototype(protoId));
-                        
-                        if (!getPrototype(protoId)) {
-                            ZEUS_DEBUG_PRINT("[VM] ERROR: Invalid protoId!");
-                            VMException::VMException exp("OBJ_LOAD_ATTR: invalid protoId for operator[.]", __line, instr);
-                            exp._throw(vmstat, currentChunk);
-                            break;
-                        }
-                        
-                        // 创建 Closure 包装 protoId
-                        Closure clo;
-                        clo.protoId = protoId;
-                        clo.autoRelease = true; // operator[.] is an immediate call wrapper
-                        int cloId = allocClosure(std::move(clo));
-                        
-                        ZEUS_DEBUG_PRINT("[VM] Created closure #%d for protoId=%d", cloId, protoId);
-                        
-                        // 压入: closure, this(对象), 属性名
-                        stack.push_back(ZeusType::ClosureHandle{cloId});
-                        // objItem remains owned by DropObj until this opcode
-                        // finishes, so the synchronous call needs its own copy.
-                        ZeusGC::retainVariantDeep(*this, objU);
-                        stack.push_back(objU);  // this
-                        stack.push_back(LexerType::Value(attr));  // 属性名作为参数
-                        
-                        ZEUS_DEBUG_PRINT("[VM] Stack prepared, calling executeClosureSync with 2 args...");
-                        
-                        // 使用同步调用 operator[.]
-                        if (!executeClosureSync(cloId, 2)) {
-                            if (vmstat != ZeusType::VMStatus::Running) break;
-                            VMException::VMException exp("OBJ_LOAD_ATTR: operator[.] sync call failed", __line, instr);
-                            exp._throw(vmstat, currentChunk);
-                            break;
-                        }
-                        
-                        ZEUS_DEBUG_PRINT("[VM] executeClosureSync returned, stack.size=%zu", stack.size());
-                        
-                        // 方法调用完成,结果在栈顶,继续执行
-                        break;
-                    } else {
-                        ZEUS_DEBUG_PRINT("[VM]   operator[.] NOT found!");
-                    }
-                }
-                
-                // 没有operator[.]重载,使用默认行为
-                if (!hasObjectField(obj, attr)) {
-                    // 如果不在values中，尝试查找instanceMethods
-                    if (classPtr) {
-                        const auto& ci = *classPtr;
-                        auto methodIt = ci.instanceMethods.find(attr);
-                        if (methodIt != ci.instanceMethods.end()) {
-                            // 找到实例方法，创建一个绑定了this的闭包
-                            int protoId = methodIt->second;
-                            ZEUS_DEBUG_PRINT("[VM] OBJ_LOAD_ATTR: found instance method '%s', protoId=%d", attr.c_str(), protoId);
-                            
-                            if (!getPrototype(protoId)) {
-                                VMException::VMException exp("OBJ_LOAD_ATTR: invalid protoId for instance method '" + attr + "'", __line, instr);
-                                exp._throw(vmstat, currentChunk);
-                                break;
-                            }
-                            
-                            // 创建闭包并绑定this（使用完整的 ObjectHandle 包含 generation）
-                            Closure clo;
-                            clo.protoId = protoId;
-                            retainObject(objHandle); // closure will own & later release boundThis
-                            clo.boundThis = objHandle;
-                            int cloId = allocClosure(std::move(clo));
-                            stack.push_back(ZeusType::ClosureHandle{cloId});
-                            ZEUS_DEBUG_PRINT("[VM] OBJ_LOAD_ATTR: created bound closure #%d for method '%s'", cloId, attr.c_str());
-                            break;
-                        }
-                    }
-                    
-                    // 打印所有可用的属性名
-                    std::string availableAttrs;
-                    for (const auto& kv : snapshotObjectFields(obj)) {
-                        if (!availableAttrs.empty()) availableAttrs += ", ";
-                        availableAttrs += kv.first;
-                    }
-                    ZEUS_DEBUG_PRINT("[VM] OBJ_LOAD_ATTR: object has fields: [%s]", availableAttrs.c_str());
-                    
-                    VMException::VMException exp("OBJ_LOAD_ATTR missing field '" + attr + "'", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                ZEUS_DEBUG_PRINT("[VM] OBJ_LOAD_ATTR: found field '%s', pushing to stack", attr.c_str());
-                auto fieldVal = readObjectField(obj, attr);
-                ZeusGC::retainVariantDeep(*this, fieldVal);
-                stack.push_back(fieldVal);
-                printStack();
-                break;
-            }
-
-            case VMOperator::OBJ_STORE_ATTR: {
-                if (instr.args.empty() || !std::holds_alternative<std::string>(instr.args[0])) {
-                    VMException::VMException exp("OBJ_STORE_ATTR missing attrName", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                if (stack.size() < 2) {
-                    VMException::VMException exp("OBJ_STORE_ATTR stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                std::string attr = std::get<std::string>(instr.args[0]);
-
-                StackItem valItem = popStackItem();
-                StackItem objItem = popStackItem();
-                auto val = valItem.value;
-                auto objU = objItem.value;
-                struct DropInputs {
-                    VM* vm;
-                    StackItem* a;
-                    StackItem* b;
-                    ~DropInputs() {
-                        if (vm && a) vm->dropStackItem(*a);
-                        if (vm && b) vm->dropStackItem(*b);
-                    }
-                } dropInputs{this, &valItem, &objItem};
-
-                // 处理 SharedObjectHandle：写入共享堆中的对象属性
-                if (std::holds_alternative<ZeusType::SharedObjectHandle>(objU)) {
-                    const auto sharedHandle = std::get<ZeusType::SharedObjectHandle>(objU);
-                    const std::string& sharedName = sharedHandle.name;
-                    
-                    auto cell = ZeusShared::getGlobalHeap().find(
-                        sharedName, sharedHandle.generation);
-                    if (!cell) {
-                        VMException::VMException exp("OBJ_STORE_ATTR: undefined shared object '" + sharedName + "'", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-
-                    std::string expectedFieldType;
-                    const std::string sharedClassName =
-                        sharedObjectTypeName(sharedHandle);
-                    if (!sharedClassName.empty()) {
-                        const int sharedClassId = findClassByName(sharedClassName);
-                        const auto* sharedClass = getClass(sharedClassId);
-                        if (sharedClass) {
-                            const auto fieldType =
-                                sharedClass->explicitFieldTypes.find(attr);
-                            if (fieldType != sharedClass->explicitFieldTypes.end()) {
-                                expectedFieldType = fieldType->second;
-                            }
-                        }
-                    }
-                    if (expectedFieldType.empty()) {
-                        expectedFieldType = serializedSharedFieldType(
-                            sharedHandle, attr);
-                    }
-                    const bool fieldTypeMismatch = !expectedFieldType.empty() && [&] {
-                        std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                        return !isValueCompatibleWithType(val, expectedFieldType);
-                    }();
-                    if (fieldTypeMismatch) {
-                        const std::string actualType = runtimeValueTypeName(val);
-                        VMException::VMException exp(
-                            "TypeError: field '" + sharedClassName + "." + attr +
-                                "' expects '" + expectedFieldType + "', got '" +
-                                actualType + "'",
-                            __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    // 加锁修改共享对象
-                    cell->lockWrite();
-                    struct SharedObjectWriteUnlock {
-                        std::shared_ptr<ZeusShared::SharedCell> cell;
-                        ~SharedObjectWriteUnlock() {
-                            if (cell) cell->unlockWrite();
-                        }
-                    } sharedWriteUnlock{cell};
-
-                    std::string sharedObjectError;
-                    cell->withValue([&](ZeusType::UniversalVariant& sharedValue) {
-                        auto* variantValue = std::get_if<ZeusType::Variant>(&sharedValue);
-                        auto* objectValue = variantValue != nullptr
-                            ? std::get_if<ZeusType::Object>(variantValue)
-                            : nullptr;
-                        if (objectValue == nullptr) {
-                            sharedObjectError =
-                                "OBJ_STORE_ATTR: shared variable is not an object";
-                            return;
-                        }
-                        if (!objectValue->impl) {
-                            sharedObjectError =
-                                "OBJ_STORE_ATTR: shared object has null impl";
-                            return;
-                        }
-                        objectValue->impl->setValue(attr, val);
-                    });
-                    if (!sharedObjectError.empty()) {
-                        VMException::VMException exp(sharedObjectError, __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    ZEUS_DEBUG_PRINT("[VM] OBJ_STORE_ATTR: shared object '%s', attr='%s'", sharedName.c_str(), attr.c_str());
-                    break;
-                }
-
-                if (!std::holds_alternative<ZeusType::ObjectHandle>(objU)) {
-                    VMException::VMException exp("OBJ_STORE_ATTR needs ObjectHandle", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-
-                // 获取 ObjectHandle 并验证 generation
-                ZeusType::ObjectHandle objHandle = std::get<ZeusType::ObjectHandle>(objU);
-                auto* objPtr = getValidObject(objHandle);
-                
-                if (!objPtr) {
-                    // 对象已被释放或 slot 已被复用
-                    // 提供更详细的错误信息
-                    std::string detailMsg = "OBJ_STORE_ATTR: object has been freed or reused (stale reference)";
-                    auto* rawObj = getObject(objHandle.id);
-                    if (!rawObj) {
-                        detailMsg += " [object not found: id=" + std::to_string(objHandle.id) + "]";
-                    } else if (rawObj->generation != objHandle.generation) {
-                        detailMsg += " [generation mismatch: handle.gen=" + std::to_string(objHandle.generation) 
-                                   + " obj.gen=" + std::to_string(rawObj->generation) + "]";
-                    } else if (rawObj->markedForDeletion) {
-                        detailMsg += " [object marked for deletion]";
-                    } else if (rawObj->classId < 0) {
-                        detailMsg += " [object cleared, classId=" + std::to_string(rawObj->classId) + "]";
-                    }
-                    VMException::VMException exp(detailMsg, __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                auto& obj = *objPtr;
-                
-                // 首先检查是否有 operator[.=] 重载
-                int classId = obj.classId;
-                auto* classPtr = getClass(classId);
-                if (classPtr) {
-                    const auto& ci = *classPtr;
-                    auto opIt = ci.operatorMethods.find("[.=]");
-                    if (opIt != ci.operatorMethods.end()) {
-                        // 有 operator[.=] 重载,调用它
-                        int protoId = opIt->second;
-                        ZEUS_DEBUG_PRINT("[VM] Calling operator[.=] for attr '%s' (protoId=%d)", attr.c_str(), protoId);
-                        
-                        // 创建 Closure 包装 protoId
-                        Closure clo;
-                        clo.protoId = protoId;
-                        int cloId = allocClosure(std::move(clo));
-                        
-                        // 压入: closure, this(对象), 属性名, 值
-                        stack.push_back(ZeusType::ClosureHandle{cloId});
-                        ZeusGC::retainVariantDeep(*this, objU);
-                        stack.push_back(objU);  // this
-                        stack.push_back(attr);  // 属性名
-                        ZeusGC::retainVariantDeep(*this, val);
-                        stack.push_back(val);   // 值
-                        
-                        // 调用 CALL_CLOSURE,3个参数(this + 属性名 + 值)
-                        // Dispatch through a real frame: executeClosureSync pushes a
-                        // CallFrame and runs it to completion, so the callee gets its own
-                        // local slots. A recursive execute() would share this frame's local
-                        // buffer and leave the callee's slots behind in it.
-                        if (!executeClosureSync(cloId, 3)) {
-                            if (vmstat != ZeusType::VMStatus::Running) break;
-                            VMException::VMException exp(
-                                "[execute] nested dispatch failed", __line, instr);
-                            exp._throw(vmstat, currentChunk);
-                            break;
-                        }
-                        
-                        // 方法调用完成,继续执行
-                        break;
-                    }
-                }
-                
-                // 没有operator[.=]重载,使用默认行为
-                auto fit = obj.flags.find(attr);
-                if (fit != obj.flags.end() && (fit->second & 0x1)) {
-                    VMException::VMException exp("OBJ_STORE_ATTR write to const field '" + attr + "'", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                if (classPtr) {
-                    const auto fieldType =
-                        classPtr->explicitFieldTypes.find(attr);
-                    if (fieldType != classPtr->explicitFieldTypes.end() &&
-                        !isValueCompatibleWithType(val, fieldType->second)) {
-                        const std::string actualType = runtimeValueTypeName(val);
-                        VMException::VMException exp(
-                            "TypeError: field '" + classPtr->name + "." + attr +
-                                "' expects '" + fieldType->second + "', got '" +
-                                actualType + "'",
-                            __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                }
-
-                // Replace the field in its declared slot or dynamic extension.
-                // Keep the old VM reference alive until the new value is stored.
-                std::optional<ZeusType::UniversalVariant> oldValue;
-                if (hasObjectField(obj, attr)) {
-                    oldValue = readObjectField(obj, attr);
-                }
-                ZeusGC::retainVariantDeep(*this, val);
-                try {
-                    writeObjectField(obj, attr, val);
-                } catch (...) {
-                    ZeusGC::releaseVariantDeep(*this, val);
-                    throw;
-                }
-                if (oldValue) ZeusGC::releaseVariantDeep(*this, *oldValue);
-                printStack();
-                break;
-            }
-
-            case VMOperator::OBJ_REPLACE_STATE: {
-                std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                if (stack.size() < 2) {
-                    VMException::VMException("@this replacement stack underflow", __line, instr)
-                        ._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                StackItem replacementItem = popStackItem();
-                StackItem receiverItem = popStackItem();
-                struct DropReplacementInputs {
-                    VM* vm;
-                    StackItem* replacement;
-                    StackItem* receiver;
-                    ~DropReplacementInputs() {
-                        if (vm && replacement) vm->dropStackItem(*replacement);
-                        if (vm && receiver) vm->dropStackItem(*receiver);
-                    }
-                } dropInputs{this, &replacementItem, &receiverItem};
-
-                if (!std::holds_alternative<ZeusType::ObjectHandle>(receiverItem.value) ||
-                    !std::holds_alternative<ZeusType::ObjectHandle>(replacementItem.value)) {
-                    VMException::VMException(
-                        "@this replacement requires two class instances", __line, instr)
-                        ._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                const auto receiverHandle =
-                    std::get<ZeusType::ObjectHandle>(receiverItem.value);
-                const auto replacementHandle =
-                    std::get<ZeusType::ObjectHandle>(replacementItem.value);
-                auto* receiver = getValidObject(receiverHandle);
-                auto* replacement = getValidObject(replacementHandle);
-                if (!receiver || !replacement) {
-                    VMException::VMException(
-                        "@this replacement received a stale class instance", __line, instr)
-                        ._throw(vmstat, currentChunk);
-                    break;
-                }
-                if (receiver->classId != replacement->classId) {
-                    std::string expectedType;
-                    if (!instr.args.empty() &&
-                        std::holds_alternative<std::string>(instr.args[0])) {
-                        expectedType = std::get<std::string>(instr.args[0]);
-                    }
-                    const auto* receiverClass = getClass(receiver->classId);
-                    const auto* replacementClass = getClass(replacement->classId);
-                    const std::string receiverType = receiverClass ? receiverClass->name :
-                        std::string("unknown");
-                    const std::string replacementType = replacementClass
-                        ? replacementClass->name : std::string("unknown");
-                    VMException::VMException(
-                        "@this replacement type mismatch: receiver '" + receiverType +
-                            "', replacement '" + replacementType +
-                            "' (declared receiver type '" + expectedType + "')",
-                        __line, instr)
-                        ._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                if (receiverHandle.id == replacementHandle.id &&
-                    receiverHandle.generation == replacementHandle.generation) {
-                    break;
-                }
-
-                const auto replacementValues = snapshotObjectFields(*replacement);
-                auto replacementDeclaredFields = replacement->declaredFields
-                    ? replacement->declaredFields->clone()
-                    : std::shared_ptr<ZeusType::DeclaredFieldBuffer>{};
-                auto replacementExtensions = replacement->extensionValues;
-                auto replacementFlags = replacement->flags;
-                const auto oldFields = snapshotObjectFields(*receiver);
-                for (const auto& field : replacementValues) {
-                    ZeusGC::retainVariantDeep(*this, field.second);
-                }
-                auto oldDeclaredFields = std::move(receiver->declaredFields);
-                auto oldExtensions = std::move(receiver->extensionValues);
-                receiver->declaredFields = std::move(replacementDeclaredFields);
-                receiver->extensionValues = std::move(replacementExtensions);
-                receiver->flags = std::move(replacementFlags);
-                for (const auto& field : oldFields) {
-                    ZeusGC::releaseVariantDeep(*this, field.second);
-                }
-                oldDeclaredFields.reset();
-                oldExtensions.clear();
-                break;
-            }
-
-            case VMOperator::CLASS_STATIC_METHOD_CALL: {
-                if (instr.args.size() < 2 || !std::holds_alternative<std::string>(instr.args[0]) || !std::holds_alternative<LexerType::Value>(instr.args[1]) || !std::holds_alternative<ZeusType::BigInteger>(std::get<LexerType::Value>(instr.args[1]).data)) {
-                    VMException::VMException exp("CLASS_STATIC_METHOD_CALL bad args", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                std::string method = std::get<std::string>(instr.args[0]);
-                int argc = VMHelpers::getIntFromValue(std::get<LexerType::Value>(instr.args[1]));
-
-                if (stack.size() < (size_t)argc + 1) {
-                    VMException::VMException exp("CLASS_STATIC_METHOD_CALL stack not enough", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                size_t calleeIndex = stack.size() - (argc + 1);
-                auto& callee = stack[calleeIndex];
-                if (!std::holds_alternative<ZeusType::ClassHandle>(callee)) {
-                    VMException::VMException exp("CLASS_STATIC_METHOD_CALL callee not class handle", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                int classId = std::get<ZeusType::ClassHandle>(callee).id;
-                auto* classPtr = getClass(classId);
-                if (!classPtr) {
-                    VMException::VMException exp("CLASS_STATIC_METHOD_CALL invalid class id", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                auto it = classPtr->staticMethods.find(method);
-                if (it == classPtr->staticMethods.end()) {
-                    VMException::VMException exp("CLASS_STATIC_METHOD_CALL unknown static method '" + method + "'", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                int protoId = it->second;
-                if (!getPrototype(protoId)) {
-                    VMException::VMException exp("CLASS_STATIC_METHOD_CALL invalid protoId", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 将类的静态方法包装成一个临时 closure 并压入栈
-                // 注意：该 closure 没有捕获 upvalue（纯静态方法）
-                Closure clo;
-                clo.protoId = protoId;
-                clo.autoRelease = true;
-
-                int cloId = allocClosure(std::move(clo));
-
-                stack.set(calleeIndex, ZeusType::ClosureHandle{cloId});
-
-                // 直接用 CALL_CLOSURE 指令调用新创建的 closure（相当于 execute(CALL_CLOSURE ...)）
-                // Dispatch through a real frame so the callee gets its own local
-                // slots instead of sharing this frame's local buffer.
-                methodCall.emplace(instr);
-                methodCall->op = VMOperator::CALL_CLOSURE;
-                methodCall->args = {LexerType::Value(argc)};
-                dispatchedInstruction = &*methodCall;
-                goto dispatch_instruction;
-            }
-
-
-            case VMOperator::OBJ_CALL_METHOD: {
-                // args: [ methodName (string), argc (Value int) ]
-                if (instr.args.size() < 2 || !std::holds_alternative<std::string>(instr.args[0]) || !std::holds_alternative<LexerType::Value>(instr.args[1]) || !std::holds_alternative<ZeusType::BigInteger>(std::get<LexerType::Value>(instr.args[1]).data)) {
-                    VMException::VMException exp("OBJ_CALL_METHOD bad args", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                std::string method = std::get<std::string>(instr.args[0]);
-                int argc = VMHelpers::getIntFromValue(std::get<LexerType::Value>(instr.args[1]));
-
-                if (stack.size() < (size_t)argc + 1) {
-                    VMException::VMException exp("OBJ_CALL_METHOD stack not enough", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // callee is at position stack.size() - (argc + 1)
-                size_t calleeIndex = stack.size() - (argc + 1);
-                int explicitGenericProtoId = -1;
-                if (instr.metadata.tag == "generic_vm_specialization") {
-                    std::string targetName;
-                    if (instr.metadata.kind != IRType::IRMetadataKind::CallTarget ||
-                        !instr.metadata.readDirectCall(targetName)) {
-                        VMException::VMException exp(
-                            "explicit generic method call has no resolved VM target",
-                            __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    const auto target = functionNameToProtoId.find(targetName);
-                    if (target == functionNameToProtoId.end() ||
-                        getPrototype(target->second) == nullptr) {
-                        VMException::VMException exp(
-                            "explicit generic method target is missing from the VM prototype table: " +
-                                targetName,
-                            __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    explicitGenericProtoId = target->second;
-                }
-                auto& callee = stack[calleeIndex];
-
-                // Support static-style call on ClassHandle as well: ClassName.method(...)
-                if (std::holds_alternative<ZeusType::ClassHandle>(callee)) {
-                    int classId = std::get<ZeusType::ClassHandle>(callee).id;
-                    auto* classPtr = getClass(classId);
-                    if (!classPtr) {
-                        VMException::VMException exp("OBJ_CALL_METHOD invalid class id", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-
-                    auto itStatic = classPtr->staticMethods.find(method);
-                    if (itStatic == classPtr->staticMethods.end()) {
-                        VMException::VMException exp("OBJ_CALL_METHOD unknown static method '" + method + "'", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-
-                    int protoId = explicitGenericProtoId >= 0
-                        ? explicitGenericProtoId : itStatic->second;
-                    if (!getPrototype(protoId)) {
-                        VMException::VMException exp("OBJ_CALL_METHOD invalid protoId", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-
-                     // Create closure for proto and replace callee with closure handle. Static methods do NOT receive implicit this.
-                     Closure clo;
-                     clo.protoId = protoId;
-                     clo.autoRelease = true;
-                     int cloId = allocClosure(std::move(clo));
-                     stack.set(calleeIndex, ZeusType::ClosureHandle{cloId});
- 
-                     // Reuse CALL_CLOSURE with same argc
-                     // Dispatch through a real frame so the callee gets its own local
-                     // slots instead of sharing this frame's local buffer.
-                     methodCall.emplace(instr);
-                     methodCall->op = VMOperator::CALL_CLOSURE;
-                     methodCall->args = {LexerType::Value(argc)};
-                     dispatchedInstruction = &*methodCall;
-                     goto dispatch_instruction;
-                 }
-
-                // 处理 SharedObjectHandle：从共享堆读取对象并调用方法
-                if (std::holds_alternative<ZeusType::SharedObjectHandle>(callee)) {
-                    const auto sharedHandle = std::get<ZeusType::SharedObjectHandle>(callee);
-                    const std::string& sharedName = sharedHandle.name;
-                    
-                    auto cell = ZeusShared::getGlobalHeap().find(
-                        sharedName, sharedHandle.generation);
-                    if (!cell) {
-                        VMException::VMException exp("SharedObjectHandle: undefined shared object '" + sharedName + "'", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    // 读取共享对象数据
-                    ZeusType::UniversalVariant sharedVal = cell->read();
-                    
-                    // 检查是否是 Variant 中的 Object
-                    if (!std::holds_alternative<ZeusType::Variant>(sharedVal)) {
-                        VMException::VMException exp("SharedObjectHandle: shared variable is not an object", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    auto& variantVal = std::get<ZeusType::Variant>(sharedVal);
-                    if (!std::holds_alternative<ZeusType::Object>(variantVal)) {
-                        VMException::VMException exp("SharedObjectHandle: shared variable is not an object", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    auto& obj = std::get<ZeusType::Object>(variantVal);
-                    if (!obj.impl) {
-                        VMException::VMException exp("SharedObjectHandle: shared object has null impl", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    // 获取 instanceMethods（存储为 Variant 中的 Object）
-                    auto methodsIt = obj.impl->data.find("__instanceMethods__");
-                    if (methodsIt == obj.impl->data.end()) {
-                        VMException::VMException exp("SharedObjectHandle: object has no instanceMethods", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    // instanceMethods 是 Variant 包装的 Object
-                    if (!std::holds_alternative<ZeusType::Variant>(methodsIt->second)) {
-                        VMException::VMException exp("SharedObjectHandle: instanceMethods is not a Variant", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    auto& methodsVariant = std::get<ZeusType::Variant>(methodsIt->second);
-                    if (!std::holds_alternative<ZeusType::Object>(methodsVariant)) {
-                        VMException::VMException exp("SharedObjectHandle: instanceMethods is not an Object", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    auto& methodsObj = std::get<ZeusType::Object>(methodsVariant);
-                    if (!methodsObj.impl) {
-                        VMException::VMException exp("SharedObjectHandle: instanceMethods has null impl", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    auto protoIt = methodsObj.impl->data.find(method);
-                    if (protoIt == methodsObj.impl->data.end()) {
-                        VMException::VMException exp("SharedObjectHandle: unknown method '" + method + "'", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    // 获取 protoId
-                    int protoId = explicitGenericProtoId;
-                    if (std::holds_alternative<LexerType::Value>(protoIt->second)) {
-                        if (protoId < 0) {
-                            protoId = VMHelpers::getIntFromValue(
-                                std::get<LexerType::Value>(protoIt->second));
-                        }
-                    }
-                    
-                    if (!getPrototype(protoId)) {
-                        VMException::VMException exp("SharedObjectHandle: invalid protoId for method '" + method + "'", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    // 创建闭包
-                    Closure clo;
-                    clo.protoId = protoId;
-                    clo.autoRelease = true;
-                    int cloId = allocClosure(std::move(clo));
-                    
-                    // 替换 callee 为闭包，实例方法需要 this 作为第一个参数
-                    // 当前栈布局: [..., SharedObjectHandle(at calleeIndex), arg0, arg1, ...]
-                    // 需要变成: [..., ClosureHandle, SharedObjectHandle(作为this), arg0, arg1, ...]
-                    
-                    // 把 SharedObjectHandle 作为 this 参数插入
-                    stack.set(calleeIndex, ZeusType::ClosureHandle{cloId});
-                    
-                    // 在参数列表开头插入 this (SharedObjectHandle)
-                    // 需要将 this 插入到 args 之前
-                    // 栈变为: [closure, this, arg0, arg1, ...]
-                    stack.insert(stack.begin() + calleeIndex + 1,
-                        ZeusType::SharedObjectHandle{sharedName, sharedHandle.generation});
-                    
-                    // 调用闭包，argc + 1 因为添加了 this
-                    // Dispatch through a real frame so the callee gets its own local
-                    // slots instead of sharing this frame's local buffer.
-                    methodCall.emplace(instr);
-                    methodCall->op = VMOperator::CALL_CLOSURE;
-                    methodCall->args = {LexerType::Value(argc + 1)};
-                    for (auto& source : methodCall->metadata.callArguments) {
-                        if (source.positionalIndex >= 0) ++source.positionalIndex;
-                    }
-                    dispatchedInstruction = &*methodCall;
-                    goto dispatch_instruction;
-                }
-
-                {
-                    const ZeusType::UniversalVariant receiver = callee;
-                    const std::string receiverType = typeImplementationName(receiver);
-                    auto implementation = typeImplementations.find(receiverType);
-                    if (implementation != typeImplementations.end()) {
-                        auto methodIt = implementation->second.instanceMethods.find(method);
-                        if (methodIt != implementation->second.instanceMethods.end()) {
-                            const int protoId = explicitGenericProtoId >= 0
-                                ? explicitGenericProtoId : methodIt->second;
-                            if (!getPrototype(protoId)) {
-                                VMException::VMException exp(
-                                    "TYPE_IMPL_BUILD registered an invalid method prototype",
-                                    __line, instr);
-                                exp._throw(vmstat, currentChunk);
-                                break;
-                            }
-
-                            Closure clo;
-                            clo.protoId = protoId;
-                            clo.autoRelease = true;
-                            const int cloId = allocClosure(std::move(clo));
-                            stack.set(calleeIndex, ZeusType::ClosureHandle{cloId});
-                            stack.insert(calleeIndex + 1, receiver);
-                            // Use the ordinary closure frame dispatcher. Running a
-                            // nested interpreter here grows the C++ stack for every
-                            // impl method, including Array/string library methods.
-                            methodCall.emplace(instr);
-                            methodCall->op = VMOperator::CALL_CLOSURE;
-                            methodCall->args = {LexerType::Value(argc + 1)};
-                            if ((receiverType == "string" || receiverType == "bytes") &&
-                                instr.args.size() >= 7 &&
-                                std::holds_alternative<std::string>(instr.args[2]) &&
-                                std::get<std::string>(instr.args[2]) ==
-                                    "__zeus_receiver_source") {
-                                methodCall->args.insert(
-                                    methodCall->args.end(),
-                                    instr.args.begin() + 2,
-                                    instr.args.end());
-                            }
-                            for (auto& source : methodCall->metadata.callArguments) {
-                                if (source.positionalIndex >= 0) ++source.positionalIndex;
-                            }
-                            dispatchedInstruction = &*methodCall;
-                            goto dispatch_instruction;
-                        }
-                    }
-                }
-
-                if (!std::holds_alternative<ZeusType::ObjectHandle>(callee)) {
-                    std::string msg = "Cannot call method '" + method + "' on a non-object value";
-                    VMException::VMException exp(msg, __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 获取 ObjectHandle 并验证 generation
-                ZeusType::ObjectHandle objHandle = std::get<ZeusType::ObjectHandle>(callee);
-                auto* objPtr = getValidObject(objHandle);
-                
-                if (!objPtr) {
-                    // 对象已被释放或 slot 已被复用
-                    std::string msg = "OBJ_CALL_METHOD: object has been freed or reused (stale reference) when calling method '" + method + "'";
-                    msg += " [handle.id=" + std::to_string(objHandle.id) +
-                           " handle.gen=" + std::to_string(objHandle.generation);
-                    auto* rawObj = getObject(objHandle.id);
-                    if (!rawObj) {
-                        msg += " object not found]";
-                    } else {
-                        msg += " object.gen=" + std::to_string(rawObj->generation) +
-                               " classId=" + std::to_string(rawObj->classId) +
-                               " markedForDeletion=" + (rawObj->markedForDeletion ? "true]" : "false]");
-                    }
-                    VMException::VMException exp(msg, __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                int classId = objPtr->classId;
-                auto* classPtr = getClass(classId);
-                if (!classPtr) {
-                    std::string msg = "Object has invalid class when calling method '" + method + "'";
-                    VMException::VMException exp(msg, __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                auto it = classPtr->instanceMethods.find(method);
-                
-                if (it == classPtr->instanceMethods.end()) {
-                    // 方法不存在于 instanceMethods 中
-                    // 首先检查对象的实例变量中是否有该名称的可调用值
-                    if (hasObjectField(*objPtr, method)) {
-                        // 找到了实例变量，检查它是否是可调用的
-                        const auto fieldValue = readObjectField(*objPtr, method);
-                        bool isCallable = std::holds_alternative<ZeusType::ClosureHandle>(fieldValue) ||
-                                         std::holds_alternative<ZeusType::NativeFuncHandle>(fieldValue);
-                        
-                        if (isCallable) {
-                            // 这是一个存储在实例变量中的函数，调用它
-                            // 当前栈布局: [..., object(在calleeIndex), arg0, arg1, ..., argN-1]
-                            // 需要变成: [..., function, arg0, arg1, ..., argN-1]
-                            
-                            // 替换 callee 位置的 object 为函数
-                            stack[calleeIndex] = fieldValue;
-                            
-                            // 根据函数类型使用不同的调用指令
-                            if (std::holds_alternative<ZeusType::ClosureHandle>(fieldValue)) {
-                                // 使用 CALL_CLOSURE 调用闭包
-                                IRType::IRInstr callIns{ VMOperator::CALL_CLOSURE, { LexerType::Value(argc) } };
-                                callIns.line = instr.line;  // 继承原指令的行号
-                                execute(callIns);
-                            } else {
-                                // 使用 CALL_NATIVE 调用原生函数
-                                IRType::IRInstr callIns{ VMOperator::CALL_NATIVE, { LexerType::Value(argc) } };
-                                callIns.line = instr.line;  // 继承原指令的行号
-                                execute(callIns);
-                            }
-                            break;
-                        }
-                    }
-                    
-                    // 检查是否有 operator[.] 重载
-                    auto opIt = classPtr->operatorMethods.find("[.]");
-                    
-                    if (opIt != classPtr->operatorMethods.end()) {
-                        // 通过 operator[.] 获取成员再调用
-                        // 当前栈布局: [..., object(在calleeIndex), arg0, arg1, ..., argN-1]
-                        int opProtoId = opIt->second;
-                        
-                        vmMessage("Found operator[.]! protoId=" + std::to_string(opProtoId) + ", getPrototype=" + (getPrototype(opProtoId) ? "valid" : "null") + ")");
-                        
-                        if (getPrototype(opProtoId)) {
-                            // 步骤1: 保存原始参数到临时数组
-                            std::vector<ZeusType::UniversalVariant> savedArgs;
-                            savedArgs.reserve(argc);
-                            
-                            for (int i = 0; i < argc; ++i) {
-                                savedArgs.push_back(stack.back());
-                                stack.pop_back();
-                            }
-                            
-                            // 现在栈顶是object,将其弹出
-                            stack.pop_back();
-                            
-                            // 步骤2: 同步调用 operator[.](methodName)
-                            // 压入调用所需的栈: [closure, this(object), methodName]
-                            Closure opClo;
-                            opClo.protoId = opProtoId;
-                            int opCloId = allocClosure(std::move(opClo));
-                            
-                            stack.push_back(ZeusType::ClosureHandle{opCloId});
-                            stack.push_back(objHandle);  // 使用完整的 ObjectHandle
-                            stack.push_back(LexerType::Value(method));
-                            
-                            vmMessage("Calling operator[.] SYNC with method='" + method + "'");
-                            
-                            // 使用同步调用，等待 operator[.] 返回
-                            if (!executeClosureSync(opCloId, 2)) {
-                                if (vmstat != ZeusType::VMStatus::Running) break;
-                                VMException::VMException exp("operator[.] sync call failed", __line, instr);
-                                exp._throw(vmstat, currentChunk);
-                                break;
-                            }
-                            // temporary opClo was used only for this sync call, release it now
-                            releaseClosure(opCloId);
-                            
-                            // 步骤3: operator[.] 返回值在栈顶,这应该是要调用的函数
-                            if (stack.empty()) {
-                                VMException::VMException exp("operator[.] returned nothing", __line, instr);
-                                exp._throw(vmstat, currentChunk);
-                                break;
-                            }
-                            
-                            auto retrievedMember = stack.back();
-                            stack.pop_back();
-                            
-                            vmMessage("operator[.] returned: " + ZeusVMUtils::valueToDebugString(retrievedMember));
-                            
-                            // 步骤4: 设置调用目标函数的栈布局
-                            // 需要: [function, arg0, arg1, ..., argN-1]
-                            stack.push_back(retrievedMember);
-                            
-                            // 恢复参数(注意savedArgs是反序的)
-                            for (int i = (int)savedArgs.size() - 1; i >= 0; --i) {
-                                stack.push_back(savedArgs[i]);
-                            }
-                            
-                            // 步骤5: 调用函数（使用栈帧机制）
-                            IRType::IRInstr callFuncInstr{VMOperator::CALL_CLOSURE, {LexerType::Value(argc)}};
-                            execute(callFuncInstr);
-                            break;
-                        }
-                    }
-                    
-                    // 没有 operator[.] 或调用失败,报错
-                    std::string className = classPtr->name;
-                    std::string msg = "Object of type '" + className + "' has no method '" + method + "'";
-                    VMException::VMException exp(msg, __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                int protoId = explicitGenericProtoId >= 0
-                    ? explicitGenericProtoId : it->second;
-                if (!getPrototype(protoId)) {
-                    VMException::VMException exp("OBJ_CALL_METHOD invalid protoId", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // We will call method with implicit 'this' via Closure::boundThis.
-                // This avoids inserting an extra arg manually and keeps ownership symmetric:
-                // - closure owns boundThis (retained)
-                // - stack drops its callee object reference when overwritten
-                ZeusType::UniversalVariant oldCallee = callee;
-                uint8_t oldOwner = stack.ownerFlag(calleeIndex);
-
-                Closure clo;
-                clo.protoId = protoId;
-                clo.autoRelease = true;
-                retainObject(objHandle); // closure will own & later release boundThis
-                clo.boundThis = objHandle;
-
-                int cloId = allocClosure(std::move(clo));
-
-                // Replace callee (object handle) with closure handle
-                stack.set(calleeIndex, ZeusType::ClosureHandle{cloId});
-
-                // Drop the overwritten callee slot (stack-owned object ref)
-                dropStackItem(StackItem{oldCallee, oldOwner});
-
-                // Reuse the normal CALL_CLOSURE frame path. Running a nested
-                // runFrameLoop here grows the native C++ stack for every method
-                // call; ordinary method chains can overflow at shallow Zeus depth.
-                methodCall.emplace(instr);
-                methodCall->op = VMOperator::CALL_CLOSURE;
-                methodCall->args = {LexerType::Value(argc)};
-                dispatchedInstruction = &*methodCall;
-                goto dispatch_instruction;
-            }
-
-
-            case VMOperator::PUSH: {
-                    if (!instr.args.empty() && std::holds_alternative<IRType::NullLiteral>(instr.args[0])) {
-                        stack.push_back(ZeusType::Variant(ZeusType::Null()));
-                    } else if (!instr.args.empty() && std::holds_alternative<LexerType::Value>(instr.args[0])) {
-                        const auto &val = std::get<LexerType::Value>(instr.args[0]);
-                        stack.push_back(val);
-                    } else if (!instr.args.empty() && std::holds_alternative<ZeusType::Bytes>(instr.args[0])) {
-                        // Bytes 字面量：包装到 Variant 后推入栈
-                        ZeusType::Variant bytesVar = std::get<ZeusType::Bytes>(instr.args[0]);
-                        stack.push_back(bytesVar);
-                    } else {
-                        // 直接将原始 Value 推入栈
-                        stack.push_back(std::get<LexerType::Value>(instr.args[0]));
-                    }
-                printStack();
-                break;
-            }
-            
-            case VMOperator::PUSH_NAMED: {
-                // PUSH_NAMED: 将栈顶的值包装成 NamedArg(命名参数)
-                // args[0] = 参数名(string)
-                if (stack.empty()) {
-                    VMException::VMException exp("PUSH_NAMED: stack empty", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                std::string paramName;
-                if (!instr.args.empty() && std::holds_alternative<std::string>(instr.args[0])) {
-                    paramName = std::get<std::string>(instr.args[0]);
-                } else {
-                    VMException::VMException exp("PUSH_NAMED: missing parameter name", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                // 从栈顶取值
-                auto value = stack.back();
-                stack.pop_back();
-                
-                // 创建 NamedArg 包装
-                auto namedArg = std::make_shared<ZeusType::NamedArg>();
-                namedArg->name = paramName;
-                namedArg->value = value;
-                
-                // 将包装后的命名参数推回栈(占用一个栈位置)
-                stack.push_back(namedArg);
-                
-                ZEUS_DEBUG_PRINT("[VM] PUSH_NAMED: wrapped '%s'", paramName.c_str());
-                printStack();
-                break;
-            }
-
-
-            case VMOperator::ADD: {
-                // 1. 类型/数量检查
-                
-                if (stack.size() < 2) {
-                    VMException::VMException exp("ADD stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 2. 弹出右操作数和左操作数（右操作数在栈顶）
-                // P1：move 替代拷贝（string/Array 等大 value 省一次深拷贝+引用计数）
-                ZeusType::UniversalVariant right = std::move(stack.back());
-                stack.pop_back();
-
-                ZeusType::UniversalVariant left  = std::move(stack.back());
-                stack.pop_back();
-
-                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
-                if (tryDispatchTypeImplementationOperator(
-                        "[+]", operatorArguments, 2, instr)) break;
-
-                // P0 fast path: int + int（覆盖 x=x+1 与 for 计数器自增）
-                // 跳过 operator重载 / Bytes / convertToValue / getStringType 全套慢路径
-                {
-                    int64_t li = 0, ri = 0;
-
-                    if (ZeusVMUtils::tryGetInt64(left, li) && ZeusVMUtils::tryGetInt64(right, ri)) {
-                        bool overflow = false;
-
-                        if (ri > 0) overflow = (li > INT64_MAX - ri);
-                        else if (ri < 0) overflow = (li < INT64_MIN - ri);
-
-                        if (!overflow) {
-                            stack.push_back(LexerType::Value(li + ri));
-                            break;
-                        }
-                        // 溢出回退慢路径（大整数加法，极少发生）
-                    }
-                }
-
-                // 2.5 检查左操作数是否为对象，且是否有operator[+]重载
-                if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
-                    int objId = std::get<ZeusType::ObjectHandle>(left).id;
-                    auto* objPtr = getObject(objId);
-                    if (objPtr) {
-                        int classId = objPtr->classId;
-                        auto* classPtr = getClass(classId);
-                        if (classPtr) {
-                            auto& classInfo = *classPtr;
-                            auto opIt = classInfo.operatorMethods.find("[+]");
-                            if (opIt != classInfo.operatorMethods.end()) {
-                                // 找到operator[+]重载，调用它
-                                int protoId = opIt->second;
-                                ZEUS_DEBUG_PRINT("[VM] Calling operator[+] overload (protoId=%d) for object %d", protoId, objId);
-                                
-                                // 创建临时闭包
-                                Closure clo;
-                                clo.protoId = protoId;
-                                int cloId = allocClosure(std::move(clo));
-                                
-                                // 栈布局: [closure, this(left), arg(right)]
-                                // 对于 func operator[+] (other) [&this]:
-                                //   - local 0 = this (来自捕获列表,但作为参数传递)
-                                //   - local 1 = other (显式参数)
-                                stack.push_back(ZeusType::ClosureHandle{cloId}); // callee
-                                stack.push_back(left);  // this -> local 0
-                                stack.push_back(right); // other -> local 1
-                                
-                                // 调用: argc=2 (this + other)
-                                // Dispatch through a real frame so the callee gets its own local
-                                // slots instead of sharing this frame's local buffer.
-                                if (!executeClosureSync(cloId, 2)) {
-                                    if (vmstat != ZeusType::VMStatus::Running) break;
-                                    VMException::VMException exp(
-                                        "[execute] nested dispatch failed", __line, instr);
-                                    exp._throw(vmstat, currentChunk);
-                                    break;
-                                }
-                                // 结果已在栈顶，直接break
-                                vmMessage(">>> Operator[+] overload called.");
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // 3. 特殊处理: Bytes + Bytes
-                // Bytes可能以两种形式存在：直接Bytes或Variant包装的Bytes
-                const ZeusType::Bytes* leftBytes = nullptr;
-                const ZeusType::Bytes* rightBytes = nullptr;
-                
-                // 尝试直接获取Bytes
-                if (std::holds_alternative<ZeusType::Bytes>(left)) {
-                    leftBytes = &std::get<ZeusType::Bytes>(left);
-                } else if (std::holds_alternative<ZeusType::Variant>(left)) {
-                    const auto& leftVar = std::get<ZeusType::Variant>(left);
-                    if (std::holds_alternative<ZeusType::Bytes>(leftVar)) {
-                        leftBytes = &std::get<ZeusType::Bytes>(leftVar);
-                    }
-                }
-                
-                if (std::holds_alternative<ZeusType::Bytes>(right)) {
-                    rightBytes = &std::get<ZeusType::Bytes>(right);
-                } else if (std::holds_alternative<ZeusType::Variant>(right)) {
-                    const auto& rightVar = std::get<ZeusType::Variant>(right);
-                    if (std::holds_alternative<ZeusType::Bytes>(rightVar)) {
-                        rightBytes = &std::get<ZeusType::Bytes>(rightVar);
-                    }
-                }
-                
-                if (leftBytes && rightBytes) {
-                    // 合并两个bytes
-                    ZeusType::Bytes result(leftBytes->data);
-                    result.data.insert(result.data.end(), rightBytes->data.begin(), rightBytes->data.end());
-                    
-                    stack.push_back(result);
-                    vmMessage(">>> Exec add (bytes).");
-                    printStack();
-                    break;
-                }
-
-                // 4. 没有重载，使用默认实现：转换为内部 Value 表示
-                LexerType::Value lv(0);
-                LexerType::Value rv(0);
-
-                if (!ZeusVMUtils::convertToValue(left, lv) || !ZeusVMUtils::convertToValue(right, rv)) {
-                    VMException::VMException exp("ADD operands not convertible", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 5. 根据类型判断是数字加法还是字符串拼接
-                bool numPair = ZeusVMUtils::isNumericValue(lv) && ZeusVMUtils::isNumericValue(rv);
-                bool strPair = (lv.getStringType() == "string" && rv.getStringType() == "string");
-                
-                if (!numPair && !strPair) {
-                    VMException::VMException exp("ADD expects numeric+numeric or string+string", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 6. 推入计算结果
-                stack.push_back(lv + rv);
-                vmMessage(">>> Exec add.");
-                printStack();
-                break;
-            }
-
-            case VMOperator::LIST_BUILD: {
-                std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                // LIST_BUILD 指令的第一个参数 args[0] 为元素数量（int Value）
-                if (instr.args.empty() || !std::holds_alternative<LexerType::Value>(instr.args[0])) {
-                    VMException::VMException exp("LIST_BUILD missing elem count", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                int n = 0;
-                const auto &val = std::get<LexerType::Value>(instr.args[0]);
-                if (std::holds_alternative<ZeusType::BigInteger>(val.data)) n = VMHelpers::getIntFromValue(val);
-                // 检查栈中是否有足够的元素
-                if (n > 0 && stack.size() < (size_t)n) {
-                    VMException::VMException exp("LIST_BUILD stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                ZeusType::Array array;
-                array.impl = ZeusGC::makeArrayData();
-                if (n > 0) {
-                    array.impl->data.resize(static_cast<size_t>(n));
-                    for (int i = n - 1; i >= 0; --i) {
-                        StackItem item = popStackItem();
-                        array.impl->data[static_cast<size_t>(i)] = std::move(item.value);
-                        // The element's existing stack ownership transfers to
-                        // ArrayData; releasing it here would drop the value
-                        // while the array is taking ownership of it.
-                        item.owner = 0;
-                    }
-                }
-                stack.push_back(ZeusType::Variant(std::move(array)));
-                printStack();
-                break;
-            }
-
-            case VMOperator::DICT_BUILD: {
-                std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                // DICT_BUILD 的第一个参数 args[0] 为键值对数量（pairCount，int）
-                if (instr.args.empty() || !std::holds_alternative<LexerType::Value>(instr.args[0])) {
-                    VMException::VMException exp("DICT_BUILD missing pair count", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                int pairCount = 0;
-                const auto &pcVal = std::get<LexerType::Value>(instr.args[0]);
-                if (std::holds_alternative<ZeusType::BigInteger>(pcVal.data)) pairCount = VMHelpers::getIntFromValue(pcVal);
-                if (pairCount < 0) {
-                    VMException::VMException exp("DICT_BUILD negative pair count", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                size_t need = (size_t)pairCount * 2;
-                if (stack.size() < need) {
-                    VMException::VMException exp("DICT_BUILD stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 更新调试计数（初始键值对数）
-                debugDictInitialPairs += (size_t)pairCount;
-                // 从栈中弹出 2N 个元素，顺序为: valN, keyN, ..., val1, key1
-                std::vector<ZeusType::UniversalVariant> tmp;
-                tmp.reserve(need);
-                for (size_t i = 0; i < need; ++i) {
-                    tmp.push_back(stack.back());
-                    stack.pop_back();
-                }
-                // tmp: [valN, keyN, ..., val1, key1]
-                auto objData = ZeusGC::makeObjectData();
-                for (int i = 0; i < pairCount; ++i) {
-                    // tmp 中的排列: [valN, keyN, ..., val1, key1]
-                    // 计算第 i 对应的 key 和 value 在 tmp 中的位置
-                    // key_i 在 tmp 的索引为 need - 1 - (i * 2)
-                    // value_i 在 tmp 的索引为 need - 2 - (i * 2)
-                    auto &keyVar = tmp[need - 1 - (i * 2)];
-                    auto &valVar = tmp[need - 2 - (i * 2)];
-
-                    const std::string keyStr = dictionaryKeyString(keyVar);
-                    auto it = (*objData).data.find(keyStr);
-                    if (it == (*objData).data.end()) {
-                        (*objData).setValue(keyStr, valVar);
-                    } else {
-                        it->second = valVar; // 覆盖已有键的值
-                    }
-                }
-                ZeusType::Object objWrap; objWrap.impl = objData;
-                ZeusType::UniversalVariant uv = objWrap;
-                stack.push_back(uv);
-                printStack();
-                break;
-            }
-
-            case VMOperator::DICT_KEYS_BUILD: {
-                std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                if (stack.empty()) {
-                    VMException::VMException exp("DICT_KEYS_BUILD stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                StackItem topItem = popStackItem();
-                ZeusType::UniversalVariant top = topItem.value;
-                // expect a dictionary/object
-                ZeusType::Array arr; arr.impl = ZeusGC::makeArrayData();
-                if (std::holds_alternative<ZeusType::Variant>(top)) {
-                    const ZeusType::Variant &var = std::get<ZeusType::Variant>(top);
-                    if (std::holds_alternative<ZeusType::Object>(var)) {
-                        const ZeusType::Object &obj = std::get<ZeusType::Object>(var);
-                        if (obj.impl) {
-                            for (std::size_t i = 0; i < obj.impl->order.size(); ++i) {
-                                if (!obj.impl->isLiveOrderEntry(i)) continue;
-                                arr.impl->data.push_back(
-                                    LexerType::Value(obj.impl->order[i]));
-                            }
-                        }
-                    }
-                }
-                dropStackItem(topItem);
-                ZeusType::Variant v = arr;
-                stack.push_back(ZeusType::UniversalVariant(v));
-                printStack();
-                break;
-            }
-
-            case VMOperator::DICT_LOAD_VALUE: {
-                if (stack.size() < 2) {
-                    VMException::VMException exp("DICT_LOAD_VALUE stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                StackItem keyItem = popStackItem();
-                StackItem dictItem = popStackItem();
-                ZeusType::UniversalVariant keyVar = keyItem.value;
-                ZeusType::UniversalVariant dictVar = dictItem.value;
-
-                struct DropInputs {
-                    VM* vm;
-                    StackItem* a;
-                    StackItem* b;
-                    ~DropInputs() {
-                        if (vm && a) vm->dropStackItem(*a);
-                        if (vm && b) vm->dropStackItem(*b);
-                    }
-                } dropInputs{this, &keyItem, &dictItem};
-
-                const ZeusType::UniversalVariant* operatorArguments[] = {
-                    &dictVar, &keyVar
-                };
-                if (tryDispatchTypeImplementationOperator(
-                        "[[]]", operatorArguments, 2, instr)) break;
-
-                ZeusType::UniversalVariant valueOut = ZeusType::Null();
-                if (const auto* range =
-                        std::get_if<ZeusType::RawBytesRange>(&dictVar)) {
-                    int64_t index = 0;
-                    if (!ZeusVMUtils::tryGetInt64(keyVar, index)) {
-                        VMException::VMException(
-                            "raw bytes range index must be an int", __line, instr)
-                            ._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    if (index < 0 || static_cast<uint64_t>(index) >= range->length) {
-                        VMException::VMException(
-                            "raw bytes range index out of range", __line, instr)
-                            ._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    const uintptr_t address = range->address +
-                        static_cast<uintptr_t>(index);
-                    std::string error;
-                    if (!ZeusVMAddress::fetch(
-                            reinterpret_cast<void*>(address), "int",
-                            valueOut, error, 1)) {
-                        VMException::VMException(error, __line, instr)
-                            ._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    stack.push_back(std::move(valueOut));
-                    break;
-                }
-                 
-                // default missing value -> nil (ZeusType::Null)
-                // 处理下标/键访问（数组或对象）
-                if (std::holds_alternative<ZeusType::Variant>(dictVar)) {
-                    const ZeusType::Variant &dv = std::get<ZeusType::Variant>(dictVar);
-                    if (std::holds_alternative<ZeusType::Array>(dv)) {
-                        // 数组访问：使用整数索引
-                        int idx = 0;
-                        bool idxIsInt = false;
-                        if (std::holds_alternative<LexerType::Value>(keyVar)) {
-                            const auto &iv = std::get<LexerType::Value>(keyVar);
-                            if (std::holds_alternative<ZeusType::BigInteger>(iv.data)) {
-                                idx = VMHelpers::getIntFromValue(iv);
-                                idxIsInt = true;
-                            }
-                        }
-                        if (!idxIsInt) {
-                            VMException::VMException exp("TypeError: array index must be integer", __line, instr);
-                            exp._throw(vmstat, currentChunk);
-                            break;
-                        }
-                        
-                        // 进行边界检查
-                        const ZeusType::Array &arr = std::get<ZeusType::Array>(dv);
-                        if (!arr.impl || idx < 0 || (size_t)idx >= arr.impl->data.size()) {
-                            std::string msg = "Array index out of bounds: index=" + std::to_string(idx) + 
-                                            ", size=" + std::to_string(arr.impl ? arr.impl->data.size() : 0);
-                            VMException::VMException exp(msg, __line, instr);
-                            exp._throw(vmstat, currentChunk);
-                            break;
-                        }
-                        
-                        valueOut = ZeusVMUtils::arrayRead(dictVar, idx);
-                    }
-                    else if (std::holds_alternative<ZeusType::Object>(dv)) {
-                        // 对象访问：使用字符串键
-                        const std::string keyStr = dictionaryKeyString(keyVar);
-                            const ZeusType::Object &obj = std::get<ZeusType::Object>(dv);
-                            if (obj.impl) {
-                                auto it = obj.impl->data.find(keyStr);
-                                if (it != obj.impl->data.end()) {
-                                    valueOut = it->second;
-                                } else {
-                                    // Missing key -> raise an error instead of returning nil
-                                    std::string msg = "KeyError: missing key '" + keyStr + "'";
-                                    VMException::VMException exp(msg, __line, instr);
-                                    exp._throw(vmstat, currentChunk);
-                                    break;
-                                }
-                            } else {
-                                // Empty object (no impl) -> missing key
-                                std::string msg = "KeyError: missing key '" + keyStr + "'";
-                                VMException::VMException exp(msg, __line, instr);
-                                exp._throw(vmstat, currentChunk);
-                                break;
-                            }
-                    }
-                } else if (std::holds_alternative<ZeusType::ObjectHandle>(dictVar)) {
-                    // 类实例：尝试调用 operator[[]]
-                    ZeusType::ObjectHandle objHandle = std::get<ZeusType::ObjectHandle>(dictVar);
-                    auto* objPtr = getValidObject(objHandle);
-                    if (!objPtr) {
-                        VMException::VMException exp("DICT_LOAD_VALUE: object has been freed or reused (stale reference)", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    int classId = objPtr->classId;
-                    auto* classPtr = getClass(classId);
-                    if (!classPtr) {
-                        VMException::VMException exp("DICT_LOAD_VALUE invalid class id", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    auto& classInfo = *classPtr;
-                    auto opIt = classInfo.operatorMethods.find("[[]]");
-                    if (opIt == classInfo.operatorMethods.end()) {
-                        VMException::VMException exp("TypeError: class '" + classInfo.name + "' does not support operator[[]]", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    int protoId = opIt->second;
-                    if (!getPrototype(protoId)) {
-                        VMException::VMException exp("DICT_LOAD_VALUE invalid operator[[]] protoId", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                     // 调用 operator[[]](key)
-                     // 栈布局: [ closure, this, key ]
-                     Closure clo;
-                     clo.protoId = protoId;
-                     clo.autoRelease = true;
-                     int cloId = allocClosure(std::move(clo));
-                    
-                    stack.push_back(ZeusType::ClosureHandle{cloId});  // callee
-                    // dictItem/keyItem stay owned by DropInputs through the
-                    // synchronous call; retain the copies placed on the VM stack.
-                    ZeusGC::retainVariantDeep(*this, dictVar);
-                    stack.push_back(objHandle);                       // this (完整 ObjectHandle)
-                    ZeusGC::retainVariantDeep(*this, keyVar);
-                    stack.push_back(keyVar);                          // key argument
-                    
-                     // 调用 CALL_CLOSURE (argc=2: this + key)
-                     // Dispatch through a real frame: executeClosureSync pushes a
-                     // CallFrame and runs it to completion, so the callee gets its own
-                     // local slots. A recursive execute() would share this frame's local
-                     // buffer and leave the callee's slots behind in it.
-                     if (!executeClosureSync(cloId, 2)) {
-                         if (vmstat != ZeusType::VMStatus::Running) break;
-                         VMException::VMException exp(
-                             "[execute] nested dispatch failed", __line, instr);
-                         exp._throw(vmstat, currentChunk);
-                         break;
-                     }
-                     break;  // 结果已在栈顶
-                 } else {
-                    // dictVar 不是 Variant 也不是 ObjectHandle，生成更友好的类型错误信息
-                    std::string msg = "TypeError: attempted subscript on non-container";
-                    VMException::VMException exp(msg, __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                ZeusGC::retainVariantDeep(*this, valueOut);
-                stack.push_back(valueOut);
-                printStack();
-                break;
-            }
-
-            case VMOperator::DICT_STORE_VALUE: {
-                std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                if (stack.size() < 3) {
-                    VMException::VMException exp("DICT_STORE_VALUE stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                debugDictStoreCount++;
-                StackItem newItem = popStackItem();
-                StackItem keyItem = popStackItem();
-                StackItem dictItem = popStackItem();
-                ZeusType::UniversalVariant& newVal = newItem.value;
-                ZeusType::UniversalVariant& keyVar = keyItem.value;
-                ZeusType::UniversalVariant& dictVar = dictItem.value;
-                struct DropInputs {
-                    VM* vm;
-                    StackItem* first;
-                    StackItem* second;
-                    StackItem* third;
-                    ~DropInputs() {
-                        if (vm && first) vm->dropStackItem(*first);
-                        if (vm && second) vm->dropStackItem(*second);
-                        if (vm && third) vm->dropStackItem(*third);
-                    }
-                } dropInputs{this, &newItem, &keyItem, &dictItem};
-
-                const ZeusType::UniversalVariant* operatorArguments[] = {
-                    &dictVar, &keyVar, &newVal
-                };
-                if (tryDispatchTypeImplementationOperator(
-                        "[[]=]", operatorArguments, 3, instr)) break;
-
-                if (const auto* range =
-                        std::get_if<ZeusType::RawBytesRange>(&dictVar)) {
-                    int64_t index = 0;
-                    int64_t byteValue = 0;
-                    if (!ZeusVMUtils::tryGetInt64(keyVar, index) ||
-                        !ZeusVMUtils::tryGetInt64(newVal, byteValue)) {
-                        VMException::VMException(
-                            "raw bytes range assignment requires int index and value",
-                            __line, instr)._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    if (index < 0 || static_cast<uint64_t>(index) >= range->length) {
-                        VMException::VMException(
-                            "raw bytes range index out of range", __line, instr)
-                            ._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    if (byteValue < 0 || byteValue > 255) {
-                        VMException::VMException(
-                            "raw bytes range assignment requires a value from 0 to 255",
-                            __line, instr)._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    const uintptr_t address = range->address +
-                        static_cast<uintptr_t>(index);
-                    std::string error;
-                    if (!ZeusVMAddress::store(
-                            reinterpret_cast<void*>(address), "int",
-                            newVal, error, 1)) {
-                        VMException::VMException(error, __line, instr)
-                            ._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    stack.push_back(std::move(newItem.value));
-                    newItem.owner = 0;
-                    break;
-                }
-                
-                if (std::holds_alternative<ZeusType::Variant>(dictVar)) {
-                    ZeusType::Variant &dv = std::get<ZeusType::Variant>(dictVar);
-                    
-                    if (std::holds_alternative<ZeusType::Array>(dv)) {
-                        int idx = 0;
-                        if (std::holds_alternative<LexerType::Value>(keyVar)) {
-                            const auto &iv = std::get<LexerType::Value>(keyVar);
-                            if (std::holds_alternative<ZeusType::BigInteger>(iv.data)) idx = VMHelpers::getIntFromValue(iv);
-                        }
-                        auto* array = ZeusBuiltins::getArrayPtr(dictVar);
-                        if (array && array->impl && idx >= 0 &&
-                            idx < static_cast<int>(array->impl->data.size())) {
-                            const auto oldValue = array->impl->data[idx];
-                            const size_t ownerCount = array->impl->valueRefCount.load(
-                                std::memory_order_relaxed);
-                            if (ZeusVMUtils::arrayWrite(dictVar, idx, newVal)) {
-                                for (size_t i = 0; i < ownerCount; ++i) {
-                                    ZeusGC::retainVariantDeep(*this, newVal);
-                                    ZeusGC::releaseVariantDeep(*this, oldValue);
-                                }
-                            }
-                        }
-                    }
-                    else if (std::holds_alternative<ZeusType::Object>(dv)) {
-                        const std::string keyStr = dictionaryKeyString(keyVar);
-                        ZeusType::Object &obj = std::get<ZeusType::Object>(dv);
-                        if (obj.impl) {
-                            auto it2 = obj.impl->data.find(keyStr);
-                            const size_t ownerCount = obj.impl->valueRefCount.load(
-                                std::memory_order_relaxed);
-                            if (it2 == obj.impl->data.end()) {
-                                for (size_t i = 0; i < ownerCount; ++i) {
-                                    ZeusGC::retainVariantDeep(*this, newVal);
-                                }
-                                obj.impl->setValue(keyStr, newVal);
-                            } else {
-                                for (size_t i = 0; i < ownerCount; ++i) {
-                                    ZeusGC::retainVariantDeep(*this, newVal);
-                                    ZeusGC::releaseVariantDeep(*this, it2->second);
-                                }
-                                it2->second = newVal;
-                            }
-                        }
-                    }
-                } else if (std::holds_alternative<ZeusType::ObjectHandle>(dictVar)) {
-                    // 类实例：尝试调用 operator[[]=]
-                    ZeusType::ObjectHandle objHandle = std::get<ZeusType::ObjectHandle>(dictVar);
-                    auto* objPtr = getValidObject(objHandle);
-                    if (!objPtr) {
-                        VMException::VMException exp("DICT_STORE_VALUE: object has been freed or reused (stale reference)", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    int classId = objPtr->classId;
-                    auto* classPtr = getClass(classId);
-                    if (!classPtr) {
-                        VMException::VMException exp("DICT_STORE_VALUE invalid class id", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    auto& classInfo = *classPtr;
-                    auto opIt = classInfo.operatorMethods.find("[[]=]");
-                    if (opIt == classInfo.operatorMethods.end()) {
-                        VMException::VMException exp("TypeError: class '" + classInfo.name + "' does not support operator[[]=]", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                    int protoId = opIt->second;
-                    if (!getPrototype(protoId)) {
-                        VMException::VMException exp("DICT_STORE_VALUE invalid operator[[]=] protoId", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    
-                     // 调用 operator[[]=](key, value)
-                     // 栈布局: [ closure, this, key, value ]
-                     Closure clo;
-                     clo.protoId = protoId;
-                     clo.autoRelease = true;
-                     int cloId = allocClosure(std::move(clo));
-                    
-                    stack.push_back(ZeusType::ClosureHandle{cloId});  // callee
-                    stack.push_back(objHandle);                       // this (完整 ObjectHandle)
-                    stack.push_back(keyVar);                          // key argument
-                    // The value is also returned as the assignment expression result.
-                    // Keep the popped input alive separately while the operator call
-                    // owns and consumes its argument copy.
-                    ZeusGC::retainVariantDeep(*this, newItem.value);
-                    stack.push_back(newVal);                          // value argument
-                    keyItem.owner = 0;
-                    dictItem.owner = 0;
-                    
-                     // 调用 CALL_CLOSURE (argc=3: this + key + value)
-                     // Dispatch through a real frame: executeClosureSync pushes a
-                     // CallFrame and runs it to completion, so the callee gets its own
-                     // local slots. A recursive execute() would share this frame's local
-                     // buffer and leave the callee's slots behind in it.
-                     if (!executeClosureSync(cloId, 3)) {
-                         if (vmstat != ZeusType::VMStatus::Running) break;
-                         VMException::VMException exp(
-                             "[execute] nested dispatch failed", __line, instr);
-                         exp._throw(vmstat, currentChunk);
-                         break;
-                     }
-                     
-                     // operator[[]=] 的返回值不会成为赋值表达式的值。
-                     // 正常释放它；newItem 仍持有赋值表达式结果。
-                     dropStackBack();
-                 }
-                // 恢复栈状态：将新值压回栈（与 LIST_STORE_ELEM 保持一致的行为）
-                stack.push_back(std::move(newItem.value));
-                newItem.owner = 0;
-                printStack();
-                break;
-            }
-
-            case VMOperator::LIST_LENGTH: {
-                if (stack.empty()) {
-                    VMException::VMException exp("LIST_LENGTH stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                StackItem topItem = popStackItem();
-
-                int lengthValue = static_cast<int>(
-                    ZeusVMUtils::arrayLength(topItem.value));
-                dropStackItem(topItem);
-                stack.push_back(LexerType::Value(lengthValue));
-                printStack();
-                break;
-            }
-
-            case VMOperator::LIST_LOAD_ELEM: {
-                if (stack.size() < 2) {
-                    VMException::VMException exp("LIST_LOAD_ELEM stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                StackItem indexItem = popStackItem();
-                StackItem listItem = popStackItem();
-
-                int idx = 0;
-                if (std::holds_alternative<LexerType::Value>(indexItem.value)) {
-                    const auto &iv = std::get<LexerType::Value>(indexItem.value);
-                    if (std::holds_alternative<ZeusType::BigInteger>(iv.data)) idx = VMHelpers::getIntFromValue(iv);
-                }
-                ZeusType::UniversalVariant elem = ZeusVMUtils::arrayRead(
-                    listItem.value, idx);
-                ZeusGC::retainVariantDeep(*this, elem);
-                dropStackItem(indexItem);
-                dropStackItem(listItem);
-                stack.push_back(std::move(elem));
-                printStack();
-                break;
-            }
-
-            case VMOperator::LIST_STORE_ELEM: {
-                std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                if (stack.size() < 3) {
-                    VMException::VMException exp("LIST_STORE_ELEM stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                StackItem valueItem = popStackItem();
-                StackItem indexItem = popStackItem();
-                StackItem listItem = popStackItem();
-
-                int idx = 0;
-                if (std::holds_alternative<LexerType::Value>(indexItem.value)) {
-                    const auto &iv = std::get<LexerType::Value>(indexItem.value);
-                    if (std::holds_alternative<ZeusType::BigInteger>(iv.data)) idx = VMHelpers::getIntFromValue(iv);
-                }
-                if (const auto* array = ZeusBuiltins::getArrayPtr(listItem.value);
-                    array && array->impl && idx >= 0 &&
-                    idx < static_cast<int>(array->impl->data.size())) {
-                    const auto oldValue = array->impl->data[idx];
-                    const size_t ownerCount = array->impl->valueRefCount.load(
-                        std::memory_order_relaxed);
-                    if (ZeusVMUtils::arrayWrite(
-                            listItem.value, idx, valueItem.value)) {
-                        for (size_t i = 0; i < ownerCount; ++i) {
-                            ZeusGC::retainVariantDeep(*this, valueItem.value);
-                            ZeusGC::releaseVariantDeep(*this, oldValue);
-                        }
-                    }
-                }
-                dropStackItem(indexItem);
-                dropStackItem(listItem);
-                stack.push_back(std::move(valueItem.value));
-                printStack();
-                break;
-            }
-
-            case VMOperator::COUNT_CHECK_NEG: {
-                if (stack.empty()) {
-                    VMException::VMException exp("COUNT_CHECK_NEG stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                ZeusType::UniversalVariant top = stack.back();
-                stack.pop_back();
-
-                bool isNeg = false;
-
-                if (std::holds_alternative<LexerType::Value>(top)) {
-                    const auto &val = std::get<LexerType::Value>(top);
-                    if (std::holds_alternative<ZeusType::BigInteger>(val.data)) {
-                        const ZeusType::BigInteger& n = std::get<ZeusType::BigInteger>(val.data);
-                        if (n < ZeusType::BigInteger(0)) {
-                            isNeg = true;
-                        }
-                        stack.push_back(LexerType::Value(n));
-                    } else {
-                        stack.push_back(top);
-                    }
-                } else {
-                    stack.push_back(top);
-                }
-
-                if (isNeg) {
-                    auto exp = VMException::VMException(
-                        VMException::ErrorCode::E1904_INVALID_OPERATION,
-                        VMException::ErrorCategory::VM_RUNTIME,
-                        "For loop end value cannot be negative",
-                        __line, instr
-                    );
-                    exp.setDetails("For loop range must have a non-negative end value");
-                    exp.setSuggestion("Check the loop range: for (start..end..step) requires end >= 0");
-                    exp._throw(vmstat, currentChunk);
-                }
-
-                printStack();
-                break;
-            }
-
-            case VMOperator::COUNT_CHECK_STEP_ZERO: {
-                if (stack.empty()) {
-                    VMException::VMException exp("COUNT_CHECK_STEP_ZERO stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                ZeusType::UniversalVariant top = stack.back();
-                stack.pop_back();
-
-                bool isZero = false;
-
-                if (std::holds_alternative<LexerType::Value>(top)) {
-                    const auto &val = std::get<LexerType::Value>(top);
-                    if (std::holds_alternative<ZeusType::BigInteger>(val.data)) {
-                        const ZeusType::BigInteger& n = std::get<ZeusType::BigInteger>(val.data);
-                        if (n == ZeusType::BigInteger(0)) {
-                            isZero = true;
-                        }
-                        stack.push_back(LexerType::Value(n));
-                    } else {
-                        stack.push_back(top);
-                    }
-                } else {
-                    stack.push_back(top);
-                }
-
-                if (isZero) {
-                    auto exp = VMException::VMException(
-                        VMException::ErrorCode::E1904_INVALID_OPERATION,
-                        VMException::ErrorCategory::VM_RUNTIME,
-                        "For loop step cannot be zero",
-                        __line, instr
-                    );
-                    exp.setDetails("A zero step would cause an infinite loop");
-                    exp.setSuggestion("Use a non-zero step value in for (start..end..step)");
-                    exp._throw(vmstat, currentChunk);
-                }
-                
-                printStack();
-                break;
-            }
-
-
-            case VMOperator::SUBTRACT: {
-                // 1. 参数和栈长度检查
-                if (stack.size() < 2) {
-                    VMException::VMException exp("SUBTRACT stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 2. 弹出右、左操作数（右操作数在栈顶）
-                ZeusType::UniversalVariant right = stack.back();
-                stack.pop_back();
-
-                ZeusType::UniversalVariant left  = stack.back();
-                stack.pop_back();
-
-                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
-                if (tryDispatchTypeImplementationOperator(
-                        "[-]", operatorArguments, 2, instr)) break;
-
-                // 3. 检查左操作数是否为对象（支持operator[-]重载）
-                if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
-                    int objId = std::get<ZeusType::ObjectHandle>(left).id;
-                    auto* objPtr = getObject(objId);
-                    if (objPtr) {
-                        int classId = objPtr->classId;
-                        auto* classPtr = getClass(classId);
-                        if (classPtr) {
-                            auto& classInfo = *classPtr;
-                            auto opIt = classInfo.operatorMethods.find("[-]");
-                            if (opIt != classInfo.operatorMethods.end()) {
-                                int protoId = opIt->second;
-                                ZEUS_DEBUG_PRINT("[VM] Calling operator- overload (protoId=%d) for object %d", protoId, objId);
-                                
-                                Closure clo;
-                                clo.protoId = protoId;
-                                int cloId = allocClosure(std::move(clo));
-                                
-                                stack.push_back(ZeusType::ClosureHandle{cloId});
-                                stack.push_back(left);
-                                stack.push_back(right);
-                                
-                                // Dispatch through a real frame: executeClosureSync pushes a
-                                // CallFrame and runs it to completion, so the callee gets its own
-                                // local slots. A recursive execute() would share this frame's local
-                                // buffer and leave the callee's slots behind in it.
-                                if (!executeClosureSync(cloId, 2)) {
-                                    if (vmstat != ZeusType::VMStatus::Running) break;
-                                    VMException::VMException exp(
-                                        "[execute] nested dispatch failed", __line, instr);
-                                    exp._throw(vmstat, currentChunk);
-                                    break;
-                                }
-                                vmMessage(">>> Operator- overload called.");
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // 4. 转换为内部 Value 表示
-                LexerType::Value lv(0);
-                LexerType::Value rv(0);
-                if (!ZeusVMUtils::convertToValue(left, lv) || !ZeusVMUtils::convertToValue(right, rv)) {
-                    VMException::VMException exp("SUBTRACT operands not convertible", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 5. 验证操作数为数值类型
-                if (!(ZeusVMUtils::isNumericValue(lv) && ZeusVMUtils::isNumericValue(rv))) {
-                    VMException::VMException exp("SUBTRACT operands must be numeric", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 6. 执行减法并推入结果
-                stack.push_back(lv - rv);
-
-                vmMessage(">>> Exec subtract.");
-                printStack();
-                break;
-            }
-
-
-
-            case VMOperator::MULTIPLY: {
-                // 1. 参数和栈长度检查
-                if (stack.size() < 2) {
-                    VMException::VMException exp("MULTIPLY stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 2. 弹出右、左操作数（右操作数在栈顶）
-                ZeusType::UniversalVariant right = stack.back();
-                stack.pop_back();
-
-                ZeusType::UniversalVariant left  = stack.back();
-                stack.pop_back();
-
-                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
-                if (tryDispatchTypeImplementationOperator(
-                        "[*]", operatorArguments, 2, instr)) break;
-
-                // 3. 检查左操作数是否为对象（支持operator[*]重载）
-                if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
-                    int objId = std::get<ZeusType::ObjectHandle>(left).id;
-                    auto* objPtr = getObject(objId);
-                    if (objPtr) {
-                        int classId = objPtr->classId;
-                        auto* classPtr = getClass(classId);
-                        if (classPtr) {
-                            auto& classInfo = *classPtr;
-                            auto opIt = classInfo.operatorMethods.find("[*]");
-                            if (opIt != classInfo.operatorMethods.end()) {
-                                int protoId = opIt->second;
-                                ZEUS_DEBUG_PRINT("[VM] Calling operator* overload (protoId=%d) for object %d", protoId, objId);
-                                
-                                Closure clo;
-                                clo.protoId = protoId;
-                                int cloId = allocClosure(std::move(clo));
-                                
-                                stack.push_back(ZeusType::ClosureHandle{cloId});
-                                stack.push_back(left);
-                                stack.push_back(right);
-                                
-                                // Dispatch through a real frame: executeClosureSync pushes a
-                                // CallFrame and runs it to completion, so the callee gets its own
-                                // local slots. A recursive execute() would share this frame's local
-                                // buffer and leave the callee's slots behind in it.
-                                if (!executeClosureSync(cloId, 2)) {
-                                    if (vmstat != ZeusType::VMStatus::Running) break;
-                                    VMException::VMException exp(
-                                        "[execute] nested dispatch failed", __line, instr);
-                                    exp._throw(vmstat, currentChunk);
-                                    break;
-                                }
-                                vmMessage(">>> Operator* overload called.");
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // 4. 转换为内部 Value 表示
-                LexerType::Value lv(0);
-                LexerType::Value rv(0);
-                if (!ZeusVMUtils::convertToValue(left, lv) || !ZeusVMUtils::convertToValue(right, rv)) {
-                    VMException::VMException exp("MULTIPLY operands not convertible", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 5. 验证操作数为数值类型
-                if (!(ZeusVMUtils::isNumericValue(lv) && ZeusVMUtils::isNumericValue(rv))) {
-                    VMException::VMException exp("MULTIPLY operands must be numeric", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 6. 执行乘法并推入结果
-                stack.push_back(lv * rv);
-
-                vmMessage(">>> Exec multiply.");
-                printStack();
-                break;
-            }
-
-
-
-            case VMOperator::DIVIDE: {
-                // 1. 参数和栈长度检查
-                if (stack.size() < 2) {
-                    VMException::VMException exp("DIVIDE stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 2. 弹出右、左操作数（右操作数在栈顶）
-                ZeusType::UniversalVariant right = stack.back();
-                stack.pop_back();
-
-                ZeusType::UniversalVariant left  = stack.back();
-                stack.pop_back();
-
-                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
-                if (tryDispatchTypeImplementationOperator(
-                        "[/]", operatorArguments, 2, instr)) break;
-
-                // 3. 检查左操作数是否为对象（支持operator[/]重载）
-                if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
-                    int objId = std::get<ZeusType::ObjectHandle>(left).id;
-                    auto* objPtr = getObject(objId);
-                    if (objPtr) {
-                        int classId = objPtr->classId;
-                        auto* classPtr = getClass(classId);
-                        if (classPtr) {
-                            auto& classInfo = *classPtr;
-                            auto opIt = classInfo.operatorMethods.find("[/]");
-                            if (opIt != classInfo.operatorMethods.end()) {
-                                int protoId = opIt->second;
-                                Closure clo;
-                                clo.protoId = protoId;
-                                int cloId = allocClosure(std::move(clo));
-                                stack.push_back(ZeusType::ClosureHandle{cloId});
-                                stack.push_back(left);
-                                stack.push_back(right);
-                                // Dispatch through a real frame: executeClosureSync pushes a
-                                // CallFrame and runs it to completion, so the callee gets its own
-                                // local slots. A recursive execute() would share this frame's local
-                                // buffer and leave the callee's slots behind in it.
-                                if (!executeClosureSync(cloId, 2)) {
-                                    if (vmstat != ZeusType::VMStatus::Running) break;
-                                    VMException::VMException exp(
-                                        "[execute] nested dispatch failed", __line, instr);
-                                    exp._throw(vmstat, currentChunk);
-                                    break;
-                                }
-                                vmMessage(">>> Operator/ overload called.");
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // 4. 转换为内部 Value 表示
-                LexerType::Value lv(0);
-                LexerType::Value rv(0);
-                if (!ZeusVMUtils::convertToValue(left, lv) || !ZeusVMUtils::convertToValue(right, rv)) {
-                    VMException::VMException exp("DIVIDE operands not convertible", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 5. 验证操作数为数值类型
-                if (!(ZeusVMUtils::isNumericValue(lv) && ZeusVMUtils::isNumericValue(rv))) {
-                    VMException::VMException exp("DIVIDE operands must be numeric", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 6. 检查除数是否为零（避免除零错误）
-                ZeusType::BigDecimal rnum(0);
-                if (ZeusVMUtils::extractNumber(right, rnum) && rnum == ZeusType::BigDecimal(0)) {
-                    VMException::VMException exp("DIVIDE by zero", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 7. 执行除法并推入结果
-                stack.push_back(lv / rv);
-
-                vmMessage(">>> Exec divide.");
-                printStack();
-                break;
-            }
-
-
-            case VMOperator::MODULUS: {
-                // 1. 参数和栈长度检查
-                if (stack.size() < 2) {
-                    VMException::VMException exp("MODULUS stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 2. 弹出右、左操作数（右操作数在栈顶）
-                ZeusType::UniversalVariant right = stack.back();
-                stack.pop_back();
-
-                ZeusType::UniversalVariant left = stack.back();
-                stack.pop_back();
-
-                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
-                if (tryDispatchTypeImplementationOperator(
-                        "[%]", operatorArguments, 2, instr)) break;
-
-                // 3. 检查左操作数是否为对象（支持operator[%]重载）
-                if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
-                    int objId = std::get<ZeusType::ObjectHandle>(left).id;
-                    auto* objPtr = getObject(objId);
-                    if (objPtr) {
-                        int classId = objPtr->classId;
-                        auto* classPtr = getClass(classId);
-                        if (classPtr) {
-                            auto& classInfo = *classPtr;
-                            auto opIt = classInfo.operatorMethods.find("[%]");
-                            if (opIt != classInfo.operatorMethods.end()) {
-                                int protoId = opIt->second;
-                                Closure clo;
-                                clo.protoId = protoId;
-                                int cloId = allocClosure(std::move(clo));
-                                stack.push_back(ZeusType::ClosureHandle{cloId});
-                                stack.push_back(left);
-                                stack.push_back(right);
-                                // Dispatch through a real frame: executeClosureSync pushes a
-                                // CallFrame and runs it to completion, so the callee gets its own
-                                // local slots. A recursive execute() would share this frame's local
-                                // buffer and leave the callee's slots behind in it.
-                                if (!executeClosureSync(cloId, 2)) {
-                                    if (vmstat != ZeusType::VMStatus::Running) break;
-                                    VMException::VMException exp(
-                                        "[execute] nested dispatch failed", __line, instr);
-                                    exp._throw(vmstat, currentChunk);
-                                    break;
-                                }
-                                vmMessage(">>> Operator% overload called.");
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // 4. 转换为内部 Value 表示
-                LexerType::Value lv(0);
-                LexerType::Value rv(0);
-                if (!ZeusVMUtils::convertToValue(left, lv) || !ZeusVMUtils::convertToValue(right, rv)) {
-                    VMException::VMException exp("MODULUS operands not convertible", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 5. 确认为整数类型（int % int）
-                if (!(lv.getStringType() == "int" && rv.getStringType() == "int")) {
-                    VMException::VMException exp("MODULUS expects int % int", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                const ZeusType::BigInteger& li = std::get<ZeusType::BigInteger>(lv.data);
-                const ZeusType::BigInteger& ri = std::get<ZeusType::BigInteger>(rv.data);
-
-                if (ri == ZeusType::BigInteger(0)) {
-                    VMException::VMException exp("MODULUS by zero", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                ZeusType::BigInteger res = li % ri;
-                stack.push_back(LexerType::Value(res));
-                vmMessage(">>> Exec modulus.");
-                printStack();
-                break;
-            }
-
-
-
-            case VMOperator::FUNC_BEGIN: {
-                // FUNC_BEGIN 占位（无实际操作）
-                break;
-            }
-
-
-            case VMOperator::IR_ANNOTATION: {
-                // 语义标注只供 LLVM 等后端读取，动态 VM 不产生任何栈副作用。
-                break;
-            }
-
-            case VMOperator::LLVM_SIZEOF: {
-                VMException::VMException exp(
-                    "sizeof(T) requires the LLVM backend",
-                    __line, instr);
-                exp._throw(vmstat, currentChunk);
-                break;
-            }
-
-
-
-            case VMOperator::FUNC_END: {
-                
-                break;
-            }
-
-            case VMOperator::POP: {
-                
-                if (!stack.empty()) {
-                    dropStackBack();
-                }
-
-                printStack();
-                break;
-            }
-
-            case VMOperator::SWAP: {
-                // 交换栈顶两个元素
-                if (stack.size() < 2) {
-                    VMException::VMException exp("SWAP requires at least 2 elements on stack", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                auto top = stack.back();
-                stack.pop_back();
-                auto second = stack.back();
-                stack.pop_back();
-                
-                stack.push_back(top);    // 原栈顶到第二位
-                stack.push_back(second); // 原第二位到栈顶
-                
-                printStack();
-                break;
-            }
-
-
-
-            case VMOperator::CALL_FUNC: {
-
-                auto const& funcName = std::get<std::string>(instr.args[0]);
-                auto const& argc = std::get<LexerType::Value>(instr.args[1]);
-
-                // printf(">>> Call function: %s %d\r\n", funcName.c_str(), std::get<int>(argc.data));
-
-                // now its function is replaced by CALL_CLOSURE
-                break;
-            }
-
-
-
-            case VMOperator::MAKE_FUNCTION: {
-                // 参数：chunkIndex (Value int)。需要通过 chunkToProtoId 映射到实际的 protoId
-                auto const& pidVal = std::get<LexerType::Value>(instr.args[0]);
-                int chunkIndex = VMHelpers::getIntFromValue(pidVal);
-
-                int protoId = -1;
-                if (chunkIndex >= 0 && (size_t)chunkIndex < chunkToProtoId.size()) {
-                    protoId = chunkToProtoId[chunkIndex];
-                }
-
-                const Prototype* protoPtr = getPrototype(protoId);
-                if (!protoPtr) {
-                    ZEUS_DEBUG_PRINT("[VM] MAKE_FUNCTION invalid chunkIndex: %d", chunkIndex);
-                    break;
-                }
-
-                const Prototype& proto = *protoPtr;
-
-                bool capturesReferenceParameter = false;
-                if (!callFrames.empty()) {
-                    const auto& currentFrame = callFrames.back();
-                    for (const auto& capture : proto.captures) {
-                        if (capture.fromKind == "local" && capture.srcIndex >= 0 &&
-                            capture.srcIndex < static_cast<int>(
-                                currentFrame.referenceParameterSlots.size()) &&
-                            currentFrame.referenceParameterSlots[
-                                static_cast<size_t>(capture.srcIndex)]) {
-                            capturesReferenceParameter = true;
-                            break;
-                        }
-                    }
-                }
-                if (capturesReferenceParameter) {
-                    VMException::VMException exp(
-                        "a by-reference parameter cannot be captured by a nested function; reference parameters are valid only for the duration of the call",
-                        __line,
-                        instr
-                    );
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                Closure clos;
-                clos.protoId = protoId;
-                clos.upvalues.resize(proto.captures.size());
-
-                // 捕获模式 modeFlag: 0 = 复制 (copy), 1 = 引用 (ref)
-                for (size_t i = 0; i < proto.captures.size(); ++i) {
-                    const auto& cap = proto.captures[i];
-                    int src = cap.srcIndex;
-
-                    bool isLocal = (cap.fromKind == "local");
-                    if (isLocal) {
-                        // 这里处理对 local 变量的捕获：
-                        // - 如果 local 数组太短则扩展
-                        // - 如果 local[src] 为空则创建一个 Cell 占位
-                        // - 解释器在 MAKE_FUNCTION/STORE_VALUE_LOCAL 时会把值分配到 Cell
-                        if (src >= 0 && (size_t)src >= local.size()) {
-                            local.resize(src + 1, nullptr);
-                        }
-                        if (src < 0) {
-                            VMException::VMException exp("Capture local negative index: " + std::to_string(src), __line, instr);
-                            exp._throw(vmstat, currentChunk);
-                            continue;
-                        }
-                        if (!local[src]) {
-                            local[src] = newCell(LexerType::Value(0), 0, "CAPTURE_placeholder"); // 占位 Cell（nil/0）
-                        }
-                        // 现在 local[src] 已可安全使用
-
-                        if (cap.modeFlag == 1) {
-                            // ref-mode: store pointer and retain
-                            clos.upvalues[cap.dstIndex] = local[src];
-                            clos.upvalues[cap.dstIndex]->retain();
-                        } else {
-                            // copy-mode: snapshot the value now (template), do not point to local
-                            clos.upvalues[cap.dstIndex] = cloneCell(local[src], "CAPTURE_copy");
-                        }
-                    } else {
-                        bool inRange = (src >= 0 && (size_t)src < upvalue.size() && upvalue[src]);
-                        
-                        if (!inRange) {
-                            VMException::VMException exp("Capture upvalue out of range: " + std::to_string(src), __line, instr);
-                            exp._throw(vmstat, currentChunk);
-                            continue;
-                        }
-
-                        if (cap.modeFlag == 1) {
-                            // ref-mode: share outer upvalue pointer
-                            clos.upvalues[cap.dstIndex] = upvalue[src];
-                            clos.upvalues[cap.dstIndex]->retain();
-                        } else {
-                            // copy-mode: snapshot outer upvalue now
-                            clos.upvalues[cap.dstIndex] = cloneCell(upvalue[src]);
-                        }
-                    }
-                }
-
-                int handle = allocClosure(std::move(clos));
-
-                    // Debug: dump closure template upvalues (debug channel)
-                    {
-                        ZEUS_DEBUG_PRINT("[MAKE_FUNCTION] proto=%d clos=%d upvalues=", protoId, handle);
-                        for (size_t ui = 0; ui < closures[handle].upvalues.size(); ++ui) {
-                            Cell* c = closures[handle].upvalues[ui];
-                            ZEUS_DEBUG_PRINT("  slot=%zu ptr=%p", ui, (void*)c);
-                        }
-                    }
-
-                stack.push_back(ZeusType::ClosureHandle{ handle });
-                printStack();
-                break;
-            }
-
-
-            case VMOperator::CALL_CLOSURE: {
-                // ========== 函数调用入口 ==========
-                const int argc = VMHelpers::getIntFromValue(std::get<LexerType::Value>(instr.args[0]));
-
-                // 错误处理 helper：在出错时从栈中弹出 callee + argc（可选）并返回占位值
-                auto fail = [&](const std::string& msg, bool includeCallee) {
-                    VMException::VMException exp(msg, __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    int pops = argc + (includeCallee ? 1 : 0);
-                    if (pops > 0 && stack.size() >= (size_t)pops) {
-                        shrinkStackWithRelease(stack.size() - (size_t)pops);
-                    } else {
-                        shrinkStackWithRelease(0);
-                    }
-                    stack.push_back(LexerType::Value(0));
-                };
-
-                // 期望栈布局: [..., callee, arg0, arg1, ..., arg{n-1}]
-                if (stack.size() < static_cast<size_t>(argc) + 1) {
-                    fail("CALL_CLOSURE stack not enough for new layout", false);
-                    break;
-                }
-
-                const size_t calleeIndex   = stack.size() - (argc + 1);
-                const size_t callFrameBase = calleeIndex;
-
-                vmMessage(
-                    std::string("[CALL_CLOSURE_ENTER] stackSize=") + std::to_string(stack.size()) +
-                    " argc=" + std::to_string(argc) +
-                    " calleeIndex=" + std::to_string(calleeIndex)
-                );
-
-                ZeusType::UniversalVariant fnVar = stack[calleeIndex];
-                
-                // DEBUG: 输出 fnVar 的类型
-                ZEUS_DEBUG_PRINT("[CALL_CLOSURE] fnVar index=%d, holds_alternative<ClosureHandle>=%d, holds_alternative<Value>=%d",
-                    (int)calleeIndex,
-                    std::holds_alternative<ZeusType::ClosureHandle>(fnVar),
-                    std::holds_alternative<LexerType::Value>(fnVar));
-
-                // late-resolve 尝试：当 callee 是字符串（函数名）时，尝试将其解析为 closure handle
-                if (instr.metadata.tag == "generic_vm_specialization") {
-                    std::string targetName;
-                    if (instr.metadata.kind != IRType::IRMetadataKind::CallTarget ||
-                        !instr.metadata.readDirectCall(targetName)) {
-                        fail("explicit generic call has no resolved VM target", true);
-                        break;
-                    }
-                    const auto target = functionNameToProtoId.find(targetName);
-                    if (target == functionNameToProtoId.end() ||
-                        getPrototype(target->second) == nullptr) {
-                        fail("explicit generic target is missing from the VM prototype table: " +
-                             targetName, true);
-                        break;
-                    }
-
-                    bool alreadySpecialized = false;
-                    if (const auto* closureHandle =
-                            std::get_if<ZeusType::ClosureHandle>(&fnVar)) {
-                        const Closure* currentClosure = getClosure(closureHandle->id);
-                        alreadySpecialized = currentClosure != nullptr &&
-                            currentClosure->protoId == target->second;
-                    }
-                    if (!alreadySpecialized) {
-                        const ZeusType::UniversalVariant previousCallee = fnVar;
-                        const uint8_t previousOwner = stack.ownerFlag(calleeIndex);
-                        Closure specializedClosure;
-                        specializedClosure.protoId = target->second;
-                        specializedClosure.autoRelease = true;
-                        const int specializedHandle =
-                            allocClosure(std::move(specializedClosure));
-                        stack.set(
-                            calleeIndex,
-                            ZeusType::ClosureHandle{specializedHandle});
-                        dropStackItem(StackItem{previousCallee, previousOwner});
-                        fnVar = stack[calleeIndex];
-                    }
-                }
-
-                auto tryLateResolve = [&](ZeusType::UniversalVariant& v) {
-                    // 如果已经是 ClosureHandle，直接返回
-                    if (std::holds_alternative<ZeusType::ClosureHandle>(v)) {
-                        return;
-                    }
-                    // 仅处理 Value<string> 类型
-                    if (!std::holds_alternative<LexerType::Value>(v)) {
-                        return;
-                    }
-
-                    const auto& vv = std::get<LexerType::Value>(v);
-                    if (!std::holds_alternative<std::string>(vv.data)) {
-                        return;
-                    }
-
-                    // 严格模式下不允许 late resolve
-                    if (!enableLateResolve) {
-                        VMException::VMException exp("Strict mode: unresolved function name before call", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        return;
-                    }
-
-                    const std::string& name = std::get<std::string>(vv.data);
-
-                    // 1) 优先查找 nameToClosure 映射
-                    auto itc = nameToClosure.find(name);
-                    if (itc != nameToClosure.end()) {
-                        int h = itc->second;
-                        if (h >= 0 && h < (int)closures.size()) {
-                            stack[calleeIndex] = ZeusType::ClosureHandle{ h };
-                            v = stack[calleeIndex];
-                            return;
-                        }
-                    }
-
-                    // 2) 回退：遍历 globalNames，对应 global 插槽中查找 closure
-                    if (!globalNames.empty()) {
-                        for (int gi = 0; gi < (int)globalNames.size(); ++gi) {
-                            if (globalNames[gi] == name && gi < (int)global.size() && global[gi]) {
-                                const auto gval = global[gi]->readValue();
-                                if (std::holds_alternative<ZeusType::ClosureHandle>(gval)) {
-                                    int cid = std::get<ZeusType::ClosureHandle>(gval).id;
-                                    if (cid >= 0 && cid < (int)closures.size()) {
-                                        nameToClosure[name]   = cid;
-                                        stack[calleeIndex]    = ZeusType::ClosureHandle{ cid };
-                                        v                     = stack[calleeIndex];
-                                    }
-                                }
-                                break; // 找到匹配后跳出循环
-                            }
-                        }
-                    }
-                };
-
-                tryLateResolve(fnVar);
-
-                // 调用前的类型检查：确保 callee 已解析为 closure handle
-                if (!std::holds_alternative<ZeusType::ClosureHandle>(fnVar)) {
-                    std::string actualType = ZeusVMUtils::valueToDebugString(fnVar);
-                    std::string errorMsg = "CALL_CLOSURE: Attempted to call non-function value. ";
-                    errorMsg += "Expected a function but got: " + actualType + ". ";
-                    errorMsg += "This usually means the variable is nil or not properly initialized as a function.";
-                    fail(errorMsg, true);
-                    break;
-                }
-
-                const int handle = std::get<ZeusType::ClosureHandle>(fnVar).id;
-                Closure* closPtr = getClosure(handle);
-                if (!closPtr) {
-                    fail("CALL_CLOSURE invalid handle", true);
-                    break;
-                }
-
-                Closure&    clos  = *closPtr;
-                const Prototype* protoPtr = getPrototype(clos.protoId);
-                if (!protoPtr) {
-                    ZEUS_DEBUG_PRINT("[CALL_CLOSURE] invalid protoId=%d, closureId=%d, closures.size=%zu, sharedClosures=%p, sharedPrototypes=%p",
-                        clos.protoId, handle, closures.size(), (void*)sharedClosures, (void*)sharedPrototypes);
-                    ZEUS_DEBUG_PRINT("[CALL_CLOSURE] closure refCount=%d, isShared=%d, upvalues=%zu, boundThis=%d",
-                        clos.refCount, (int)isSharedClosure(handle), clos.upvalues.size(), clos.boundThis.has_value() ? 1 : 0);
-                    if (sharedClosures) {
-                        ZEUS_DEBUG_PRINT("[CALL_CLOSURE] sharedClosures->size=%zu", sharedClosures->size());
-                    }
-                    if (sharedPrototypes) {
-                        ZEUS_DEBUG_PRINT("[CALL_CLOSURE] sharedPrototypes->size=%zu", sharedPrototypes->size());
-                    }
-                    fail("CALL_CLOSURE invalid protoId", true);
-                    break;
-                }
-                const Prototype&  proto = *protoPtr;
-
-                // 保存调用前的 local 和 upvalue 环境
-                bool capturesReady = true;
-                for (Cell* captureCell : clos.upvalues) {
-                    if (!captureCell) {
-                        fail("CALL_CLOSURE: closure has an uninitialized capture cell", true);
-                        capturesReady = false;
-                        break;
-                    }
-                }
-                if (!capturesReady) break;
-
-                auto oldLocal   = local;
-                auto oldUpvalue = upvalue;
-
-                const bool hasBorrowedReceiverSource = instr.args.size() >= 6 &&
-                    std::holds_alternative<std::string>(instr.args[1]) &&
-                    std::get<std::string>(instr.args[1]) ==
-                        "__zeus_receiver_source";
-                Cell* borrowedReceiverCell = nullptr;
-                std::shared_ptr<ZeusShared::SharedCell> borrowedReceiverShared;
-                ZeusType::UniversalVariant borrowedReceiverValue;
-                ZeusType::UniversalVariant borrowedReceiverReference;
-                bool borrowedReceiverReadOnly = false;
-                std::string receiverSourceError;
-                if (hasBorrowedReceiverSource) {
-                    if (!std::holds_alternative<std::string>(instr.args[2]) ||
-                        !std::holds_alternative<LexerType::Value>(instr.args[3]) ||
-                        !std::holds_alternative<std::string>(instr.args[4]) ||
-                        !std::holds_alternative<LexerType::Value>(instr.args[5])) {
-                        receiverSourceError = "VM method receiver source metadata is invalid";
-                    } else {
-                        const std::string& scope = std::get<std::string>(instr.args[2]);
-                        const std::string& name = std::get<std::string>(instr.args[4]);
-                        int64_t rawIndex = -1;
-                        int64_t rawReadOnly = 0;
-                        if (!ZeusVMUtils::tryGetInt64FromValue(
-                                std::get<LexerType::Value>(instr.args[3]), rawIndex) ||
-                            !ZeusVMUtils::tryGetInt64FromValue(
-                                std::get<LexerType::Value>(instr.args[5]), rawReadOnly)) {
-                            receiverSourceError = "VM method receiver source locator is invalid";
-                        } else {
-                            borrowedReceiverReadOnly = rawReadOnly != 0;
-                            if (scope == "local" && rawIndex >= 0 &&
-                                rawIndex < static_cast<int64_t>(oldLocal.size())) {
-                                borrowedReceiverCell = oldLocal[static_cast<size_t>(rawIndex)];
-                            } else if (scope == "global" && rawIndex >= 0 &&
-                                       rawIndex < static_cast<int64_t>(global.size())) {
-                                borrowedReceiverCell = global[static_cast<size_t>(rawIndex)];
-                            } else if (scope == "upvalue" && rawIndex >= 0 &&
-                                       rawIndex < static_cast<int64_t>(oldUpvalue.size())) {
-                                borrowedReceiverCell = oldUpvalue[static_cast<size_t>(rawIndex)];
-                            } else if (scope == "shared" && !name.empty()) {
-                                borrowedReceiverShared =
-                                    ZeusShared::getGlobalHeap().find(name);
-                            } else {
-                                receiverSourceError =
-                                    "VM method receiver source is outside its " + scope + " storage";
-                            }
-
-                            if (receiverSourceError.empty()) {
-                                if (borrowedReceiverCell) {
-                                    try {
-                                        borrowedReceiverValue = loadCellValue(
-                                            borrowedReceiverCell);
-                                    } catch (const std::exception& error) {
-                                        receiverSourceError = error.what();
-                                    }
-                                    borrowedReceiverReference =
-                                        ZeusType::ReferenceHandle{
-                                            borrowedReceiverCell, "cell"};
-                                } else if (borrowedReceiverShared) {
-                                    borrowedReceiverValue = borrowedReceiverShared->read();
-                                    borrowedReceiverReference =
-                                        ZeusType::ReferenceHandle{
-                                            borrowedReceiverShared.get(), "shared",
-                                            borrowedReceiverShared->generation};
-                                } else if (receiverSourceError.empty()) {
-                                    receiverSourceError =
-                                        "VM method receiver source is no longer alive";
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 清空并初始化新的 local，用于被调用函数（大小为 proto.paramCount），并为每个参数创建占位 Cell
-                local.clear();
-                local.resize(proto.paramCount);
-                for (int i = 0; i < proto.paramCount; ++i) {
-                    local[i] = newCell(LexerType::Value(0), 0, "CALL_CLOSURE_local");
-                }
-                // upvalue 指向 closure 的 upvalues（Cell 指针集合）
-                // The closure owns the capture cells. Reference captures share
-                // the outer cell; copy captures share the closure's snapshot cell.
-                // Both modes use that same cell for each invocation, so a copied
-                // capture can keep private mutable state across calls.
-                std::vector<Cell*> callUpvalues = clos.upvalues;
-                for (auto* cell : callUpvalues) cell->retain();
-                upvalue = callUpvalues;
-                    // Debug: dump callUpvalues (debug channel)
-                    ZEUS_DEBUG_PRINT("[CALL_CLOSURE] calling proto=%d clos=%d callUpvals=", clos.protoId, handle);
-                    for (size_t ui = 0; ui < callUpvalues.size(); ++ui) {
-                        ZEUS_DEBUG_PRINT("  slot=%zu ptr=%p", ui, (void*)callUpvalues[ui]);
-                    }
-
-                // 如果闭包有绑定的this (来自 OBJ_LOAD_ATTR 获取实例方法), 将其作为第一个参数插入
-                // 当前栈: [callee, arg0, arg1, ...]
-                // 需要变为: [callee, this, arg0, arg1, ...]
-                int actualArgc = argc;
-                if (clos.boundThis.has_value()) {
-                    ZEUS_DEBUG_PRINT("[CALL_CLOSURE] Closure has boundThis, inserting as first arg");
-                    // 在 calleeIndex + 1 位置插入 boundThis
-                    retainObject(*clos.boundThis); // stack owns a reference
-                    stack.insert(stack.begin() + (calleeIndex + 1), clos.boundThis.value());
-                    actualArgc++;
-                }
-                    
-
-                // ===== 参数处理：支持默认参数、可变参数和命名参数 =====
-                int regularParamCount = proto.paramCount;
-                
-                // 扩展 local 以容纳常规参数 + *args + **kwargs
-                if (proto.hasVariadicArgs || proto.hasVariadicKwargs) {
-                    int extraSlots = 0;
-                    if (proto.hasVariadicArgs) extraSlots++;
-                    if (proto.hasVariadicKwargs) extraSlots++;
-                    
-                    int newLocalSize = regularParamCount + extraSlots;
-                    local.resize(newLocalSize);
-                    for (int idx = regularParamCount; idx < newLocalSize; ++idx) {
-                        local[idx] = newCell(LexerType::Value(0), 0, "CALL_varargs");
-                    }
-                }
-                
-                // 扫描栈上的参数,分离位置参数和命名参数
-                std::map<std::string, ZeusType::UniversalVariant> namedArgs;
-                std::vector<ZeusType::UniversalVariant> positionalArgs;
-                std::vector<bool> paramProvided(regularParamCount, false);
-                
-                for (int i = 0; i < actualArgc; ++i) {
-                    auto& arg = stack[calleeIndex + 1 + i];
-                    if (std::holds_alternative<std::shared_ptr<ZeusType::NamedArg>>(arg)) {
-                        // 命名参数
-                        auto namedArgPtr = std::get<std::shared_ptr<ZeusType::NamedArg>>(arg);
-                        namedArgs[namedArgPtr->name] = namedArgPtr->value;
-                        ZEUS_DEBUG_PRINT("[CALL_CLOSURE] Named arg: %s", namedArgPtr->name.c_str());
-                    } else {
-                        // 位置参数
-                        positionalArgs.push_back(arg);
-                    }
-                }
-                
-                int positionalCount = (int)positionalArgs.size();
-                ZEUS_DEBUG_PRINT("[CALL_CLOSURE] positional=%d, named=%d", positionalCount, (int)namedArgs.size());
-                if (hasBorrowedReceiverSource && receiverSourceError.empty()) {
-                    if (positionalArgs.empty() ||
-                        runtimeValueTypeName(positionalArgs.front()) !=
-                            runtimeValueTypeName(borrowedReceiverValue)) {
-                        receiverSourceError =
-                            "VM method receiver changed before its borrowed address was used";
-                    }
-                }
-                
-                // 填充常规参数
-                std::set<std::string> consumedNamedArgs; // 记录已使用的命名参数
-                
-                bool parameterTypeMismatch = false;
-                for (int i = 0; i < regularParamCount; ++i) {
-                    bool filled = false;
-                    
-                    // 优先使用位置参数
-                    if (i < positionalCount) {
-                        ZeusType::UniversalVariant argumentValue = positionalArgs[i];
-                        const bool useBorrowedReceiver =
-                            hasBorrowedReceiverSource && i == 0;
-                        if (useBorrowedReceiver) {
-                            if (!receiverSourceError.empty()) {
-                                parameterTypeMismatch = true;
-                                break;
-                            }
-                            argumentValue = i < static_cast<int>(proto.paramIsReference.size()) &&
-                                    proto.paramIsReference[i]
-                                ? borrowedReceiverReference
-                                : borrowedReceiverValue;
-                        } else if (i < static_cast<int>(proto.paramIsReference.size()) &&
-                            proto.paramIsReference[i]) {
-                            const int receiverOffset = clos.boundThis.has_value() ? 1 : 0;
-                            const int positionalSourceIndex = i - receiverOffset;
-                            if (!resolveReferenceArgument(
-                                    instr,
-                                    proto,
-                                    oldLocal,
-                                    oldUpvalue,
-                                    i,
-                                    positionalSourceIndex,
-                                    i < static_cast<int>(proto.paramNames.size())
-                                        ? proto.paramNames[i]
-                                        : std::string(),
-                                    positionalArgs[i],
-                                    argumentValue)) {
-                                parameterTypeMismatch = true;
-                                break;
-                            }
-                        }
-                        if (!validateFunctionArgument(proto, i, argumentValue, instr)) {
-                            parameterTypeMismatch = true;
-                            break;
-                        }
-                        if (useBorrowedReceiver) {
-                            assignCellValue(local[i], borrowedReceiverReference);
-                            if (borrowedReceiverReadOnly) local[i]->flags |= 1;
-                        } else {
-                            assignCellValue(local[i], argumentValue);
-                        }
-                        paramProvided[i] = true;
-                        filled = true;
-                    }
-                    
-                    // 尝试从命名参数中按名字匹配
-                    if (!filled && i < (int)proto.paramNames.size()) {
-                        const std::string& paramName = proto.paramNames[i];
-                        auto it = namedArgs.find(paramName);
-                        if (it != namedArgs.end()) {
-                            ZeusType::UniversalVariant argumentValue = it->second;
-                            if (i < static_cast<int>(proto.paramIsReference.size()) &&
-                                proto.paramIsReference[i]) {
-                                if (!resolveReferenceArgument(
-                                        instr, proto, oldLocal, oldUpvalue,
-                                        i, -1, paramName,
-                                        it->second, argumentValue)) {
-                                    parameterTypeMismatch = true;
-                                    break;
-                                }
-                            }
-                            if (!validateFunctionArgument(proto, i, argumentValue, instr)) {
-                                parameterTypeMismatch = true;
-                                break;
-                            }
-                            assignCellValue(local[i], argumentValue);
-                            consumedNamedArgs.insert(paramName);
-                            paramProvided[i] = true;
-                            filled = true;
-                            ZEUS_DEBUG_PRINT("[CALL_CLOSURE] Filled param[%d] '%s' from named arg", i, paramName.c_str());
-                        }
-                    }
-
-                    if (!filled && !proto.hasRuntimeDefaultPrologue &&
-                        i < (int)proto.paramHasDefault.size() && proto.paramHasDefault[i] &&
-                        i < (int)proto.paramDefaultValues.size()) {
-                        if (!validateFunctionArgument(
-                                proto, i, proto.paramDefaultValues[i], instr)) {
-                            parameterTypeMismatch = true;
-                            break;
-                        }
-                        assignCellValue(local[i], proto.paramDefaultValues[i]);
-                        filled = true;
-                    }
-                    
-                    // 最后用0初始化
-                    if (!filled) {
-                        assignCellValue(local[i], LexerType::Value(0));
-                    }
-                }
-
-                if (parameterTypeMismatch) {
-                    releaseCurrentFrameEnvironment();
-                    local = std::move(oldLocal);
-                    upvalue = std::move(oldUpvalue);
-                    shrinkStackWithRelease(calleeIndex);
-                    if (!receiverSourceError.empty()) {
-                        VMException::VMException(
-                            receiverSourceError, __line, instr)
-                            ._throw(vmstat, currentChunk);
-                    } else {
-                        stack.push_back(LexerType::Value(0));
-                    }
-                    break;
-                }
-
-                for (int i = 0; i < regularParamCount; ++i) {
-                    const bool hasDefault = i < (int)proto.paramHasDefault.size() && proto.paramHasDefault[i];
-                    if (!paramProvided[i] && !hasDefault) {
-                        const std::string paramName = i < (int)proto.paramNames.size()
-                            ? proto.paramNames[i]
-                            : std::to_string(i);
-                        VMException::VMException exp(
-                            "CALL_CLOSURE: missing required argument '" + paramName + "'",
-                            __line,
-                            instr
-                        );
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                }
-                if (vmstat != ZeusType::VMStatus::Running) break;
-                
-                // 检查是否传递了过多的参数（仅当没有 *args 时）
-                if (!proto.hasVariadicArgs && positionalCount > regularParamCount) {
-                    VMException::VMException exp(
-                        "CALL_CLOSURE: too many arguments. Expected at most " + 
-                        std::to_string(regularParamCount) + " arguments, but got " +
-                        std::to_string(positionalCount),
-                        __line,
-                        instr
-                    );
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                // 检查未被消费的命名参数（仅当没有 **kwargs 时）
-                if (!proto.hasVariadicKwargs) {
-                    for (const auto& kv : namedArgs) {
-                        if (consumedNamedArgs.find(kv.first) == consumedNamedArgs.end()) {
-                            VMException::VMException exp(
-                                "CALL_CLOSURE: unexpected named argument '" + kv.first + "'",
-                                __line,
-                                instr
-                            );
-                            exp._throw(vmstat, currentChunk);
-                            break;
-                        }
-                    }
-                }
-                
-                // 构建 *args 数组(收集多余的位置参数)
-                if (proto.hasVariadicArgs) {
-                    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                    std::vector<ZeusType::UniversalVariant> argsVec;
-                    for (int i = regularParamCount; i < positionalCount; ++i) {
-                        argsVec.push_back(positionalArgs[i]);
-                    }
-                    
-                    auto arrayDataPtr = ZeusGC::makeArrayData();
-                    arrayDataPtr->valueRefCount.store(0, std::memory_order_relaxed);
-                    arrayDataPtr->data = argsVec;
-                    ZeusType::Array argsArray;
-                    argsArray.impl = arrayDataPtr;
-                    
-                    ZeusType::Variant variantArgsArray = argsArray;
-                    assignCellValue(local[regularParamCount], variantArgsArray);
-                }
-                
-                // 构建 **kwargs 字典(收集未被消费的命名参数)
-                if (proto.hasVariadicKwargs) {
-                    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                    auto objDataPtr = ZeusGC::makeObjectData();
-                    
-                    // 只加入未被消费的命名参数
-                    for (const auto& kv : namedArgs) {
-                        if (consumedNamedArgs.find(kv.first) == consumedNamedArgs.end()) {
-                            objDataPtr->setValue(kv.first, kv.second);
-                            ZEUS_DEBUG_PRINT("[CALL_CLOSURE] Extra named arg '%s' -> kwargs", kv.first.c_str());
-                        }
-                    }
-                    
-                    ZeusType::Object kwargsDict;
-                    kwargsDict.impl = objDataPtr;
-                    
-                    ZeusType::Variant variantKwargs = kwargsDict;
-                    int kwargsSlot = regularParamCount;
-                    if (proto.hasVariadicArgs) kwargsSlot++;
-                    assignCellValue(local[kwargsSlot], variantKwargs);
-                }
-
-                // ========== 新的栈帧实现：不再使用while循环 ==========
-                // 检查调用深度
-                if (callFrames.size() >= (size_t)MAX_CALL_DEPTH) {
-                    auto exp = VMException::VMException(
-                        VMException::ErrorCode::E1900_STACK_OVERFLOW,
-                        VMException::ErrorCategory::VM_RUNTIME,
-                        "Stack overflow: possible infinite recursion",
-                        __line, instr
-                    );
-                    exp.setDetails(
-                        std::string("Call depth exceeded ") + std::to_string(MAX_CALL_DEPTH) + " levels\r\n" +
-                        "Current call depth: " + std::to_string(callFrames.size())
-                    );
-                    exp.setSuggestion(
-                        std::string("Check for infinite recursion, especially in:\r\n") +
-                        "  • operator[.] overloads accessing 'this.member' (use getattr instead)\r\n" +
-                        "  • Recursive function calls without proper base case\r\n" +
-                        "  • Circular references in object construction"
-                    );
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                // 创建新栈帧
-                CallFrame newFrame;
-                newFrame.code = &proto.body;
-                newFrame.pc = 0;
-                newFrame.savedLocal = oldLocal;
-                newFrame.savedUpvalue = oldUpvalue;
-                newFrame.stackBase = callFrameBase;
-                newFrame.savedLine = __line;
-                newFrame.paramProvided = std::move(paramProvided);
-                newFrame.referenceParameterSlots = proto.paramIsReference;
-                
-                 // callee closure 的生命周期由栈收缩（RETURN -> shrinkStackWithRelease(stackBase)）统一处理。
-                 // 这里不再基于 refCount 推断“临时闭包”，避免与栈/容器 retain 语义冲突。
-                 newFrame.calleeAutoReleaseId = -1;
-                 callFrames.push_back(newFrame);
-                 justPushedFrame = true;  // 标记已创建栈帧
-                
-                ZEUS_DEBUG_PRINT("[CALL_CLOSURE] Pushed frame (depth=%zu), proto body size=%zu", 
-                    callFrames.size(), proto.body.size());
-                
-                // 不需要while循环了，runChunk会处理新栈帧的执行
-                break;
-                
-                // ========== 以下是旧代码，已被栈帧机制替代 ==========
-                #if 0
-                while (pc < proto.body.size()) {
-                    const auto& ins = proto.body[pc];
-
-                    // ---- 跳过 FUNC_BEGIN / CAPTURE_OUTSIDE_VAR 指令 ----
-                    if (ins.op == VMOperator::FUNC_BEGIN || ins.op == VMOperator::CAPTURE_OUTSIDE_VAR) {
-                        pc++;
-                        continue;
-                    }
-
-                    if (ins.op == VMOperator::FUNC_END) {
-                        pc++;
-                        continue;
-                    }
-
-                    // ---- RETURN ----
-                    if (ins.op == VMOperator::RETURN) {
-                        if (!stack.empty()) {
-                            retVal = stack.back();
-                            stack.pop_back();
-                            hasRet = true;
-                        }
-                        break;
-                    }
-
-                    // ---- 跳转指令处理 ----
-                    if (ins.op == VMOperator::JUMP) {
-                        int off = VMHelpers::getIntFromValue(std::get<LexerType::Value>(ins.args[0]));
-                        pc += 1 + off;
-                        continue;
-                    }
-
-                    if (ins.op == VMOperator::JUMP_IF_FALSE) {
-                        int off = VMHelpers::getIntFromValue(std::get<LexerType::Value>(ins.args[0]));
-                        
-                        if (!stack.empty()) {
-                            auto cond = stack.back();
-                            stack.pop_back();
-                            if (!truthy(cond)) {
-                                pc += 1 + off;
-                                continue;
-                            }
-                        }
-                        pc++;
-                        continue;
-                    }
-
-                    if (ins.op == VMOperator::JUMP_IF_TRUE) {
-                        int off = VMHelpers::getIntFromValue(std::get<LexerType::Value>(ins.args[0]));
-                        
-                        if (!stack.empty()) {
-                            auto cond = stack.back();
-                            stack.pop_back();
-
-                            if (truthy(cond)) {
-                                pc += 1 + off;
-                                continue;
-                            }
-                        }
-                        pc++;
-                        continue;
-                    }
-
-                    // ---- 执行普通指令 ----
-                    execute(ins);
-                    pc++;
-                }
-                #endif
-                // ========== 旧的清理代码已移到RETURN处理（runChunk） ==========
-                #if 0
-                // 恢复调用前的 local/upvalue 状态，并对需要闭合的 local 做闭合处理
-                {
-                    // 收集当前 local 中的 Cell 指针
-                    std::unordered_set<Cell*> localSet;
-                    localSet.reserve(local.size());
-
-                    for (Cell* c : local)
-                        if (c) localSet.insert(c);
-
-                    // 遍历所有 closures 的 upvalues，若某个 upvalue 指向当前 local 中的 Cell，则需要将其替换为闭包闭合的 Cell
-                    std::unordered_map<Cell*, Cell*> closedMap; // oldLocalPtr -> closedCell
-                    
-                    for (auto& c : closures) {
-                        for (auto& uv : c.upvalues) {
-                            if (uv && localSet.count(uv)) {
-                                Cell* oldPtr = uv;
-                                Cell* closed = nullptr;
-
-                                auto it = closedMap.find(oldPtr);
-                                if (it == closedMap.end()) {
-                                    closed = cloneCell(oldPtr);
-                                    closedMap.emplace(oldPtr, closed);
-                                } else {
-                                    closed = it->second;
-                                }
-                                // closed 是闭合后的 Cell 指针，增加引用计数
-                                closed->retain();
-                                // 释放原 upvalue 的引用
-                                uv->release();
-                                // 用闭合后的 Cell 替换 upvalue
-                                uv = closed;
-                            }
-                        }
-                    }
-
-                    // 清理当前函数的 local：释放并置空所有占位 Cell
-                    for (auto& cptr : local) {
-                        if (cptr) { cptr->release(); cptr = nullptr; }
-                    }
-                    // release any temporary per-call upvalues we created earlier
-                    for (size_t ci = 0; ci < /*callUpvalues size*/ (size_t)0; ++ci) {
-                        // no-op placeholder: actual callUpvalues is out of scope here, so we cleanup below
-                    }
-                }
-
-                // 在缩小栈回到 callFrameBase 时进行校验
-                if (stack.size() < callFrameBase + argc + 1) {
-                    vmMessage("[CALL_CLOSURE_WARN] unexpected stack shrink before frame cleanup: size=" + std::to_string(stack.size()) +
-                        " expected>=" + std::to_string(callFrameBase + argc + 1));
-                }
-                shrinkStackWithRelease(callFrameBase);
-
-                local = std::move(oldLocal);
-                upvalue = std::move(oldUpvalue);
-
-                // 将返回值压回栈（如果有返回值则压入返回值，否则压入 nil）
-                stack.push_back(hasRet ? retVal : ZeusType::UniversalVariant(LexerType::Value(0)));
-                vmMessage("[CALL_CLOSURE_EXIT] base=" + std::to_string(callFrameBase) + " finalStackSize=" + std::to_string(stack.size()) +
-                    " retType=" + (hasRet?retVal.index()==0?"val":"complex":"void"));
-                printStack();
-                
-                // 递归深度恢复
-                callDepth--;
-                #endif
-                break;
-            }
-
-
-
-            case VMOperator::LOAD_NATIVE: {
-                if (instr.args.empty() || !std::holds_alternative<LexerType::Value>(instr.args[0])) {
-                    VMException::VMException exp("LOAD_NATIVE missing id", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                int nid = VMHelpers::getIntFromValue(std::get<LexerType::Value>(instr.args[0]));
-
-                // Non-negative ids address builtins; negative ids are native
-                // injections resolved from @native declarations.
-                const bool validHandle = nid >= 0
-                    ? ZeusBuiltins::get(nid) != nullptr
-                    : ZeusBuiltins::nativeInjectionFromHandle(nid) != nullptr;
-                if (!validHandle) {
-                    VMException::VMException exp("LOAD_NATIVE invalid id: " + std::to_string(nid), __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                stack.push_back(ZeusType::NativeFuncHandle{ nid });
-                printStack();
-                break;
-            }
-
-            case VMOperator::CALL_NATIVE: {
-                NativeCallContext ctx;
-                if (!prepareNativeCall(instr, ctx)) { break; }
-                 if (!validateNativeArity(ctx, instr)) {
-                    for (int i = 0; i < ctx.argc + 1; ++i) {
-                        if (!stack.empty()) dropStackBack();
-                    }
-                    stack.push_back(LexerType::Value(0));
-                    printStack();
-                    break;
-                 }
-                if (startPendingObjectClone(ctx)) {
-                    printStack();
-                    break;
-                }
-                auto ret = invokeNative(ctx);
-                cleanupNativeCall(ctx, ret);
-                printStack();
-                break;
-            }
-
-
-            case VMOperator::STORE_VALUE_LOCAL: {
-                auto const& __varIndex = std::get<LexerType::Value>(instr.args[0]);
-                const int __varIndexInt = VMHelpers::getIntFromValue(__varIndex);
-
-                auto const& __mutOrConst = std::get<std::string>(instr.args[1]);
-
-                if (local.size() <= (size_t)__varIndexInt) {
-                    local.resize(__varIndexInt + 1, nullptr);
-                }
-
-                StackItem newItem = popStackItem();
-                ZeusType::UniversalVariant newVal = newItem.value;
-                
-                // local Cell 将持有新值的一份引用
-                ZeusGC::retainVariantDeep(*this, newVal);
-
-                if (!local[__varIndexInt]) {
-                    local[__varIndexInt] = newCell(newVal, (__mutOrConst == "const") ? 1 : 0, "STORE_LOCAL");
-                } else {
-                    if (local[__varIndexInt]->flags & 0x1) {
-                        VMException::VMException exp("Attempt to modify a const local variable at index " + std::to_string(__varIndexInt), __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-
-                    const auto oldVal = local[__varIndexInt]->readValue();
-                    ZeusGC::releaseVariantDeep(*this, oldVal);
-
-                    local[__varIndexInt]->writeValue(newVal);
-
-                    if (__mutOrConst == "const") {
-                        local[__varIndexInt]->flags |= 0x1;
-                    } else {
-                        local[__varIndexInt]->flags &= ~0x1;
-                    }
-                }
-
-                // 丢弃栈持有的那一份引用（local cell 已 retain 一份）
-                dropStackItem(newItem);
-
-                printLocals();
-                printStack();
-                break;
-            }
-
-
-            case VMOperator::STORE_VALUE_GLOBAL: {
-                auto const& __varIndex = std::get<LexerType::Value>(instr.args[0]);
-                const int __varIndexInt = VMHelpers::getIntFromValue(__varIndex);
-                auto const& __mutOrConst = std::get<std::string>(instr.args[1]);
-                
-                ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_GLOBAL: index=%d, mutOrConst='%s', stack.size=%zu", 
-                    __varIndexInt, __mutOrConst.c_str(), stack.size());
-                
-                // 可选 inline 名称（来自 .zir），用于在 globalNames 中记录符号名称以便后续查找
-                std::string inlineName;
-                if (instr.args.size() > 2 && std::holds_alternative<std::string>(instr.args[2])) {
-                    inlineName = std::get<std::string>(instr.args[2]);
-                    if (__varIndexInt >= 0) {
-                        if (__varIndexInt >= (int)globalNames.size()) globalNames.resize(__varIndexInt+1);
-                        if (globalNames[__varIndexInt].empty()) globalNames[__varIndexInt] = inlineName;
-                    }
-                }
-                
-                ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_GLOBAL: Getting stack.back()...");
-                StackItem newItem = popStackItem();
-                ZeusType::UniversalVariant newVal = newItem.value; // 将栈顶值视为要存储的新值（可能包含 closure）
-                
-                // global Cell 将持有新值的一份引用
-                ZeusGC::retainVariantDeep(*this, newVal);
-                
-                ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_GLOBAL: Resizing global if needed (current size=%zu)...", global.size());
-                if (global.size() <= __varIndexInt) {
-                    global.resize(__varIndexInt + 1, nullptr);
-                }
-                
-                ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_GLOBAL: Setting global[%d]...", __varIndexInt);
-                if (!global[__varIndexInt]) {
-                    global[__varIndexInt] = newCell(newVal, (__mutOrConst == "const") ? 1 : 0, "STORE_GLOBAL");
-                    ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_GLOBAL: Created new cell with flags=%d", global[__varIndexInt]->flags);
-                } else {
-                    ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_GLOBAL: Cell exists, flags=%d, mutOrConst=%s", 
-                        global[__varIndexInt]->flags, __mutOrConst.c_str());
-
-                    if (global[__varIndexInt]->flags & 0x1) {
-                        VMException::VMException exp("Attempt to modify a const global variable at index " + std::to_string(__varIndexInt), __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-
-                    const auto oldVal = global[__varIndexInt]->readValue();
-                    ZeusGC::releaseVariantDeep(*this, oldVal);
-
-                    global[__varIndexInt]->writeValue(newVal);
-
-                    if (__mutOrConst == "const") {
-                        global[__varIndexInt]->flags |= 0x1;
-                    } else {
-                        global[__varIndexInt]->flags &= ~0x1;
-                    }
-                }
-
-                ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_GLOBAL: Popping stack...");
-                // 释放栈临时持有的对象引用（global cell 已 retain 一份）
-                dropStackItem(newItem);
-
-                ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_GLOBAL: tryRegisterGlobalClosure...");
-                // 如果新值是 closure，则尝试在 nameToClosure/register 中注册
-                tryRegisterGlobalClosure(__varIndexInt, newVal);
-
-                ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_GLOBAL: printGlobals...");
-                printGlobals();
-                
-                ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_GLOBAL: printStack...");
-                printStack();
-                
-                ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_GLOBAL: Done!");
-                // TODO: future: 如果在注册 closure 时需要自动记录名称（nameToClosure），
-                // 需要考虑名字冲突、作用域以及 late-resolve 的一致性。目前通过
-                // tryRegisterGlobalClosure 做部分处理，后续可在这里统一改进。
-                break;
-            }
-
-            case VMOperator::ASSIGN_VALUE_GLOBAL: {
-                auto const& __varIndex = std::get<LexerType::Value>(instr.args[0]);
-                int idx = VMHelpers::getIntFromValue(__varIndex);
-
-                // 处理 inline 名称参数（index, mut/const, name?）
-                if (instr.args.size() > 2 && std::holds_alternative<std::string>(instr.args[2])) {
-                    if (idx >= 0) {
-                        if (idx >= (int)globalNames.size()) {
-                            globalNames.resize(idx + 1);
-                        }
-                        if (globalNames[idx].empty()) {
-                            globalNames[idx] = std::get<std::string>(instr.args[2]);
-                        }
-                    }
-                }
-
-                if (idx < 0 || idx >= (int)global.size() || !global[idx]) {
-                    VMException::VMException exp("ASSIGN global slot invalid: " + std::to_string(idx), __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                if (global[idx]->flags & 0x1) {
-                    std::string varName = (idx >= 0 && idx < (int)globalNames.size()) 
-                        ? globalNames[idx] : ("g[" + std::to_string(idx) + "]");
-                    
-                    auto exp = VMException::VMException(
-                        VMException::ErrorCode::E1301_CONST_ASSIGNMENT,
-                        VMException::ErrorCategory::VM_RUNTIME,
-                        "Cannot assign to constant '" + varName + "'",
-                        __line, instr
-                    );
-                    exp.setDetails("The variable '" + varName + "' was declared as 'const' and cannot be modified");
-                    exp.setSuggestion("If you need to modify this variable, declare it with 'let' instead of 'const'");
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                if (stack.empty()) {
-                    VMException::VMException exp("ASSIGN global stack empty", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                StackItem newItem = popStackItem();
-                ZeusType::UniversalVariant newVal = newItem.value;
-
-                const auto referenceWrite = writeThroughReference(global[idx], newVal);
-                if (referenceWrite != ReferenceWriteResult::NotReference) {
-                    if (referenceWrite != ReferenceWriteResult::Stored) {
-                        VMException::VMException exp(
-                            referenceWrite == ReferenceWriteResult::ConstTarget
-                                ? "Cannot assign through a reference to a const cell"
-                                : "Cannot assign this value through the reference",
-                            __line, instr
-                        );
-                        exp._throw(vmstat, currentChunk);
-                    }
-                    dropStackItem(newItem);
-                    printGlobals();
-                    printStack();
-                    break;
-                }
-
-                const auto oldVal = global[idx]->readValue();
-                ZeusGC::releaseVariantDeep(*this, oldVal);
-                ZeusGC::retainVariantDeep(*this, newVal);
-
-                global[idx]->writeValue(newVal);
-
-                // TODO: 如果可能，应在 nameToClosure 中记录名称（当新值为 closure 时），以便 later-resolve
-                tryRegisterGlobalClosure(idx, newVal);
-                // 释放栈临时持有的对象引用（slot 已 retain）
-                dropStackItem(newItem);
-
-                printGlobals();
-                printStack();
-                // TODO: 需要将名称注册到 nameToClosure（当新值为 closure 时），以便 later-resolve
-                break;
-            }
-
-            case VMOperator::ASSIGN_VALUE_LOCAL: {
-                auto const& __varIndex = std::get<LexerType::Value>(instr.args[0]);
-                int idx = VMHelpers::getIntFromValue(__varIndex);
-
-                if (idx < 0 || idx >= (int)local.size() || !local[idx]) {
-                    VMException::VMException exp("ASSIGN local slot invalid: " + std::to_string(idx), __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                if (local[idx]->flags & 0x1) {
-                    VMException::VMException exp("Assign to const local index " + std::to_string(idx), __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                if (stack.empty()) {
-                    VMException::VMException exp("ASSIGN local stack empty", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                StackItem newItem = popStackItem();
-                ZeusType::UniversalVariant newVal = newItem.value;
-
-                const auto referenceWrite = writeThroughReference(local[idx], newVal);
-                if (referenceWrite != ReferenceWriteResult::NotReference) {
-                    if (referenceWrite != ReferenceWriteResult::Stored) {
-                        VMException::VMException exp(
-                            referenceWrite == ReferenceWriteResult::ConstTarget
-                                ? "Cannot assign through a reference to a const cell"
-                                : "Cannot assign this value through the reference",
-                            __line, instr
-                        );
-                        exp._throw(vmstat, currentChunk);
-                    }
-                    dropStackItem(newItem);
-                    printLocals();
-                    printStack();
-                    break;
-                }
-
-                const auto oldVal = local[idx]->readValue();
-                ZeusGC::releaseVariantDeep(*this, oldVal);
-                ZeusGC::retainVariantDeep(*this, newVal);
-
-                local[idx]->writeValue(newVal);
-                // 释放栈临时持有的对象引用（slot 已 retain）
-                dropStackItem(newItem);
-                printLocals();
-                printStack();
-                break;
-            }
-
-            case VMOperator::ASSIGN_VALUE_UPVALUE: {
-                auto const& __varIndex = std::get<LexerType::Value>(instr.args[0]);
-                int idx = VMHelpers::getIntFromValue(__varIndex);
-
-                if (idx < 0 || idx >= (int)upvalue.size() || !upvalue[idx]) {
-                    VMException::VMException exp("ASSIGN upvalue slot invalid: " + std::to_string(idx), __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                if (upvalue[idx]->flags & 0x1) {
-                    VMException::VMException exp("Assign to const upvalue index " + std::to_string(idx), __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                if (stack.empty()) {
-                    VMException::VMException exp("ASSIGN upvalue stack empty", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                StackItem newItem = popStackItem();
-                ZeusType::UniversalVariant newVal = newItem.value;
-
-                const auto referenceWrite = writeThroughReference(upvalue[idx], newVal);
-                if (referenceWrite != ReferenceWriteResult::NotReference) {
-                    if (referenceWrite != ReferenceWriteResult::Stored) {
-                        VMException::VMException exp(
-                            referenceWrite == ReferenceWriteResult::ConstTarget
-                                ? "Cannot assign through a reference to a const cell"
-                                : "Cannot assign this value through the reference",
-                            __line, instr
-                        );
-                        exp._throw(vmstat, currentChunk);
-                    }
-                    dropStackItem(newItem);
-                    printVarStack(2);
-                    printStack();
-                    break;
-                }
-
-                const auto oldVal = upvalue[idx]->readValue();
-                ZeusGC::releaseVariantDeep(*this, oldVal);
-                ZeusGC::retainVariantDeep(*this, newVal);
-
-                upvalue[idx]->writeValue(newVal);
-                // 释放栈临时持有的对象引用（slot 已 retain）
-                dropStackItem(newItem);
-                printVarStack(2);
-                printStack();
-                break;
-            }
-
-            // ===== 共享堆操作 =====
-
-            case VMOperator::STORE_VALUE_SHARED: {
-                // STORE_VALUE_SHARED "varName" "mut/const"
-                if (instr.args.size() < 2) {
-                    VMException::VMException exp("STORE_VALUE_SHARED missing arguments", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                std::string varName = std::get<std::string>(instr.args[0]);
-                std::string mutOrConst = std::get<std::string>(instr.args[1]);
-
-                if (stack.empty()) {
-                    VMException::VMException exp("STORE_VALUE_SHARED stack empty", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                ZeusType::UniversalVariant newVal = stack.back();
-                stack.pop_back();
-
-                // 特殊处理 ObjectHandle：将对象序列化存储到共享堆
-                if (std::holds_alternative<ZeusType::ObjectHandle>(newVal)) {
-                    std::unique_lock<std::recursive_mutex> graph(ZeusGC::graphMutex());
-                    int oid = std::get<ZeusType::ObjectHandle>(newVal).id;
-                    
-                    auto* objPtr = getObject(oid);
-                    if (objPtr) {
-                        auto& obj = *objPtr;
-                        
-                        // 构造一个 Object 存储到共享堆
-                        // 使用 ZeusType::Object 包装 ObjectData
-                        ZeusType::Object sharedObj;
-                        sharedObj.impl = ZeusGC::makeObjectData();
-                        auto& sharedObjData = *sharedObj.impl;
-                        
-                        // 存储类信息
-                        auto* classPtr = getClass(obj.classId);
-                        if (classPtr) {
-                            sharedObjData.setValue("__className__", LexerType::Value(classPtr->name));
-                            
-                            // 存储 instanceMethods（protoId 映射）- 作为嵌套 Object
-                            ZeusType::Object methodsObj;
-                            methodsObj.impl = ZeusGC::makeObjectData();
-                            for (const auto& kv : classPtr->instanceMethods) {
-                                methodsObj.impl->setValue(
-                                    kv.first, LexerType::Value((long long)kv.second));
-                            }
-                            // 将 Object 包装为 Variant 存储
-                            sharedObjData.setValue("__instanceMethods__", ZeusType::Variant(methodsObj));
-                            
-                            // 存储别名
-                            sharedObjData.setValue("__alias__", LexerType::Value(classPtr->usingThisAlias));
-
-                            for (const auto& fieldType : classPtr->explicitFieldTypes) {
-                                sharedObjData.setValue(
-                                    "__field_type__" + fieldType.first,
-                                    LexerType::Value(fieldType.second));
-                            }
-                        }
-
-                        // 复制所有字段值
-                        for (const auto& kv : snapshotObjectFields(obj)) {
-                            sharedObjData.setValue(kv.first, kv.second);
-                        }
-                        
-                        // 存储到共享堆（作为 Variant 包装的 Object）
-                        ZeusType::Variant variantObj = sharedObj;
-                        graph.unlock();
-                        auto cell = ZeusShared::getGlobalHeap().getOrCreate(varName, variantObj);
-                        cell->write(variantObj);
-                        
-                        ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_SHARED: serialized ObjectHandle to shared heap, name='%s'", 
-                            varName.c_str());
-                    }
-                } else {
-                    // 其他类型直接存储
-                    auto cell = ZeusShared::getGlobalHeap().getOrCreate(varName, newVal);
-                    cell->write(newVal);
-                    
-                    ZEUS_DEBUG_PRINT("[VM] STORE_VALUE_SHARED: name='%s', mutOrConst='%s'", 
-                        varName.c_str(), mutOrConst.c_str());
-                }
-
-                printStack();
-                break;
-            }
-
-            case VMOperator::LOAD_VALUE_SHARED: {
-                // LOAD_VALUE_SHARED "varName"
-                if (instr.args.empty()) {
-                    VMException::VMException exp("LOAD_VALUE_SHARED missing varName", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                std::string varName = std::get<std::string>(instr.args[0]);
-
-                auto cell = ZeusShared::getGlobalHeap().find(varName);
-
-                if (!cell) {
-                    VMException::VMException exp("LOAD_VALUE_SHARED: undefined shared variable '" + varName + "'", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 读取值（内部自动加读锁）
-                ZeusType::UniversalVariant val = cell->read();
-                
-                // 检查是否是序列化的对象（Variant 中的 Object 带 __className__）
-                if (std::holds_alternative<ZeusType::Variant>(val)) {
-                    auto& variantVal = std::get<ZeusType::Variant>(val);
-                    
-                    if (std::holds_alternative<ZeusType::Object>(variantVal)) {
-                        auto& obj = std::get<ZeusType::Object>(variantVal);
-                        
-                        if (obj.impl && obj.impl->data.find("__className__") != obj.impl->data.end()) {
-                            // 这是一个共享对象，返回 SharedObjectHandle
-                            stack.push_back(ZeusType::SharedObjectHandle{varName, cell->generation});
-                            
-                            ZEUS_DEBUG_PRINT("[VM] LOAD_VALUE_SHARED: name='%s' (shared object)", varName.c_str());
-                            printStack();
-                            break;
-                        }
-                    }
-                }
-                
-                stack.push_back(val);
-
-                ZEUS_DEBUG_PRINT("[VM] LOAD_VALUE_SHARED: name='%s'", varName.c_str());
-
-                printStack();
-                break;
-            }
-
-            case VMOperator::ASSIGN_VALUE_SHARED: {
-                // ASSIGN_VALUE_SHARED "varName"
-                if (instr.args.empty()) {
-                    VMException::VMException exp("ASSIGN_VALUE_SHARED missing varName", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                std::string varName = std::get<std::string>(instr.args[0]);
-
-                if (stack.empty()) {
-                    VMException::VMException exp("ASSIGN_VALUE_SHARED stack empty", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                auto cell = ZeusShared::getGlobalHeap().find(varName);
-
-                if (!cell) {
-                    VMException::VMException exp("ASSIGN_VALUE_SHARED: undefined shared variable '" + varName + "'", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                ZeusType::UniversalVariant newVal = stack.back();
-                stack.pop_back();
-
-                // 写入值（内部自动加写锁）
-                cell->write(newVal);
-
-                ZEUS_DEBUG_PRINT("[VM] ASSIGN_VALUE_SHARED: name='%s'", varName.c_str());
-
-                printStack();
-                break;
-            }
-
-            case VMOperator::SHARED_LOCK: {
-                // SHARED_LOCK "varName" - 获取共享变量的写锁
-                if (instr.args.empty()) {
-                    VMException::VMException exp("SHARED_LOCK missing varName", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                std::string varName = std::get<std::string>(instr.args[0]);
-                auto cell = ZeusShared::getGlobalHeap().find(varName);
-
-                if (!cell) {
-                    VMException::VMException exp("SHARED_LOCK: undefined shared variable '" + varName + "'", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                cell->lockWrite();
-
-                ZEUS_DEBUG_PRINT("[VM] SHARED_LOCK: name='%s' locked", varName.c_str());
-                break;
-            }
-
-            case VMOperator::SHARED_UNLOCK: {
-                // SHARED_UNLOCK "varName" - 释放共享变量的写锁
-                if (instr.args.empty()) {
-                    VMException::VMException exp("SHARED_UNLOCK missing varName", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                std::string varName = std::get<std::string>(instr.args[0]);
-                auto cell = ZeusShared::getGlobalHeap().find(varName);
-
-                if (!cell) {
-                    VMException::VMException exp("SHARED_UNLOCK: undefined shared variable '" + varName + "'", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                cell->unlockWrite();
-
-                ZEUS_DEBUG_PRINT("[VM] SHARED_UNLOCK: name='%s' unlocked", varName.c_str());
-                break;
-            }
-
-
-            case VMOperator::LOAD_CELL_REFERENCE: {
-                if (instr.args.size() < 2 || !std::holds_alternative<std::string>(instr.args[0]) ||
-                    !std::holds_alternative<LexerType::Value>(instr.args[1])) {
-                    VMException::VMException exp("LOAD_CELL_REFERENCE requires a scope and index", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                const auto& scope = std::get<std::string>(instr.args[0]);
-                const int index = VMHelpers::getIntFromValue(std::get<LexerType::Value>(instr.args[1]));
-                if (scope != "global") {
-                    VMException::VMException exp(
-                        "reference return requires stable global storage; local and upvalue references cannot escape",
-                        __line, instr
-                    );
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                if (index < 0 || index >= static_cast<int>(global.size()) || !global[index]) {
-                    VMException::VMException exp("LOAD_CELL_REFERENCE global slot is invalid", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                stack.push_back(ZeusType::ReferenceHandle{global[index], "cell"});
-                printStack();
-                break;
-            }
-
-            case VMOperator::LOAD_VALUE: {
-                // Support multiple IR forms:
-                // 1) [ string name ] -> resolve & load variable (late-resolve / global name lookup)
-                // 2) [ LexerType::Value literal ] -> push literal value (for late-resolve class names etc.)
-                // 3) [ string scope, LexerType::Value index, (optional string name) ] -> load cell
-                
-                // Form (2): single LexerType::Value argument - push as literal
-                if (instr.args.size() == 1 && std::holds_alternative<LexerType::Value>(instr.args[0])) {
-                    stack.push_back(std::get<LexerType::Value>(instr.args[0]));
-                    printStack();
-                    break;
-                }
-                
-                // Form (1): single string argument - resolve variable name
-                if (instr.args.size() == 1 && std::holds_alternative<std::string>(instr.args[0])) {
-                    // form (1) - resolve variable name to its value (top-level/global expected)
-                    std::string name = std::get<std::string>(instr.args[0]);
-                    bool found = false;
-
-                    if (!globalNames.empty()) {
-                        // First try: exact match
-                        for (int gi = 0; gi < (int)globalNames.size(); ++gi) {
-                            if (globalNames[gi] == name) {
-                                if (gi < (int)global.size() && global[gi]) {
-                                    pushLoadedCellValue(global[gi]);
-                                    found = true;
-                                }
-                                break;
-                            }
-                        }
-                        
-                        // Second try: match with package prefix (for module-internal references)
-                        // e.g., "Bytes" can match "zeus.socket.Bytes"
-                        if (!found) {
-                            for (int gi = 0; gi < (int)globalNames.size(); ++gi) {
-                                const std::string& fullName = globalNames[gi];
-
-                                // Check if fullName ends with ".name"
-                                size_t dotPos = fullName.rfind('.');
-
-                                if (dotPos != std::string::npos) {
-                                    std::string suffix = fullName.substr(dotPos + 1);
-
-                                    if (suffix == name) {
-                                        if (gi < (int)global.size() && global[gi]) {
-                                            pushLoadedCellValue(global[gi]);
-                                            found = true;
-                                            vmMessage(std::string("[LOAD_VALUE] Resolved '") + name + "' to '" + fullName + "'");
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if (!found) {
-                        VMException::VMException exp(std::string("NameError: undefined variable '") + name + "'", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-
-                    printStack();
-                    break;
-                }
-
-                // Form (3): scope + index format
-                auto const& kind = std::get<std::string>(instr.args[0]);
-                auto const& indexVal = std::get<LexerType::Value>(instr.args[1]);
-                int index = VMHelpers::getIntFromValue(indexVal);
-
-                if (kind == "local") {
-                    if (index >= 0 && index < (int)local.size() && local[index]) {
-                        pushLoadedCellValue(local[index]);
-                    } else {
-                        std::string varname = "<unknown>";
-                        // 尝试从args[2]获取变量名
-                        if (instr.args.size() >= 3 && std::holds_alternative<std::string>(instr.args[2])) {
-                            varname = std::get<std::string>(instr.args[2]);
-                        }
-                        // local变量没有globalNames映射，保持<unknown>
-                        VMException::VMException exp(
-                            std::string("NameError: undefined variable '") + varname + "'",
-                            __line, instr
-                        );
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                } else if (kind == "global") {
-                    if (index >= 0 && index < (int)global.size() && global[index]) {
-                        const auto loadedVal = global[index]->readValue();
-                        // DEBUG: 检查 global[46] 的值
-                        if (index == 46) {
-                            std::string valType = "unknown";
-                            if (std::holds_alternative<ZeusType::ClosureHandle>(loadedVal)) {
-                                valType = "ClosureHandle(" + std::to_string(std::get<ZeusType::ClosureHandle>(loadedVal).id) + ")";
-                            } else if (std::holds_alternative<LexerType::Value>(loadedVal)) {
-                                valType = "Value: " + ZeusVMUtils::valueToDebugString(loadedVal);
-                            } else {
-                                valType = "OtherType";
-                            }
-                            ZEUS_DEBUG_PRINT("[LOAD_VALUE global 46] Cell=%p, refCount=%d, value=%s", 
-                                (void*)global[index], global[index]->refCount, valType.c_str());
-                        }
-                        pushLoadedCellValue(global[index]);
-                    } else {
-                        std::string varname = "<unknown>";
-                        // 尝试从args[2]获取变量名
-                        if (instr.args.size() >= 3 && std::holds_alternative<std::string>(instr.args[2])) {
-                            varname = std::get<std::string>(instr.args[2]);
-                        } 
-                        // 如果args[2]不存在，尝试从globalNames查找
-                        else if (index >= 0 && index < (int)globalNames.size()) {
-                            varname = globalNames[index];
-                        }
-                        VMException::VMException exp(std::string("NameError: undefined variable '") + varname + "'", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                } else if (kind == "upvalue") {
-                    if (index >= 0 && index < (int)upvalue.size() && upvalue[index]) {
-                        pushLoadedCellValue(upvalue[index]);
-                    } else {
-                        std::string varname = "<unknown>";
-                        // 尝试从args[2]获取变量名
-                        if (instr.args.size() >= 3 && std::holds_alternative<std::string>(instr.args[2])) {
-                            varname = std::get<std::string>(instr.args[2]);
-                        }
-                        // upvalue变量没有globalNames映射，保持<unknown>
-                        VMException::VMException exp(std::string("NameError: undefined variable '") + varname + "'", __line, instr);
-                        exp._throw(vmstat, currentChunk);
-                        break;
-                    }
-                } else {
-                    // 直接把 kind（字面量或标识）压入栈
-                    stack.push_back(kind);
-                }
-
-                printStack();
-                break;
-            }
-
-            case VMOperator::JUMP: {
-                // 单个 execute 中不处理 PC，PC 的整体控制由 runChunk 负责
-                break;
-            }
-            case VMOperator::JUMP_IF_TRUE: {
-                break;
-            }
-            case VMOperator::JUMP_IF_FALSE: {
-                break;
-            }
-            case VMOperator::JUMP_IF_PARAM_PROVIDED: {
-                break;
-            }
-
-            case VMOperator::EQUL: {
-                // 1. 检查栈中是否有足够的元素
-                if (stack.size() < 2) {
-                    VMException::VMException exp("EQUL stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 2. 弹出并保留所有权标记，比较完成后由 guard 释放。
-                StackItem rightItem = popStackItem();
-                StackItem leftItem = popStackItem();
-                StackItemPairGuard operands(*this, std::move(leftItem),
-                                            std::move(rightItem));
-                const ZeusType::UniversalVariant& left = operands.left.value;
-                const ZeusType::UniversalVariant& right = operands.right.value;
-
-                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
-                if (tryDispatchTypeImplementationOperator(
-                        "[==]", operatorArguments, 2, instr)) break;
-
-                // 2.5 处理 nil 比较: nil == nil 为 true，nil == 非nil 为 false
-                bool leftIsNull = ZeusVMUtils::isNull(left);
-                bool rightIsNull = ZeusVMUtils::isNull(right);
-                
-                if (leftIsNull || rightIsNull) {
-                    bool result = (leftIsNull && rightIsNull);
-                    stack.push_back(LexerType::Value(result));
-                    printStack();
-                    break;
-                }
-
-                // 3. 检查左操作数是否为对象（支持operator[==]重载）
-                if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
-                    int objId = std::get<ZeusType::ObjectHandle>(left).id;
-                    auto* objPtr = getObject(objId);
-                    if (objPtr) {
-                        int classId = objPtr->classId;
-                        auto* classPtr = getClass(classId);
-                        if (classPtr) {
-                            auto& classInfo = *classPtr;
-                            auto opIt = classInfo.operatorMethods.find("[==]");
-                            if (opIt != classInfo.operatorMethods.end()) {
-                                int protoId = opIt->second;
-                                Closure clo;
-                                clo.protoId = protoId;
-                                int cloId = allocClosure(std::move(clo));
-                                stack.push_back(ZeusType::ClosureHandle{cloId});
-                                operands.transferToStack();
-                                // Dispatch through a real frame: executeClosureSync pushes a
-                                // CallFrame and runs it to completion, so the callee gets its own
-                                // local slots. A recursive execute() would share this frame's local
-                                // buffer and leave the callee's slots behind in it.
-                                if (!executeClosureSync(cloId, 2)) {
-                                    if (vmstat != ZeusType::VMStatus::Running) break;
-                                    VMException::VMException exp(
-                                        "[execute] nested dispatch failed", __line, instr);
-                                    exp._throw(vmstat, currentChunk);
-                                    break;
-                                }
-                                vmMessage(">>> Operator== overload called.");
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // 4. 处理闭包和原生函数句柄的相等性比较
-                if (std::holds_alternative<ZeusType::ClosureHandle>(left) &&
-                    std::holds_alternative<ZeusType::ClosureHandle>(right)) {
-                    bool r = std::get<ZeusType::ClosureHandle>(left).id ==
-                              std::get<ZeusType::ClosureHandle>(right).id;
-                    stack.push_back(LexerType::Value(r));
-                    printStack();
-                    break;
-                }
-                if (std::holds_alternative<ZeusType::NativeFuncHandle>(left) &&
-                    std::holds_alternative<ZeusType::NativeFuncHandle>(right)) {
-                    bool r = std::get<ZeusType::NativeFuncHandle>(left).id ==
-                              std::get<ZeusType::NativeFuncHandle>(right).id;
-                    stack.push_back(LexerType::Value(r));
-                    printStack();
-                    break;
-                }
-
-                // 5. 将任意值转换为内部可比较的 LexerType::Value（如果可能）
-                LexerType::Value lv(0);
-                LexerType::Value rv(0);
-                if (!(ZeusVMUtils::convertToValue(left, lv) && ZeusVMUtils::convertToValue(right, rv))) {
-                    // 无法转换为可比较的值或类型不一致 -> 视为不相等
-                    stack.push_back(LexerType::Value(false));
-                    printStack();
-                    break;
-                }
-
-                // 6. 根据类型选择比较策略（数值/字符串/布尔等）
-                std::string lt = lv.getStringType();
-                std::string rt = rv.getStringType();
-
-                auto isNum = [](const std::string &s) {
-                    return s == "int" || s == "float";
-                };
-
-                bool result = false;
-                if (isNum(lt) && isNum(rt)) {
-                    ZeusType::BigDecimal lf = (lt == "int") ? ZeusType::BigDecimal(std::get<ZeusType::BigInteger>(lv.data))
-                                              : std::get<ZeusType::BigDecimal>(lv.data);
-                    ZeusType::BigDecimal rf = (rt == "int") ? ZeusType::BigDecimal(std::get<ZeusType::BigInteger>(rv.data))
-                                              : std::get<ZeusType::BigDecimal>(rv.data);
-                    result = (lf == rf);
-                } else if (lt == rt) {
-                    if (lt == "string")       result = std::get<std::string>(lv.data) == std::get<std::string>(rv.data);
-                    else if (lt == "bool")    result = std::get<bool>(lv.data)        == std::get<bool>(rv.data);
-                    else if (lt == "int")     result = std::get<ZeusType::BigInteger>(lv.data) == std::get<ZeusType::BigInteger>(rv.data);
-                    else if (lt == "float")   result = std::get<ZeusType::BigDecimal>(lv.data)       == std::get<ZeusType::BigDecimal>(rv.data);
-                }
-
-                // 7. 推入比较结果
-                stack.push_back(LexerType::Value(result));
-                printStack();
-                break;
-            }
-
-            case VMOperator::NOT_EQUAL: {
-                // 1. 前置检查：栈元素数量是否足够
-                if (stack.size() < 2) {
-                    VMException::VMException exp("NOT_EQUAL stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 2. 弹出并保留所有权标记，比较完成后由 guard 释放。
-                StackItem rightItem = popStackItem();
-                StackItem leftItem = popStackItem();
-                StackItemPairGuard operands(*this, std::move(leftItem),
-                                            std::move(rightItem));
-                const ZeusType::UniversalVariant& left = operands.left.value;
-                const ZeusType::UniversalVariant& right = operands.right.value;
-
-                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
-                if (tryDispatchTypeImplementationOperator(
-                        "[!=]", operatorArguments, 2, instr)) break;
-
-                // 2.5 处理 nil 比较: nil != nil 为 false，nil != 非nil 为 true
-                bool leftIsNull = ZeusVMUtils::isNull(left);
-                bool rightIsNull = ZeusVMUtils::isNull(right);
-                
-                if (leftIsNull || rightIsNull) {
-                    bool result = !(leftIsNull && rightIsNull);
-                    stack.push_back(LexerType::Value(result));
-                    printStack();
-                    break;
-                }
-
-                // 3. 检查左操作数是否为对象（支持operator[!=]重载）
-                if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
-                    int objId = std::get<ZeusType::ObjectHandle>(left).id;
-                    auto* objPtr = getObject(objId);
-                    if (objPtr) {
-                        int classId = objPtr->classId;
-                        auto* classPtr = getClass(classId);
-                        if (classPtr) {
-                            auto& classInfo = *classPtr;
-                            auto opIt = classInfo.operatorMethods.find("[!=]");
-                            if (opIt != classInfo.operatorMethods.end()) {
-                                int protoId = opIt->second;
-                                Closure clo;
-                                clo.protoId = protoId;
-                                int cloId = allocClosure(std::move(clo));
-                                stack.push_back(ZeusType::ClosureHandle{cloId});
-                                operands.transferToStack();
-                                // Dispatch through a real frame: executeClosureSync pushes a
-                                // CallFrame and runs it to completion, so the callee gets its own
-                                // local slots. A recursive execute() would share this frame's local
-                                // buffer and leave the callee's slots behind in it.
-                                if (!executeClosureSync(cloId, 2)) {
-                                    if (vmstat != ZeusType::VMStatus::Running) break;
-                                    VMException::VMException exp(
-                                        "[execute] nested dispatch failed", __line, instr);
-                                    exp._throw(vmstat, currentChunk);
-                                    break;
-                                }
-                                vmMessage(">>> Operator!= overload called.");
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // 4. 处理闭包/原生函数句柄的特殊不等比较
-                if (std::holds_alternative<ZeusType::ClosureHandle>(left) &&
-                    std::holds_alternative<ZeusType::ClosureHandle>(right)) {
-                    bool r = std::get<ZeusType::ClosureHandle>(left).id !=
-                              std::get<ZeusType::ClosureHandle>(right).id;
-                    stack.push_back(LexerType::Value(r));
-                    printStack();
-                    break;
-                }
-                if (std::holds_alternative<ZeusType::NativeFuncHandle>(left) &&
-                    std::holds_alternative<ZeusType::NativeFuncHandle>(right)) {
-                    bool r = std::get<ZeusType::NativeFuncHandle>(left).id !=
-                              std::get<ZeusType::NativeFuncHandle>(right).id;
-                    stack.push_back(LexerType::Value(r));
-                    printStack();
-                    break;
-                }
-
-                // 5. 尝试将值转换为内部可比较形式
-                LexerType::Value lv(0);
-                LexerType::Value rv(0);
-                if (!(ZeusVMUtils::convertToValue(left, lv) && ZeusVMUtils::convertToValue(right, rv))) {
-                    // 无法转换为可比较值 -> 视为不相等
-                    stack.push_back(LexerType::Value(true));
-                    printStack();
-                    break;
-                }
-
-                // 6. 根据类型决定比较逻辑
-                std::string lt = lv.getStringType();
-                std::string rt = rv.getStringType();
-                auto isNum = [](const std::string &s) { return s == "int" || s == "float"; };
-
-                bool result = true; // 默认认为不相等
-                if (isNum(lt) && isNum(rt)) {
-                    ZeusType::BigDecimal lf = (lt == "int") ? ZeusType::BigDecimal(std::get<ZeusType::BigInteger>(lv.data))
-                                              : std::get<ZeusType::BigDecimal>(lv.data);
-                    ZeusType::BigDecimal rf = (rt == "int") ? ZeusType::BigDecimal(std::get<ZeusType::BigInteger>(rv.data))
-                                              : std::get<ZeusType::BigDecimal>(rv.data);
-                    result = (lf != rf);
-                } else if (lt == rt) {
-                    if (lt == "string")       result = std::get<std::string>(lv.data) != std::get<std::string>(rv.data);
-                    else if (lt == "bool")    result = std::get<bool>(lv.data)        != std::get<bool>(rv.data);
-                    else if (lt == "int")     result = std::get<ZeusType::BigInteger>(lv.data) != std::get<ZeusType::BigInteger>(rv.data);
-                    else if (lt == "float")   result = std::get<ZeusType::BigDecimal>(lv.data)       != std::get<ZeusType::BigDecimal>(rv.data);
-                    else                       result = true;
-                } else {
-                    result = true; // 不同类型 -> 视为不相等
-                }
-
-                // 7. 推入不等比较结果
-                stack.push_back(LexerType::Value(result));
-                printStack();
-                break;
-            }
-
-            case VMOperator::GREATER_THAN: {
-                // 1. 前置检查：栈元素数量是否足够
-                if (stack.size() < 2) {
-                    VMException::VMException exp("GREATER_THAN stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                StackItem rightItem = popStackItem();
-                StackItem leftItem = popStackItem();
-                StackItemPairGuard operands(*this, std::move(leftItem),
-                                            std::move(rightItem));
-                const ZeusType::UniversalVariant& left = operands.left.value;
-                const ZeusType::UniversalVariant& right = operands.right.value;
-
-                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
-                if (tryDispatchTypeImplementationOperator(
-                        "[>]", operatorArguments, 2, instr)) break;
-
-                // 3. 检查左操作数是否为对象（支持operator[>]重载）
-                if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
-                    int objId = std::get<ZeusType::ObjectHandle>(left).id;
-                    auto* objPtr = getObject(objId);
-                    if (objPtr) {
-                        int classId = objPtr->classId;
-                        auto* classPtr = getClass(classId);
-                        if (classPtr) {
-                            auto& classInfo = *classPtr;
-                            auto opIt = classInfo.operatorMethods.find("[>]");
-                            if (opIt != classInfo.operatorMethods.end()) {
-                                int protoId = opIt->second;
-                                Closure clo;
-                                clo.protoId = protoId;
-                                int cloId = allocClosure(std::move(clo));
-                                stack.push_back(ZeusType::ClosureHandle{cloId});
-                                operands.transferToStack();
-                                // Dispatch through a real frame: executeClosureSync pushes a
-                                // CallFrame and runs it to completion, so the callee gets its own
-                                // local slots. A recursive execute() would share this frame's local
-                                // buffer and leave the callee's slots behind in it.
-                                if (!executeClosureSync(cloId, 2)) {
-                                    if (vmstat != ZeusType::VMStatus::Running) break;
-                                    VMException::VMException exp(
-                                        "[execute] nested dispatch failed", __line, instr);
-                                    exp._throw(vmstat, currentChunk);
-                                    break;
-                                }
-                                vmMessage(">>> Operator> overload called.");
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // 4. 尝试提取数值（用于数值比较）
-                ZeusType::BigDecimal a(0);
-                ZeusType::BigDecimal b(0);
-                bool okLeft  = ZeusVMUtils::extractNumber(left,  a);
-                bool okRight = ZeusVMUtils::extractNumber(right, b);
-
-                // 5. 如果两侧均为数值，则进行数值比较
-                bool result = false;
-                if (okLeft && okRight) {
-                    result = (a > b);
-                }
-
-                // 6. 推入比较结果
-                stack.push_back(LexerType::Value(result));
-                printStack();
-                break;
-            }
-
-            case VMOperator::LESS_THAN: {
-                // 1. 检查栈是否至少有两个值
-                if (stack.size() < 2) {
-                    VMException::VMException exp("LESS_THAN stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                // 2. 弹出并保留所有权标记，比较完成后由 guard 释放。
-                StackItem rightItem = popStackItem();
-                StackItem leftItem = popStackItem();
-                StackItemPairGuard operands(*this, std::move(leftItem),
-                                            std::move(rightItem));
-                const ZeusType::UniversalVariant& left = operands.left.value;
-                const ZeusType::UniversalVariant& right = operands.right.value;
-
-                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
-                if (tryDispatchTypeImplementationOperator(
-                        "[<]", operatorArguments, 2, instr)) break;
-
-                // P0 fast path: int < int（覆盖 for 循环条件）
-                // 跳过 BigDecimal(0) 构造 + extractNumber + BigDecimal 比较全套
-                {
-                    int64_t li = 0, ri = 0;
-
-                    if (ZeusVMUtils::tryGetInt64(left, li) && ZeusVMUtils::tryGetInt64(right, ri)) {
-                        stack.push_back(LexerType::Value(li < ri));
-                        printStack();
-                        break;
-                    }
-                }
-
-                // 4. 检查左操作数是否为对象（支持operator[<]重载）
-                if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
-                    int objId = std::get<ZeusType::ObjectHandle>(left).id;
-                    auto* objPtr = getObject(objId);
-                    if (objPtr) {
-                        int classId = objPtr->classId;
-                        auto* classPtr = getClass(classId);
-                        if (classPtr) {
-                            auto& classInfo = *classPtr;
-                            auto opIt = classInfo.operatorMethods.find("[<]");
-                            if (opIt != classInfo.operatorMethods.end()) {
-                                int protoId = opIt->second;
-                                Closure clo;
-                                clo.protoId = protoId;
-                                int cloId = allocClosure(std::move(clo));
-                                stack.push_back(ZeusType::ClosureHandle{cloId});
-                                operands.transferToStack();
-                                // Dispatch through a real frame: executeClosureSync pushes a
-                                // CallFrame and runs it to completion, so the callee gets its own
-                                // local slots. A recursive execute() would share this frame's local
-                                // buffer and leave the callee's slots behind in it.
-                                if (!executeClosureSync(cloId, 2)) {
-                                    if (vmstat != ZeusType::VMStatus::Running) break;
-                                    VMException::VMException exp(
-                                        "[execute] nested dispatch failed", __line, instr);
-                                    exp._throw(vmstat, currentChunk);
-                                    break;
-                                }
-                                vmMessage(">>> Operator< overload called.");
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // 5. 尝试将两侧转换为数值并比较
-                ZeusType::BigDecimal a(0);
-                ZeusType::BigDecimal b(0);
-                bool okLeft  = ZeusVMUtils::extractNumber(left,  a);
-                bool okRight = ZeusVMUtils::extractNumber(right, b);
-
-                bool result = false;
-                if (okLeft && okRight) {
-                    result = (a < b);
-                }
-
-                // 6. 推入比较结果
-                stack.push_back(LexerType::Value(result));
-                printStack();
-                break;
-            }
-
-            case VMOperator::GREATER_EQUAL: {
-                if (stack.size() < 2) {
-                    VMException::VMException exp("GREATER_EQUAL stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                StackItem rightItem = popStackItem();
-                StackItem leftItem = popStackItem();
-                StackItemPairGuard operands(*this, std::move(leftItem),
-                                            std::move(rightItem));
-                const ZeusType::UniversalVariant& left = operands.left.value;
-                const ZeusType::UniversalVariant& right = operands.right.value;
-
-                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
-                if (tryDispatchTypeImplementationOperator(
-                        "[>=]", operatorArguments, 2, instr)) break;
-
-                // 检查左操作数是否为对象（支持operator[>=]重载）
-                if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
-                    int objId = std::get<ZeusType::ObjectHandle>(left).id;
-                    auto* objPtr = getObject(objId);
-                    if (objPtr) {
-                        int classId = objPtr->classId;
-                        auto* classPtr = getClass(classId);
-                        if (classPtr) {
-                            auto& classInfo = *classPtr;
-                            auto opIt = classInfo.operatorMethods.find("[>=]");
-                            if (opIt != classInfo.operatorMethods.end()) {
-                                int protoId = opIt->second;
-                                Closure clo;
-                                clo.protoId = protoId;
-                                int cloId = allocClosure(std::move(clo));
-                                stack.push_back(ZeusType::ClosureHandle{cloId});
-                                operands.transferToStack();
-                                // Dispatch through a real frame: executeClosureSync pushes a
-                                // CallFrame and runs it to completion, so the callee gets its own
-                                // local slots. A recursive execute() would share this frame's local
-                                // buffer and leave the callee's slots behind in it.
-                                if (!executeClosureSync(cloId, 2)) {
-                                    if (vmstat != ZeusType::VMStatus::Running) break;
-                                    VMException::VMException exp(
-                                        "[execute] nested dispatch failed", __line, instr);
-                                    exp._throw(vmstat, currentChunk);
-                                    break;
-                                }
-                                vmMessage(">>> Operator>= overload called.");
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                ZeusType::BigDecimal a(0);
-                ZeusType::BigDecimal b(0);
-                bool okL = ZeusVMUtils::extractNumber(left,  a);
-                bool okR = ZeusVMUtils::extractNumber(right, b);
-
-                bool res = false;
-                if (okL && okR) {
-                    res = (a >= b);
-                }
-                stack.push_back(LexerType::Value(res));
-                printStack();
-                break;
-            }
-
-            case VMOperator::LESS_EQUAL: {
-                if (stack.size() < 2) {
-                    VMException::VMException exp("LESS_EQUAL stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                StackItem rightItem = popStackItem();
-                StackItem leftItem = popStackItem();
-                StackItemPairGuard operands(*this, std::move(leftItem),
-                                            std::move(rightItem));
-                const ZeusType::UniversalVariant& left = operands.left.value;
-                const ZeusType::UniversalVariant& right = operands.right.value;
-
-                const ZeusType::UniversalVariant* operatorArguments[] = { &left, &right };
-                if (tryDispatchTypeImplementationOperator(
-                        "[<=]", operatorArguments, 2, instr)) break;
-
-                // 检查左操作数是否为对象（支持operator[<=]重载）
-                if (std::holds_alternative<ZeusType::ObjectHandle>(left)) {
-                    int objId = std::get<ZeusType::ObjectHandle>(left).id;
-                    auto* objPtr = getObject(objId);
-                    if (objPtr) {
-                        int classId = objPtr->classId;
-                        auto* classPtr = getClass(classId);
-                        if (classPtr) {
-                            auto& classInfo = *classPtr;
-                            auto opIt = classInfo.operatorMethods.find("[<=]");
-                            if (opIt != classInfo.operatorMethods.end()) {
-                                int protoId = opIt->second;
-                                Closure clo;
-                                clo.protoId = protoId;
-                                int cloId = allocClosure(std::move(clo));
-                                stack.push_back(ZeusType::ClosureHandle{cloId});
-                                operands.transferToStack();
-                                // Dispatch through a real frame: executeClosureSync pushes a
-                                // CallFrame and runs it to completion, so the callee gets its own
-                                // local slots. A recursive execute() would share this frame's local
-                                // buffer and leave the callee's slots behind in it.
-                                if (!executeClosureSync(cloId, 2)) {
-                                    if (vmstat != ZeusType::VMStatus::Running) break;
-                                    VMException::VMException exp(
-                                        "[execute] nested dispatch failed", __line, instr);
-                                    exp._throw(vmstat, currentChunk);
-                                    break;
-                                }
-                                vmMessage(">>> Operator<= overload called.");
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                ZeusType::BigDecimal a(0);
-                ZeusType::BigDecimal b(0);
-                bool okL = ZeusVMUtils::extractNumber(left,  a);
-                bool okR = ZeusVMUtils::extractNumber(right, b);
-
-                bool res = false;
-                if (okL && okR) {
-                    res = (a <= b);
-                }
-                stack.push_back(LexerType::Value(res));
-                printStack();
-                break;
-            }
-
-            case VMOperator::LOGICAL_AND: {
-                // 逻辑与运算: left and right
-                if (stack.size() < 2) {
-                    VMException::VMException exp("LOGICAL_AND stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                auto right = stack.back();
-                stack.pop_back();
-                auto left = stack.back();
-                stack.pop_back();
-                
-                // 将左右操作数转换为布尔值
-                bool leftBool = ZeusVMUtils::toBool(left);
-                bool rightBool = ZeusVMUtils::toBool(right);
-                
-                bool result = leftBool && rightBool;
-                stack.push_back(LexerType::Value(result));
-                printStack();
-                break;
-            }
-
-            case VMOperator::LOGICAL_OR: {
-                // 逻辑或运算: left or right
-                if (stack.size() < 2) {
-                    VMException::VMException exp("LOGICAL_OR stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                auto right = stack.back();
-                stack.pop_back();
-                auto left = stack.back();
-                stack.pop_back();
-                
-                // 将左右操作数转换为布尔值
-                bool leftBool = ZeusVMUtils::toBool(left);
-                bool rightBool = ZeusVMUtils::toBool(right);
-                
-                bool result = leftBool || rightBool;
-                stack.push_back(LexerType::Value(result));
-                printStack();
-                break;
-            }
-
-            case VMOperator::LOGICAL_NOT: {
-                if (stack.empty()) {
-                    VMException::VMException exp("LOGICAL_NOT stack underflow", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-
-                const auto operand = stack.back();
-                stack.pop_back();
-                stack.push_back(LexerType::Value(!ZeusVMUtils::toBool(operand)));
-                printStack();
-                break;
-            }
-
-
-            case VMOperator::IMPORT: {
-                // IMPORT: 导入模块
-                // 参数: [packageName(Value string)]
-                
-                if (instr.args.empty() || !std::holds_alternative<LexerType::Value>(instr.args[0])) {
-                    VMException::VMException exp("IMPORT requires package name", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                const auto& val = std::get<LexerType::Value>(instr.args[0]);
-                
-                if (!std::holds_alternative<std::string>(val.data)) {
-                    VMException::VMException exp("IMPORT package name must be string", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                std::string packageName = std::get<std::string>(val.data);
-                
-                vmMessage("[IMPORT] Loading package: " + packageName);
-                
-                // TODO: 实现实际的包加载逻辑
-                // 1. 使用IRImport::loadPackage获取包文件路径
-                // 2. 编译包文件为IR
-                // 3. 执行包的IR代码
-                // 4. 注册包的导出符号到命名空间
-                
-                vmMessage("[IMPORT] Package loaded (placeholder): " + packageName);
-                
-                printStack();
-                break;
-            }
-
-
-            case VMOperator::DELETE_VAR: {
-                // DELETE_VAR: 删除变量，释放其 Cell 对象
-                // 参数: [string varName, string kind, Value index]
-                // kind: "local", "upvalue", "global"
-                // 如果对象有 operator[~]，会在释放前调用它
-                
-                if (instr.args.empty() || !std::holds_alternative<std::string>(instr.args[0])) {
-                    vmMessage("[DELETE_VAR] Error: Missing variable name");
-                    break;
-                }
-
-                std::string varName = std::get<std::string>(instr.args[0]);
-                std::string kind = "global";
-                int varIndex = -1;
-                
-                // 解析类型和索引参数
-                if (instr.args.size() >= 2 && std::holds_alternative<std::string>(instr.args[1])) {
-                    kind = std::get<std::string>(instr.args[1]);
-                }
-                
-                if (instr.args.size() >= 3 && std::holds_alternative<LexerType::Value>(instr.args[2])) {
-                    varIndex = VMHelpers::getIntFromValue(std::get<LexerType::Value>(instr.args[2]));
-                }
-                
-                ZEUS_DEBUG_PRINT("[DELETE_VAR] Deleting %s variable: %s (index=%d)", kind.c_str(), varName.c_str(), varIndex);
-                
-                // 调用 operator[~] 的辅助 lambda
-                auto objectHandleFromStoredObject = [&](const ZeusType::UniversalVariant& value) {
-                    ZeusType::ObjectHandle invalid{-1, 0};
-                    const auto* wrapped = std::get_if<ZeusType::Variant>(&value);
-                    if (!wrapped) return invalid;
-                    const auto* object = std::get_if<ZeusType::Object>(wrapped);
-                    if (!object || !object->impl) return invalid;
-
-                    const auto idIt = object->impl->data.find("__obj_id__");
-                    if (idIt == object->impl->data.end() ||
-                        !std::holds_alternative<LexerType::Value>(idIt->second)) {
-                        return invalid;
-                    }
-                    const int objectId = VMHelpers::getIntFromValue(
-                        std::get<LexerType::Value>(idIt->second));
-                    int generation = 0;
-                    const auto generationIt = object->impl->data.find("__obj_generation__");
-                    if (generationIt != object->impl->data.end() &&
-                        std::holds_alternative<LexerType::Value>(generationIt->second)) {
-                        generation = VMHelpers::getIntFromValue(
-                            std::get<LexerType::Value>(generationIt->second));
-                    }
-                    return ZeusType::ObjectHandle{objectId, generation};
-                };
-
-                auto resolveObjectHandle = [&](const ZeusType::UniversalVariant& value) {
-                    if (std::holds_alternative<ZeusType::ObjectHandle>(value)) {
-                        return std::get<ZeusType::ObjectHandle>(value);
-                    }
-                    if (std::holds_alternative<ZeusType::SharedObjectHandle>(value)) {
-                        const auto& shared = std::get<ZeusType::SharedObjectHandle>(value);
-                        auto source = ZeusShared::getGlobalHeap().find(shared.name, shared.generation);
-                        return source ? objectHandleFromStoredObject(source->read())
-                                      : ZeusType::ObjectHandle{-1, 0};
-                    }
-                    return objectHandleFromStoredObject(value);
-                };
-
-                auto callDestructor = [&](const ZeusType::UniversalVariant& cellVal) {
-                    ZeusType::ObjectHandle objH = resolveObjectHandle(cellVal);
-                    if (objH.id < 0) return;
-                    invokeObjectDestructor(objH);
-                };
-                
-                // 释放 Cell 中持有的对象或闭包的辅助 lambda
-                auto releaseRefInCell = [&](const ZeusType::UniversalVariant& cellVal) {
-                    if (std::holds_alternative<ZeusType::ObjectHandle>(cellVal)) {
-                        releaseObject(std::get<ZeusType::ObjectHandle>(cellVal));
-                    } else if (std::holds_alternative<ZeusType::SharedObjectHandle>(cellVal)) {
-                        const auto shared = std::get<ZeusType::SharedObjectHandle>(cellVal);
-                        auto target = ZeusShared::getGlobalHeap().find(shared.name, shared.generation);
-                        if (target) {
-                            const auto targetObject = objectHandleFromStoredObject(target->read());
-                            auto removedTarget = ZeusShared::getGlobalHeap().erase(
-                                shared.name, shared.generation);
-                            if (removedTarget) {
-                                removedTarget->write(ZeusType::Variant(ZeusType::Null{}));
-                                if (targetObject.id >= 0) releaseObject(targetObject);
-                            }
-                        }
-                    } else if (std::holds_alternative<ZeusType::ClosureHandle>(cellVal)) {
-                        int cloId = std::get<ZeusType::ClosureHandle>(cellVal).id;
-                        releaseClosure(cloId);
-                        ZEUS_DEBUG_PRINT("[DELETE_VAR] Released closure #%d from cell", cloId);
-                    }
-                };
-                
-                bool found = false;
-                
-                // 提取对象 ID 并打断闭包循环的辅助 lambda
-                auto breakCyclesIfObject = [&](const ZeusType::UniversalVariant& cellVal) {
-                    const auto handle = resolveObjectHandle(cellVal);
-                    if (handle.id < 0 || !getValidObject(handle)) return;
-                    forceBreakClosureCycles(handle);
-                    destroyObjectSource(handle);
-                };
-                
-                if (kind == "shared") {
-                    auto source = ZeusShared::getGlobalHeap().find(varName);
-                    if (source) {
-                        source->lockWrite();
-                        struct SharedDeleteUnlock {
-                            std::shared_ptr<ZeusShared::SharedCell> cell;
-                            ~SharedDeleteUnlock() {
-                                if (cell) cell->unlockWrite();
-                            }
-                        } sharedDeleteUnlock{source};
-
-                        const auto value = source->read();
-                        callDestructor(value);
-                        if (vmstat != ZeusType::VMStatus::Running) break;
-                        breakCyclesIfObject(value);
-                        const auto objectHandle = objectHandleFromStoredObject(value);
-                        releaseRefInCell(value);
-
-                        auto removed = ZeusShared::getGlobalHeap().erase(
-                            varName, source->generation);
-                        if (removed) {
-                            removed->write(ZeusType::Variant(ZeusType::Null{}));
-                            if (objectHandle.id >= 0) releaseObject(objectHandle);
-                        }
-                        found = !ZeusShared::getGlobalHeap().find(
-                            varName, source->generation);
-                    }
-                } else if (kind == "local" && varIndex >= 0 && varIndex < (int)local.size()) {
-                    // 删除局部变量
-                    Cell* cell = local[varIndex];
-                    
-                    if (cell) {
-                        callDestructor(cell->readValue());
-                        if (vmstat != ZeusType::VMStatus::Running) break;
-                        const auto value = cell->readValue();
-                        breakCyclesIfObject(value);
-                        releaseRefInCell(value);
-                        cell->release();
-                        local[varIndex] = nullptr;
-                        found = true;
-                    }
-                } else if (kind == "upvalue" && varIndex >= 0 && varIndex < (int)upvalue.size()) {
-                    // 删除 upvalue
-                    Cell* cell = upvalue[varIndex];
-                    
-                    if (cell) {
-                        callDestructor(cell->readValue());
-                        if (vmstat != ZeusType::VMStatus::Running) break;
-                        const auto value = cell->readValue();
-                        breakCyclesIfObject(value);
-                        releaseRefInCell(value);
-                        cell->release();
-                        upvalue[varIndex] = nullptr;
-                        found = true;
-                    }
-                } else {
-                    // 删除全局变量（按名称查找）
-                    for (size_t i = 0; i < global.size(); ++i) {
-                        if (i < globalNames.size() && globalNames[i] == varName) {
-                            if (global[i]) {
-                                callDestructor(global[i]->readValue());
-                                if (vmstat != ZeusType::VMStatus::Running) break;
-                                const auto value = global[i]->readValue();
-                                breakCyclesIfObject(value);
-                                releaseRefInCell(value);
-                                global[i]->release();
-                                global[i] = nullptr;
-                                found = true;
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                if (vmstat != ZeusType::VMStatus::Running) break;
-
-                if (!found) {
-                    vmMessage("[DELETE_VAR] Warning: Variable not found or already null: " + varName);
-                }
-
-                // Safe point: sweep truly unreachable objects/closures.
-                collectGarbageSweep();
-
-                printStack();
-                break;
-            }
-
-            // ===== 异常处理操作码 =====
-            case VMOperator::TRY_BEGIN: {
-                // TRY_BEGIN catchOffset: 注册异常处理器
-                // catchOffset 是从当前位置到 catch 块的偏移量
-                if (instr.args.empty()) {
-                    VMException::VMException exp("TRY_BEGIN missing catchOffset", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                int64_t catchOffset = 0;
-                if (std::holds_alternative<LexerType::Value>(instr.args[0])) {
-                    catchOffset = VMHelpers::getIntFromValue(std::get<LexerType::Value>(instr.args[0]));
-                }
-                
-                // 获取当前 PC（需要从调用栈帧获取）
-                size_t currentPc = 0;
-                const std::vector<IRType::IRInstr>* currentCode = nullptr;
-                if (!callFrames.empty()) {
-                    currentPc = callFrames.back().pc;
-                    currentCode = callFrames.back().code;
-                }
-                
-                // 注册异常处理器
-                ExceptionHandler handler;
-                handler.catchPc = currentPc + catchOffset;  // catch 块的起始位置
-                handler.callFrameDepth = callFrames.size();
-                handler.code = currentCode;
-                handler.stackBase = stack.size();
-                handler.localSize = local.size();
-                exceptionHandlers.push_back(handler);
-                
-                ZEUS_DEBUG_PRINT("[VM] TRY_BEGIN: registered handler, catchPc=%zu, depth=%zu", 
-                    handler.catchPc, handler.callFrameDepth);
-                break;
-            }
-            
-            case VMOperator::TRY_END: {
-                // TRY_END: try 块正常完成，移除异常处理器
-                if (!exceptionHandlers.empty()) {
-                    exceptionHandlers.pop_back();
-                    ZEUS_DEBUG_PRINT("[VM] TRY_END: removed handler, remaining=%zu", exceptionHandlers.size());
-                }
-                break;
-            }
-            
-            case VMOperator::CATCH_BEGIN: {
-                // CATCH_BEGIN "varName" slotIndex: catch 块开始
-                // 如果有变量名和槽索引，将当前异常存储到该槽位
-                std::string varName;
-                int slotIndex = -1;
-                
-                if (!instr.args.empty() && std::holds_alternative<std::string>(instr.args[0])) {
-                    varName = std::get<std::string>(instr.args[0]);
-                }
-                if (instr.args.size() > 1 && std::holds_alternative<LexerType::Value>(instr.args[1])) {
-                    slotIndex = VMHelpers::getIntFromValue(std::get<LexerType::Value>(instr.args[1]));
-                }
-                
-                if (!varName.empty() && slotIndex >= 0 && hasUnhandledException) {
-                    // 确保 local 足够大
-                    while (local.size() <= (size_t)slotIndex) {
-                        local.push_back(nullptr);
-                    }
-                    
-                    // 如果该槽已有值，先释放
-                    if (local[slotIndex]) {
-                        releaseCellAndContent(local[slotIndex]);
-                    }
-                    
-                    // 在指定槽位存储异常
-                    Cell* excCell = newCell(currentException, 0, "catch_var");
-                    local[slotIndex] = excCell;
-                    ZEUS_DEBUG_PRINT("[VM] CATCH_BEGIN: stored exception to '%s', local[%d]", 
-                        varName.c_str(), slotIndex);
-                }
-                
-                hasUnhandledException = false;
-                break;
-            }
-            
-            case VMOperator::CATCH_END: {
-                // CATCH_END: catch 块结束
-                ZEUS_DEBUG_PRINT("[VM] CATCH_END");
-                break;
-            }
-            
-            case VMOperator::THROW: {
-                // THROW: 抛出异常（栈顶是异常对象）
-                if (stack.empty()) {
-                    VMException::VMException exp("THROW: stack is empty", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                currentException = stack.back();
-                stack.pop_back();
-                hasUnhandledException = true;
-                
-                ZEUS_DEBUG_PRINT("[VM] THROW: exception raised");
-                
-                vmstat = ZeusType::VMStatus::Error;
-                if (exceptionHandlers.empty()) {
-                    std::string errorMsg = "Unhandled exception";
-                    if (std::holds_alternative<ZeusType::ObjectHandle>(currentException)) {
-                        auto& oh = std::get<ZeusType::ObjectHandle>(currentException);
-                        auto* obj = getObject(oh.id);
-                        if (obj) {
-                            // 尝试获取 _message 字段
-                            if (hasObjectField(*obj, "_message")) {
-                                auto message = readObjectField(*obj, "_message");
-                                if (std::holds_alternative<std::string>(message)) {
-                                    errorMsg = std::get<std::string>(message);
-                                }
-                            }
-                            // 尝试获取 _type 字段
-                            if (hasObjectField(*obj, "_type")) {
-                                auto type = readObjectField(*obj, "_type");
-                                if (std::holds_alternative<std::string>(type)) {
-                                    errorMsg = std::get<std::string>(type) + ": " + errorMsg;
-                                }
-                            }
-                        }
-                    } else if (std::holds_alternative<std::string>(currentException)) {
-                        errorMsg = std::get<std::string>(currentException);
-                    } else if (std::holds_alternative<LexerType::Value>(currentException)) {
-                        auto& val = std::get<LexerType::Value>(currentException);
-                        if (std::holds_alternative<std::string>(val.data)) {
-                            errorMsg = std::get<std::string>(val.data);
-                        }
-                    }
-                    
-                    VMException::VMException exp("Uncaught exception: " + errorMsg, __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                }
-                break;
-            }
-            
-            case VMOperator::WITH_BEGIN: {
-                // WITH_BEGIN slotIdx: 开始 with 块（栈顶是 with 对象）
-                // slotIdx: capture 变量槽索引，-1 表示无 capture
-                if (stack.empty()) {
-                    VMException::VMException exp("WITH_BEGIN: stack is empty", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                auto withObj = stack.back();
-                stack.pop_back();
-                
-                if (!std::holds_alternative<ZeusType::ObjectHandle>(withObj)) {
-                    VMException::VMException exp("WITH_BEGIN: expected object, got " + 
-                        ZeusVMUtils::valueToDebugString(withObj), __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                auto& oh = std::get<ZeusType::ObjectHandle>(withObj);
-                auto* obj = getObject(oh.id);
-                if (!obj) {
-                    VMException::VMException exp("WITH_BEGIN: object not found", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                // 检查是否有 operator[with] 方法
-                auto* classPtr = getClass(obj->classId);
-                if (!classPtr) {
-                    VMException::VMException exp("WITH_BEGIN: class not found", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                auto opIt = classPtr->operatorMethods.find("[with]");
-                if (opIt == classPtr->operatorMethods.end()) {
-                    VMException::VMException exp("WITH_BEGIN: object does not have operator[with] method", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                // 如果有 capture 槽，将对象引用存入该槽
-                int captureSlot = -1;
-                if (!instr.args.empty() && std::holds_alternative<LexerType::Value>(instr.args[0])) {
-                    captureSlot = VMHelpers::getIntFromValue(std::get<LexerType::Value>(instr.args[0]));
-                }
-                
-                if (captureSlot >= 0) {
-                    // 将对象引用存入 capture 槽
-                    if (local.size() <= static_cast<size_t>(captureSlot)) {
-                        local.resize(captureSlot + 1, nullptr);
-                    }
-                    if (!local[captureSlot]) {
-                        local[captureSlot] = newCell(withObj, 0, "WITH_CAPTURE");
-                    } else {
-                        assignCellValue(local[captureSlot], withObj);
-                    }
-                    ZEUS_DEBUG_PRINT("[VM] WITH_BEGIN: stored object to capture slot %d", captureSlot);
-                }
-                
-                // 调用 operator[with]()
-                //
-                // 用 executeClosureSync 而不是递归 execute()：它会压一个真正的栈帧
-                // 并把帧跑完，局部变量随帧保存/还原。递归 execute() 会共用同一份
-                // local 缓冲区，被调用帧的槽位会污染调用者。
-                int protoId = opIt->second;
-                Closure clo;
-                clo.protoId = protoId;
-                int cloId = allocClosure(std::move(clo));
-                stack.push_back(ZeusType::ClosureHandle{cloId});
-                // The nested call machinery releases every argument slot it pops,
-                // so the stack has to own a reference for the receiver it pushes.
-                ZeusGC::retainVariantDeep(*this, withObj);
-                stack.push_back(withObj);  // this 参数
-                // Dispatch through a real frame: executeClosureSync pushes a
-                // CallFrame and runs it to completion, so the callee gets its own
-                // local slots. A recursive execute() would share this frame's local
-                // buffer and leave the callee's slots behind in it.
-                if (!executeClosureSync(cloId, 1)) {
-                    if (vmstat != ZeusType::VMStatus::Running) break;
-                    VMException::VMException exp("WITH_BEGIN: operator[with] call failed", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                // 弹出 operator[with]() 的返回值（不需要使用）
-                if (!stack.empty()) {
-                    stack.pop_back();
-                }
-                
-                // 检查是否有 operator[~with] 方法
-                bool hasExitMethod = (classPtr->operatorMethods.find("[~with]") != classPtr->operatorMethods.end());
-                
-                // 保存 with 上下文
-                WithContext ctx;
-                ctx.objHandle = oh;
-                ctx.hasExitMethod = hasExitMethod;
-                withContextStack.push_back(ctx);
-                
-                ZEUS_DEBUG_PRINT("[VM] WITH_BEGIN: entered with block, hasExitMethod=%d", hasExitMethod);
-                break;
-            }
-            
-            case VMOperator::WITH_END: {
-                // WITH_END: 结束 with 块
-                if (withContextStack.empty()) {
-                    VMException::VMException exp("WITH_END: no active with block", __line, instr);
-                    exp._throw(vmstat, currentChunk);
-                    break;
-                }
-                
-                WithContext ctx = withContextStack.back();
-                withContextStack.pop_back();
-                
-                // 如果有 operator[~with] 方法，调用它
-                if (ctx.hasExitMethod) {
-                    auto* obj = getObject(ctx.objHandle.id);
-                    if (obj) {
-                        auto* classPtr = getClass(obj->classId);
-                        if (classPtr) {
-                            auto opIt = classPtr->operatorMethods.find("[~with]");
-                            if (opIt != classPtr->operatorMethods.end()) {
-                                int protoId = opIt->second;
-                                Closure clo;
-                                clo.protoId = protoId;
-                                int cloId = allocClosure(std::move(clo));
-                                stack.push_back(ZeusType::ClosureHandle{cloId});
-                                // Same ownership rule as WITH_BEGIN: the nested call
-                                // releases the receiver slot it pops.
-                                ZeusGC::retainVariantDeep(
-                                    *this, ZeusType::ObjectHandle{ctx.objHandle.id, ctx.objHandle.generation});
-                                stack.push_back(ZeusType::ObjectHandle{ctx.objHandle.id, ctx.objHandle.generation});
-                                // Dispatch through a real frame: executeClosureSync pushes a
-                                // CallFrame and runs it to completion, so the callee gets its
-                                // own local slots instead of sharing this frame's buffer.
-                                if (!executeClosureSync(cloId, 1)) {
-                                    if (vmstat != ZeusType::VMStatus::Running) break;
-                                    VMException::VMException exp(
-                                        "WITH_END: operator[~with] call failed", __line, instr);
-                                    exp._throw(vmstat, currentChunk);
-                                    break;
-                                }
-                                
-                                // 弹出 operator[~with]() 的返回值（不需要使用）
-                                if (!stack.empty()) {
-                                    stack.pop_back();
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                ZEUS_DEBUG_PRINT("[VM] WITH_END: exited with block");
-                break;
-            }
-
-            
-            case VMOperator::HOTSPOT: {
-                // HOTSPOT: 热点触发指令，根据第一个参数决定要执行的热热点 ID
-                // 支持两种参数布局：
-                //  - HotspotCompiler 生成的参数序列: [id(Value int), pushValue(Value), idx(Value int), mutOrConst(string), name?]
-                //  - 返回/写入形式: [idx(Value int), mutOrConst(string), name?]（用于读/写操作）
-                int hotId = -1;
-                if (!instr.args.empty() && std::holds_alternative<LexerType::Value>(instr.args[0]) &&
-                    std::holds_alternative<ZeusType::BigInteger>(std::get<LexerType::Value>(instr.args[0]).data)) {
-                    hotId = VMHelpers::getIntFromValue(std::get<LexerType::Value>(instr.args[0]));
-                }
-
-                // 构造 HotspotContext（封装 VM 状态以供热点处理器使用）
-                HotspotContext hctx{
-                    /*stack*/   this->stack.data,
-                    /*global*/  this->global,
-                    /*local*/   this->local,
-                    /*upvalue*/ this->upvalue,
-                    /*vmstat*/  this->vmstat,
-                    /*__line*/  this->__line,
-                    /*globalNames*/ this->globalNames,
-                    /*nameToClosure*/ this->nameToClosure,
-                    /*enableLateResolve*/ this->enableLateResolve,
-                    /*newCellCb*/ [this](const ZeusType::UniversalVariant& v, uint8_t flags, const char* createdBy){ return this->newCell(v, flags, createdBy); },
-                    /*assignCellValueCb*/ [this](Cell* cell, const ZeusType::UniversalVariant& v){ this->assignCellValue(cell, v); },
-                    /*tryRegisterGlobalClosureCb*/ [this](int slot, const ZeusType::UniversalVariant& v){ this->tryRegisterGlobalClosure(slot, v); },
-                    /*printGlobalsCb*/ [this](){ this->printGlobals(); },
-                    /*printStackCb*/   [this](){ this->printStack(); }
-                };
-                // 处理已知的 hotspot id（hotId==0 为示例处理器）
-                if (hotId == 0) {
-                    // instr 可能直接携带 hotspot1 的内部参数布局，调用 hotspot1 处理
-                    hotspot1(instr, hctx);
-                } else {
-                    // 未知的 hotspot id：仅打印调试信息并跳过
-                    ZEUS_DEBUG_PRINT("[VM][HOTSPOT] unknown id=%d, noop", hotId);
-                }
-                break;
-            }
+    // Opcode handlers must remain separate under LTCG: their temporary storage
+    // must not accumulate in one native stack frame on every VM instruction.
+    #include "Dispatch/ZeusVMAddress.inl"
+    #include "Dispatch/ZeusVMConstruction.inl"
+    #include "Dispatch/ZeusVMObjects.inl"
+    #include "Dispatch/ZeusVMControl.inl"
+    #include "Dispatch/ZeusVMOperators.inl"
+    #include "Dispatch/ZeusVMNativeDouble.inl"
+    #include "Dispatch/ZeusVMCollections.inl"
+    #include "Dispatch/ZeusVMCalls.inl"
+    #include "Dispatch/ZeusVMVariables.inl"
+    #include "Dispatch/ZeusVMLifetime.inl"
+
+    ZEUS_VM_NOINLINE void execute(const IRType::IRInstr& initialInstruction) {
+        std::optional<IRType::IRInstr> currentInstruction;
+        const IRType::IRInstr* instruction = &initialInstruction;
+        while (true) {
+            const auto& instr = *instruction;
+            if (instr.line >= 0) __line = instr.line;
+            if (instr.sourceFileId >= 0) __sourceFileId = instr.sourceFileId;
+            if (vmstat != ZeusType::VMStatus::Running) return;
+            if (!applyClassAssignmentCopy(instr)) return;
+
+            // Handlers copy/retain deferred call arguments before their locals
+            // are released. Only this dispatcher starts the prepared call.
+            std::optional<IRType::IRInstr> nextInstruction;
+            if (tryExecuteNativeDouble(instr)) return;
+            switch (instr.op) {
+                case VMOperator::LLVM_ADDR: execute_LLVM_ADDR(instr, nextInstruction); break;
+                case VMOperator::LLVM_FADDR: execute_LLVM_FADDR(instr, nextInstruction); break;
+                case VMOperator::LLVM_FSTORE: execute_LLVM_FSTORE(instr, nextInstruction); break;
+                case VMOperator::TYPE_IMPL_BUILD: execute_TYPE_IMPL_BUILD(instr, nextInstruction); break;
+                case VMOperator::CLASS_BUILD: execute_CLASS_BUILD(instr, nextInstruction); break;
+                case VMOperator::CLASS_BUILD_SHARED: execute_CLASS_BUILD_SHARED(instr, nextInstruction); break;
+                case VMOperator::OBJ_BUILD: execute_OBJ_BUILD(instr, nextInstruction); break;
+                case VMOperator::OBJ_BUILD_SHARED: execute_OBJ_BUILD_SHARED(instr, nextInstruction); break;
+                case VMOperator::OBJ_LOAD_ATTR:
+                case VMOperator::OBJ_LOAD_SAFE_ATTR: execute_OBJ_LOAD_ATTR(instr, nextInstruction); break;
+                case VMOperator::OBJ_STORE_ATTR: execute_OBJ_STORE_ATTR(instr, nextInstruction); break;
+                case VMOperator::OBJ_REPLACE_STATE: execute_OBJ_REPLACE_STATE(instr, nextInstruction); break;
+                case VMOperator::CLASS_STATIC_METHOD_CALL: execute_CLASS_STATIC_METHOD_CALL(instr, nextInstruction); break;
+                case VMOperator::OBJ_CALL_METHOD:
+                case VMOperator::OBJ_CALL_SAFE: execute_OBJ_CALL_METHOD(instr, nextInstruction); break;
+                case VMOperator::PUSH: execute_PUSH(instr, nextInstruction); break;
+                case VMOperator::PUSH_NAMED: execute_PUSH_NAMED(instr, nextInstruction); break;
+                case VMOperator::ADD: execute_ADD(instr, nextInstruction); break;
+                case VMOperator::LIST_BUILD: execute_LIST_BUILD(instr, nextInstruction); break;
+                case VMOperator::DICT_BUILD: execute_DICT_BUILD(instr, nextInstruction); break;
+                case VMOperator::DICT_KEYS_BUILD: execute_DICT_KEYS_BUILD(instr, nextInstruction); break;
+                case VMOperator::DICT_LOAD_VALUE: execute_DICT_LOAD_VALUE(instr, nextInstruction); break;
+                case VMOperator::DICT_STORE_VALUE: execute_DICT_STORE_VALUE(instr, nextInstruction); break;
+                case VMOperator::LIST_LENGTH: execute_LIST_LENGTH(instr, nextInstruction); break;
+                case VMOperator::LIST_LOAD_ELEM: execute_LIST_LOAD_ELEM(instr, nextInstruction); break;
+                case VMOperator::LIST_STORE_ELEM: execute_LIST_STORE_ELEM(instr, nextInstruction); break;
+                case VMOperator::COUNT_CHECK_NEG: execute_COUNT_CHECK_NEG(instr, nextInstruction); break;
+                case VMOperator::COUNT_CHECK_STEP_ZERO: execute_COUNT_CHECK_STEP_ZERO(instr, nextInstruction); break;
+                case VMOperator::SUBTRACT: execute_SUBTRACT(instr, nextInstruction); break;
+                case VMOperator::MULTIPLY: execute_MULTIPLY(instr, nextInstruction); break;
+                case VMOperator::DIVIDE: execute_DIVIDE(instr, nextInstruction); break;
+                case VMOperator::MODULUS: execute_MODULUS(instr, nextInstruction); break;
+                case VMOperator::FUNC_BEGIN: execute_FUNC_BEGIN(instr, nextInstruction); break;
+                case VMOperator::IR_ANNOTATION: execute_IR_ANNOTATION(instr, nextInstruction); break;
+                case VMOperator::LLVM_SIZEOF: execute_LLVM_SIZEOF(instr, nextInstruction); break;
+                case VMOperator::FUNC_END: execute_FUNC_END(instr, nextInstruction); break;
+                case VMOperator::POP: execute_POP(instr, nextInstruction); break;
+                case VMOperator::SWAP: execute_SWAP(instr, nextInstruction); break;
+                case VMOperator::CALL_FUNC: execute_CALL_FUNC(instr, nextInstruction); break;
+                case VMOperator::MAKE_FUNCTION: execute_MAKE_FUNCTION(instr, nextInstruction); break;
+                case VMOperator::CALL_CLOSURE: execute_CALL_CLOSURE(instr, nextInstruction); break;
+                case VMOperator::LOAD_NATIVE: execute_LOAD_NATIVE(instr, nextInstruction); break;
+                case VMOperator::CALL_NATIVE: execute_CALL_NATIVE(instr, nextInstruction); break;
+                case VMOperator::STORE_VALUE_LOCAL: execute_STORE_VALUE_LOCAL(instr, nextInstruction); break;
+                case VMOperator::STORE_VALUE_GLOBAL: execute_STORE_VALUE_GLOBAL(instr, nextInstruction); break;
+                case VMOperator::ASSIGN_VALUE_GLOBAL: execute_ASSIGN_VALUE_GLOBAL(instr, nextInstruction); break;
+                case VMOperator::ASSIGN_VALUE_LOCAL: execute_ASSIGN_VALUE_LOCAL(instr, nextInstruction); break;
+                case VMOperator::ASSIGN_VALUE_UPVALUE: execute_ASSIGN_VALUE_UPVALUE(instr, nextInstruction); break;
+                case VMOperator::STORE_VALUE_SHARED: execute_STORE_VALUE_SHARED(instr, nextInstruction); break;
+                case VMOperator::LOAD_VALUE_SHARED: execute_LOAD_VALUE_SHARED(instr, nextInstruction); break;
+                case VMOperator::ASSIGN_VALUE_SHARED: execute_ASSIGN_VALUE_SHARED(instr, nextInstruction); break;
+                case VMOperator::SHARED_LOCK: execute_SHARED_LOCK(instr, nextInstruction); break;
+                case VMOperator::SHARED_UNLOCK: execute_SHARED_UNLOCK(instr, nextInstruction); break;
+                case VMOperator::LOAD_CELL_REFERENCE: execute_LOAD_CELL_REFERENCE(instr, nextInstruction); break;
+                case VMOperator::LOAD_VALUE: execute_LOAD_VALUE(instr, nextInstruction); break;
+                case VMOperator::JUMP: execute_JUMP(instr, nextInstruction); break;
+                case VMOperator::JUMP_IF_TRUE: execute_JUMP_IF_TRUE(instr, nextInstruction); break;
+                case VMOperator::JUMP_IF_FALSE: execute_JUMP_IF_FALSE(instr, nextInstruction); break;
+                case VMOperator::JUMP_IF_PARAM_PROVIDED: execute_JUMP_IF_PARAM_PROVIDED(instr, nextInstruction); break;
+                case VMOperator::EQUL: execute_EQUL(instr, nextInstruction); break;
+                case VMOperator::NOT_EQUAL: execute_NOT_EQUAL(instr, nextInstruction); break;
+                case VMOperator::GREATER_THAN: execute_GREATER_THAN(instr, nextInstruction); break;
+                case VMOperator::LESS_THAN: execute_LESS_THAN(instr, nextInstruction); break;
+                case VMOperator::GREATER_EQUAL: execute_GREATER_EQUAL(instr, nextInstruction); break;
+                case VMOperator::LESS_EQUAL: execute_LESS_EQUAL(instr, nextInstruction); break;
+                case VMOperator::LOGICAL_AND: execute_LOGICAL_AND(instr, nextInstruction); break;
+                case VMOperator::LOGICAL_OR: execute_LOGICAL_OR(instr, nextInstruction); break;
+                case VMOperator::LOGICAL_NOT: execute_LOGICAL_NOT(instr, nextInstruction); break;
+                case VMOperator::IMPORT: execute_IMPORT(instr, nextInstruction); break;
+                case VMOperator::DELETE_VAR: execute_DELETE_VAR(instr, nextInstruction); break;
+                case VMOperator::TRY_BEGIN: execute_TRY_BEGIN(instr, nextInstruction); break;
+                case VMOperator::TRY_END: execute_TRY_END(instr, nextInstruction); break;
+                case VMOperator::CATCH_BEGIN: execute_CATCH_BEGIN(instr, nextInstruction); break;
+                case VMOperator::CATCH_END: execute_CATCH_END(instr, nextInstruction); break;
+                case VMOperator::THROW: execute_THROW(instr, nextInstruction); break;
+                case VMOperator::WITH_BEGIN: execute_WITH_BEGIN(instr, nextInstruction); break;
+                case VMOperator::WITH_END: execute_WITH_END(instr, nextInstruction); break;
+                case VMOperator::HOTSPOT: execute_HOTSPOT(instr, nextInstruction); break;
+            }
+            if (!nextInstruction || vmstat != ZeusType::VMStatus::Running) return;
+            currentInstruction = std::move(nextInstruction);
+            instruction = &*currentInstruction;
         }
     }
     
@@ -11013,13 +4803,19 @@ namespace ZeusThread {
     // 线程入口函数：在新线程中创建 VM 并执行指定的函数
     inline void threadEntry(std::shared_ptr<ThreadInfo> info) {
         ZEUS_DEBUG_PRINT("[Thread] threadEntry: id=%d, protoId=%d", info->id, info->protoId);
+        std::optional<VM> vmStorage;
+        int preparedTargetClosureId = -1;
 
         try {
             info->state = ThreadState::Running;
             info->nativeId = std::this_thread::get_id();
 
             // 创建新的 VM 实例
-            VM vm;
+            vmStorage.emplace();
+            VM& vm = *vmStorage;
+            // Configure a coherent shared domain before child execution while
+            // the pending-peer lease protects the parent's published roots.
+            std::unique_lock<std::recursive_mutex> rootSetup(ZeusGC::graphMutex());
             
             // 设置外部停止标志（用于 eliminate）
             vm.externalStopFlag = &info->shouldStop;
@@ -11052,6 +4848,7 @@ namespace ZeusThread {
                 vm.sharedObjects = info->sharedObjects;
                 vm.sharedObjectsMutex = info->sharedObjectsMutex;
                 vm.sharedFreeObjectSlots = info->sharedFreeObjectSlots;
+                vm.syncVMRootDomain();
                 if (info->sharedTypeImplementations) {
                     vm.typeImplementations = *static_cast<
                         std::unordered_map<std::string, ZeusType::ClassInfo>*>(
@@ -11094,6 +4891,64 @@ namespace ZeusThread {
                 vm.sharedNameToClass = static_cast<std::unordered_map<std::string,int>*>(info->sharedNameToClass);
             }
 
+            // ThreadInfo may own arguments before they reach the operand
+            // stack. Publish those roots before completing the hand-off.
+            for (const auto& argument : info->args) vm.pinVMTemporaryRoot(argument);
+            if (info->boundThis) vm.pinVMObjectRoot(*info->boundThis);
+
+            if (info->targetClosureId >= 0) {
+                std::vector<Cell*> captureCells;
+                captureCells.reserve(info->targetUpvalues.size());
+                for (void* capture : info->targetUpvalues) {
+                    auto* cell = static_cast<Cell*>(capture);
+                    if (!cell) {
+                        throw std::runtime_error(
+                            "thread target closure contains an uninitialized capture cell");
+                    }
+                    captureCells.push_back(cell);
+                }
+
+                VM::Closure targetClosure;
+                targetClosure.protoId = info->protoId;
+                targetClosure.boundThis = info->boundThis;
+                targetClosure.upvalues = captureCells;
+
+                bool retainedCaptures = false;
+                bool retainedBoundThis = false;
+                try {
+                    {
+                        std::lock_guard<std::recursive_mutex> graph(
+                            ZeusGC::graphMutex());
+                        for (Cell* capture : captureCells) capture->retain();
+                        retainedCaptures = true;
+                        if (targetClosure.boundThis) {
+                            vm.retainObject(*targetClosure.boundThis);
+                            retainedBoundThis = true;
+                        }
+                    }
+                    preparedTargetClosureId = vm.allocClosure(std::move(targetClosure));
+                    retainedCaptures = false;
+                    retainedBoundThis = false;
+                } catch (...) {
+                    if (retainedCaptures) {
+                        for (Cell* capture : captureCells) {
+                            vm.releaseCellAndContent(capture);
+                        }
+                    }
+                    if (retainedBoundThis && info->boundThis) {
+                        vm.releaseObject(*info->boundThis);
+                    }
+                    throw;
+                }
+
+                // The child now owns its local closure and capture references.
+                // It no longer reads from the parent's resizable closure table.
+                info->releaseRetainedTargetClosure();
+            }
+
+            info->rootPeerLease.reset();
+            rootSetup.unlock();
+
             // 如果 VM 仍在运行，执行目标函数
             const VM::Prototype* protoPtr = vm.getPrototype(info->protoId);
             if (vm.vmstat == ZeusType::VMStatus::Running && protoPtr) {
@@ -11105,15 +4960,17 @@ namespace ZeusThread {
                 
                 if (!proto.body.empty()) {
                     // 构造闭包并执行
-                     int closureId = (int)vm.closures.size();
-                     VM::Closure clos;
-                     clos.protoId = info->protoId;
-                     // 设置 boundThis，CALL_CLOSURE 会自动处理 this 参数的插入
-                     if (info->boundThis.has_value()) {
-                         vm.retainObject(*info->boundThis); // closure will own & later release boundThis
+                     int closureId = preparedTargetClosureId;
+                     if (closureId < 0) {
+                         VM::Closure clos;
+                         clos.protoId = info->protoId;
+                         // CALL_CLOSURE inserts the bound receiver when present.
+                         if (info->boundThis.has_value()) {
+                             vm.retainObject(*info->boundThis);
+                         }
+                         clos.boundThis = info->boundThis;
+                         closureId = vm.allocClosure(std::move(clos));
                      }
-                     clos.boundThis = info->boundThis;
-                     vm.closures.push_back(clos);
                     
                     ZEUS_DEBUG_PRINT("[Thread] Created closure #%d for protoId %d", closureId, info->protoId);
                     
@@ -11145,12 +5002,22 @@ namespace ZeusThread {
 
                     // 线程内临时闭包只用于执行一次，执行后释放
                     vm.releaseClosure(closureId);
+                    preparedTargetClosureId = -1;
                 } else {
                     ZEUS_DEBUG_PRINT("[Thread] Empty prototype body!");
+                    if (preparedTargetClosureId >= 0) {
+                        vm.releaseClosure(preparedTargetClosureId);
+                        preparedTargetClosureId = -1;
+                    }
                 }
             } else {
                 ZEUS_DEBUG_PRINT("[Thread] Skipped execution: vmstat=%d protoId=%d protoPtr=%p",
                     (int)vm.vmstat, info->protoId, (void*)protoPtr);
+            }
+
+            if (preparedTargetClosureId >= 0) {
+                vm.releaseClosure(preparedTargetClosureId);
+                preparedTargetClosureId = -1;
             }
 
             // 线程结束时释放 info->args / boundThis 中的对象或闭包引用，避免线程记录长期持有
@@ -11170,9 +5037,36 @@ namespace ZeusThread {
             ZEUS_DEBUG_PRINT("[Thread] threadEntry finished: id=%d", info->id);
 
         } catch (const std::exception& e) {
+            if (preparedTargetClosureId >= 0 && vmStorage) {
+                try {
+                    vmStorage->releaseClosure(preparedTargetClosureId);
+                } catch (...) {
+                    ZEUS_DEBUG_PRINT(
+                        "[Thread] failed to release prepared closure #%d after error",
+                        preparedTargetClosureId);
+                }
+            }
+            info->releaseRetainedTargetClosure();
+            info->rootPeerLease.reset();
             info->state = ThreadState::Error;
             info->errorMessage = e.what();
             ZEUS_DEBUG_PRINT("[Thread] threadEntry error: id=%d, msg=%s", info->id, e.what());
+        } catch (...) {
+            if (preparedTargetClosureId >= 0 && vmStorage) {
+                try {
+                    vmStorage->releaseClosure(preparedTargetClosureId);
+                } catch (...) {
+                    ZEUS_DEBUG_PRINT(
+                        "[Thread] failed to release prepared closure #%d after error",
+                        preparedTargetClosureId);
+                }
+            }
+            info->releaseRetainedTargetClosure();
+            info->rootPeerLease.reset();
+            info->state = ThreadState::Error;
+            info->errorMessage = "thread entry threw a non-standard exception";
+            ZEUS_DEBUG_PRINT(
+                "[Thread] threadEntry error: id=%d, non-standard exception", info->id);
         }
     }
 

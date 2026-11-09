@@ -1,0 +1,16 @@
+import native_decl_static_const_package;
+
+let const LocalInt32ID = InferredID;
+let const LocalInt64ID: int = TypedID;
+let const LocalInt8ID: int = 4;
+@native decl ImportedInt32 = LocalInt32ID;
+@native decl ImportedInt64 = LocalInt64ID;
+@native decl LocalInt8 = LocalInt8ID;
+
+var inferred: ImportedInt32 = -123456;
+var typed: ImportedInt64 = 4294967296;
+var local: LocalInt8 = -128;
+if (inferred != -123456 or typed != 4294967296 or local != -128) {
+    throw "compile-time static value mismatch";
+}
+print("NATIVE_DECL_STATIC_CONST_PASS");

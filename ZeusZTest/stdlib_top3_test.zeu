@@ -1,0 +1,62 @@
+import zeus.csv;
+import zeus.path;
+import zeus.url;
+import zeus.exception;
+
+func assertStdlib(condition, message: string) {
+    if (!condition) throw new Exception("stdlib test failed: " + message);
+}
+
+let parsedURL = URL.parse("https://example.test:8443/a/b?x=1#top");
+assertStdlib(parsedURL.scheme == "https", "URL scheme");
+assertStdlib(parsedURL.authority == "example.test:8443", "URL authority");
+assertStdlib(parsedURL.path == "/a/b", "URL path");
+assertStdlib(parsedURL.query == "x=1" and parsedURL.hasQuery, "URL query");
+assertStdlib(parsedURL.fragment == "top" and parsedURL.hasFragment, "URL fragment");
+assertStdlib(URL.format(parsedURL) == "https://example.test:8443/a/b?x=1#top",
+    "URL parse/format round trip");
+assertStdlib(URL.encodeComponent("hello 雪+") == "hello%20%E9%9B%AA%2B",
+    "URL UTF-8 component encoding");
+assertStdlib(URL.decodeComponent("hello%20%E9%9B%AA%2B") == "hello 雪+",
+    "URL UTF-8 component decoding");
+
+let query = URL.parseQuery("tag=one&tag=two&space=hello+world&empty");
+assertStdlib(query.get("tag") == "one", "query returns first repeated value");
+assertStdlib(query.getAll("tag").length() == 2 and
+    query.getAll("tag").get(1) == "two", "query preserves repeated values");
+assertStdlib(query.get("space") == "hello world", "query plus decodes to space");
+assertStdlib(query.get("empty") == "", "query key without equals has empty value");
+query.append("tag", "three");
+assertStdlib(query.getAll("tag").length() == 3, "query append");
+query.set("space", "a+b");
+assertStdlib(query.get("space") == "a+b", "query set");
+assertStdlib(URL.parseQuery(URL.stringifyQuery(query)).get("space") == "a+b",
+    "query stringify round trip");
+
+assertStdlib(Path.normalize("/var//log/../tmp/") == "/var/tmp",
+    "absolute path normalization");
+assertStdlib(Path.normalize("a/./b/../../c") == "c",
+    "relative path normalization");
+assertStdlib(Path.normalize("C:\\Users\\me\\..\\data") == "C:/Users/data",
+    "Windows path normalization");
+assertStdlib(Path.join("/var/app", "../data") == "/var/data", "path join");
+assertStdlib(Path.basename("/var/log/app.txt") == "app.txt", "path basename");
+assertStdlib(Path.dirname("/var/log/app.txt") == "/var/log", "path dirname");
+assertStdlib(Path.extension("/var/log/.hidden") == "", "dotfile has no extension");
+assertStdlib(Path.extension("/var/log/app.tar.gz") == ".gz", "path extension");
+assertStdlib(Path.isAbsolute("C:\\temp\\file.txt"), "Windows absolute path");
+
+let csvText = "name,notes\r\n\"A, B\",\"said \"\"hello\"\"\"\r\n\"line1\nline2\",雪\r\n";
+let table = CSV.parse(csvText);
+assertStdlib(table.length() == 3, "CSV rows");
+assertStdlib(table.get(1).get(0) == "A, B", "CSV quoted delimiter");
+assertStdlib(table.get(1).get(1) == "said \"hello\"", "CSV escaped quotes");
+assertStdlib(table.get(2).get(0) == "line1\nline2" and
+    table.get(2).get(1) == "雪", "CSV multiline and UTF-8 fields");
+assertStdlib(CSV.parse(CSV.stringify(table)).get(1).get(1) == "said \"hello\"",
+    "CSV stringify round trip");
+let tabular = CSV.stringify([["a", "b\tc"], ["x", "y"]], "\t");
+assertStdlib(CSV.parse(tabular, "\t").get(0).get(1) == "b\tc",
+    "CSV custom delimiter");
+
+print("PASS top-three standard libraries: url, path, csv");

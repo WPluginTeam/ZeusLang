@@ -10,6 +10,7 @@ interface Sized {
 }
 
 interface RefInput {
+    using &self;
     decl func inspect(&value: int) -> int;
 }
 
@@ -27,36 +28,43 @@ class HashMap [Map, Sized] {
 }
 
 class RefInputImpl [RefInput] {
+    using &self;
     func inspect(&value: int) -> int {
         return value;
     }
 }
 
 interface RefTypeInput {
+    using &self;
     decl func inspect(value: &int) -> int;
 }
 
 class RefTypeInputImpl [RefTypeInput] {
+    using &self;
     func inspect(&value: int) -> int {
         return value;
     }
 }
 
 interface RefPrefixInput {
+    using &self;
     decl func inspect(&value: int) -> int;
 }
 
 class RefPrefixInputImpl [RefPrefixInput] {
+    using &self;
     func inspect(value: &int) -> int {
         return value;
     }
 }
 
 interface VariadicInput {
+    using &self;
     decl func collect(*args, **kwargs) -> int;
 }
 
 class VariadicInputImpl [VariadicInput] {
+    using &self;
     func collect(*args, **kwargs) -> int {
         return 1;
     }

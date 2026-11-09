@@ -20,6 +20,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "../ZeusRuntimeLib/ZeusVariant.hpp"
 #include "../ZeusRuntimeLib/ZeusSharedHeap.hpp"
@@ -42,12 +43,21 @@ namespace ZeusThread {
     
     // 闘包解析函数类型：从 closureId 获取 protoId
     using ClosureResolverFunc = std::function<int(int closureId)>;
+
+    struct ClosureSnapshot {
+        int protoId = -1;
+        std::vector<void*> upvalues;
+        std::optional<ZeusType::ObjectHandle> boundThis;
+    };
+    using ClosureSnapshotResolverFunc =
+        std::function<std::optional<ClosureSnapshot>(int closureId)>;
     
     // BoundThis 解析函数类型：从 closureId 获取 boundThis（如果有）
     using BoundThisResolverFunc = std::function<std::optional<ZeusType::ObjectHandle>(int closureId)>;
     
     // 共享对象系统 - 包含子线程需要的所有主 VM 数据（提前声明）
     struct SharedObjectSystem {
+        std::shared_ptr<void> rootPeerLease;
         // 类和对象（原有）
         std::vector<ZeusType::ClassInfo>* classes = nullptr;
         void* typeImplementations = nullptr;  // std::unordered_map<std::string, ClassInfo>*
@@ -80,6 +90,7 @@ namespace ZeusThread {
 
     // 线程信息
     struct ThreadInfo {
+        std::shared_ptr<void> rootPeerLease;
         int id;                             // 线程 ID（Zeus 层面）
         std::thread::id nativeId;           // 原生线程 ID
         std::string name;                   // 线程名称
@@ -93,6 +104,9 @@ namespace ZeusThread {
         const std::vector<std::vector<IRType::IRInstr>>* program = nullptr;  // 指向主程序
         std::vector<std::string> globalNames;  // 保留用于兼容性，但优先使用 sharedGlobalNames
         int protoId = -1;                   // 要执行的函数原型 ID
+        int targetClosureId = -1;           // 原始闭包 ID；线程 VM 会复制它的捕获环境
+        std::function<void(int)> releaseTargetClosure;
+        std::vector<void*> targetUpvalues;   // 源闭包保活期间快照的 Cell* 槽位
         std::vector<ZeusType::UniversalVariant> args;  // 闭包参数
         std::optional<ZeusType::ObjectHandle> boundThis;  // 绑定的 this（用于方法引用）
         
@@ -112,6 +126,21 @@ namespace ZeusThread {
         void* sharedPrototypes = nullptr;       // std::vector<VM::Prototype>*
         void* sharedNameToClosure = nullptr;    // std::unordered_map<std::string,int>*
         void* sharedNameToClass = nullptr;      // std::unordered_map<std::string,int>*
+
+        void releaseRetainedTargetClosure() noexcept {
+            const int closureId = std::exchange(targetClosureId, -1);
+            auto release = std::move(releaseTargetClosure);
+            releaseTargetClosure = {};
+            targetUpvalues.clear();
+            if (closureId >= 0 && release) {
+                try {
+                    release(closureId);
+                } catch (...) {
+                    ZEUS_DEBUG_PRINT(
+                        "[ThreadManager] failed to release target closure #%d", closureId);
+                }
+            }
+        }
 
         ThreadInfo() : id(-1), name("thread-unknown") {}
         
@@ -219,7 +248,10 @@ namespace ZeusThread {
             const std::vector<ZeusType::UniversalVariant>& args,
             ThreadEntryFunc entryFunc,
             std::optional<ZeusType::ObjectHandle> boundThis = std::nullopt,
-            const SharedObjectSystem& shared = SharedObjectSystem()
+            const SharedObjectSystem& shared = SharedObjectSystem(),
+            int targetClosureId = -1,
+            std::function<void(int)> releaseTargetClosure = {},
+            const std::vector<void*>& targetUpvalues = {}
         ) {
             std::shared_ptr<ThreadInfo> info;
             {
@@ -231,6 +263,7 @@ namespace ZeusThread {
                 info = it->second;
                 info->protoId = protoId;
                 info->args = args;
+                info->targetUpvalues = targetUpvalues;
                 info->boundThis = boundThis;
                 info->sharedClasses = shared.classes;
                 info->sharedTypeImplementations = shared.typeImplementations;
@@ -245,14 +278,30 @@ namespace ZeusThread {
                 info->sharedPrototypes = shared.prototypes;
                 info->sharedNameToClosure = shared.nameToClosure;
                 info->sharedNameToClass = shared.nameToClass;
+                info->targetClosureId = targetClosureId;
+                info->releaseTargetClosure = std::move(releaseTargetClosure);
+                // Attach only after potentially throwing argument copies succeed.
+                info->rootPeerLease = shared.rootPeerLease;
             }
 
-            auto* context = new VMThreadTaskContext{std::move(entryFunc), info};
-            if (!zeus_thread_start_task(id, runVMThreadTask, context, destroyVMThreadTask)) {
-                delete context;
-                ZEUS_DEBUG_PRINT("[ThreadManager] startThread failed: id=%d protoId=%d",
-                    id, protoId);
-                return false;
+            try {
+                auto* context = new VMThreadTaskContext{std::move(entryFunc), info};
+                if (!zeus_thread_start_task(id, runVMThreadTask, context, destroyVMThreadTask)) {
+                    delete context;
+                    info->rootPeerLease.reset();
+                    info->targetClosureId = -1;
+                    info->releaseTargetClosure = {};
+                    info->targetUpvalues.clear();
+                    ZEUS_DEBUG_PRINT("[ThreadManager] startThread failed: id=%d protoId=%d",
+                        id, protoId);
+                    return false;
+                }
+            } catch (...) {
+                info->rootPeerLease.reset();
+                info->targetClosureId = -1;
+                info->releaseTargetClosure = {};
+                info->targetUpvalues.clear();
+                throw;
             }
             ZEUS_DEBUG_PRINT("[ThreadManager] startThread: id=%d protoId=%d hasBoundThis=%d hasSharedEnv=%d",
                 id, protoId, boundThis.has_value(), shared.global != nullptr);
@@ -269,6 +318,7 @@ namespace ZeusThread {
             }
 
             if (!zeus_thread_join(id)) return false;
+            info->releaseRetainedTargetClosure();
             std::lock_guard<std::mutex> lock(managerMutex);
             const auto it = threads.find(id);
             if (it == threads.end() || it->second != info) return true;
@@ -294,6 +344,7 @@ namespace ZeusThread {
                 ZEUS_DEBUG_PRINT("[ThreadManager] eliminateThread failed: id=%d", id);
                 return false;
             }
+            info->releaseRetainedTargetClosure();
 
             std::lock_guard<std::mutex> lock(managerMutex);
             const auto it = threads.find(id);
@@ -426,6 +477,15 @@ namespace ZeusThread {
     // 设置全局闭包解析器
     inline void setGlobalClosureResolver(ClosureResolverFunc func) {
         getGlobalClosureResolver() = func;
+    }
+
+    inline ClosureSnapshotResolverFunc& getGlobalClosureSnapshotResolver() {
+        static thread_local ClosureSnapshotResolverFunc func = nullptr;
+        return func;
+    }
+
+    inline void setGlobalClosureSnapshotResolver(ClosureSnapshotResolverFunc func) {
+        getGlobalClosureSnapshotResolver() = std::move(func);
     }
     
     // 全局 BoundThis 解析器（由 VM 设置）

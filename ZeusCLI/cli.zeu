@@ -1,0 +1,161 @@
+import zeus.path;
+import zeus.process;
+
+func __zeus_cli_quote_argument(value: string) -> string {
+    let slash = "\\";
+    let quote = "\"";
+    if (value.length() > 0 and value.index(" ") < 0 and
+        value.index("\t") < 0 and value.index(quote) < 0) {
+        return value;
+    }
+
+    var result = quote;
+    var backslashes = 0;
+    for (0..value.length()) [const &index] {
+        let character = value.slice(index, index + 1);
+        if (character == slash) {
+            backslashes = backslashes + 1;
+            continue;
+        }
+        if (character == quote) {
+            for (0..(backslashes * 2 + 1)) [const &copyIndex] {
+                result = result + slash;
+            }
+            result = result + quote;
+        } else {
+            for (0..backslashes) [const &copyIndex] {
+                result = result + slash;
+            }
+            result = result + character;
+        }
+        backslashes = 0;
+    }
+    for (0..(backslashes * 2)) [const &copyIndex] {
+        result = result + slash;
+    }
+    return result + quote;
+}
+
+func __zeus_cli_compiler_path() -> string {
+    return Path.join(Path.dirname(Process.executablePath()), "ZeusCompiler.exe");
+}
+
+func __zeus_cli_compiler_command(arguments: list, startIndex: int) -> string {
+    var command = __zeus_cli_quote_argument(__zeus_cli_compiler_path());
+    for (0..arguments.length()) [const &index] {
+        if (index >= startIndex) {
+            command = command + " " +
+                __zeus_cli_quote_argument(arguments.get(index));
+        }
+    }
+    return command;
+}
+
+func __zeus_cli_spawn(commandLine: string) -> int {
+    let child = Process.runConsole(commandLine);
+    child.wait();
+    let exitCode = child.exitCodeOf();
+    child.close();
+    return exitCode;
+}
+
+func __zeus_cli_usage() {
+    print("Usage:");
+    print("  Zeus run <source.zeu> [compiler options]");
+    print("  Zeus build <source.zeu> [-o <output.exe>] [--opt-level 0|1|2|3|s|z] [--onefile]");
+    print("  Zeus <compiler arguments>  (legacy compiler interface)");
+}
+
+func __zeus_cli_build(arguments: list) -> int {
+    var source = "";
+    var output = "";
+    var optimization = "";
+    var onefile = false;
+    var index = 1;
+    for (index < arguments.length()) {
+        let argument = arguments.get(index);
+        if (argument == "-o" or argument == "--output") {
+            index = index + 1;
+            if (index >= arguments.length()) {
+                print("Zeus build: expected a path after " + argument);
+                return 2;
+            }
+            output = arguments.get(index);
+        } else if (argument == "--opt-level") {
+            index = index + 1;
+            if (index >= arguments.length()) {
+                print("Zeus build: expected a level after --opt-level");
+                return 2;
+            }
+            optimization = arguments.get(index);
+        } else if (argument == "--onefile") {
+            onefile = true;
+        } else if (argument.startswith("-")) {
+            print("Zeus build: unknown option " + argument);
+            return 2;
+        } else if (source == "") {
+            source = argument;
+        } else {
+            print("Zeus build: only one source file is supported");
+            return 2;
+        }
+        index = index + 1;
+    }
+
+    if (source == "") {
+        print("Zeus build: source file is required");
+        __zeus_cli_usage();
+        return 2;
+    }
+    if (onefile and output == "") {
+        print("Zeus build: --onefile requires an explicit -o output path");
+        return 2;
+    }
+
+    let root = Path.dirname(Process.executablePath());
+    let driver = Path.join(root, "zeusc.bat");
+    var batchCommand = "call " + __zeus_cli_quote_argument(driver) + " " +
+        __zeus_cli_quote_argument(source);
+    if (output != "") {
+        batchCommand = batchCommand + " -o " +
+            __zeus_cli_quote_argument(output);
+    }
+    if (optimization != "") {
+        batchCommand = batchCommand + " --opt-level " +
+            __zeus_cli_quote_argument(optimization);
+    }
+    if (onefile) batchCommand = batchCommand + " --onefile";
+
+    let commandLine = "cmd.exe /d /s /c \"" + batchCommand + "\"";
+    return __zeus_cli_spawn(commandLine);
+}
+
+func zeus_cli_main() -> int {
+    let arguments = Process.arguments();
+    if (arguments.length() == 0) {
+        __zeus_cli_usage();
+        return 0;
+    }
+
+    let command = arguments.get(0);
+    if (command == "--help" or command == "-h" or command == "help") {
+        __zeus_cli_usage();
+        return 0;
+    }
+    if (command == "run") {
+        if (arguments.length() < 2) {
+            print("Zeus run: source file is required");
+            __zeus_cli_usage();
+            return 2;
+        }
+        return __zeus_cli_spawn(
+            __zeus_cli_compiler_command(arguments, 1));
+    }
+    if (command == "build") {
+        return __zeus_cli_build(arguments);
+    }
+
+    // Keep the old compiler entry usable while existing scripts migrate.
+    return __zeus_cli_spawn(
+        __zeus_cli_compiler_command(arguments, 0));
+}

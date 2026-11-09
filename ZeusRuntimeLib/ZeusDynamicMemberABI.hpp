@@ -134,6 +134,26 @@ void zeus_value_dynamic_member_call(
     const ZeusValue* const* arguments
 );
 
+// Safe navigation: a nil receiver short-circuits to nil instead of
+// dispatching. Arguments are borrowed (as in the plain call), so the nil
+// path releases nothing.
+void zeus_value_dynamic_safe_member_call(
+    ZeusValue* out,
+    const ZeusValue* receiver,
+    const char* method_name,
+    int32_t argc,
+    const ZeusValue* const* arguments
+);
+
+// Safe navigation for attribute loads: nil receiver short-circuits to nil.
+void zeus_value_dynamic_safe_attribute_load(
+    ZeusValue* out,
+    const ZeusValue* receiver,
+    const char* member_name,
+    int32_t line,
+    ZeusClosureInvoke method_invoke
+);
+
 // DICT_LOAD_VALUE and DICT_STORE_VALUE can represent a runtime class
 // subscript as well as a built-in array or dictionary operation.
 void zeus_value_subscript_load(

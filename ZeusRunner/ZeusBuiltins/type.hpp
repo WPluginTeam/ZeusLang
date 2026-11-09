@@ -96,6 +96,10 @@ namespace ZeusBuiltins {
                 result = val.toString();
             }
         }
+        else if (std::holds_alternative<ZeusType::Bytes>(v)) {
+            result = ZeusVMUtils::bytesToDebugString(
+                std::get<ZeusType::Bytes>(v), (size_t)-1);
+        }
         else if (std::holds_alternative<ZeusType::Variant>(v)) {
             const auto& var = std::get<ZeusType::Variant>(v);
 
@@ -114,18 +118,24 @@ namespace ZeusBuiltins {
             const auto& objHandle = std::get<ZeusType::ObjectHandle>(v);
             std::string className = "object";
 
-            if (g_vmObjects && g_vmClasses && objHandle.id >= 0 && objHandle.id < (int)g_vmObjects->size()) {
-                const auto& obj = (*g_vmObjects)[objHandle.id];
-
-                if (obj.classId >= 0 && obj.classId < (int)g_vmClasses->size()) {
-                    className = (*g_vmClasses)[obj.classId].name;
+            if (const auto* obj = getValidObject(objHandle); obj && g_vmClasses) {
+                if (obj->classId < (int)g_vmClasses->size()) {
+                    className = (*g_vmClasses)[obj->classId].name;
                 }
             }
 
             result = "<" + className + ":#" + std::to_string(objHandle.id) + ">";
         }
+        else if (std::holds_alternative<ZeusType::LLVMClassHandle>(v)) {
+            const auto& classHandle = std::get<ZeusType::LLVMClassHandle>(v);
+            std::string className = "object";
+            if (classHandle.state && !classHandle.state->typeName.empty()) {
+                className = classHandle.state->typeName;
+            }
+            result = "<" + className + ">";
+        }
         else if (std::holds_alternative<ZeusType::ClassHandle>(v)) {
-            result = "<class:#" + std::to_string(std::get<ZeusType::ClassHandle>(v).id) + ">";
+            result = formatClassHandle(std::get<ZeusType::ClassHandle>(v));
         }
         else if (std::holds_alternative<ZeusType::NativeFuncHandle>(v)) {
             result = "<native:#" + std::to_string(std::get<ZeusType::NativeFuncHandle>(v).id) + ">";
@@ -279,7 +289,8 @@ namespace ZeusBuiltins {
             } else if (std::holds_alternative<ZeusType::Array>(var)) {
                 typeName = "Array";
             } else if (std::holds_alternative<ZeusType::Object>(var)) {
-                typeName = "object";
+                // Object 是字典值本身；类实例走下面的 ObjectHandle 分支。
+                typeName = "dict";
             } else if (std::holds_alternative<ZeusType::Bytes>(var)) {
                 typeName = "bytes";
             } else {
@@ -292,11 +303,9 @@ namespace ZeusBuiltins {
         else if (std::holds_alternative<ZeusType::ObjectHandle>(v)) {
             const auto& objHandle = std::get<ZeusType::ObjectHandle>(v);
 
-            if (g_vmObjects && g_vmClasses && objHandle.id >= 0 && objHandle.id < (int)g_vmObjects->size()) {
-                const auto& obj = (*g_vmObjects)[objHandle.id];
-
-                if (obj.classId >= 0 && obj.classId < (int)g_vmClasses->size()) {
-                    typeName = (*g_vmClasses)[obj.classId].name;
+            if (const auto* obj = getValidObject(objHandle); obj && g_vmClasses) {
+                if (obj->classId < (int)g_vmClasses->size()) {
+                    typeName = (*g_vmClasses)[obj->classId].name;
                 } else {
                     typeName = "object";
                 }

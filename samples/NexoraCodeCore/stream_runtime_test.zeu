@@ -1,0 +1,284 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.thread;
+
+import samples.NexoraCodeCore.journal;
+import samples.NexoraCodeCore.stream_runtime;
+
+func __nexora_stream_assert(value: bool, message: string) {
+    if (!value) throw new Exception("stream runtime test: " + message);
+}
+
+class NexoraRuntimeDoneWorker {
+    using &this;
+
+    func operator[@=]() -> &NexoraRuntimeDoneWorker {
+        return this;
+    }
+
+    func run(context) {
+        context.setStage("provider");
+        context.onEvent({"type": "text", "text": "hello "});
+        context.pushChunk({"type": "text", "text": "world"});
+        return {"status": "done", "rounds": 1, "toolCalls": 0,
+            "usage": {"raw_input": 4, "output": 2},
+            "messages": [{"role": "assistant", "content": "hello world"}]};
+    }
+}
+
+class NexoraRuntimeCancelWorker {
+    using &this;
+
+    func operator[@=]() -> &NexoraRuntimeCancelWorker {
+        return this;
+    }
+
+    func run(context) {
+        context.setStage("waiting");
+        for (0..100) [const &index] {
+            if (context.isCancelRequested()) return {"status": "cancelled"};
+            if (index == 0) context.pushChunk({"type": "progress", "value": 1});
+            thread_sleep(2);
+        }
+        return {"status": "done"};
+    }
+}
+
+class NexoraRuntimeManyChunkWorker {
+    using &this;
+
+    func operator[@=]() -> &NexoraRuntimeManyChunkWorker {
+        return this;
+    }
+
+    func run(context) {
+        for (0..4) [const &index] {
+            context.pushChunk({"type": "item", "value": index});
+        }
+        return {"status": "done"};
+    }
+}
+
+class NexoraRuntimeManyTextWorker {
+    using &this;
+
+    let liveContent = "";
+
+    func operator[@=]() -> &NexoraRuntimeManyTextWorker {
+        return this;
+    }
+
+    func run(context) {
+        for (0..128) [const &index] {
+            context.pushChunk({"type": "text", "text": "x"});
+        }
+        this.liveContent = context.runtime.getAccumulatedContent(context.streamId);
+        return {"status": "done"};
+    }
+}
+
+class NexoraRuntimeErrorWorker {
+    using &this;
+
+    func operator[@=]() -> &NexoraRuntimeErrorWorker {
+        return this;
+    }
+
+    func run(context) {
+        throw new Exception("worker failed");
+    }
+}
+
+class NexoraRuntimeCapturedWorker {
+    using &this;
+
+    let payload = nil;
+
+    func init(payloadValue) {
+        this.payload = payloadValue;
+    }
+
+    func operator[@=]() -> &NexoraRuntimeCapturedWorker {
+        return this;
+    }
+
+    func run(context) {
+        context.pushChunk({"type": "progress", "value": 1});
+        return {"status": "done"};
+    }
+}
+
+class NexoraRuntimeCapturedErrorWorker {
+    using &this;
+
+    let payload = nil;
+
+    func init(payloadValue) {
+        this.payload = payloadValue;
+    }
+
+    func operator[@=]() -> &NexoraRuntimeCapturedErrorWorker {
+        return this;
+    }
+
+    func run(context) {
+        throw new Exception("captured worker failed");
+    }
+}
+
+func __nexora_runtime_find_event(chunks, eventType: string) -> bool {
+    for (chunks) [chunk] {
+        if (dict_get(chunk, "type", "") == eventType) return true;
+    }
+    return false;
+}
+
+func testStreamRuntime(root: string) {
+    let journal = new NexoraCoreTaskJournal(root + "/runtime");
+    let runtime = new NexoraCoreStreamRuntime(journal, 16, 2);
+    let worker = new NexoraRuntimeDoneWorker();
+    let streamId = runtime.startSession("conv-runtime", worker.run,
+        {"provider": "test", "model": "offline", "api_key": "must-not-persist"});
+    __nexora_stream_assert(runtime.joinSession(streamId, 5000), "completed worker must join");
+
+    let meta = runtime.getSessionMeta(streamId);
+    __nexora_stream_assert(dict_get(meta, "status", "") == "done", "worker status must finish");
+    __nexora_stream_assert(dict_get(meta, "stage", "") == "done", "terminal stage must be saved");
+    __nexora_stream_assert(dict_get(meta, "last_seq", 0) == 3, "events must receive monotonic sequence numbers");
+    __nexora_stream_assert(dict_get(meta["metadata"], "provider", "") == "test",
+        "safe request metadata must be retained");
+    __nexora_stream_assert(dict_get(meta["metadata"], "api_key", nil) == nil,
+        "credential fields must not be persisted");
+    __nexora_stream_assert(runtime.records[0]["contentParts"].length() == 0,
+        "completed sessions must release their in-memory text fragments");
+    __nexora_stream_assert(runtime.getAccumulatedContent(streamId) == "hello world",
+        "text events must be accumulated");
+    let read = runtime.readSessionChunks(streamId, 0, 16);
+    __nexora_stream_assert(dict_get(read, "gap", true) == false, "initial cursor must not have a gap");
+    __nexora_stream_assert(read["chunks"].length() == 3, "events and terminal frame must be replayed");
+    __nexora_stream_assert(__nexora_runtime_find_event(read["chunks"], "task_finished"),
+        "terminal event must be in the replay log");
+
+    let reloaded = new NexoraCoreStreamRuntime(new NexoraCoreTaskJournal(root + "/runtime"), 16, 2);
+    let diskMeta = reloaded.getSessionMeta(streamId);
+    __nexora_stream_assert(dict_get(diskMeta, "status", "") == "done",
+        "finished session metadata must survive runtime recreation");
+    __nexora_stream_assert(reloaded.iterChunks(streamId, 0).length() == 3,
+        "journal must replay flushed chunks");
+    __nexora_stream_assert(reloaded.getAccumulatedContent(streamId) == "hello world",
+        "journal content must be joined after runtime recreation");
+
+    let textRuntime = new NexoraCoreStreamRuntime(
+        new NexoraCoreTaskJournal(root + "/text-content"), 16, 128);
+    let textWorker = new NexoraRuntimeManyTextWorker();
+    let textId = textRuntime.startSession("conv-text-content", textWorker.run);
+    __nexora_stream_assert(textRuntime.joinSession(textId, 5000),
+        "many text chunks must complete");
+    __nexora_stream_assert(textWorker.liveContent.length() == 128,
+        "active sessions must expose their accumulated text");
+    let textContent = textRuntime.getAccumulatedContent(textId);
+    __nexora_stream_assert(textContent.length() == 128 and textContent[127] == "x",
+        "many text chunks must retain their order and full content");
+    let textReloaded = new NexoraCoreStreamRuntime(
+        new NexoraCoreTaskJournal(root + "/text-content"), 16, 128);
+    __nexora_stream_assert(textReloaded.getAccumulatedContent(textId) == textContent,
+        "many text chunks must join from the persisted journal");
+
+    let bounded = new NexoraCoreStreamRuntime(new NexoraCoreTaskJournal(root + "/bounded"), 2, 99);
+    let many = new NexoraRuntimeManyChunkWorker();
+    let boundedId = bounded.startSession("conv-bounded", many.run);
+    __nexora_stream_assert(bounded.joinSession(boundedId, 5000), "bounded worker must join");
+    let gapRead = bounded.readSessionChunks(boundedId, 0, 16);
+    __nexora_stream_assert(dict_get(gapRead, "gap", false),
+        "a cursor older than memory retention must report a gap");
+    let gapEntries = bounded.iterChunks(boundedId, 0);
+    __nexora_stream_assert(gapEntries.length() == 1 and
+        dict_get(gapEntries[0]["event"], "type", "") == "task_stream_gap",
+        "task-stream adapter must report cursor gaps");
+
+    let cancellable = new NexoraCoreStreamRuntime(new NexoraCoreTaskJournal(root + "/cancel"), 16, 2);
+    let cancelWorker = new NexoraRuntimeCancelWorker();
+    let cancelId = cancellable.startSession("conv-cancel", cancelWorker.run);
+    __nexora_stream_assert(cancellable.requestCancel(cancelId), "running worker must accept cancellation");
+    __nexora_stream_assert(cancellable.joinSession(cancelId, 5000), "cancelled worker must join");
+    let cancelMeta = cancellable.getSessionMeta(cancelId);
+    __nexora_stream_assert(dict_get(cancelMeta, "status", "") == "cancelled",
+        "cancellation must win over a normal worker return");
+    let cancelRead = cancellable.readSessionChunks(cancelId, 0, 16);
+    __nexora_stream_assert(__nexora_runtime_find_event(cancelRead["chunks"], "cancelled"),
+        "cancellation marker must be visible in the live session");
+
+    let failing = new NexoraCoreStreamRuntime(new NexoraCoreTaskJournal(root + "/failure"), 16, 2);
+    let errorWorker = new NexoraRuntimeErrorWorker();
+    let errorId = failing.startSession("conv-error", errorWorker.run);
+    __nexora_stream_assert(failing.joinSession(errorId, 5000), "failing worker must join");
+    let errorMeta = failing.getSessionMeta(errorId);
+    __nexora_stream_assert(dict_get(errorMeta, "status", "") == "error",
+        "worker exceptions must become terminal error state");
+    __nexora_stream_assert(str(dict_get(errorMeta, "error", "")).index("worker failed") >= 0,
+        "worker error details must be preserved");
+
+    testRuntimeReleasesCompletedWorker(root);
+
+    let cleaned = failing.cleanupSessionsIfDue(0, 0);
+    __nexora_stream_assert(dict_get(cleaned, "memory", 0) == 1,
+        "due cleanup must remove expired terminal sessions from memory");
+    __nexora_stream_assert(failing.records.length() == 0,
+        "expired task chunks and accumulated content must leave the live runtime");
+}
+
+func __nexora_runtime_payload() -> Array {
+    let payload: Array = [];
+    for (0..128) [const &index] {
+        payload.append({"index": index, "nested": [{"value": index}]});
+    }
+    return payload;
+}
+
+func __nexora_runtime_wait_terminal(runtime, streamId: string, expected: string) {
+    let status = "";
+    for (0..5000) [const &spin] {
+        let meta = runtime.getSessionMeta(streamId);
+        status = str(dict_get(meta, "status", ""));
+        if (status == expected) return;
+        if (__nexora_runtime_terminal_status(status)) break;
+        thread_sleep(1);
+    }
+    __nexora_stream_assert(status == expected,
+        "captured worker did not reach " + expected + " status");
+}
+
+func testRuntimeReleasesCompletedWorker(root: string) {
+    let runtime = new NexoraCoreStreamRuntime(
+        new NexoraCoreTaskJournal(root + "/worker-release"), 16, 2);
+
+    __gc_collect();
+    let baseline = __gc_native_nodes();
+    let payload = __nexora_runtime_payload();
+    let worker = new NexoraRuntimeCapturedWorker(payload);
+    let streamId = runtime.startSession("conv-worker-release", worker.run);
+    worker = nil;
+    payload = nil;
+    __nexora_runtime_wait_terminal(runtime, streamId, "done");
+    thread_sleep(20);
+    let afterSuccess = __gc_collect();
+    __nexora_stream_assert(afterSuccess <= baseline + 64,
+        "completed worker callback must release its captured object graph before join");
+
+    __nexora_stream_assert(runtime.joinSession(streamId, 5000),
+        "completed captured worker must remain joinable");
+    __gc_collect();
+    let errorBaseline = __gc_native_nodes();
+    payload = __nexora_runtime_payload();
+    let errorWorker = new NexoraRuntimeCapturedErrorWorker(payload);
+    let errorId = runtime.startSession("conv-worker-error-release", errorWorker.run);
+    errorWorker = nil;
+    payload = nil;
+    __nexora_runtime_wait_terminal(runtime, errorId, "error");
+    thread_sleep(20);
+    let afterError = __gc_collect();
+    __nexora_stream_assert(afterError <= errorBaseline + 64,
+        "failed worker callback must release its captured object graph before join");
+    __nexora_stream_assert(runtime.joinSession(errorId, 5000),
+        "failed captured worker must remain joinable");
+}

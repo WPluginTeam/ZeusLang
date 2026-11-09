@@ -1,0 +1,60 @@
+import zeus.requests [&];
+
+func assert(condition: bool, message: string = "assertion failed") {
+    if (!condition) {
+        throw new Exception(message);
+    }
+}
+
+// 1. Response unit tests
+let r = new Response();
+r.status_code = 200;
+r.reason = "OK";
+r.headers.set("content-type", "application/json");
+r.headers.set("x-custom", "zeus");
+r.content = bytes("{\"status\": \"ok\", \"count\": 42}");
+
+assert(r.ok() == true);
+assert(r.text() == "{\"status\": \"ok\", \"count\": 42}");
+let parsed = r.json();
+assert(parsed["status"] == "ok");
+assert(parsed["count"] == 42);
+assert(r.getHeader("Content-Type") == "application/json");
+assert(r.getHeader("X-Custom") == "zeus");
+assert(r.getHeader("Missing", "default_val") == "default_val");
+print("checkpoint 1");
+
+// 2. URL and query params with dict? = nil
+let u1 = requests.__requests_url("http://example.com:8080/api/v1");
+assert(u1.host == "example.com");
+assert(u1.port == 8080);
+assert(u1.target == "/api/v1");
+print("checkpoint 2");
+
+let u2 = requests.__requests_url("https://example.com/search", {"q": "zeus lang", "page": 1});
+assert(u2.host == "example.com");
+assert(u2.port == 443);
+assert(u2.target.startswith("/search?"));
+print("checkpoint 3");
+
+// 3. Invalid method caught by `when`
+let caughtMethod = false;
+try {
+    requests.request("FOOBAR", "http://example.com");
+} catch (&e) {
+    caughtMethod = true;
+}
+assert(caughtMethod == true);
+print("checkpoint 4");
+
+// 4. Invalid timeout caught by `when`
+let caughtTimeout = false;
+try {
+    requests.request("GET", "http://example.com", nil, nil, nil, "not_a_number");
+} catch (&e) {
+    caughtTimeout = true;
+}
+assert(caughtTimeout == true);
+print("checkpoint 5");
+
+print("REQUESTS_UNIT_TESTS_PASS");

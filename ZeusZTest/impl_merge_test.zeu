@@ -1,0 +1,31 @@
+import zeus.exception;
+
+// 后写的 impl 块要合并进已有的类型实现，而不是覆盖它。
+// 实例方法必须在 impl 块里写 `using &this;`；不写的话编译器按静态函数处理
+// （P0044 警告），只能通过 bytes.xxx() 调用。
+
+impl bytes {
+    using &this;
+
+    func mergedInstance() -> int {
+        return this.length() + 1;
+    }
+}
+
+impl bytes {
+    func mergedStatic() -> string {
+        return "merged-static";
+    }
+}
+
+let value = b"abcd";
+
+if (value.mergedInstance() != 5) throw new Exception("merged instance method");
+if (bytes.mergedStatic() != "merged-static") throw new Exception("merged static method");
+
+// 合并不能把库里原有成员挤掉。
+if (value.length() != 4) throw new Exception("library method survived the merge");
+if (value[0] != 97) throw new Exception("library operator survived the merge");
+if (value.slice(1, 3).length() != 2) throw new Exception("library slice survived");
+
+print("IMPL_MERGE_PASS");

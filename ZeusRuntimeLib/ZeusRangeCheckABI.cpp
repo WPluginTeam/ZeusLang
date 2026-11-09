@@ -2,6 +2,7 @@
 
 #include "ZeusABIInternal.hpp"
 #include "ZeusVariant.hpp"
+#include "ZeusSignedInteger.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -74,6 +75,21 @@ const ZeusType::BigInteger* getBigInteger(
 }
 
 } // namespace
+
+extern "C" int64_t zeus_checked_signed_integer(int64_t value, int32_t bits) {
+    return ZeusSignedInteger::require(value, bits);
+}
+
+extern "C" int64_t zeus_value_require_signed_integer(const ZeusValue* value, int32_t bits) {
+    if (value && (value->tag == ZEUS_VALUE_TAG_INT64 ||
+                  value->tag == ZEUS_VALUE_TAG_REF_INT64)) {
+        return ZeusSignedInteger::require(zeus_value_require_i64(value), bits);
+    }
+    if (!value) throw std::runtime_error("Null signed integer value");
+    OwnedZeusBox box(zeus_value_to_box(value), &zeus_box_release);
+    if (!box) throw std::runtime_error("Invalid signed integer value");
+    return ZeusSignedInteger::require(box->v, bits);
+}
 
 extern "C" void zeus_range_check_i64(
     int64_t value,

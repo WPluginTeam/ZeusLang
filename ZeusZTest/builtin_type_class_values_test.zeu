@@ -1,0 +1,24 @@
+print(string);
+print(dict);
+
+if (type(string) != "class") throw "string is not exposed as a class value";
+if (type(dict) != "class") throw "dict is not exposed as a class value";
+if (str(string) != "<class 'string'>") {
+    throw "string class value did not stringify by name";
+}
+if (str(dict) != "<class 'dict'>") {
+    throw "dict class value did not stringify by name";
+}
+
+let text: string = "string construction remains available";
+if (text != "string construction remains available") {
+    throw "string type annotation or literal behavior changed";
+}
+let constructed = new string("native string construction remains available");
+if (constructed != "native string construction remains available") {
+    throw "native string constructor behavior changed";
+}
+let values: dict = {"alpha": 1};
+if (values["alpha"] != 1) throw "native dict behavior changed";
+
+print("BUILTIN_TYPE_CLASS_VALUES_PASS");

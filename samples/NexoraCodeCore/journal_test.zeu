@@ -1,0 +1,217 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.json;
+
+import samples.NexoraCodeCore.journal;
+import samples.NexoraCodeCore.task_stream;
+
+// 事件日志（S6）的契约测试：元数据原子写、事件追加、游标续读、重启标记、
+// 任务列表顺序、保留策略，最后端到端接上 S5 的任务流中继。
+var const JOURNAL_RUNNING = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+var const JOURNAL_DONE = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+var const JOURNAL_STALE = "ffeeddccbbaa99887766554433221100";
+var const JOURNAL_OVERFLOW = "0123456789abcdef0123456789abcdef";
+var const JOURNAL_STREAM = "11223344556677889900aabbccddeeff";
+var const JOURNAL_SUBSCRIPTION = "99887766554433221100ffeeddccbbaa";
+
+class FakeJournalConnection {
+    using &this;
+
+    let sent = [];
+
+    func operator[@=]() -> &FakeJournalConnection {
+        return this;
+    }
+
+    func sendText(text: string) {
+        this.sent.append(text);
+    }
+}
+
+func __journal_test_contains(values, wanted) -> bool {
+    for (values) [value] {
+        if (value == wanted) return true;
+    }
+    return false;
+}
+
+func __journal_test_frames(connection, fromIndex, wantedType) -> int {
+    let count = 0;
+    for (0..connection.sent.length()) [const &index] {
+        if (index < fromIndex) continue;
+        let frame = JSON.parse(connection.sent[index]);
+        if (dict_get(frame, "type", "") == wantedType) count = count + 1;
+    }
+    return count;
+}
+
+func testTaskJournal(root: string) {
+    let journalRoot = root + "/task_events";
+    let journal = new NexoraCoreTaskJournal(journalRoot);
+
+    // 1. 元数据落盘
+    let meta = journal.saveMeta({
+        "stream_id": JOURNAL_RUNNING,
+        "status": "running",
+        "stage": "thinking",
+        "title": "跑到一半的任务"
+    });
+    if (!file.exists(journalRoot + "/" + JOURNAL_RUNNING + ".json")) {
+        throw new Exception("元数据没有落盘");
+    }
+    if (dict_get(meta, "last_seq", nil) != 0) throw new Exception("last_seq 初值不是 0");
+
+    // 2. 空日志：没有块，同进程内的 running 不能被改成 interrupted
+    let empty = journal.read(JOURNAL_RUNNING);
+    if (dict_get(empty, "chunks", []).length() != 0) throw new Exception("空日志不该有块");
+    let emptyMeta = dict_get(empty, "meta", nil);
+    if (dict_get(emptyMeta, "status", "") != "running") {
+        throw new Exception("本进程写过的任务被误标成中断");
+    }
+
+    // 3. 追加与游标
+    journal.append(JOURNAL_RUNNING, [
+        {"_stream_seq": 1, "type": "text", "text": "第一段"},
+        {"_stream_seq": 2, "type": "text", "text": "第二段"},
+        {"_stream_seq": 3, "type": "text", "text": "第三段"}
+    ]);
+
+    let all = journal.read(JOURNAL_RUNNING, 0, 100);
+    let allChunks = dict_get(all, "chunks", []);
+    if (allChunks.length() != 3) throw new Exception("应读到 3 条，实际 " + str(allChunks.length()));
+    let allMeta = dict_get(all, "meta", nil);
+    if (allMeta == nil) throw new Exception("读取没有返回元数据");
+    if (dict_get(allMeta, "last_seq", -1) != 3) {
+        throw new Exception("last_seq 没有推进到 3");
+    }
+
+    let tail = dict_get(journal.read(JOURNAL_RUNNING, 2, 100), "chunks", []);
+    if (tail.length() != 1) throw new Exception("after=2 应只读到 1 条");
+    if (dict_get(tail[0], "_stream_seq", 0) != 3) throw new Exception("游标读错了块");
+
+    let limited = dict_get(journal.read(JOURNAL_RUNNING, 0, 2), "chunks", []);
+    if (limited.length() != 2) throw new Exception("limit 没有生效");
+
+    // 4. 再批量追加，续读要能接上（不是重开文件丢内容）
+    journal.append(JOURNAL_RUNNING, [{"_stream_seq": 4, "type": "text", "text": "第四段"}]);
+    let resumed = dict_get(journal.read(JOURNAL_RUNNING, 3, 10), "chunks", []);
+    if (resumed.length() != 1) throw new Exception("续读丢了第二批");
+    if (dict_get(resumed[0], "_stream_seq", 0) != 4) throw new Exception("续读读到了旧块");
+
+    // 5. 上次进程留下的 running：读出来必须是 interrupted
+    let staleHandle = file.open(journalRoot + "/" + JOURNAL_STALE + ".json", "w");
+    staleHandle.write(JSON.stringify({
+        "stream_id": JOURNAL_STALE,
+        "status": "running",
+        "stage": "thinking",
+        "last_seq": 0
+    }));
+    staleHandle.close();
+
+    let staleMeta = dict_get(journal.read(JOURNAL_STALE), "meta", nil);
+    if (dict_get(staleMeta, "status", "") != "interrupted") throw new Exception("重启标记没生效");
+    if (dict_get(staleMeta, "error", "") == "") throw new Exception("中断原因缺失");
+    if (dict_get(staleMeta, "title", "") != "") throw new Exception("元数据出现了没写过的字段");
+
+    // 6. 非法任务号直接拒绝，避免拼出目录外的路径
+    let rejected = false;
+    try {
+        journal.read("../escape");
+    } catch (&error) {
+        rejected = true;
+    }
+    if (!rejected) throw new Exception("非法任务号应被拒绝");
+
+    // 7. 任务列表新的在前
+    journal.saveMeta({
+        "stream_id": JOURNAL_DONE,
+        "status": "finished",
+        "title": "做完的任务",
+        "last_seq": 5
+    });
+    let listed = journal.recent(10);
+    if (listed.length() < 3) throw new Exception("任务列表少了任务，实际 " + str(listed.length()));
+    if (dict_get(listed[0], "stream_id", "") != JOURNAL_DONE) {
+        throw new Exception("任务列表没按时间倒序");
+    }
+
+    // 8. 过期清理：非本进程的任务被删，运行中的留下
+    let expired = journal.purgeExpired(0, 100);
+    if (!__journal_test_contains(expired, JOURNAL_STALE)) {
+        throw new Exception("过期任务没有被清理");
+    }
+    if (!file.exists(journalRoot + "/" + JOURNAL_RUNNING + ".json")) {
+        throw new Exception("运行中的日志被删了");
+    }
+
+    // 9. 超量清理：maxFiles=0 时非本进程的日志全部清掉
+    let overflowHandle = file.open(journalRoot + "/" + JOURNAL_OVERFLOW + ".json", "w");
+    overflowHandle.write(JSON.stringify({
+        "stream_id": JOURNAL_OVERFLOW,
+        "status": "finished",
+        "last_seq": 1
+    }));
+    overflowHandle.close();
+
+    let pruned = journal.purgeExpired(365, 0);
+    if (!__journal_test_contains(pruned, JOURNAL_OVERFLOW)) {
+        throw new Exception("超量清理没生效");
+    }
+    if (!file.exists(journalRoot + "/" + JOURNAL_RUNNING + ".json")) {
+        throw new Exception("超量清理删了运行中的日志");
+    }
+
+    // 10. 端到端：日志 -> 宿主适配 -> S5 中继
+    let host = new NexoraCoreJournalTaskStream(journal);
+    let handler = new NexoraCoreTaskStreamHandler(host);
+    let connection = new FakeJournalConnection();
+
+    journal.saveMeta({"stream_id": JOURNAL_STREAM, "status": "finished", "title": "端到端"});
+    journal.append(JOURNAL_STREAM, [
+        {"_stream_seq": 1, "type": "text", "text": "第一段"},
+        {"_stream_seq": 2, "type": "text", "text": "第二段"}
+    ]);
+
+    let frame = {
+        "subscription_id": JOURNAL_SUBSCRIPTION,
+        "stream_id": JOURNAL_STREAM,
+        "after_seq": 0
+    };
+    if (!handler.handleSubscribe(frame, connection)) throw new Exception("订阅失败");
+
+    let events = __journal_test_frames(connection, 0, "task_event");
+    if (events != 2) throw new Exception("端到端应推 2 条 task_event，实际 " + str(events));
+
+    for (connection.sent) [text] {
+        let parsed = JSON.parse(text);
+        if (dict_get(parsed, "type", "") != "task_event") continue;
+        let event = dict_get(parsed, "event", nil);
+        if (event == nil) throw new Exception("task_event 没有事件体");
+        if (dict_get(event, "_stream_seq", nil) != nil) {
+            throw new Exception("转发给宿主的事件不该带 _stream_seq");
+        }
+    }
+
+    // 游标前进后 pump 不重发旧块
+    let beforePump = connection.sent.length();
+    handler.pump(connection);
+    if (__journal_test_frames(connection, beforePump, "task_event") != 0) {
+        throw new Exception("pump 重发了旧事件");
+    }
+
+    // 新事件追加后 pump 推一条
+    journal.append(JOURNAL_STREAM, [{"_stream_seq": 3, "type": "text", "text": "第三段"}]);
+    let afterAppend = connection.sent.length();
+    handler.pump(connection);
+    if (__journal_test_frames(connection, afterAppend, "task_event") != 1) {
+        throw new Exception("pump 没有推出新事件");
+    }
+
+    // 11. 收尾：删掉测试创建的任务与目录
+    handler.stopAll();
+    for ([JOURNAL_RUNNING, JOURNAL_DONE, JOURNAL_STREAM]) [streamId] {
+        journal.removeTask(streamId);
+    }
+    if (file.exists(journalRoot)) file.removeDir(journalRoot);
+}

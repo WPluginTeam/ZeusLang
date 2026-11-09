@@ -11,6 +11,9 @@
 import zeus.exception;
 import zeus.list;
 
+@native("zeus_native_time_monotonic_ns", from="ZeusNativeRuntime")
+decl func __time_monotonic_ns() -> int64;
+
 var _Global_Thread_Pool = [];
 
 @native("zeus_thread_create")
@@ -87,6 +90,13 @@ decl func __mutex_destroy(mutexId: int) -> bool;
 class Lock {
     using &this;
     
+
+    // 引用语义：本类持有原生资源或共享表项。值语义下「读字段」就会复制一份，
+    // 副本析构时 [~] 会把同一个句柄释放掉（或把状态写在快照上）。
+    func operator[@=]() -> &Lock {
+        return this;
+    }
+
     let _mutex_id = -1;
     let _locked = false;
     
@@ -125,9 +135,21 @@ class Lock {
     // 使用锁执行函数（自动获取和释放锁）
     func with(fn) {
         this.acquire();
-        let result = fn();
+        try {
+            return fn();
+        } fin {
+            this.release();
+        }
+    }
+
+    func operator[with] () {
+        this.acquire();
+        return nil;
+    }
+
+    func operator[~with] () {
         this.release();
-        return result;
+        return nil;
     }
     
     // 检查锁是否被当前持有
@@ -187,6 +209,13 @@ func lock_destroy(mutexId) {
 class RLock {
     using &this;
     
+
+    // 引用语义：本类持有原生资源或共享表项。值语义下「读字段」就会复制一份，
+    // 副本析构时 [~] 会把同一个句柄释放掉（或把状态写在快照上）。
+    func operator[@=]() -> &RLock {
+        return this;
+    }
+
     let _mutex_id = -1;
     let _owner_thread = -1;
     let _count = 0;
@@ -243,9 +272,21 @@ class RLock {
     
     func with(fn) {
         this.acquire();
-        let result = fn();
+        try {
+            return fn();
+        } fin {
+            this.release();
+        }
+    }
+
+    func operator[with] () {
+        this.acquire();
+        return nil;
+    }
+
+    func operator[~with] () {
         this.release();
-        return result;
+        return nil;
     }
     
     func operator[~]() {
@@ -268,6 +309,13 @@ class RLock {
 class Semaphore {
     using &this;
     
+
+    // 引用语义：本类持有原生资源或共享表项。值语义下「读字段」就会复制一份，
+    // 副本析构时 [~] 会把同一个句柄释放掉（或把状态写在快照上）。
+    func operator[@=]() -> &Semaphore {
+        return this;
+    }
+
     let _mutex_id = -1;
     let _count = 0;
     let _max_count = 1;
@@ -337,6 +385,13 @@ class Semaphore {
 class Event {
     using &this;
     
+
+    // 引用语义：本类持有原生资源或共享表项。值语义下「读字段」就会复制一份，
+    // 副本析构时 [~] 会把同一个句柄释放掉（或把状态写在快照上）。
+    func operator[@=]() -> &Event {
+        return this;
+    }
+
     let _mutex_id = -1;
     let _flag = false;
     
@@ -366,24 +421,45 @@ class Event {
         return f;
     }
     
-    // 等待事件被设置（阻塞）
+    // 等待事件被设置（阻塞，可带超时）
     // timeout: 超时毫秒数，-1 表示无限等待
-    // 返回: true 如果事件被设置，false 如果超时
-    func wait(timeout=-1) {
-        let start = 0;  // TODO: 需要 __time_ms() 函数
-        
-        for (true) {
-            __mutex_lock(this._mutex_id);
-            if (this._flag) {
-                __mutex_unlock(this._mutex_id);
-                return true;
-            }
-            __mutex_unlock(this._mutex_id);
-            
-            // TODO: 实现超时检查
-            // 目前只支持无限等待
-            __thread_sleep(1);
+    // 返回: true 表示事件已被设置，false 表示等待超时
+    // 期限用单调时钟计算，系统时间调整不会让等待提前或延后结束。
+    func wait(timeout=-1) -> bool {
+        let deadline = -1;
+        let bounded = false;
+
+        if (timeout != nil and timeout >= 0) {
+            deadline = __time_monotonic_ns() + timeout * 1000000;
+            bounded = true;
         }
+
+        // 长等待退避轮询：1ms 起步翻倍到 8ms（30s 从 3 万次唤醒降到约 4 千次）；
+        // 短等待（< 50ms）保持 1ms，调用方依赖它的精度。
+        let pollMillis = 1;
+        let adaptive = !bounded or (timeout != nil and timeout >= 50);
+        let signalled = false;
+
+        for (!signalled) {
+            __mutex_lock(this._mutex_id);
+            signalled = this._flag;
+            __mutex_unlock(this._mutex_id);
+
+            if (!signalled) {
+                // 检查期限放在解锁之后，set() 仍能在这个间隙里把事件置起来。
+                if (deadline >= 0 and __time_monotonic_ns() >= deadline) {
+                    return false;
+                }
+
+                __thread_sleep(pollMillis);
+
+                if (adaptive and pollMillis < 8) {
+                    pollMillis = pollMillis * 2;
+                }
+            }
+        }
+
+        return true;
     }
     
     func operator[~]() {
@@ -400,6 +476,13 @@ class Event {
 class Barrier {
     using &this;
     
+
+    // 引用语义：本类持有原生资源或共享表项。值语义下「读字段」就会复制一份，
+    // 副本析构时 [~] 会把同一个句柄释放掉（或把状态写在快照上）。
+    func operator[@=]() -> &Barrier {
+        return this;
+    }
+
     let _mutex_id = -1;
     let _parties = 0;      // 需要等待的线程数
     let _waiting = 0;      // 当前等待的线程数
@@ -572,6 +655,13 @@ class ThreadPoolTask {
 class ThreadPool {
     using &this;
     
+
+    // 引用语义：本类持有原生资源或共享表项。值语义下「读字段」就会复制一份，
+    // 副本析构时 [~] 会把同一个句柄释放掉（或把状态写在快照上）。
+    func operator[@=]() -> &ThreadPool {
+        return this;
+    }
+
     let _workers = [];
     let _size = 0;
     let _tasks: PriorityQueue;
@@ -723,6 +813,13 @@ class ThreadPool {
 class Thread {
     using &this;
 
+
+    // 引用语义：本类持有原生资源或共享表项。值语义下「读字段」就会复制一份，
+    // 副本析构时 [~] 会把同一个句柄释放掉（或把状态写在快照上）。
+    func operator[@=]() -> &Thread {
+        return this;
+    }
+
     let _Thread_ID = -1;
     let _is_alive = false;
     let _has_started = false;
@@ -765,6 +862,16 @@ class Thread {
         // 直接传递 target 闭包启动线程
     }
 
+    func operator[with] () {
+        this.start();
+        return nil;
+    }
+
+    func operator[~with] () {
+        this.join();
+        return nil;
+    }
+
     func getName() {
         if (this._Thread_ID >= 0) {
             return __thread_get_name(this._Thread_ID);
@@ -781,18 +888,27 @@ class Thread {
         }
     }
 
-    func join () {
-        if (this._Thread_ID >= 0) {
-            let joined = __thread_join(this._Thread_ID);
-            this._is_alive = false;
-            this._Thread_ID = -1;
-            // The runtime has finished with its cloned task context. Release
-            // this Thread's copy now so bound-method captures do not stay alive.
-            this.target = nil;
-            this.args = [];
-            return joined;
+    // timeout: 毫秒；-1 表示一直等到线程结束。返回 true 表示线程已经结束。
+    func join (timeout: int = -1) {
+        if (this._Thread_ID < 0) return false;
+
+        if (timeout >= 0) {
+            let deadline = __time_monotonic_ns() + timeout * 1000000;
+
+            for (__thread_is_alive(this._Thread_ID)) {
+                if (__time_monotonic_ns() >= deadline) return false;
+                __thread_sleep(1);
+            }
         }
-        return false;
+
+        let joined = __thread_join(this._Thread_ID);
+        this._is_alive = false;
+        this._Thread_ID = -1;
+        // The runtime has finished with its cloned task context. Release
+        // this Thread's copy now so bound-method captures do not stay alive.
+        this.target = nil;
+        this.args = [];
+        return joined;
     }
 
     func eliminate () {

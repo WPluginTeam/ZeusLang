@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -8,6 +10,7 @@
 #include <vector>
 
 #include "TypeInfer.hpp"
+#include "ReceiverReturnInference.hpp"
 #include "../ZeusParser/GenericCallSyntax.hpp"
 #include "../ZeusParser/AstElementView.hpp"
 #include "../ZeusBuiltins/BuiltinRegistry.hpp"
@@ -30,7 +33,8 @@ namespace ZeusTypeInfer {
         GenericTypeArgumentMismatch,
         GenericTypeArgumentUnknown,
         GenericTypeParameterNameInvalid,
-        GenericTypeParameterUnsupportedContext
+        GenericTypeParameterUnsupportedContext,
+        ReceiverReturnTypeAmbiguous
     };
 
     struct TypeCheckDiagnostic {
@@ -93,6 +97,10 @@ namespace ZeusTypeInfer {
             bool hasReturn = false;
             bool expectedReturnIsReference = false;
             std::string expectedReturnTypeName;
+            bool expectedReturnNullable = false;
+            std::string inferredReceiverAlias;
+            bool hasReceiverReturn = false;
+            bool hasOtherReturn = false;
         };
 
         const std::vector<TreeParser::NodeAndBlock>& nodes;
@@ -139,7 +147,8 @@ namespace ZeusTypeInfer {
 
         static bool sameFlowType(const TypeInfo& left, const TypeInfo& right) {
             return left.isResolved() == right.isResolved() &&
-                left.type == right.type;
+                left.type == right.type &&
+                left.type.nullable == right.type.nullable;
         }
 
         static bool sameFunctionReturnInfos(
@@ -163,6 +172,15 @@ namespace ZeusTypeInfer {
             const TypeInfo& right
         ) const {
             if (sameFlowType(left, right)) return left;
+            // Two branches that only disagree on nilability keep their base
+            // type. The result is nullable because one path may carry nil.
+            if (left.isResolved() == right.isResolved() &&
+                left.type == right.type) {
+                TypeInfo merged = left;
+                merged.type.nullable =
+                    left.type.nullable || right.type.nullable;
+                return merged;
+            }
             if (left.type.kind == InferredType::Object &&
                 right.type.kind == InferredType::Nil) {
                 return left;
@@ -186,11 +204,23 @@ namespace ZeusTypeInfer {
             const std::string& typeName,
             const std::unordered_map<std::string, std::string>& substitutions
         ) {
-            const bool isReference = !typeName.empty() && typeName.front() == '&';
-            const std::string baseType = isReference ? typeName.substr(1) : typeName;
+            if (typeName.empty()) return typeName;
+            const bool isReference = typeName.front() == '&';
+            const std::string stripped = isReference ? typeName.substr(1) : typeName;
+            const bool isNullable = !stripped.empty() && stripped.back() == '?';
+            const std::string baseType = isNullable ? stripped.substr(0, stripped.size() - 1) : stripped;
+
+            auto formatResult = [&](const std::string& substitutedBase) {
+                std::string res;
+                if (isReference) res += '&';
+                res += substitutedBase;
+                if (isNullable) res += '?';
+                return res;
+            };
+
             const auto found = substitutions.find(baseType);
             if (found != substitutions.end()) {
-                return (isReference ? "&" : "") + found->second;
+                return formatResult(found->second);
             }
 
             std::string genericBase;
@@ -210,15 +240,18 @@ namespace ZeusTypeInfer {
 
             const std::string specialized = ZeusTypeInfer::genericSpecializationName(
                 genericBase, genericArguments);
-            return (isReference ? "&" : "") + specialized;
+            return formatResult(specialized);
         }
 
         static bool containsGenericTypeParameter(
             const std::string& typeName,
             const std::vector<std::string>& parameters
         ) {
-            const std::string baseType = !typeName.empty() && typeName.front() == '&'
-                ? typeName.substr(1) : typeName;
+            if (typeName.empty()) return false;
+            std::string baseType = typeName.front() == '&' ? typeName.substr(1) : typeName;
+            if (!baseType.empty() && baseType.back() == '?') {
+                baseType.pop_back();
+            }
             if (std::find(parameters.begin(), parameters.end(), baseType) !=
                 parameters.end()) {
                 return true;
@@ -416,9 +449,16 @@ namespace ZeusTypeInfer {
         }
 
         InferredType parseDeclaredType(const std::string& name) const {
-            InferredType type = parseTypeName(name);
+            // The nullable suffix is handled by parseDeclaredTypeRef; the
+            // bare kind query ignores it so `Node?` resolves like `Node`.
+            std::string strippedName = name;
+            if (!strippedName.empty() && strippedName.back() == '?') {
+                strippedName.pop_back();
+            }
+            InferredType type = parseTypeName(strippedName);
             const std::string baseName =
-                !name.empty() && name.front() == '&' ? name.substr(1) : name;
+                !strippedName.empty() && strippedName.front() == '&'
+                    ? strippedName.substr(1) : strippedName;
             if (activeTypeParameters.count(baseName) != 0) {
                 return InferredType::TypeParameter;
             }
@@ -433,12 +473,20 @@ namespace ZeusTypeInfer {
         }
 
         TypeRef parseDeclaredTypeRef(const std::string& name) const {
-            TypeRef result = parseTypeRef(name);
+            // Strip the nullable suffix first so the base name resolves
+            // exactly like its non-nullable spelling (`int?` like `int`).
+            std::string baseName = name;
+            bool nullable = false;
+            if (!baseName.empty() && baseName.back() == '?') {
+                nullable = true;
+                baseName.pop_back();
+            }
+            TypeRef result = parseTypeRef(baseName);
+            result.nullable = nullable;
             const InferredType type = parseDeclaredType(
-                result.isReference ? name.substr(1) : name
+                result.isReference ? baseName.substr(1) : baseName
             );
             result.kind = type;
-            const std::string baseName = result.isReference ? name.substr(1) : name;
             if (type == InferredType::TypeParameter) {
                 result.namedType = baseName;
             }
@@ -530,9 +578,114 @@ namespace ZeusTypeInfer {
             return false;
         }
 
+        struct ConditionalParts {
+            size_t question = 0;
+            size_t colon = 0;
+            bool elvis = false;
+        };
+
+        static bool findTopLevelConditional(
+            const std::vector<LexerType::Token>& tokens,
+            ConditionalParts& parts
+        ) {
+            int parenDepth = 0;
+            int bracketDepth = 0;
+            int braceDepth = 0;
+            int nestedConditionals = 0;
+            bool foundQuestion = false;
+
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                if (isOperator(tokens[i], "(")) ++parenDepth;
+                else if (isOperator(tokens[i], ")")) --parenDepth;
+                else if (isOperator(tokens[i], "[")) ++bracketDepth;
+                else if (isOperator(tokens[i], "]")) --bracketDepth;
+                else if (isOperator(tokens[i], "{")) ++braceDepth;
+                else if (isOperator(tokens[i], "}")) --braceDepth;
+
+                if (parenDepth != 0 || bracketDepth != 0 || braceDepth != 0) continue;
+
+                if (isOperator(tokens[i], "?")) {
+                    if (i + 1 < tokens.size() && isOperator(tokens[i + 1], ".")) continue;
+                    if (!foundQuestion) {
+                        foundQuestion = true;
+                        parts.question = i;
+                        if (i + 1 < tokens.size() && isOperator(tokens[i + 1], ":")) {
+                            parts.colon = i + 1;
+                            parts.elvis = true;
+                            return true;
+                        }
+                    } else {
+                        ++nestedConditionals;
+                    }
+                } else if (foundQuestion && isOperator(tokens[i], ":")) {
+                    if (nestedConditionals > 0) {
+                        --nestedConditionals;
+                    } else {
+                        parts.colon = i;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        static TypeInfo mergeConditionalBranchTypes(
+            const TypeInfo& left,
+            const TypeInfo& right,
+            bool elvis
+        ) {
+            if (left.isDynamic() || right.isDynamic()) return TypeInfo::dynamic();
+            if (!left.isResolved() || !right.isResolved()) return TypeInfo::unresolved();
+
+            if (left.type.kind == InferredType::Nil &&
+                right.type.kind == InferredType::Nil) {
+                return TypeInfo::fromType(TypeRef(InferredType::Nil));
+            }
+            if (left.type.kind == InferredType::Nil) {
+                TypeRef result = right.type;
+                if (!elvis) result.nullable = true;
+                return TypeInfo::fromType(std::move(result));
+            }
+            if (right.type.kind == InferredType::Nil) {
+                TypeRef result = left.type;
+                result.nullable = elvis
+                    ? left.type.nullable
+                    : true;
+                return TypeInfo::fromType(std::move(result));
+            }
+
+            if (left.type == right.type) {
+                TypeRef result = left.type;
+                result.nullable = elvis
+                    ? left.type.nullable && right.type.nullable
+                    : left.type.nullable || right.type.nullable;
+                return TypeInfo::fromType(std::move(result));
+            }
+
+            if (isNumeric(left.type.kind) && isNumeric(right.type.kind)) {
+                const InferredType commonType =
+                    left.type.kind == InferredType::Float ||
+                    right.type.kind == InferredType::Float
+                        ? InferredType::Float
+                        : left.type.kind == InferredType::BigInt ||
+                          right.type.kind == InferredType::BigInt
+                            ? InferredType::BigInt
+                            : InferredType::Int;
+                TypeRef result(commonType);
+                result.nullable = elvis
+                    ? left.type.nullable && right.type.nullable
+                    : left.type.nullable || right.type.nullable;
+                return TypeInfo::fromType(std::move(result));
+            }
+
+            return TypeInfo::dynamic();
+        }
+
         TypeInfo inferExpressionInfo(
             const std::vector<LexerType::Token>& expression,
-            const Environment& environment
+            const Environment& environment,
+            bool preserveReference = false
         ) const {
             for (size_t i = 0; i < expression.size(); ++i) {
                 if (!std::holds_alternative<LexerType::Keyword>(expression[i])) {
@@ -550,6 +703,30 @@ namespace ZeusTypeInfer {
                     binding->second.bindingNodeId != TreeParser::InvalidNodeId) {
                     observedBindingNodes.insert(binding->second.bindingNodeId);
                 }
+            }
+
+            ConditionalParts conditional;
+            if (findTopLevelConditional(expression, conditional)) {
+                if (conditional.elvis) {
+                    std::vector<LexerType::Token> value(
+                        expression.begin(), expression.begin() + conditional.question);
+                    std::vector<LexerType::Token> fallback(
+                        expression.begin() + conditional.colon + 1,
+                        expression.end());
+                    return mergeConditionalBranchTypes(
+                        inferExpressionInfo(value, environment),
+                        inferExpressionInfo(fallback, environment), true);
+                }
+
+                std::vector<LexerType::Token> whenTrue(
+                    expression.begin() + conditional.question + 1,
+                    expression.begin() + conditional.colon);
+                std::vector<LexerType::Token> whenFalse(
+                    expression.begin() + conditional.colon + 1,
+                    expression.end());
+                return mergeConditionalBranchTypes(
+                    inferExpressionInfo(whenTrue, environment),
+                    inferExpressionInfo(whenFalse, environment), false);
             }
 
             if (expression.size() >= 4 &&
@@ -733,7 +910,7 @@ namespace ZeusTypeInfer {
                         function->first);
                     if (inferred != inferredFunctionReturnInfos.end()) {
                         TypeInfo result = inferred->second;
-                        result.type.isReference = false;
+                        if (!preserveReference) result.type.isReference = false;
                         return result;
                     }
                 }
@@ -804,7 +981,7 @@ namespace ZeusTypeInfer {
                     const std::string specializedReturn = substituteGenericTypeName(
                         function->second.returnTypeName, substitutions);
                     TypeRef result = parseDeclaredTypeRef(specializedReturn);
-                    result.isReference = false;
+                    if (!preserveReference) result.isReference = false;
                     return TypeInfo::fromType(std::move(result), false, true);
                 }
 
@@ -819,7 +996,7 @@ namespace ZeusTypeInfer {
                         function->second.typeParameterNames.front());
                     if (concrete != substitutions.end()) {
                         TypeRef result = parseDeclaredTypeRef(concrete->second);
-                        result.isReference = false;
+                        if (!preserveReference) result.isReference = false;
                         return TypeInfo::fromType(std::move(result), false, true);
                     }
                     return TypeInfo::unresolved();
@@ -828,7 +1005,7 @@ namespace ZeusTypeInfer {
                 TypeRef result = function->second.returnTypeName.empty()
                     ? TypeRef(function->second.returnType)
                     : parseDeclaredTypeRef(function->second.returnTypeName);
-                result.isReference = false;
+                if (!preserveReference) result.isReference = false;
                 return TypeInfo::fromType(
                     std::move(result),
                     false,
@@ -966,6 +1143,27 @@ namespace ZeusTypeInfer {
                 }
             }
 
+            // Safe navigation `recv?.method(args)` evaluates to a dynamic
+            // value: nil short-circuits the whole call, otherwise the method
+            // runs. Only the exact single-call shape is folded here; longer
+            // chains stay unresolved and flow dynamically, matching how plain
+            // chained calls are treated. Receiver and `?.` misuse rules live
+            // in checkCallArgumentTypes, which has source positions.
+            if (expression.size() >= 6 &&
+                std::holds_alternative<LexerType::Keyword>(expression[0]) &&
+                isOperator(expression[1], "?") &&
+                isOperator(expression[2], ".") &&
+                std::holds_alternative<LexerType::Keyword>(expression[3]) &&
+                isOperator(expression[4], "(")) {
+                size_t closeParen = 4;
+                std::vector<std::vector<LexerType::Token>> safeArguments;
+                if (splitCallArguments(expression, closeParen, closeParen,
+                                        safeArguments) &&
+                    closeParen + 1 == expression.size()) {
+                    return TypeInfo::dynamic();
+                }
+            }
+
             int depth = 0;
             for (size_t i = 0; i < expression.size(); ++i) {
                 if (isOperator(expression[i], "(")) {
@@ -1038,6 +1236,11 @@ namespace ZeusTypeInfer {
                         symbol == ">" || symbol == "<=" || symbol == ">=") {
                         return TypeInfo::fromType(TypeRef(InferredType::Bool));
                     }
+                    const std::string nativeDouble = ZeusBuiltins::isNativeFloatingPointType(leftInfo.type.namedType)
+                        ? leftInfo.type.namedType : rightInfo.type.namedType;
+                    if (ZeusBuiltins::isNativeFloatingPointType(nativeDouble)) {
+                        return TypeInfo::fromType(parseDeclaredTypeRef(nativeDouble));
+                    }
                     return TypeInfo::fromType(TypeRef(
                         leftInfo.type.kind == InferredType::Float ||
                         rightInfo.type.kind == InferredType::Float
@@ -1097,11 +1300,33 @@ namespace ZeusTypeInfer {
             InferredType expected,
             const TypeInfo& actualInfo,
             const std::string& valueDescription,
-            const TypeCheckOptions& options
+            const TypeCheckOptions& options,
+            const std::string& expectedNativeType = {},
+            bool expectedNullable = false
         ) {
             const InferredType actual = actualInfo.type.kind;
 
             if (expected == InferredType::Unknown) return;
+            // A nullable target accepts nil; the runtime representation is
+            // a dynamic box in phase 1, which always holds nil.
+            if (actual == InferredType::Nil && expectedNullable) return;
+            // A nullable value must not flow into a non-nullable slot
+            // without an explicit nil check. Dynamic values stay exempt:
+            // they are already checked at runtime.
+            if (!expectedNullable && actualInfo.isKnown() &&
+                actual != InferredType::Unknown && actualInfo.type.nullable) {
+                addDiagnostic(
+                    nodeIndex,
+                    TypeCheckSeverity::Error,
+                    valueDescription + " cannot hold a nullable value; " +
+                        "check for nil first"
+                );
+                return;
+            }
+            if (ZeusBuiltins::findNativeIntegerABI(expectedNativeType) &&
+                (actual == InferredType::BigInt || actual == InferredType::Float)) return;
+            if (ZeusBuiltins::isNativeFloatingPointType(expectedNativeType) &&
+                (actual == InferredType::Int || actual == InferredType::BigInt)) return;
 
             if (actual == InferredType::Unknown) {
                 if (options.rejectUnknownExpressions) {
@@ -1134,6 +1359,23 @@ namespace ZeusTypeInfer {
                 expected.type.kind != InferredType::Bool) {
                 return false;
             }
+            if (ZeusBuiltins::isNativeFloatingPointType(expected.type.namedType) &&
+                !expected.type.isReference && !actual.type.isReference &&
+                (actual.type.kind == InferredType::Int ||
+                 actual.type.kind == InferredType::BigInt)) return true;
+            if (ZeusBuiltins::findNativeIntegerABI(expected.type.namedType) &&
+                !expected.type.isReference && !actual.type.isReference &&
+                (actual.type.kind == InferredType::BigInt ||
+                 actual.type.kind == InferredType::Float)) return true;
+            // A plain `object` parameter accepts dictionary values, mirroring
+            // the runtime isCompatible rule. The annotation carries no class
+            // name here (namedType stays empty unless it names a class), so
+            // class-typed parameters still require an exact match below.
+            // This also covers `: Dict` declarations, which resolve to the
+            // same (Object, "") shape.
+            if (expected.type.kind == InferredType::Object &&
+                expected.type.namedType.empty() &&
+                actual.type.kind == InferredType::Dict) return true;
             if (expected.type.kind != actual.type.kind) return false;
             if ((expected.type.kind == InferredType::Object ||
                  expected.type.kind == InferredType::TypeParameter) &&
@@ -1234,6 +1476,17 @@ namespace ZeusTypeInfer {
                             ZeusBuiltins::findTypeImplementation(receiverType)) {
                         receiverType = builtin->canonicalName;
                     }
+                    // A bare method call on a nullable receiver would crash
+                    // on nil. Force `?.` or an explicit nil check instead.
+                    if (receiver.type.nullable) {
+                        addDiagnostic(
+                            nodeIndex,
+                            TypeCheckSeverity::Error,
+                            "cannot call method '" + methodName +
+                                "' on a nullable value; use '?.' or check for nil first",
+                            TypeCheckDiagnosticCode::CallArgumentTypeMismatch
+                        );
+                    }
 
                     if (!receiverType.empty()) {
                         auto method = functions.find(receiverType + "::" + methodName);
@@ -1245,6 +1498,61 @@ namespace ZeusTypeInfer {
                             callName = method->second.name;
                             if (method->second.isClassMethod &&
                                 !method->second.isStaticMethod) {
+                                parameterOffset = 1;
+                            }
+                        }
+                    }
+                } else if (callableNameIndex >= 3 &&
+                    std::holds_alternative<LexerType::Keyword>(tokens[callableNameIndex]) &&
+                    isOperator(tokens[callableNameIndex - 1], ".") &&
+                    isOperator(tokens[callableNameIndex - 2], "?") &&
+                    std::holds_alternative<LexerType::Keyword>(tokens[callableNameIndex - 3])) {
+                    // Safe-navigation call `recv?.method(`. The nil check
+                    // itself is lowered by the IR generator; here we validate
+                    // the receiver and check the arguments as usual.
+                    const std::string safeMethodName =
+                        std::get<LexerType::Keyword>(tokens[callableNameIndex]).name;
+                    const std::vector<LexerType::Token> safeReceiverTokens{
+                        tokens[callableNameIndex - 3]};
+                    const TypeInfo safeReceiver = inferExpressionInfo(
+                        safeReceiverTokens, environment);
+                    ownerTypeArguments = safeReceiver.type.namedTypeArguments;
+                    std::string safeReceiverType = safeReceiver.type.namedType;
+                    if (safeReceiverType.empty() && safeReceiver.isKnown()) {
+                        safeReceiverType = typeName(safeReceiver.type.kind);
+                    }
+                    if (const auto* safeBuiltin =
+                            ZeusBuiltins::findTypeImplementation(safeReceiverType)) {
+                        safeReceiverType = safeBuiltin->canonicalName;
+                    }
+                    // `?.` on a value that cannot be nil is a static
+                    // contradiction. Dynamic and unknown receivers stay
+                    // allowed because nil remains possible at runtime.
+                    if (safeReceiver.isKnown() && !safeReceiver.isDynamic() &&
+                        safeReceiver.type.kind != InferredType::Nil &&
+                        !safeReceiver.type.nullable) {
+                        addDiagnostic(
+                            nodeIndex,
+                            TypeCheckSeverity::Error,
+                            "'?.' needs a nullable receiver; '" +
+                                std::get<LexerType::Keyword>(
+                                    tokens[callableNameIndex - 3]).name +
+                                "' cannot be nil",
+                            TypeCheckDiagnosticCode::CallArgumentTypeMismatch
+                        );
+                    }
+                    if (!safeReceiverType.empty()) {
+                        auto safeMethod = functions.find(
+                            safeReceiverType + "::" + safeMethodName);
+                        if (safeMethod == functions.end()) {
+                            safeMethod = functions.find(
+                                safeReceiverType + "." + safeMethodName);
+                        }
+                        if (safeMethod != functions.end()) {
+                            function = &safeMethod->second;
+                            callName = safeMethod->second.name;
+                            if (safeMethod->second.isClassMethod &&
+                                !safeMethod->second.isStaticMethod) {
                                 parameterOffset = 1;
                             }
                         }
@@ -1490,6 +1798,26 @@ namespace ZeusTypeInfer {
                     const TypeInfo expected = TypeInfo::fromType(
                         parseDeclaredTypeRef(expectedName), false, true);
                     const TypeInfo actual = inferExpressionInfo(expression, environment);
+                    // Nil flows into nullable parameters; a nullable value
+                    // never flows into a non-nullable one without a check.
+                    if (actual.type.kind == InferredType::Nil &&
+                        expected.type.nullable) {
+                        continue;
+                    }
+                    if (!expected.type.nullable && actual.isKnown() &&
+                        actual.type.kind != InferredType::Unknown &&
+                        actual.type.nullable) {
+                        const size_t nullableIndex = parameterIndex - parameterOffset + 1;
+                        addDiagnostic(
+                            nodeIndex,
+                            TypeCheckSeverity::Error,
+                            callName + "(): argument " + std::to_string(nullableIndex) +
+                                " cannot pass a nullable value to a non-nullable parameter; " +
+                                "check for nil first",
+                            TypeCheckDiagnosticCode::CallArgumentTypeMismatch
+                        );
+                        continue;
+                    }
                     if (!actual.isKnown() || !expected.isKnown() ||
                         hasSameDeclaredType(expected, actual)) {
                         continue;
@@ -1688,6 +2016,33 @@ namespace ZeusTypeInfer {
                 );
             }
 
+            if (const auto* integerABI = ZeusBuiltins::findNativeIntegerABI(declaredTypeName)) {
+                if (expression.size() == 1 &&
+                    std::holds_alternative<LexerType::Value>(expression.front())) {
+                    const auto& literal = std::get<LexerType::Value>(expression.front());
+                    if (const auto* integer = std::get_if<ZeusType::BigInteger>(&literal.data)) {
+                        const bool isUnsigned = integerABI->valueABI ==
+                            ZeusBuiltins::NativeValueABI::UnsignedInteger;
+                        const ZeusType::BigInteger minimum = isUnsigned
+                            ? ZeusType::BigInteger(0)
+                            : ZeusType::BigInteger(integerABI->integerBits == 64
+                                ? (std::numeric_limits<int64_t>::min)()
+                                : -(int64_t{1} << (integerABI->integerBits - 1)));
+                        const ZeusType::BigInteger maximum = isUnsigned
+                            ? ZeusType::BigInteger(integerABI->integerBits == 64
+                                ? "18446744073709551615"
+                                : std::to_string((uint64_t{1} << integerABI->integerBits) - 1))
+                            : ZeusType::BigInteger(integerABI->integerBits == 64
+                                ? (std::numeric_limits<int64_t>::max)()
+                                : (int64_t{1} << (integerABI->integerBits - 1)) - 1);
+                        if (*integer < minimum || *integer > maximum) {
+                            addDiagnostic(nodeIndex, TypeCheckSeverity::Error,
+                                "Integer literal is out of range for " + declaredTypeName);
+                        }
+                    }
+                }
+            }
+
             TypeInfo actualInfo = expression.empty()
                 ? TypeInfo::unresolved()
                 : inferExpressionInfo(expression, environment);
@@ -1713,12 +2068,15 @@ namespace ZeusTypeInfer {
             }
 
             if (hasDeclaredType) {
+                const TypeRef declaredTypeRef =
+                    parseDeclaredTypeRef(declaredTypeName);
                 checkValueType(
                     nodeIndex,
                     declaredType,
                     actualInfo,
                     "变量 " + name,
-                    options
+                    options, declaredTypeName,
+                    declaredTypeRef.nullable
                 );
                 environment[name] = TypeInfo::fromType(
                     hasDeclaredType
@@ -1787,7 +2145,7 @@ namespace ZeusTypeInfer {
                     return;
                 }
                 checkValueType(nodeIndex, targetInfo.type.kind, actualInfo,
-                               "@faddr 写入值", options);
+                               "@faddr 写入值", options, targetInfo.type.namedType);
                 return;
             }
             if (isSubscriptAssignmentTarget(statement.tokens, equalIndex)) {
@@ -1868,7 +2226,8 @@ namespace ZeusTypeInfer {
                     targetInfo.type.kind,
                     actualInfo,
                     "类字段赋值",
-                    options
+                    options, targetInfo.type.namedType,
+                    targetInfo.type.nullable
                 );
                 return;
             }
@@ -1946,14 +2305,16 @@ namespace ZeusTypeInfer {
                 variable->second.type.kind,
                 actualInfo,
                 "变量 " + name,
-                options
+                options, variable->second.type.namedType,
+                variable->second.type.nullable
             );
         }
 
         static bool allPathsReturn(
-            const std::vector<TreeParser::NodeAndBlock>& blockNodes
+            const std::vector<TreeParser::NodeAndBlock>& blockNodes,
+            bool throwingPathsTerminate = false
         ) {
-            auto sequenceReturns = [](
+            auto sequenceReturns = [throwingPathsTerminate](
                 auto&& self,
                 auto&& blockReturns,
                 const std::vector<TreeParser::NodeAndBlock>& statements,
@@ -1961,7 +2322,9 @@ namespace ZeusTypeInfer {
             ) -> bool {
                 for (const auto& element : statements) {
                     if (std::holds_alternative<TreeParser::Node>(element)) {
-                        if (std::get<TreeParser::Node>(element).type == NodeType::RETURN_STMT) {
+                        const auto type = std::get<TreeParser::Node>(element).type;
+                        if (type == NodeType::RETURN_STMT ||
+                            (throwingPathsTerminate && type == NodeType::THROW_STMT)) {
                             return true;
                         }
                         continue;
@@ -1970,10 +2333,12 @@ namespace ZeusTypeInfer {
                     const auto& nested = std::get<std::unique_ptr<TreeParser::CodeBlock>>(element);
                     if (!nested || nested->type == CodeBlockType::FUNC ||
                         nested->type == CodeBlockType::CLASS ||
-                        (skipElseBranches && nested->isElseBranch)) {
+                        (skipElseBranches && (nested->isElseBranch ||
+                            (throwingPathsTerminate && nested->type == CodeBlockType::CATCH)))) {
                         continue;
                     }
-                    if (nested->type == CodeBlockType::IF &&
+                    if ((nested->type == CodeBlockType::IF ||
+                         (throwingPathsTerminate && nested->type == CodeBlockType::TRY)) &&
                         blockReturns(blockReturns, self, *nested)) {
                         return true;
                     }
@@ -1981,11 +2346,27 @@ namespace ZeusTypeInfer {
                 return false;
             };
 
-            auto blockReturns = [](
+            auto blockReturns = [throwingPathsTerminate](
                 auto&& self,
                 auto&& sequenceReturns,
                 const TreeParser::CodeBlock& block
             ) -> bool {
+                if (throwingPathsTerminate && block.type == CodeBlockType::TRY) {
+                    if (!sequenceReturns(sequenceReturns, self, block.nodes, true)) {
+                        return false;
+                    }
+                    for (const auto& element : block.nodes) {
+                        if (!std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(element)) {
+                            continue;
+                        }
+                        const auto& handler = std::get<std::unique_ptr<TreeParser::CodeBlock>>(element);
+                        if (handler && handler->type == CodeBlockType::CATCH &&
+                            !sequenceReturns(sequenceReturns, self, handler->nodes, false)) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
                 if (block.type != CodeBlockType::IF) {
                     return sequenceReturns(sequenceReturns, self, block.nodes, false);
                 }
@@ -2018,9 +2399,12 @@ namespace ZeusTypeInfer {
             const TypeCheckOptions& options
         ) {
             std::vector<LexerType::Token> expression = returnExpression(statement);
+            const bool preserveReference = function != nullptr &&
+                (function->expectedReturn == InferredType::Unknown ||
+                 function->expectedReturnIsReference);
             TypeInfo actualInfo = expression.empty()
                 ? TypeInfo::fromType(TypeRef(InferredType::Nil))
-                : inferExpressionInfo(expression, environment);
+                : inferExpressionInfo(expression, environment, preserveReference);
             InferredType actualType = actualInfo.type.kind;
 
             if (function == nullptr) {
@@ -2035,6 +2419,18 @@ namespace ZeusTypeInfer {
             }
 
             function->hasReturn = true;
+
+            if (!function->inferredReceiverAlias.empty()) {
+                const auto receiver = environment.find(function->inferredReceiverAlias);
+                const bool originalReceiverBinding = receiver != environment.end() &&
+                    receiver->second.bindingNodeId == TreeParser::InvalidNodeId;
+                if (originalReceiverBinding &&
+                    isDirectReceiverReturn(expression, function->inferredReceiverAlias)) {
+                    function->hasReceiverReturn = true;
+                } else {
+                    function->hasOtherReturn = true;
+                }
+            }
 
             if (function->expectedReturn != InferredType::Unknown) {
                 if (function->expectedReturnIsReference &&
@@ -2081,7 +2477,8 @@ namespace ZeusTypeInfer {
                     function->expectedReturn,
                     actualInfo,
                     "函数 " + function->name + " 的返回值",
-                    options
+                    options, function->expectedReturnTypeName,
+                    function->expectedReturnNullable
                 );
                 return;
             }
@@ -2127,6 +2524,10 @@ namespace ZeusTypeInfer {
             FunctionContext function;
             function.name = block.funcName;
             const std::string receiverAlias = instanceReceiverAlias(block);
+            if (block.returnTypeName.empty() && !receiverAlias.empty() &&
+                classNames.count(block.ownerClassName) != 0) {
+                function.inferredReceiverAlias = receiverAlias;
+            }
             TypeCheckOptions functionOptions = rootOptions;
             const bool hasGenericTypeParameters = !block.typeParameters.empty() ||
                 !block.classTypeParameters.empty();
@@ -2177,8 +2578,10 @@ namespace ZeusTypeInfer {
             }
 
             for (const auto& decorator : block.decorators) {
+                // `native` 在函数定义上是“导出为 C 链接函数”，语法校验已确认
+                // 它只出现在定义上且不带 from=/reference ABI。
                 if (decorator != "static" && decorator != "no_safepoint" &&
-                    decorator != "type") {
+                    decorator != "type" && decorator != "native") {
                     addDiagnostic(
                         nodeIndex,
                         TypeCheckSeverity::Error,
@@ -2257,17 +2660,23 @@ namespace ZeusTypeInfer {
                 }
             }
 
-            if (!receiverAlias.empty() && !block.ownerClassName.empty() &&
-                block.paramNames.end() == std::find(
-                    block.paramNames.begin(), block.paramNames.end(), receiverAlias
-                )) {
-                TypeRef receiverType(InferredType::Object, block.ownerClassName);
-                receiverType.namedTypeArguments = block.classTypeParameters;
-                environment[receiverAlias] = TypeInfo::fromType(
-                    std::move(receiverType),
-                    false,
-                    true
-                );
+            if (!block.ownerClassName.empty() && block.isClassMethod && !block.isStaticMethod) {
+                TypeInfo receiverInfo;
+                if (!receiverAlias.empty() && environment.find(receiverAlias) != environment.end()) {
+                    receiverInfo = environment[receiverAlias];
+                } else if (environment.find("this") != environment.end()) {
+                    receiverInfo = environment["this"];
+                } else {
+                    TypeRef receiverType = parseDeclaredTypeRef(block.ownerClassName);
+                    receiverType.namedTypeArguments = block.classTypeParameters;
+                    receiverInfo = TypeInfo::fromType(std::move(receiverType), false, true);
+                }
+                if (!receiverAlias.empty() && environment.find(receiverAlias) == environment.end()) {
+                    environment[receiverAlias] = receiverInfo;
+                }
+                if (environment.find("this") == environment.end()) {
+                    environment["this"] = std::move(receiverInfo);
+                }
             }
 
             const size_t receiverParameterOffset = receiverAlias.empty() ? 0 : 1;
@@ -2284,6 +2693,28 @@ namespace ZeusTypeInfer {
                     parseDeclaredTypeRef(block.paramTypeNames[i]), false, true);
                 const TypeInfo actual = inferExpressionInfo(
                     block.paramDefaults[i], environment);
+                // Defaults follow the same nil rules as call arguments: nil
+                // is a valid default for a nullable parameter, while a
+                // nullable value still needs an explicit check before it can
+                // initialize a non-nullable parameter.
+                if (actual.isKnown() && actual.type.kind == InferredType::Nil &&
+                    expected.type.nullable) {
+                    continue;
+                }
+                if (!expected.type.nullable && actual.isKnown() &&
+                    actual.type.kind != InferredType::Unknown &&
+                    actual.type.nullable) {
+                    addDiagnostic(
+                        nodeIndex,
+                        TypeCheckSeverity::Error,
+                        block.funcName + "(): argument " +
+                            std::to_string(i - receiverParameterOffset + 1) +
+                            " cannot use a nullable default for a non-nullable parameter; " +
+                            "check for nil first",
+                        TypeCheckDiagnosticCode::CallArgumentTypeMismatch
+                    );
+                    continue;
+                }
                 if (!actual.isKnown() || !expected.isKnown() ||
                     hasSameDeclaredType(expected, actual)) {
                     continue;
@@ -2312,8 +2743,7 @@ namespace ZeusTypeInfer {
                 const bool isGenericParameter =
                     activeTypeParameters.find(targetType) != activeTypeParameters.end();
                 const bool isClassType = classNames.find(baseType) != classNames.end();
-                if (parseTypeName(targetType) != InferredType::Unknown ||
-                    (!isClassType && !isGenericParameter)) {
+                if (!isClassType && !isGenericParameter) {
                     addDiagnostic(
                         nodeIndex,
                         TypeCheckSeverity::Error,
@@ -2330,6 +2760,8 @@ namespace ZeusTypeInfer {
             }
             if (hasReturnAnnotation) {
                 function.expectedReturn = parseDeclaredType(block.returnTypeName);
+                function.expectedReturnNullable =
+                    parseDeclaredTypeRef(block.returnTypeName).nullable;
                 if (function.expectedReturn == InferredType::Unknown) {
                     addDiagnostic(
                         nodeIndex,
@@ -2344,13 +2776,32 @@ namespace ZeusTypeInfer {
             currentSourceColumn = block.sourceColumn;
 
             if (!hasReturnAnnotation) {
+                if (function.hasReceiverReturn) {
+                    if (function.hasOtherReturn || !allPathsReturn(block.nodes, true)) {
+                        addDiagnostic(
+                            nodeIndex,
+                            TypeCheckSeverity::Error,
+                            "function " + block.funcName +
+                                " mixes receiver and other returns; declare an explicit return type",
+                            TypeCheckDiagnosticCode::ReceiverReturnTypeAmbiguous
+                        );
+                    } else {
+                        function.inferredReturnType = TypeRef(
+                            InferredType::Object, block.ownerClassName);
+                        function.inferredReturnType.namedTypeArguments = block.classTypeParameters;
+                        function.inferredReturnType.isReference = true;
+                        function.hasInferredReturnType = true;
+                        function.inferredReturnIsDynamic = false;
+                        function.sawUnknownReturnType = false;
+                    }
+                }
                 if (!function.hasReturn) {
                     function.inferredReturnType = TypeRef(InferredType::Nil);
                     function.hasInferredReturnType = true;
                 } else if (!function.inferredReturnIsDynamic &&
                            function.hasInferredReturnType &&
                            function.inferredReturnType.kind != InferredType::Nil &&
-                           !allPathsReturn(block.nodes)) {
+                           !allPathsReturn(block.nodes, function.hasReceiverReturn)) {
                     // A conditional return may fall through to implicit nil.
                     // Keep that function on the dynamic ABI unless nil is the
                     // only possible result.
@@ -2690,6 +3141,140 @@ namespace ZeusTypeInfer {
             }
         }
 
+        static bool isNilLiteralToken(const LexerType::Token& token) {
+            return isKeyword(token, "nil");
+        }
+
+        static bool isBindingNameToken(const LexerType::Token& token) {
+            if (!std::holds_alternative<LexerType::Keyword>(token)) return false;
+            const std::string& name = std::get<LexerType::Keyword>(token).name;
+            return !name.empty() && name != "nil" && name != "true" && name != "false";
+        }
+
+        static bool isWrappedInParentheses(
+            const std::vector<LexerType::Token>& tokens
+        ) {
+            if (tokens.size() < 2 || !isOperator(tokens.front(), "(") ||
+                !isOperator(tokens.back(), ")")) {
+                return false;
+            }
+            int depth = 0;
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                if (isOperator(tokens[i], "(")) {
+                    ++depth;
+                } else if (isOperator(tokens[i], ")")) {
+                    --depth;
+                    if (depth == 0 && i + 1 != tokens.size()) return false;
+                }
+            }
+            return depth == 0;
+        }
+
+        static bool findTopLevelLogicalOperator(
+            const std::vector<LexerType::Token>& tokens,
+            const std::string& symbol,
+            size_t& position
+        ) {
+            int parenDepth = 0;
+            int bracketDepth = 0;
+            int braceDepth = 0;
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                if (isOperator(tokens[i], "(")) {
+                    ++parenDepth;
+                } else if (isOperator(tokens[i], ")")) {
+                    --parenDepth;
+                } else if (isOperator(tokens[i], "[")) {
+                    ++bracketDepth;
+                } else if (isOperator(tokens[i], "]")) {
+                    --bracketDepth;
+                } else if (isOperator(tokens[i], "{")) {
+                    ++braceDepth;
+                } else if (isOperator(tokens[i], "}")) {
+                    --braceDepth;
+                } else if (parenDepth == 0 && bracketDepth == 0 &&
+                           braceDepth == 0 &&
+                           (isOperator(tokens[i], symbol) ||
+                            (symbol == "&&" && isOperator(tokens[i], "and")) ||
+                            (symbol == "||" &&
+                             (isOperator(tokens[i], "or") ||
+                              isOperator(tokens[i], "||"))))) {
+                    position = i;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Flow-sensitive nil narrowing. `whenTrue` selects the branch being
+        // analysed, so `if (x != nil)` narrows x to its non-nullable base type
+        // in the then-branch, while `if (x == nil) { return; }` narrows x after
+        // the statement. Only the shapes that are unambiguous from tokens are
+        // handled; anything else keeps the declared nullable type.
+        void applyNilNarrowing(
+            const std::vector<LexerType::Token>& tokens,
+            bool whenTrue,
+            Environment& environment
+        ) const {
+            if (tokens.empty()) return;
+
+            if (isWrappedInParentheses(tokens)) {
+                std::vector<LexerType::Token> inner(
+                    tokens.begin() + 1, tokens.end() - 1);
+                applyNilNarrowing(inner, whenTrue, environment);
+                return;
+            }
+
+            size_t logicalPosition = 0;
+            if (findTopLevelLogicalOperator(tokens, "&&", logicalPosition)) {
+                if (whenTrue) {
+                    std::vector<LexerType::Token> left(
+                        tokens.begin(), tokens.begin() + logicalPosition);
+                    std::vector<LexerType::Token> right(
+                        tokens.begin() + logicalPosition + 1, tokens.end());
+                    applyNilNarrowing(left, true, environment);
+                    applyNilNarrowing(right, true, environment);
+                }
+                return;
+            }
+            if (findTopLevelLogicalOperator(tokens, "||", logicalPosition)) {
+                if (!whenTrue) {
+                    std::vector<LexerType::Token> left(
+                        tokens.begin(), tokens.begin() + logicalPosition);
+                    std::vector<LexerType::Token> right(
+                        tokens.begin() + logicalPosition + 1, tokens.end());
+                    applyNilNarrowing(left, false, environment);
+                    applyNilNarrowing(right, false, environment);
+                }
+                return;
+            }
+
+            if (tokens.size() != 3) return;
+            const bool notEqual = isOperator(tokens[1], "!=");
+            if (!notEqual && !isOperator(tokens[1], "==")) return;
+
+            std::string name;
+            if (isBindingNameToken(tokens[0]) && isNilLiteralToken(tokens[2])) {
+                name = std::get<LexerType::Keyword>(tokens[0]).name;
+            } else if (isNilLiteralToken(tokens[0]) &&
+                       isBindingNameToken(tokens[2])) {
+                name = std::get<LexerType::Keyword>(tokens[2]).name;
+            } else {
+                return;
+            }
+
+            // `x != nil` is the non-null branch; `x == nil` is the nil branch.
+            const bool nonNullWhenTrue = notEqual;
+            if (whenTrue != nonNullWhenTrue) return;
+
+            auto binding = environment.find(name);
+            if (binding == environment.end() ||
+                !binding->second.type.nullable ||
+                binding->second.type.kind == InferredType::Unknown) {
+                return;
+            }
+            binding->second.type.nullable = false;
+        }
+
         void checkIfBranchEnvironments(
             const TreeParser::CodeBlock& ifBlock,
             const Environment& baseEnvironment,
@@ -2715,6 +3300,7 @@ namespace ZeusTypeInfer {
             }
 
             Environment thenEnvironment = baseEnvironment;
+            applyNilNarrowing(ifBlock.conditionTokens, true, thenEnvironment);
             thenEnvironment = checkBlock(
                 ifBlock.nodes,
                 std::move(thenEnvironment),
@@ -2736,9 +3322,12 @@ namespace ZeusTypeInfer {
             }
 
             if (elseBranch->type == CodeBlockType::IF) {
+                Environment elseIfBaseEnvironment = baseEnvironment;
+                applyNilNarrowing(
+                    ifBlock.conditionTokens, false, elseIfBaseEnvironment);
                 checkIfBranchEnvironments(
                     *elseBranch,
-                    baseEnvironment,
+                    elseIfBaseEnvironment,
                     branchEnvironments,
                     nodeIndex,
                     options,
@@ -2757,6 +3346,7 @@ namespace ZeusTypeInfer {
             checkCallArgumentTypes(
                 elseBranch->conditionTokens, baseEnvironment, nodeIndex);
             Environment elseEnvironment = baseEnvironment;
+            applyNilNarrowing(ifBlock.conditionTokens, false, elseEnvironment);
             elseEnvironment = checkBlock(
                 elseBranch->nodes,
                 std::move(elseEnvironment),
@@ -2853,6 +3443,23 @@ namespace ZeusTypeInfer {
                     );
                     mergeBranchEnvironments(
                         environment, baseEnvironment, branchEnvironments);
+
+                    // `if (x == nil) { return; }` guards the rest of the
+                    // block: when the then-branch always leaves the function,
+                    // the fall-through path has the condition's false shape.
+                    bool hasElseBranch = false;
+                    for (const auto& child : block->nodes) {
+                        TreeParser::AstElementView childElement(child);
+                        const auto* childBlock = childElement.block();
+                        if (childBlock != nullptr && childBlock->isElseBranch) {
+                            hasElseBranch = true;
+                            break;
+                        }
+                    }
+                    if (!hasElseBranch && allPathsReturn(block->nodes, true)) {
+                        applyNilNarrowing(
+                            block->conditionTokens, false, environment);
+                    }
                 } else if (block->type == CodeBlockType::FUNC) {
                     checkCallArgumentTypes(block->conditionTokens, environment, nodeIndex);
                     checkFunction(*block, environment, nodeIndex);
@@ -2932,6 +3539,28 @@ namespace ZeusTypeInfer {
             const std::vector<std::string>& parameterTypes
         ) {
             inferer.registerExternalFunction(name, returnType, parameterTypes);
+        }
+
+        void registerExternalMethod(
+            const std::string& ownerType,
+            const std::string& name,
+            const std::string& returnType,
+            const std::vector<std::string>& parameterNames,
+            const std::vector<std::string>& parameterTypes,
+            const std::vector<std::string>& typeParameterNames,
+            const std::vector<std::string>& ownerTypeParameterNames,
+            bool isStaticMethod
+        ) {
+            inferer.registerExternalMethod(
+                ownerType,
+                name,
+                returnType,
+                parameterNames,
+                parameterTypes,
+                typeParameterNames,
+                ownerTypeParameterNames,
+                isStaticMethod
+            );
         }
 
         void registerExternalClass(

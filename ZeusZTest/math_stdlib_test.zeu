@@ -1,0 +1,21 @@
+import zeus.math;
+
+func expectMath(actual: int, expected: int, label: string) {
+    if (actual != expected) {
+        throw new Exception("math stdlib mismatch: " + label);
+    }
+}
+
+expectMath(abs(-17), 17, "abs");
+expectMath(min(3, -2), -2, "min");
+expectMath(max(3, -2), 3, "max");
+expectMath(clamp(20, 2, 10), 10, "clamp high");
+expectMath(clamp(-5, 10, 2), 2, "clamp swapped bounds");
+expectMath(gcd(54, 24), 6, "gcd");
+expectMath(lcm(21, 6), 42, "lcm");
+expectMath(factorial(0), 1, "factorial zero");
+expectMath(factorial(10), 3628800, "factorial");
+expectMath(fibonacci(-3), 0, "negative fibonacci");
+expectMath(fibonacci(50), 12586269025, "iterative fibonacci");
+
+print("PASS math standard library");

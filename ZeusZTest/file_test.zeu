@@ -1,0 +1,126 @@
+import zeus.file [&file];
+
+// The runner rewrites base to a per-run ground directory it deletes later.
+let base = "__GROUND__";
+let body = "alpha beta\nline two";
+
+// Text mode round trip, then the same octets re-read as binary.
+let writer = file.open(base + "/text.log", "w");
+writer.write(body);
+writer.close();
+
+let reader = file.open(base + "/text.log", "r");
+let echoed = reader.read();
+reader.close();
+if (echoed != body) {
+    throw new Exception("text round trip mismatch: " + echoed);
+}
+
+let updateSeed = file.open(base + "/update.log", "w");
+updateSeed.write("preserve");
+updateSeed.close();
+
+let updateText = file.open(base + "/update.log", "r+");
+if (updateText.read() != "preserve") {
+    throw new Exception("r+ must preserve and read an existing file");
+}
+updateText.close();
+
+let updateBinary = file.open(base + "/update.log", "rb+");
+if (updateBinary.read().decode() != "preserve") {
+    throw new Exception("rb+ must preserve and read an existing file");
+}
+updateBinary.close();
+
+let updateBinaryReversed = file.open(base + "/update.log", "r+b");
+if (updateBinaryReversed.read().decode() != "preserve") {
+    throw new Exception("r+b must preserve and read an existing file");
+}
+updateBinaryReversed.close();
+
+let appendUpdate = file.open(base + "/update.log", "ab+");
+appendUpdate.seek(0, 0);
+if (appendUpdate.read().decode() != "preserve") {
+    throw new Exception("ab+ must read an existing file");
+}
+appendUpdate.write("+");
+appendUpdate.close();
+
+let verifyUpdate = file.open(base + "/update.log", "r");
+if (verifyUpdate.read() != "preserve+") {
+    throw new Exception("ab+ must append without truncating");
+}
+verifyUpdate.close();
+
+// Binary content survives the write and the read as individual octets.
+let binary = file.open(base + "/blob.bin", "wb");
+binary.write(b"\x00\x10\xff\x7f");
+binary.close();
+
+let back = file.open(base + "/blob.bin", "rb");
+let data = back.read();
+back.close();
+if (data.length() != 4 or data.get(0) != 0 or
+        data.get(1) != 16 or data.get(2) != 255 or data.get(3) != 127) {
+    throw new Exception("binary round trip mismatch");
+}
+
+// Append joins at the end; an 'x' open refuses the existing file.
+let appender = file.open(base + "/text.log", "a");
+appender.write("+tail");
+appender.close();
+
+let tail = file.open(base + "/text.log", "r");
+let grown = tail.read();
+tail.close();
+if (!grown.startswith("alpha") or !grown.endswith("+tail")) {
+    throw new Exception("append mismatch: " + grown);
+}
+
+var refused = false;
+try {
+    let exclusive = file.open(base + "/blob.bin", "x");
+    exclusive.close();
+} catch (&existing) {
+    refused = true;
+}
+if (!refused) {
+    throw new Exception("x mode must refuse an existing file");
+}
+
+var duplicateTextModeRefused = false;
+try {
+    let invalidMode = file.open(base + "/update.log", "rtt");
+    invalidMode.close();
+} catch (&invalid) {
+    duplicateTextModeRefused = true;
+}
+if (!duplicateTextModeRefused) {
+    throw new Exception("a mode with duplicate 't' must be rejected");
+}
+
+// Position arithmetic: seek to 6, tell must agree, sized read stops on its own.
+let seeker = file.open(base + "/text.log", "r");
+seeker.seek(6, 0);
+if (seeker.tell() != 6) {
+    throw new Exception("seek position mismatch");
+}
+let slice = seeker.read(5);
+if (slice.length() != 5 or !slice.startswith("beta\n")) {
+    throw new Exception("sized read mismatch: " + slice);
+}
+seeker.close();
+
+// With statements close on exit; reading through a closed handle throws.
+var closedError = false;
+var holder = file.open(base + "/text.log", "r");
+holder.close();
+try {
+    holder.read();
+} catch (&spent) {
+    closedError = true;
+}
+if (!closedError) {
+    throw new Exception("reading a closed handle must throw");
+}
+print("FILE_TEST_PASS");

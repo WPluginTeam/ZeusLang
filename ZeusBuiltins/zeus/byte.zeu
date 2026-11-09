@@ -23,6 +23,11 @@ decl func __bytes_decode(data: bytes, encoding: string) -> string;
 @native("zeus_bytes_to_list")
 decl func __bytes_to_list(data: bytes) -> list;
 
+// Bytes toString must stay a leaf: the generic str() protocol enters
+// obj.toString(), so calling str() back from here would recurse forever.
+@native("zeus_string_builtin_str")
+decl func __builtin_str(value);
+
 impl bytes {
     using &this;
 
@@ -70,7 +75,7 @@ impl bytes {
     }
 
     func toString() -> string {
-        return str(this);
+        return __builtin_str(this);
     }
 
     func operator[+](other: bytes) -> bytes {
@@ -129,8 +134,8 @@ func __bytebuffer_write_bytes(destinationAddress: int, source: bytes) {
 func __bytebuffer_zeroed_bytes(length: int) -> bytes {
     if (length <= 0) return b"";
 
-    var result: bytes = b"\0";
-    var capacity: int = 1;
+    let result: bytes = b"\0";
+    let capacity: int = 1;
     for (true) {
         if (capacity >= length) break;
         if (capacity > 4611686018427387903) {
@@ -206,7 +211,7 @@ class ByteBuffer {
             return this;
         }
 
-        var nextCapacity: int = capacity;
+        let nextCapacity: int = capacity;
         if (nextCapacity < 64) nextCapacity = 64;
         for (true) {
             if (nextCapacity >= requiredLength) break;
@@ -250,11 +255,11 @@ class ByteBuffer {
             throw new Exception("ByteBuffer index out of range");
         }
 
-        return this._storage.get(this._headOffset + index);
+        return __bytes_get(this._storage, this._headOffset + index);
     }
 
     func indexOf(pattern: bytes, startAt: int=0) -> int {
-        var searchStart: int = startAt;
+        let searchStart: int = startAt;
         if (searchStart < 0) searchStart = 0;
 
         let patternLength = pattern.length();
@@ -267,7 +272,7 @@ class ByteBuffer {
 
         // KMP keeps delimiter scanning linear in the input and pattern lengths.
         let prefix: bytes = __bytebuffer_zeroed_bytes(patternLength * 8);
-        var prefixAddress: int = 0;
+        let prefixAddress: int = 0;
         using LLVM {
             prefixAddress = prefix.dataAddress();
         }
@@ -275,33 +280,34 @@ class ByteBuffer {
             prefixAddress = prefix.dataAddress();
         }
         __bytebuffer_write_int(prefixAddress, 0);
-        var matched: int = 0;
-        var patternIndex: int = 1;
+        let matched: int = 0;
+        let patternIndex: int = 1;
         for (true) {
             if (patternIndex >= patternLength) break;
-            let value = pattern.get(patternIndex);
+            let value = __bytes_get(pattern, patternIndex);
             for (true) {
-                if (matched == 0 or value == pattern.get(matched)) break;
+                if (matched == 0 or value == __bytes_get(pattern, matched)) break;
                 matched = __bytebuffer_read_int(
                     prefixAddress + (matched - 1) * 8);
             }
-            if (value == pattern.get(matched)) matched = matched + 1;
+            if (value == __bytes_get(pattern, matched)) matched = matched + 1;
             __bytebuffer_write_int(prefixAddress + patternIndex * 8, matched);
             patternIndex = patternIndex + 1;
         }
 
-        var absoluteIndex: int = 0;
+        let absoluteIndex: int = 0;
         matched = 0;
         for (true) {
             if (absoluteIndex >= this._length) break;
-            let value = this._storage.get(this._headOffset + absoluteIndex);
+            let value = __bytes_get(
+                this._storage, this._headOffset + absoluteIndex);
             if (absoluteIndex >= searchStart) {
                 for (true) {
-                    if (matched == 0 or value == pattern.get(matched)) break;
+                    if (matched == 0 or value == __bytes_get(pattern, matched)) break;
                     matched = __bytebuffer_read_int(
                         prefixAddress + (matched - 1) * 8);
                 }
-                if (value == pattern.get(matched)) matched = matched + 1;
+                if (value == __bytes_get(pattern, matched)) matched = matched + 1;
                 if (matched == patternLength) {
                     return absoluteIndex - patternLength + 1;
                 }
@@ -312,8 +318,8 @@ class ByteBuffer {
     }
 
     func slice(start: int, end: int) -> bytes {
-        var sliceStart: int = start;
-        var sliceEnd: int = end;
+        let sliceStart: int = start;
+        let sliceEnd: int = end;
         if (sliceStart < 0) sliceStart = 0;
         if (sliceEnd < 0) sliceEnd = 0;
         if (sliceStart > this._length) sliceStart = this._length;

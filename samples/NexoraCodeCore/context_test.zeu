@@ -1,0 +1,113 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import samples.NexoraCodeCore.context;
+
+func assertContext(condition, message: string) {
+    if (!condition) throw new Exception("Nexora context test failed: " + message);
+}
+
+func testMessagePayload() {
+    let user = nexora_message_payload({"role": "user", "content": "hi"});
+    assertContext(user["role"] == "user" and user["content"] == "hi",
+        "user message passes through");
+
+    let sys = nexora_message_payload({"role": "system", "content": "s"});
+    assertContext(sys["content"] == "s", "system message keeps text");
+
+    let tool = nexora_message_payload({"role": "tool", "tool_call_id": "c1", "content": "ok"});
+    assertContext(tool["tool_call_id"] == "c1", "tool keeps call id");
+
+    let oldStyle = nexora_message_payload({"role": "assistant", "content": "",
+        "tool_calls": [{"id": "c1", "name": "run", "arguments": {"cmd": "ls"}}]});
+    let rebuilt = oldStyle["tool_calls"][0];
+    assertContext(rebuilt["type"] == "function", "old-style call gets a type");
+    assertContext(JSON.parse(rebuilt["function"]["arguments"])["cmd"] == "ls",
+        "dict arguments are serialized");
+
+    let newStyle = nexora_message_payload({"role": "assistant",
+        "tool_calls": [{"id": "c2", "type": "function",
+            "function": {"name": "read", "arguments": "{}"}}]});
+    assertContext(newStyle["tool_calls"][0]["id"] == "c2",
+        "new-style calls pass through untouched");
+
+    let rejected = false;
+    try {
+        nexora_message_payload({"role": "robot", "content": "x"});
+    } catch (&error) {
+        rejected = true;
+    }
+    assertContext(rejected, "unknown roles are rejected");
+}
+
+func testBuildRequestMessages() {
+    let history = [{"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"}];
+    let messages = nexora_build_request_messages("sys", history, 0, "");
+    assertContext(messages.length() == 3, "system plus two history messages");
+    assertContext(messages[0]["role"] == "system", "system stays first");
+
+    let summarized = nexora_build_request_messages("sys", history, 2, "old stuff");
+    assertContext(summarized.length() == 2, "cut history is replaced by the summary");
+    assertContext(summarized[1]["role"] == "user", "summary arrives as a user message");
+
+    let rejected = false;
+    try {
+        nexora_build_request_messages("sys", history, 1, "");
+    } catch (&error) {
+        rejected = true;
+    }
+    assertContext(rejected, "a cut without a summary is rejected");
+}
+
+func testRequestOutputLimit() {
+    assertContext(nexora_request_output_limit(128000, 4096, 1000) == 4096,
+        "a short request keeps the configured limit");
+    assertContext(nexora_request_output_limit(8000, 4096, 3600) == 4000,
+        "a tight window trims the output limit");
+    let rejected = false;
+    try {
+        nexora_request_output_limit(8000, 4096, 7400);
+    } catch (&error) {
+        rejected = true;
+    }
+    assertContext(rejected, "an over-budget request is rejected");
+}
+
+func testMeasureRequestBasis() {
+    assertContext(nexora_measure_request_basis(0, 0, 2, 100, 100) == 100,
+        "without an anchor the plain estimate is used");
+    assertContext(nexora_measure_request_basis(1000, 4, 4, 1200, 50) == 1000,
+        "no fresh messages keeps the anchor");
+    assertContext(nexora_measure_request_basis(1000, 2, 4, 1200, 100) == 1100,
+        "fresh messages add to the anchor");
+    assertContext(nexora_measure_request_basis(1000, 2, 4, 0, 101, 1.5) == 1152,
+        "a fractional rate rounds the increment up");
+}
+
+func testPrepareDecision() {
+    assertContext(nexora_prepare_decision(128000, 4096, 1000) == "direct",
+        "a short request goes direct");
+    assertContext(nexora_prepare_decision(8000, 4096, 3000) == "direct",
+        "an over-threshold but fitting request keeps its prefix");
+    assertContext(nexora_prepare_decision(8000, 4096, 7000) == "compress",
+        "an overflowing request asks for compression");
+}
+
+func testEstimateTokens() {
+    let estimate = nexora_estimate_tokens({"messages": [{"role": "user",
+        "content": "你好"}]});
+    assertContext(estimate >= 1, "estimates stay positive");
+    let bigger = nexora_estimate_tokens({"messages": [{"role": "user",
+        "content": "你好，请详细介绍一下这个项目的功能和架构"}]});
+    assertContext(bigger > estimate, "longer input estimates higher");
+}
+
+func testContext() {
+    testMessagePayload();
+    testBuildRequestMessages();
+    testRequestOutputLimit();
+    testMeasureRequestBasis();
+    testPrepareDecision();
+    testEstimateTokens();
+}

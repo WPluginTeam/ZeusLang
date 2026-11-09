@@ -1,0 +1,290 @@
+// RFC 3986 URL components and application query string helpers.
+
+import zeus.byte;
+import zeus.exception;
+import zeus.string;
+
+func __url_hex_value(value: int) -> int {
+    if (value >= 48 and value <= 57) return value - 48;
+    if (value >= 65 and value <= 70) return value - 55;
+    if (value >= 97 and value <= 102) return value - 87;
+    return -1;
+}
+
+func __url_component_unreserved(value: int) -> bool {
+    return (value >= 65 and value <= 90) or (value >= 97 and value <= 122) or
+        (value >= 48 and value <= 57) or value == 45 or value == 95 or
+        value == 46 or value == 33 or value == 126 or value == 42 or
+        value == 39 or value == 40 or value == 41;
+}
+
+func __url_plus_to_space(value: string) -> string {
+    let raw: bytes = bytes(value);
+    let output: bytes = b"";
+    for (0..raw.length()) [const &i] {
+        if (__bytes_get(raw, i) == 43) {
+            output = output + bytes([32]);
+        } else {
+            output = output + raw.slice(i, i + 1);
+        }
+    }
+    return output.decode("utf-8");
+}
+
+func __url_encode_component(value: string) -> string {
+    let raw: bytes = bytes(value);
+    let hex: string = "0123456789ABCDEF";
+    let output: string = "";
+    for (0..raw.length()) [const &i] {
+        let current: int = __bytes_get(raw, i);
+        if (__url_component_unreserved(current)) {
+            output = output + bytes([current]).decode("utf-8");
+        } else {
+            let high: int = int(current / 16);
+            let low: int = current % 16;
+            output = output + "%" + hex.slice(high, high + 1) +
+                hex.slice(low, low + 1);
+        }
+    }
+    return output;
+}
+
+func __url_decode_component(value: string) -> string {
+    let raw: bytes = bytes(value);
+    let output: bytes = b"";
+    let index: int = 0;
+    for (index < raw.length()) {
+        let current: int = __bytes_get(raw, index);
+        if (current == 37) {
+            if (index + 2 >= raw.length()) {
+                throw new Exception("URL percent escape is incomplete");
+            }
+            let high: int = __url_hex_value(__bytes_get(raw, index + 1));
+            let low: int = __url_hex_value(__bytes_get(raw, index + 2));
+            if (high < 0 or low < 0) {
+                throw new Exception("URL percent escape contains a non-hex digit");
+            }
+            output = output + bytes([high * 16 + low]);
+            index = index + 3;
+        } else {
+            output = output + raw.slice(index, index + 1);
+            index = index + 1;
+        }
+    }
+    return output.decode("utf-8");
+}
+
+func __url_scheme_character(value: int, first: bool) -> bool {
+    if ((value >= 65 and value <= 90) or (value >= 97 and value <= 122)) return true;
+    if (first) return false;
+    return (value >= 48 and value <= 57) or value == 43 or
+        value == 45 or value == 46;
+}
+
+class URLParts {
+    using &this;
+    let scheme: string = "";
+    let authority: string = "";
+    let path: string = "";
+    let query: string = "";
+    let fragment: string = "";
+    let hasAuthority: bool = false;
+    let hasQuery: bool = false;
+    let hasFragment: bool = false;
+}
+
+class QueryParams {
+    using &this;
+    let _keys: list = [];
+    let _values: list = [];
+
+    func init(query: string="") {
+        this._keys = [];
+        this._values = [];
+        if (query.length() == 0) return;
+        let parts: list = query.split("&");
+        for (0..parts.length()) [const &i] {
+            let part: string = parts[i];
+            if (part.length() > 0) {
+                let equal: int = part.index("=");
+                let key: string = part;
+                let value: string = "";
+                if (equal >= 0) {
+                    key = part.slice(0, equal);
+                    value = part.slice(equal + 1, part.length());
+                }
+                let formKey: string = __url_plus_to_space(key);
+                let formValue: string = __url_plus_to_space(value);
+                let decodedKey: string = __url_decode_component(formKey);
+                let decodedValue: string = __url_decode_component(formValue);
+                this.append(decodedKey, decodedValue);
+            }
+        }
+    }
+
+    func append(key: string, value: string) {
+        this._keys.append(key);
+        this._values.append(value);
+        return this;
+    }
+
+    func get(key: string, defaultValue=nil) {
+        for (0..this._keys.length()) [const &i] {
+            if (this._keys[i] == key) return this._values[i];
+        }
+        return defaultValue;
+    }
+
+    func getAll(key: string) -> list {
+        let output: list = [];
+        for (0..this._keys.length()) [const &i] {
+            if (this._keys[i] == key) output.append(this._values[i]);
+        }
+        return output;
+    }
+
+    func has(key: string) -> bool {
+        for (0..this._keys.length()) [const &i] {
+            if (this._keys[i] == key) return true;
+        }
+        return false;
+    }
+
+    func set(key: string, value: string) {
+        let nextKeys: list = [];
+        let nextValues: list = [];
+        let found: bool = false;
+        for (0..this._keys.length()) [const &i] {
+            let currentKey: string = this._keys[i];
+            if (currentKey == key) {
+                if (!found) {
+                    nextKeys.append(key);
+                    nextValues.append(value);
+                    found = true;
+                }
+            } else {
+                nextKeys.append(currentKey);
+                nextValues.append(this._values[i]);
+            }
+        }
+        if (!found) {
+            nextKeys.append(key);
+            nextValues.append(value);
+        }
+        this._keys = nextKeys;
+        this._values = nextValues;
+        return this;
+    }
+
+    func deleteKey(key: string) {
+        let nextKeys: list = [];
+        let nextValues: list = [];
+        for (0..this._keys.length()) [const &i] {
+            if (this._keys[i] != key) {
+                nextKeys.append(this._keys[i]);
+                nextValues.append(this._values[i]);
+            }
+        }
+        this._keys = nextKeys;
+        this._values = nextValues;
+        return this;
+    }
+
+    func length() -> int {
+        return this._keys.length();
+    }
+
+    func toString() -> string {
+        let output: string = "";
+        for (0..this._keys.length()) [const &i] {
+            if (i > 0) output = output + "&";
+            output = output + __url_encode_component(this._keys[i]) + "=" +
+                __url_encode_component(this._values[i]);
+        }
+        return output;
+    }
+}
+
+class URL {
+    func static encodeComponent(value: string) -> string {
+        return __url_encode_component(value);
+    }
+
+    func static decodeComponent(value: string) -> string {
+        return __url_decode_component(value);
+    }
+
+    func static parse(text: string) -> URLParts {
+        let parts: URLParts = new URLParts();
+        let source: string = text;
+        let colon: int = source.index(":");
+        let firstDelimiter: int = source.length();
+        let slash: int = source.index("/");
+        let question: int = source.index("?");
+        let hash: int = source.index("#");
+        if (slash >= 0 and slash < firstDelimiter) firstDelimiter = slash;
+        if (question >= 0 and question < firstDelimiter) firstDelimiter = question;
+        if (hash >= 0 and hash < firstDelimiter) firstDelimiter = hash;
+        if (colon > 0 and colon < firstDelimiter) {
+            let validScheme: bool = true;
+            let sourceBytes: bytes = bytes(source);
+            for (0..colon) [const &i] {
+                if (!__url_scheme_character(__bytes_get(sourceBytes, i), i == 0)) {
+                    validScheme = false;
+                    break;
+                }
+            }
+            if (validScheme) {
+                parts.scheme = source.slice(0, colon).lower();
+                source = source.slice(colon + 1, source.length());
+            }
+        }
+
+        if (source.startswith("//")) {
+            parts.hasAuthority = true;
+            source = source.slice(2, source.length());
+            let authorityEnd: int = source.length();
+            let authoritySlash: int = source.index("/");
+            let authorityQuestion: int = source.index("?");
+            let authorityHash: int = source.index("#");
+            if (authoritySlash >= 0 and authoritySlash < authorityEnd) authorityEnd = authoritySlash;
+            if (authorityQuestion >= 0 and authorityQuestion < authorityEnd) authorityEnd = authorityQuestion;
+            if (authorityHash >= 0 and authorityHash < authorityEnd) authorityEnd = authorityHash;
+            parts.authority = source.slice(0, authorityEnd);
+            source = source.slice(authorityEnd, source.length());
+        }
+
+        let fragmentAt: int = source.index("#");
+        if (fragmentAt >= 0) {
+            parts.hasFragment = true;
+            parts.fragment = source.slice(fragmentAt + 1, source.length());
+            source = source.slice(0, fragmentAt);
+        }
+        let queryAt: int = source.index("?");
+        if (queryAt >= 0) {
+            parts.hasQuery = true;
+            parts.query = source.slice(queryAt + 1, source.length());
+            source = source.slice(0, queryAt);
+        }
+        parts.path = source;
+        return parts;
+    }
+
+    func static format(parts: URLParts) -> string {
+        let output: string = "";
+        if (parts.scheme.length() > 0) output = parts.scheme + ":";
+        if (parts.hasAuthority) output = output + "//" + parts.authority;
+        output = output + parts.path;
+        if (parts.hasQuery) output = output + "?" + parts.query;
+        if (parts.hasFragment) output = output + "#" + parts.fragment;
+        return output;
+    }
+
+    func static parseQuery(query: string) -> QueryParams {
+        return new QueryParams(query);
+    }
+
+    func static stringifyQuery(params: QueryParams) -> string {
+        return params.toString();
+    }
+}

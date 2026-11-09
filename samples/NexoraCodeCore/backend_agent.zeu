@@ -1,0 +1,359 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.string;
+import zeus.time [&zeusTime];
+
+import samples.NexoraCodeCore.agent_loop;
+import samples.NexoraCodeCore.agent_settings;
+import samples.NexoraCodeCore.conversation_store;
+import samples.NexoraCodeCore.provider_config;
+import samples.NexoraCodeCore.provider_stream;
+import samples.NexoraCodeCore.project_instructions;
+import samples.NexoraCodeCore.stream_session;
+import samples.NexoraCodeCore.tool_approval_model;
+import samples.NexoraCodeCore.tool_permission_events;
+import samples.NexoraCodeCore.tool_approval_store;
+import samples.NexoraCodeCore.tool_permissions;
+import samples.NexoraCodeCore.tool_registry;
+
+func __nexora_backend_timeout_seconds(value) -> int {
+    if (type(value) != "int" and type(value) != "float") return 120;
+    if (value <= 0) return 120;
+    if (type(value) == "int") return value;
+    let seconds = int(value);
+    if (float(seconds) < value) seconds = seconds + 1;
+    if (seconds < 1) return 1;
+    return seconds;
+}
+
+class NexoraCoreChatJob {
+    using &this;
+
+    let store = nil;
+    let provider = nil;
+    let conversationId = "";
+    let workDir = ".";
+    let systemPrompt = "You are a coding assistant. Use the available tools when they help answer the request.";
+    let model = "";
+    let endpoint = "";
+    let headers = nil;
+    let tools = nil;
+    let temperature = 0.7;
+    let maxTokens = 4096;
+    let contextWindow = 0;
+    let timeoutSeconds = 120;
+    let permissionMode = "confirm";
+    let providerName = "";
+    let context = nil;
+    let toolRegistry = nil;
+    let approvalStore = nil;
+    let skipUserMessage = false;
+    let agentSettings = nil;
+    let providers = nil;
+    let approvalModelId = "";
+    let permissionEventsPath = "";
+    let approvalRequestFn = nil;
+    let currentApprovalContext: dict = {};
+    let lastApprovalAction = nil;
+    let messages: Array;
+
+    func init(storeValue, providerValue, conversationIdValue: string,
+            workDirValue: string, systemPromptValue: string,
+            messagesValue: Array, approvalStoreValue=nil,
+            permissionModeValue: string="confirm",
+            skipUserMessageValue: bool=false, agentSettingsValue=nil,
+            approvalModelIdValue: string="", permissionEventsPathValue: string="",
+            providersValue=nil, approvalRequestFnValue=nil) {
+        this.store = storeValue;
+        this.provider = providerValue;
+        this.conversationId = conversationIdValue;
+        this.workDir = workDirValue;
+        this.systemPrompt = systemPromptValue;
+        this.messages = messagesValue;
+        this.approvalStore = approvalStoreValue;
+        this.permissionMode = permissionModeValue;
+        this.skipUserMessage = skipUserMessageValue;
+        this.agentSettings = agentSettingsValue;
+        this.approvalModelId = approvalModelIdValue;
+        this.permissionEventsPath = permissionEventsPathValue;
+        this.approvalRequestFn = approvalRequestFnValue;
+        this.providers = providersValue;
+        if (this.agentSettings == nil) {
+            this.agentSettings = {
+                "local_custom_system_prompt": "",
+                "local_read_agents_md": true,
+                "local_auto_retry_count": 5,
+                "local_empty_response_retry_count": 2
+            };
+        }
+        this.toolRegistry = new NexoraCoreToolRegistry(this.workDir);
+
+        this.providerName = str(dict_get(providerValue, "name", ""));
+        this.model = str(dict_get(providerValue, "model", ""));
+        this.endpoint = nexora_completions_url(str(dict_get(providerValue, "base_url", "")));
+        this.headers = nexora_provider_headers(str(dict_get(providerValue, "api_key", "")));
+        this.tools = this.toolRegistry.toolDefinitions();
+
+        let configuredTemperature = dict_get(providerValue, "temperature", 0.7);
+        if (type(configuredTemperature) == "int" or type(configuredTemperature) == "float") {
+            this.temperature = configuredTemperature;
+        }
+        let configuredMaxTokens = dict_get(providerValue, "max_tokens", 4096);
+        if (type(configuredMaxTokens) == "int" and configuredMaxTokens > 0) {
+            this.maxTokens = configuredMaxTokens;
+        }
+        let configuredWindow = dict_get(providerValue, "context_window", 0);
+        if (type(configuredWindow) == "int" and configuredWindow > 0) {
+            this.contextWindow = configuredWindow;
+        }
+        this.timeoutSeconds = __nexora_backend_timeout_seconds(
+            dict_get(providerValue, "timeout_seconds", 120));
+    }
+
+    func operator[@=]() -> &NexoraCoreChatJob {
+        return this;
+    }
+
+    func openRound(messages, maxTokens: int=-1) {
+        let requestMaxTokens = this.maxTokens;
+        if (maxTokens > 0) requestMaxTokens = maxTokens;
+        let payload = nexora_chat_stream_payload(this.model, messages, this.tools,
+            this.temperature, requestMaxTokens);
+        return nexora_open_chat_session(this.endpoint, payload, this.headers,
+            this.timeoutSeconds);
+    }
+
+    func executeTool(call) {
+        this.lastApprovalAction = nil;
+        let prepared = this.toolRegistry.prepareCall(call);
+        if (!dict_get(prepared, "ok", false)) {
+            return {"error": str(dict_get(prepared, "error", "Invalid tool call."))};
+        }
+
+        let normalizedCall = dict_get(prepared, "call", {});
+        let operation = this.toolRegistry.operationOf(
+            str(dict_get(prepared, "name", "")),
+            dict_get(prepared, "arguments", {}));
+        let decision = nexora_tool_permission_decision(this.permissionMode, operation);
+        if (decision == "deny") {
+            this.lastApprovalAction = {"tool_name": str(dict_get(prepared, "name", "")),
+                "operation": operation, "decision": "deny", "success": false};
+            return {"error": "The current permission mode denies this tool operation."};
+        }
+        if (decision == "confirm") {
+            if (this.approvalStore == nil or this.context == nil) {
+                return {"error": "Tool approval is unavailable; the operation was not run."};
+            }
+            let request = this.approvalStore.create(this.context.getStreamId(),
+                this.conversationId, this.providerName, this.permissionMode,
+                operation, normalizedCall);
+            if (dict_get(request, "approval_id", nil) == nil) {
+                return {"error": str(dict_get(request, "error",
+                    "Could not create a tool approval request."))};
+            }
+            return {"permission_required": true,
+                "approval_id": request["approval_id"],
+                "operation": operation,
+                "name": request["name"],
+                "summary": request["summary"],
+                "call_id": str(dict_get(normalizedCall, "id", ""))};
+        }
+        if (decision == "auto") {
+            let approval = nexora_tool_approval_evaluate(this.providers,
+                this.approvalModelId, this.currentApprovalContext,
+                str(dict_get(prepared, "name", "")), operation,
+                dict_get(prepared, "arguments", {}), this.shouldCancel,
+                this.approvalRequestFn);
+            let approved = str(dict_get(approval, "decision", "deny")) == "allow" and
+                str(dict_get(approval, "error_type", "")) == "";
+            let event = {"timestamp": zeusTime.time(),
+                "operation": operation,
+                "tool": str(dict_get(prepared, "name", "")),
+                "mode": "auto", "decision": "deny", "stage": "auto_model",
+                "approval_model_id": this.approvalModelId,
+                "duration_ms": dict_get(approval, "duration_ms", 0),
+                "reason": dict_get(approval, "reason", "")};
+            if (approved) event["decision"] = "allow";
+            let usage = dict_get(approval, "usage", nil);
+            if (type(usage) == "dict") {
+                let tokenUsage = {"input_tokens": dict_get(usage, "raw_input", 0),
+                    "output_tokens": dict_get(usage, "output", 0),
+                    "total_tokens": dict_get(usage, "total", 0)};
+                let cachedInput = dict_get(usage, "cached_input", 0);
+                if (cachedInput > 0) tokenUsage["cached_input_tokens"] = cachedInput;
+                event["token_usage"] = tokenUsage;
+            }
+            let errorType = str(dict_get(approval, "error_type", ""));
+            if (errorType != "") event["error_type"] = errorType;
+            if (operation == "command" or operation == "write" or
+                    operation == "network") {
+                try {
+                    nexora_tool_permission_event_record(
+                        this.permissionEventsPath, event);
+                } catch (&auditError) {
+                    this.lastApprovalAction = {"tool_name": str(dict_get(prepared,
+                        "name", "")), "operation": operation,
+                        "decision": "deny", "success": false};
+                    return {"error": "The approval audit event could not be saved; the tool was not run."};
+                }
+            }
+            if (!approved) {
+                this.lastApprovalAction = {"tool_name": str(dict_get(prepared,
+                    "name", "")), "operation": operation,
+                    "decision": "deny", "success": false};
+                let denied = "The approval model denied this tool operation.";
+                let reason = str(dict_get(approval, "reason", ""));
+                if (reason != "") denied = denied + " " + reason;
+                return {"error": denied};
+            }
+            decision = "allow";
+        }
+        let result = this.toolRegistry.executePrepared(prepared);
+        let success = true;
+        if (type(result) == "dict" and dict_get(result, "error", nil) != nil) {
+            success = false;
+        }
+        this.lastApprovalAction = {"tool_name": str(dict_get(prepared, "name", "")),
+            "operation": operation, "decision": decision, "success": success};
+        return result;
+    }
+
+    func setApprovalContext(contextValue) {
+        this.currentApprovalContext = {};
+        if (type(contextValue) == "dict") this.currentApprovalContext = contextValue;
+    }
+
+    func getApprovalAction() {
+        return this.lastApprovalAction;
+    }
+
+    func executeApprovedTool(call) {
+        let prepared = this.toolRegistry.prepareCall(call);
+        if (!dict_get(prepared, "ok", false)) {
+            return {"error": str(dict_get(prepared, "error", "Invalid tool call."))};
+        }
+        return this.toolRegistry.executePrepared(prepared);
+    }
+
+    func saveMessage(message) {
+        if (type(message) != "dict") throw new Exception("agent returned a non-object message");
+        let saved = {};
+        for (message) [&key: &value] {
+            dict_set(saved, key, value);
+        }
+        if (dict_get(saved, "timestamp", nil) == nil) {
+            dict_set(saved, "timestamp", zeusTime.time());
+        }
+        if (!this.store.appendMessage(this.conversationId, saved)) {
+            throw new Exception("conversation disappeared while saving an agent message");
+        }
+    }
+
+    func loadInjectionState() {
+        let conversation = this.store.get(this.conversationId);
+        if (conversation == nil) return {};
+        return conversation;
+    }
+
+    func saveInjections(messages: Array, baseline: dict,
+            permissionMode: string, skipUserMessageValue: bool) {
+        if (!this.store.insertTurnInjections(this.conversationId, messages,
+                baseline, permissionMode, skipUserMessageValue)) {
+            throw new Exception("could not persist project instruction injection");
+        }
+    }
+
+    func saveContext(record: dict, injections: Array, requestMessages: Array) {
+        let expectedPrefix: Array = [];
+        for (0..requestMessages.length()) [const &index] {
+            let message = requestMessages[index];
+            if (index == 0 and type(message) == "dict" and
+                    str(dict_get(message, "role", "")) == "system" and
+                    str(dict_get(message, "content", "")) == this.systemPrompt) {
+                continue;
+            }
+            expectedPrefix.append(message);
+        }
+        this.store.saveContext(this.conversationId, record,
+            expectedPrefix, injections);
+    }
+
+    func onEvent(event) {
+        return this.context.onEvent(event);
+    }
+
+    func shouldCancel() -> bool {
+        return this.context.shouldCancel();
+    }
+
+    func bindExecutionContext(contextValue) {
+        this.context = contextValue;
+    }
+
+    func releaseRunReferences() {
+        this.toolRegistry.setCancelCheck(nil);
+        this.context = nil;
+        this.currentApprovalContext = {};
+        this.lastApprovalAction = nil;
+    }
+
+    func run(contextValue) {
+        this.bindExecutionContext(contextValue);
+        let openRound = this.openRound;
+        let executeTool = this.executeTool;
+        let setApprovalContext = this.setApprovalContext;
+        let getApprovalAction = this.getApprovalAction;
+        let saveMessage = this.saveMessage;
+        let loadInjectionState = this.loadInjectionState;
+        let saveInjections = this.saveInjections;
+        let saveContext = this.saveContext;
+        let onEvent = this.onEvent;
+        let shouldCancel = this.shouldCancel;
+        this.toolRegistry.setCancelCheck(shouldCancel);
+        let messages = this.messages;
+        let projectInstructions = "";
+        if (dict_get(this.agentSettings, "local_read_agents_md", true) == true) {
+            projectInstructions = nexora_read_project_instructions(this.workDir);
+        }
+        let injectionSources = {
+            "project_conventions": projectInstructions,
+            "custom_instructions": nexora_agent_settings_injection_prompt(
+                this.agentSettings)
+        };
+        let options = {
+            "messages": messages,
+            "openRound": openRound,
+            "executeTool": executeTool,
+            "setApprovalContext": setApprovalContext,
+            "getApprovalAction": getApprovalAction,
+            "saveMessage": saveMessage,
+            "injectionSources": injectionSources,
+            "loadInjectionState": loadInjectionState,
+            "saveInjections": saveInjections,
+            "saveContext": saveContext,
+            "permissionMode": this.permissionMode,
+            "skipUserMessage": this.skipUserMessage,
+            "onEvent": onEvent,
+            "shouldCancel": shouldCancel,
+            "contextWindow": this.contextWindow,
+            "maxOutputTokens": this.maxTokens,
+            "tools": this.tools,
+            "autoRetryCount": nexora_agent_settings_normalize_retry_count(
+                dict_get(this.agentSettings, "local_auto_retry_count", 5)),
+            "emptyResponseRetryCount": nexora_agent_settings_normalize_retry_count(
+                dict_get(this.agentSettings, "local_empty_response_retry_count", 2)),
+            "maxRounds": 8,
+            "sliceMillis": 1000,
+            "maxToolOutput": 20000
+        };
+        let result = nil;
+        try {
+            result = nexora_agent_run(options);
+        } catch (&error) {
+            this.releaseRunReferences();
+            throw error;
+        }
+        this.releaseRunReferences();
+        return result;
+    }
+}

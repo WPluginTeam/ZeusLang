@@ -1,8 +1,9 @@
 // RFC 6455 WebSocket support over the HTTP/1.1 Upgrade path.
-// v1 supports ws://, text/binary messages, fragmentation, and control frames.
+// Supports ws:// and wss://, text/binary messages, fragmentation, and control frames.
 
 import zeus.http;
 import zeus.socket;
+import zeus.ssl;
 import zeus.thread;
 import zeus.crypto;
 import zeus.exception;
@@ -44,6 +45,150 @@ func __ws_valid_close_code(code: int) -> bool {
 func __ws_length_byte(length: int, divisor: int) -> int {
     return int(length / divisor) % 256;
 }
+// Keep transport dispatch statically typed at the FFI boundary. A dynamic
+// member call here is emitted as a closure lookup, which is not a stream
+// protocol and fails for SSLSocket in AOT builds.
+func __ws_socket_recv(socket: Socket, size: int) -> bytes {
+    return socket.recv(size);
+}
+
+func __ws_ssl_recv(socket: SSLSocket, size: int) -> bytes {
+    return socket.recv(size);
+}
+
+func __ws_socket_recv_exact(socket: Socket, size: int) -> bytes {
+    return socket.recvExact(size);
+}
+
+func __ws_ssl_recv_exact(socket: SSLSocket, size: int) -> bytes {
+    return socket.recvExact(size);
+}
+
+func __ws_socket_send_all(socket: Socket, data: bytes) -> int {
+    return socket.sendAll(data);
+}
+
+func __ws_ssl_send_all(socket: SSLSocket, data: bytes) -> int {
+    return socket.sendAll(data);
+}
+
+func __ws_socket_close(socket: Socket) {
+    socket.close();
+}
+
+func __ws_ssl_close(socket: SSLSocket) {
+    socket.close();
+}
+
+func __ws_lock_acquire(lock: Lock) {
+    lock.acquire();
+}
+
+func __ws_lock_release(lock: Lock) {
+    lock.release();
+}
+
+func __ws_socket_take(&socket: Socket) -> Socket {
+    let moved = new Socket(nil, nil, false);
+    moved.adoptHandle(socket.detachHandle());
+    return moved;
+}
+
+func __ws_ssl_take(&socket: SSLSocket) -> SSLSocket {
+    return socket.take();
+}
+
+func __ws_stream_recv(stream, size: int) -> bytes {
+    when (type(stream)) {
+        "Socket": return __ws_socket_recv(stream, size);
+        "SSLSocket": return __ws_ssl_recv(stream, size);
+        else: throw new Exception("WebSocket transport must be a Socket or SSLSocket");
+    }
+}
+
+func __ws_stream_recv_exact(stream, size: int) -> bytes {
+    when (type(stream)) {
+        "Socket": return __ws_socket_recv_exact(stream, size);
+        "SSLSocket": return __ws_ssl_recv_exact(stream, size);
+        else: throw new Exception("WebSocket transport must be a Socket or SSLSocket");
+    }
+}
+
+func __ws_stream_send_all(stream, data: bytes) -> int {
+    when (type(stream)) {
+        "Socket": return __ws_socket_send_all(stream, data);
+        "SSLSocket": return __ws_ssl_send_all(stream, data);
+        else: throw new Exception("WebSocket transport must be a Socket or SSLSocket");
+    }
+}
+
+func __ws_stream_close(stream) {
+    when (type(stream)) {
+        "Socket": {
+            __ws_socket_close(stream);
+            return;
+        }
+        "SSLSocket": {
+            __ws_ssl_close(stream);
+            return;
+        }
+        else: throw new Exception("WebSocket transport must be a Socket or SSLSocket");
+    }
+}
+
+func __ws_socket_wait_readable(socket: Socket, timeoutMillis: int) -> bool {
+    return socket.waitReadable(timeoutMillis);
+}
+
+func __ws_ssl_wait_readable(socket: SSLSocket, timeoutMillis: int) -> bool {
+    return socket.waitReadable(timeoutMillis);
+}
+
+func __ws_socket_timeout_of(socket: Socket) -> int {
+    return socket.getTimeout();
+}
+
+func __ws_ssl_timeout_of(socket: SSLSocket) -> int {
+    return socket.getTimeout();
+}
+
+func __ws_socket_set_timeout(socket: Socket, timeoutMillis: int) {
+    socket.setTimeout(timeoutMillis);
+}
+
+func __ws_ssl_set_timeout(socket: SSLSocket, timeoutMillis: int) {
+    socket.setTimeout(timeoutMillis);
+}
+
+func __ws_stream_wait_readable(stream, timeoutMillis: int) -> bool {
+    when (type(stream)) {
+        "Socket": return __ws_socket_wait_readable(stream, timeoutMillis);
+        "SSLSocket": return __ws_ssl_wait_readable(stream, timeoutMillis);
+        else: throw new Exception("WebSocket transport must be a Socket or SSLSocket");
+    }
+}
+
+func __ws_stream_timeout_of(stream) -> int {
+    when (type(stream)) {
+        "Socket": return __ws_socket_timeout_of(stream);
+        "SSLSocket": return __ws_ssl_timeout_of(stream);
+        else: throw new Exception("WebSocket transport must be a Socket or SSLSocket");
+    }
+}
+
+func __ws_stream_set_timeout(stream, timeoutMillis: int) {
+    when (type(stream)) {
+        "Socket": {
+            __ws_socket_set_timeout(stream, timeoutMillis);
+            return;
+        }
+        "SSLSocket": {
+            __ws_ssl_set_timeout(stream, timeoutMillis);
+            return;
+        }
+        else: throw new Exception("WebSocket transport must be a Socket or SSLSocket");
+    }
+}
 
 class WebSocketURL {
     using &this;
@@ -51,6 +196,7 @@ class WebSocketURL {
     let authority = "";
     let port = 80;
     let target = "/";
+    let secure = false;
 }
 
 func __ws_parse_port(text: string) -> int {
@@ -68,10 +214,18 @@ func __ws_parse_port(text: string) -> int {
 }
 
 func __ws_parse_url(url: string) {
-    if (url.slice(0, 5).lower() != "ws://") {
-        throw new Exception("WebSocketClient supports ws:// URLs only");
+    let scheme = url.slice(0, 6).lower();
+    let schemeLength: int = 0;
+    let secure: bool = false;
+    if (scheme.slice(0, 5) == "ws://") {
+        schemeLength = 5;
+    } else if (scheme == "wss://") {
+        schemeLength = 6;
+        secure = true;
+    } else {
+        throw new Exception("WebSocketClient requires a ws:// or wss:// URL");
     }
-    let remainder = url.slice(5, url.length());
+    let remainder = url.slice(schemeLength, url.length());
     let fragment = remainder.index("#");
     if (fragment >= 0) remainder = remainder.slice(0, fragment);
 
@@ -92,7 +246,8 @@ func __ws_parse_url(url: string) {
     }
 
     let host = authority;
-    let port = 80;
+    let port: int = 80;
+    if (secure) port = 443;
     let firstColon = authority.index(":");
     let lastColon = authority.rindex(":");
     if (firstColon >= 0) {
@@ -113,6 +268,7 @@ func __ws_parse_url(url: string) {
     result.authority = authority;
     result.port = port;
     result.target = target;
+    result.secure = secure;
     return result;
 }
 
@@ -141,7 +297,7 @@ func __ws_read_handshake_response(socket) {
         if (buffer.length() >= 16384) {
             throw new Exception("WebSocket handshake response headers are too large");
         }
-        let received = socket.recv(4096);
+        let received = __ws_stream_recv(socket, 4096);
         if (received.length() == 0) {
             throw new Exception("connection closed during WebSocket handshake");
         }
@@ -176,8 +332,40 @@ class WebSocketFrame {
     let payload: bytes = b"";
 }
 
+// A read that ran out of its waiting time before a frame started. Nothing was
+// consumed, so the connection stays open and the caller can keep listening or
+// send a heartbeat; the timeout is a scheduling fact, not a protocol error.
+class WebSocketTimeout {
+    using &this;
+
+    let timeoutMillis = -1;
+
+    func init(waitedMillis: int = -1) {
+        this.timeoutMillis = waitedMillis;
+    }
+
+    func getTimeoutMillis() -> int {
+        return this.timeoutMillis;
+    }
+
+    func getMessage() {
+        return "no WebSocket frame arrived within the receive timeout";
+    }
+
+    func toString() {
+        return "WebSocketTimeout: " + this.getMessage();
+    }
+}
+
 class WebSocketConnection {
     using &this;
+
+    // 引用语义：本类持有原生资源或共享表项。值语义下「读字段」就会复制一份，
+    // 副本析构时 [~] 会把同一个句柄释放掉（或把状态写在快照上）。
+    func operator[@=]() -> &WebSocketConnection {
+        return this;
+    }
+
     let socket = nil;
     let isClient = false;
     let isOpen = false;
@@ -189,12 +377,15 @@ class WebSocketConnection {
     let receiveLock = nil;
     let _failureCloseCode = 1002;
 
-    func init(socket, isClient: bool, pendingBytes: bytes=b"", maxMessageBytes: int=1048576) {
+    func init(&socket, isClient: bool, pendingBytes: bytes=b"", maxMessageBytes: int=1048576) {
         if (maxMessageBytes <= 0 or maxMessageBytes > 16777216) {
             throw new Exception("WebSocket maxMessageBytes must be between 1 and 16777216");
         }
-        this.socket = new Socket();
-        this.socket.adoptHandle(socket.detachHandle());
+        when (type(socket)) {
+            "Socket": this.socket = __ws_socket_take(socket);
+            "SSLSocket": this.socket = __ws_ssl_take(socket);
+            else: throw new Exception("WebSocketConnection needs a Socket or SSLSocket");
+        }
         this.isClient = isClient;
         this.isOpen = true;
         this.closeSent = false;
@@ -219,7 +410,7 @@ class WebSocketConnection {
         let output = this.pendingBytes;
         this.pendingBytes = b"";
         let missing = size - output.length();
-        let received = this.socket.recvExact(missing);
+        let received = __ws_stream_recv_exact(this.socket, missing);
         return output + received;
     }
 
@@ -415,15 +606,15 @@ class WebSocketConnection {
         if (this.isClient) header = header + mask;
         let frameBytes = header + wirePayload;
 
-        this.sendLock.acquire();
+        __ws_lock_acquire(this.sendLock);
         try {
-            let sent = this.socket.sendAll(frameBytes);
+            let sent = __ws_stream_send_all(this.socket, frameBytes);
             if (sent != frameBytes.length()) throw new Exception("incomplete WebSocket frame write");
         } catch (&error) {
-            this.sendLock.release();
+            __ws_lock_release(this.sendLock);
             throw error;
         }
-        this.sendLock.release();
+        __ws_lock_release(this.sendLock);
         return frameBytes.length();
     }
 
@@ -452,14 +643,36 @@ class WebSocketConnection {
         return true;
     }
 
-    func receive() {
+    // Reads the next message. timeoutMillis < 0 waits without a deadline, which
+    // is the original behaviour. With a timeout the call waits that long for the
+    // first byte of a frame; running out of time throws WebSocketTimeout and
+    // leaves the connection untouched. Once the frame has started the same
+    // timeout bounds every read inside it, and a stall there is fatal because a
+    // half-consumed frame cannot be resumed.
+    func receive(timeoutMillis: int = -1) {
         if (!this.isOpen) return nil;
-        this.receiveLock.acquire();
+        __ws_lock_acquire(this.receiveLock);
+        let previousTimeout = -1;
+        let armed = false;
         try {
+            if (timeoutMillis >= 0) {
+                if (this.pendingBytes.length() == 0 and
+                    !__ws_stream_wait_readable(this.socket, timeoutMillis)) {
+                    throw new WebSocketTimeout(timeoutMillis);
+                }
+                previousTimeout = __ws_stream_timeout_of(this.socket);
+                __ws_stream_set_timeout(this.socket, timeoutMillis);
+                armed = true;
+            }
             let message = this._readMessage();
-            this.receiveLock.release();
+            if (armed) __ws_stream_set_timeout(this.socket, previousTimeout);
+            __ws_lock_release(this.receiveLock);
             return message;
         } catch (&error) {
+            if (type(error) == "WebSocketTimeout") {
+                __ws_lock_release(this.receiveLock);
+                throw error;
+            }
             let code = this._failureCloseCode;
             if (this.isOpen and !this.closeSent) {
                 try {
@@ -469,7 +682,7 @@ class WebSocketConnection {
                 }
             }
             this._closeTransport();
-            this.receiveLock.release();
+            __ws_lock_release(this.receiveLock);
             throw error;
         }
     }
@@ -477,7 +690,7 @@ class WebSocketConnection {
     func _closeTransport() {
         if (this.isOpen) {
             this.isOpen = false;
-            this.socket.close();
+            __ws_stream_close(this.socket);
         }
     }
 
@@ -601,27 +814,61 @@ func __ws_validate_server_response(headerText: string, key: string) -> bool {
 }
 
 class WebSocketClient {
-    func static connect(url: string, maxMessageBytes: int=1048576) {
+    func static connect(url: string, maxMessageBytes: int=1048576, sslContext=nil) -> WebSocketConnection {
         let parsedURL = __ws_parse_url(url);
         let socket = new Socket(parsedURL.host, parsedURL.port);
-        let key = Crypto.base64Encode(Crypto.randomBytes(16));
-        let request = bytes(
-            "GET " + parsedURL.target + " HTTP/1.1\r\n" +
-            "Host: " + parsedURL.authority + "\r\n" +
-            "Upgrade: websocket\r\n" +
-            "Connection: Upgrade\r\n" +
-            "Sec-WebSocket-Key: " + key + "\r\n" +
-            "Sec-WebSocket-Version: 13\r\n\r\n");
+        if (parsedURL.secure) {
+            let context: SSLContext = createDefaultContext();
+            if (sslContext != nil) context = sslContext;
+            let transport = context.wrapSocket(socket, parsedURL.host);
+            try {
+                let key = Crypto.base64Encode(Crypto.randomBytes(16));
+                let request = bytes(
+                    "GET " + parsedURL.target + " HTTP/1.1\r\n" +
+                    "Host: " + parsedURL.authority + "\r\n" +
+                    "Upgrade: websocket\r\n" +
+                    "Connection: Upgrade\r\n" +
+                    "Sec-WebSocket-Key: " + key + "\r\n" +
+                    "Sec-WebSocket-Version: 13\r\n\r\n");
+                let sent = __ws_ssl_send_all(transport, request);
+                if (sent != request.length()) {
+                    throw new Exception("incomplete WebSocket handshake write");
+                }
+                let response = __ws_read_handshake_response(transport);
+                if (!__ws_validate_server_response(response.headerText, key)) {
+                    throw new Exception("server rejected the WebSocket handshake");
+                }
+                return new WebSocketConnection(
+                    transport, true, response.pendingBytes, maxMessageBytes);
+            } catch (&error) {
+                try {
+                    __ws_ssl_close(transport);
+                } catch (&cleanup) {}
+                throw error;
+            }
+        }
         try {
-            __http_send_all(socket, request);
+            let key = Crypto.base64Encode(Crypto.randomBytes(16));
+            let request = bytes(
+                "GET " + parsedURL.target + " HTTP/1.1\r\n" +
+                "Host: " + parsedURL.authority + "\r\n" +
+                "Upgrade: websocket\r\n" +
+                "Connection: Upgrade\r\n" +
+                "Sec-WebSocket-Key: " + key + "\r\n" +
+                "Sec-WebSocket-Version: 13\r\n\r\n");
+            let sent = __ws_socket_send_all(socket, request);
+            if (sent != request.length()) throw new Exception("incomplete WebSocket handshake write");
             let response = __ws_read_handshake_response(socket);
             if (!__ws_validate_server_response(response.headerText, key)) {
                 throw new Exception("server rejected the WebSocket handshake");
             }
-            return new WebSocketConnection(
+            let connection = new WebSocketConnection(
                 socket, true, response.pendingBytes, maxMessageBytes);
+            return connection;
         } catch (&error) {
-            socket.close();
+            try {
+                __ws_socket_close(socket);
+            } catch (&cleanup) {}
             throw error;
         }
     }

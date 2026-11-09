@@ -1,0 +1,865 @@
+import zeus.byte;
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import zeus.string;
+import samples.NexoraCodeCore.agent_loop;
+import samples.NexoraCodeCore.turn_injection;
+
+// agent 循环的离线测试：假会话喂帧，假宿主记录工具调用与落盘。
+// 不碰网络，也不依赖真实 provider。
+
+func assertAgentLoop(condition, message: string) {
+    if (!condition) throw new Exception("agent_loop 测试失败: " + message);
+}
+
+func __agent_textFrame(text: string) {
+    return {"type": "event", "data": JSON.stringify({
+        "choices": [{"index": 0, "delta": {"content": text},
+            "finish_reason": nil}]})};
+}
+
+func __agent_toolFrame(slot: int, callId: string, name: string, fragment: string) {
+    return {"type": "event", "data": JSON.stringify({
+        "choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": slot,
+            "id": callId,
+            "type": "function",
+            "function": {"name": name, "arguments": fragment}}]},
+            "finish_reason": nil}]})};
+}
+
+func __agent_usageFrame(prompt: int, completion: int) {
+    return {"type": "event", "data": JSON.stringify({
+        "choices": [],
+        "usage": {"prompt_tokens": prompt, "completion_tokens": completion,
+            "total_tokens": prompt + completion}})};
+}
+
+func __agent_finishFrame(reason: string) {
+    return {"type": "event", "data": JSON.stringify({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}]})};
+}
+
+// 假会话：按脚本吐帧，脚本用完就是 done。cancel() 只是记账。
+class FakeAgentSession {
+    using &this;
+
+    let frames = [];
+    let cursor = 0;
+    let closed = false;
+    let cancelled = 0;
+
+    func operator[@=]() -> &FakeAgentSession {
+        return this;
+    }
+
+    func init(framesValue: Array) {
+        this.frames = framesValue;
+        this.cursor = 0;
+        this.closed = false;
+        this.cancelled = 0;
+    }
+
+    func next(sliceMillis: int = 1000) {
+        if (this.cursor >= this.frames.length()) return {"type": "done"};
+        let frame = this.frames[this.cursor];
+        this.cursor = this.cursor + 1;
+        if (type(frame) == "dict" and dict_get(frame, "type", "") == "throw") {
+            throw new Exception(str(dict_get(frame, "message", "fake stream error")));
+        }
+        return frame;
+    }
+
+    func cancel() {
+        this.cancelled = this.cancelled + 1;
+    }
+
+    func close() {
+        this.closed = true;
+    }
+}
+
+// 假宿主：每轮一份帧脚本，并记录工具调用 / 落盘消息 / 开过的会话。
+class FakeAgentHost {
+    using &this;
+
+    let rounds = [];
+    let roundCursor = 0;
+    let toolCalls = [];
+    let saved = [];
+    let events = [];
+    let sessions = [];
+    let opened = 0;
+    let cancelChecks = 0;
+    let cancelAt = -1;
+    let toolOutput = "";
+    let lastMessages = [];
+    let lastMaxTokens = 0;
+
+    func operator[@=]() -> &FakeAgentHost {
+        return this;
+    }
+
+    func init(roundScripts: Array) {
+        this.rounds = roundScripts;
+    }
+
+    func openRound(messages, maxTokens: int=-1) {
+        this.opened = this.opened + 1;
+        this.lastMessages = messages;
+        this.lastMaxTokens = maxTokens;
+        let frames = [];
+        if (this.roundCursor < this.rounds.length()) {
+            frames = this.rounds[this.roundCursor];
+            this.roundCursor = this.roundCursor + 1;
+        }
+        let session = new FakeAgentSession(frames);
+        this.sessions.append(session);
+        return session;
+    }
+
+    func executeTool(call) {
+        this.toolCalls.append(call);
+        if (this.toolOutput != "") return {"content": this.toolOutput};
+        return {"content": "tool:" + str(call["name"])};
+    }
+
+    func saveMessage(message) {
+        this.saved.append(message);
+    }
+
+    func onEvent(event) {
+        this.events.append(event);
+    }
+
+    func shouldCancel() {
+        this.cancelChecks = this.cancelChecks + 1;
+        if (this.cancelAt < 0) return false;
+        return this.cancelChecks >= this.cancelAt;
+    }
+}
+
+class FakeInjectionPersistence {
+    using &this;
+
+    let state = {};
+    let inserted = [];
+    let skippedUserMessage = false;
+    let contextRecord = nil;
+    let contextMessages = [];
+    let contextExpectedMessages = [];
+
+    func operator[@=]() -> &FakeInjectionPersistence {
+        return this;
+    }
+
+    func init(stateValue: dict = {}) {
+        this.state = stateValue;
+    }
+
+    func loadState() {
+        return this.state;
+    }
+
+    func saveInjections(messages: Array, baseline: dict, permissionMode: string,
+            skipUserMessage: bool) {
+        this.inserted = messages;
+        this.skippedUserMessage = skipUserMessage;
+        this.state["injection_version"] = NEXORA_INJECTION_VERSION;
+        this.state["injection_baseline"] = baseline;
+        this.state["injection_permission_mode"] = permissionMode;
+    }
+
+    func saveContext(record: dict, injections: Array, expectedMessages: Array) {
+        this.contextRecord = record;
+        this.contextMessages = injections;
+        this.contextExpectedMessages = expectedMessages;
+    }
+}
+
+func __agent_count_type(events: Array, wanted: string) -> int {
+    let count = 0;
+    for (events) [event] {
+        if (str(event["type"]) == wanted) count = count + 1;
+    }
+    return count;
+}
+
+func __agent_firstRound(text: string) -> Array {
+    return [__agent_textFrame(text), __agent_usageFrame(25, 10), {"type": "done"}];
+}
+
+func __agent_repeat(piece: string, times: int) -> string {
+    let text = "";
+    for (0..times) [const &i] {
+        text = text + piece;
+    }
+    return text;
+}
+
+func testAgentLoopSingleRound() {
+    let host = new FakeAgentHost([__agent_firstRound("你好")]);
+    let options = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "saveMessage": host.saveMessage,
+        "maxRounds": 4
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "done", "单轮纯文本应以 done 收尾");
+    assertAgentLoop(int(result["rounds"]) == 1, "应只跑一轮");
+    assertAgentLoop(int(result["toolCalls"]) == 0, "不该有工具执行");
+    assertAgentLoop(result["truncated"] == false, "不该被标记截断");
+    assertAgentLoop(str(result["error"]) == "", "不该有错误说明");
+    assertAgentLoop(host.opened == 1, "应只开一次会话");
+
+    let message = result["message"];
+    assertAgentLoop(str(message["role"]) == "assistant", "结果消息应为 assistant");
+    assertAgentLoop(str(message["content"]) == "你好", "结果正文应完整");
+    assertAgentLoop(host.saved.length() == 1, "收尾消息应落盘一次");
+    assertAgentLoop(host.toolCalls.length() == 0, "不该有工具调用");
+
+    let usage = result["usage"];
+    assertAgentLoop(int(usage["raw_input"]) == 25, "应累计输入用量");
+    assertAgentLoop(int(usage["output"]) == 10, "应累计输出用量");
+    assertAgentLoop(int(usage["total"]) == 35, "应累计总用量");
+}
+
+func testAgentLoopToolRound() {
+    // 第一轮：要一次工具调用，arguments 分两片到达。
+    let toolRound = [
+        __agent_toolFrame(0, "call_a", "read_file", "{\"pa"),
+        __agent_toolFrame(0, "", "", "th\": \"a.txt\"}"),
+        __agent_usageFrame(30, 12),
+        {"type": "done"}
+    ];
+    let host = new FakeAgentHost([toolRound, __agent_firstRound("读完了")]);
+    let options = {
+        "messages": [{"role": "user", "content": "读 a.txt"}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "saveMessage": host.saveMessage,
+        "onEvent": host.onEvent,
+        "maxRounds": 4
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "done", "两轮后应以 done 收尾");
+    assertAgentLoop(int(result["rounds"]) == 2, "应跑满两轮");
+    assertAgentLoop(int(result["toolCalls"]) == 1, "应记录一次工具执行");
+    assertAgentLoop(host.opened == 2, "应开两次会话");
+    assertAgentLoop(str(result["message"]["content"]) == "读完了", "最终正文应是第二轮的");
+
+    assertAgentLoop(host.toolCalls.length() == 1, "应执行一次工具");
+    let call = host.toolCalls[0];
+    assertAgentLoop(str(call["name"]) == "read_file", "工具名应正确");
+    assertAgentLoop(str(call["id"]) == "call_a", "调用 id 应正确");
+    assertAgentLoop(str(call["arguments"]["path"]) == "a.txt", "参数应解析成字典");
+
+    let messages = result["messages"];
+    assertAgentLoop(messages.length() == 4, "应多出 assistant 与 tool 两条消息");
+    assertAgentLoop(str(messages[1]["role"]) == "assistant", "第二条应是 assistant");
+    assertAgentLoop(messages[1].get("tool_calls", nil) != nil, "assistant 消息应带工具调用");
+    assertAgentLoop(str(messages[2]["role"]) == "tool", "第三条应是 tool");
+    assertAgentLoop(str(messages[2]["tool_call_id"]) == "call_a", "tool 消息应对上调用 id");
+    assertAgentLoop(str(messages[2]["content"]) == "tool:read_file", "tool 消息应带工具输出");
+    assertAgentLoop(str(messages[3]["content"]) == "读完了", "最后一条应是最终回答");
+
+    assertAgentLoop(host.saved.length() == 3, "assistant + tool + 最终回答都应落盘");
+    assertAgentLoop(__agent_count_type(host.events, "text") == 1, "应转发第二轮的文本增量");
+    assertAgentLoop(__agent_count_type(host.events, "usage") == 2, "两轮的 usage 都应转发");
+    assertAgentLoop(__agent_count_type(host.events, "function_call") == 1,
+        "工具执行前应转发调用事件");
+    assertAgentLoop(__agent_count_type(host.events, "function_result") == 1,
+        "工具执行结果应转发成一个事件");
+    for (host.events) [event] {
+        if (str(event["type"]) == "function_call") {
+            assertAgentLoop(str(event["name"]) == "read_file" and
+                str(event["call_id"]) == "call_a", "调用事件应包含工具名和调用 id");
+        }
+    }
+}
+
+func testAgentLoopRoundEvents() {
+    let host = new FakeAgentHost([
+        [__agent_toolFrame(0, "call_a", "noop", "{}"),
+            __agent_finishFrame("tool_calls"), {"type": "done"}],
+        [__agent_textFrame("好"), __agent_finishFrame("stop"), {"type": "done"}]
+    ]);
+    let options = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "onEvent": host.onEvent,
+        "maxRounds": 4
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "done", "应正常收尾");
+    assertAgentLoop(__agent_count_type(host.events, "round_start") == 2, "两轮应各发一次 round_start");
+    assertAgentLoop(__agent_count_type(host.events, "round_end") == 2, "两轮应各发一次 round_end");
+
+    let reasons = result["finishReasons"];
+    assertAgentLoop(type(reasons) == "Array", "finishReasons 应为数组");
+    assertAgentLoop(reasons.length() == 2, "两轮各记一次结束原因");
+    assertAgentLoop(str(reasons[0]) == "tool_calls", "第一轮结束原因应是 tool_calls");
+    assertAgentLoop(str(reasons[1]) == "stop", "第二轮结束原因应是 stop");
+
+    // round_end 必须带上这一轮的统计，宿主要靠它驱动进度条。
+    let ends: Array = [];
+    for (host.events) [event] {
+        if (str(event["type"]) == "round_end") ends.append(event);
+    }
+    assertAgentLoop(ends.length() == 2, "应能取出两条 round_end");
+    assertAgentLoop(int(ends[0]["round"]) == 1, "第一轮编号应为 1");
+    assertAgentLoop(int(ends[0]["toolCalls"]) == 1, "第一轮应报告一个工具调用");
+    assertAgentLoop(int(ends[1]["round"]) == 2, "第二轮编号应为 2");
+    assertAgentLoop(int(ends[1]["toolCalls"]) == 0, "第二轮不该有工具调用");
+    assertAgentLoop(ends[1]["truncated"] == false, "第二轮没被截断");
+}
+
+func testAgentLoopTruncatedAnswer() {
+    let host = new FakeAgentHost([
+        [__agent_textFrame("说到一半"), __agent_finishFrame("length"), {"type": "done"}]
+    ]);
+    let options = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "onEvent": host.onEvent,
+        "maxRounds": 3
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "done", "被 max_tokens 截断仍然是 done");
+    assertAgentLoop(result["truncated"] == true, "应把截断标记回传");
+    assertAgentLoop(str(result["finishReasons"][0]) == "length", "结束原因应是 length");
+}
+
+func testAgentLoopToolOutputTruncation() {
+    let toolRound = [
+        __agent_toolFrame(0, "call_big", "read_file", "{}"),
+        {"type": "done"}
+    ];
+    let host = new FakeAgentHost([toolRound, __agent_firstRound("好")]);
+    let big = "";
+    for (0..50) [const &i] {
+        big = big + "0123456789";
+    }
+    host.toolOutput = big;
+
+    let options = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "onEvent": host.onEvent,
+        "maxToolOutput": 100,
+        "maxRounds": 3
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "done", "截断工具输出不影响收尾");
+
+    let toolMessage = result["messages"][2];
+    let content = str(toolMessage["content"]);
+    assertAgentLoop(content.length() < big.length(), "回填内容应短于原始输出");
+    assertAgentLoop(content.index("truncated") >= 0, "截断后应留下说明");
+    assertAgentLoop(content.index("0123456789") == 0, "应保留输出的开头部分");
+
+    let results: Array = [];
+    for (host.events) [event] {
+        if (str(event["type"]) == "function_result") results.append(event);
+    }
+    assertAgentLoop(results.length() == 1, "应有一条工具结果事件");
+    assertAgentLoop(results[0]["truncated"] == true, "事件应标记被截断");
+    assertAgentLoop(int(results[0]["originalLength"]) == big.length(), "事件应带原始长度");
+}
+
+func testAgentLoopToolOutputLimitKeepsUtf8Whole() {
+    // "中文字" 是 9 字节；从第 4 字节切会劈开第二个字，必须回退到边界。
+    let kept = __nexora_agent_truncate_utf8("中文字", 4);
+    assertAgentLoop(str(kept) == "中", "截断点应回退到完整字符边界");
+    assertAgentLoop(bytes(kept).length() == 3, "留下的应是完整的三字节字符");
+
+    let untouched = __nexora_agent_truncate_utf8("中文字", 100);
+    assertAgentLoop(str(untouched) == "中文字", "未超限时应原样返回");
+}
+
+func testAgentLoopCancelledBeforeStart() {
+    let host = new FakeAgentHost([__agent_firstRound("不该跑到")]);
+    host.cancelAt = 1;
+    let options = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "shouldCancel": host.shouldCancel,
+        "maxRounds": 4
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "cancelled", "开跑前取消应以 cancelled 收尾");
+    assertAgentLoop(int(result["rounds"]) == 0, "取消不该计轮");
+    assertAgentLoop(host.opened == 0, "取消不该开会话");
+}
+
+func testAgentLoopCancelledMidStream() {
+    // 会话自己报 cancelled（等价于流被 cancel()）。
+    let host = new FakeAgentHost([[__agent_textFrame("半"), {"type": "cancelled"}]]);
+    let options = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "maxRounds": 4
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "cancelled", "流中取消应以 cancelled 收尾");
+    assertAgentLoop(int(result["rounds"]) == 1, "已开跑的那轮应计数");
+}
+
+func testAgentLoopCancelReachesSession() {
+    // 第 1 次检查在开轮前，之后每读一帧检查一次；第 3 次命中。
+    let host = new FakeAgentHost([__agent_firstRound("abc")]);
+    host.cancelAt = 3;
+    let options = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "shouldCancel": host.shouldCancel,
+        "maxRounds": 4
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "cancelled", "读到一半取消应以 cancelled 收尾");
+    assertAgentLoop(host.sessions.length() == 1, "应开过一次会话");
+    let session = host.sessions[0];
+    assertAgentLoop(int(session.cancelled) == 1, "取消必须传到会话，不能只退出读循环");
+    assertAgentLoop(session.closed == true, "取消后仍要关闭会话");
+}
+
+func testAgentLoopMaxRounds() {
+    // 每轮都要工具，永远不收敛。
+    let toolRound = [
+        __agent_toolFrame(0, "call_loop", "noop", "{}"),
+        {"type": "done"}
+    ];
+    let host = new FakeAgentHost([toolRound, toolRound, toolRound]);
+    let options = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "maxRounds": 3
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "max_rounds", "不收敛时应以 max_rounds 收尾");
+    assertAgentLoop(int(result["rounds"]) == 3, "应跑满 maxRounds");
+    assertAgentLoop(int(result["toolCalls"]) == 3, "每轮都应执行工具");
+    assertAgentLoop(type(result["message"]) == "dict", "max_rounds 也应回传最后一条消息");
+}
+
+func testAgentLoopNeedsToolExecutor() {
+    let toolRound = [
+        __agent_toolFrame(0, "call_a", "noop", "{}"),
+        {"type": "done"}
+    ];
+    let host = new FakeAgentHost([toolRound]);
+    let options = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "openRound": host.openRound,
+        "maxRounds": 2
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "error", "缺 executeTool 应报错收尾");
+    assertAgentLoop(str(result["error"]) != "", "应说明缺少回调");
+}
+
+func testAgentLoopRequiresOpenRound() {
+    let failed = false;
+    try {
+        nexora_agent_run({"messages": []});
+    } catch (&error) {
+        failed = true;
+    }
+    assertAgentLoop(failed, "没有 openRound 时应抛异常");
+}
+
+func testAgentLoopCompressesBeforeSending() {
+    let huge = __agent_repeat("0123456789", 3000);
+    let messages: Array = [
+        {"role": "system", "content": "系统提示"},
+        {"role": "user", "content": "读大文件"},
+        {"role": "assistant", "content": ""},
+        {"role": "tool", "tool_call_id": "call_a", "content": huge},
+        {"role": "user", "content": "总结"}
+    ];
+
+    let host = new FakeAgentHost([__agent_firstRound("好")]);
+    let options = {
+        "messages": messages,
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "onEvent": host.onEvent,
+        "contextWindow": 4000,
+        "maxOutputTokens": 200,
+        "maxRounds": 2
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "done", "压缩后应正常出结果");
+    assertAgentLoop(str(result["compressed"]) == "trimmed", "结果应记录压缩方式");
+    assertAgentLoop(__agent_count_type(host.events, "context_compression") == 1,
+        "应发出一次压缩事件");
+
+    let sent = host.lastMessages;
+    assertAgentLoop(str(sent[3]["content"]).length() < huge.length(),
+        "发给模型的工具结果应已被裁剪");
+    assertAgentLoop(str(sent[4]["content"]) == "总结", "当前轮应原样发出");
+    assertAgentLoop(str(messages[3]["content"]) == huge, "调用方历史不应被改写");
+}
+
+func testAgentLoopContextGuard() {
+    let host = new FakeAgentHost([__agent_firstRound("不该跑到")]);
+    let longText = "";
+    for (0..40) [const &i] {
+        longText = longText + "0123456789";
+    }
+    let options = {
+        "messages": [{"role": "user", "content": longText}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "contextWindow": 100,
+        "maxOutputTokens": 10,
+        "maxRounds": 4
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "context_overflow",
+        "超出直发预算应以 context_overflow 收尾");
+    assertAgentLoop(int(result["rounds"]) == 0, "超预算不该开轮");
+    assertAgentLoop(host.opened == 0, "超预算不该开会话");
+    assertAgentLoop(str(result["error"]) != "", "应说明需要压缩");
+}
+
+func testAgentLoopContextFits() {
+    let host = new FakeAgentHost([__agent_firstRound("ok")]);
+    let options = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "contextWindow": 262144,
+        "maxOutputTokens": 4096,
+        "maxRounds": 2
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "done", "预算充足时应正常跑完");
+    assertAgentLoop(host.opened == 1, "预算充足时应开会话");
+}
+
+func testAgentLoopInjectsAndPersistsChangedSources() {
+    let host = new FakeAgentHost([__agent_firstRound("完成")]);
+    let persistence = new FakeInjectionPersistence();
+    let options = {
+        "messages": [{"role": "user", "content": "开始"}],
+        "openRound": host.openRound,
+        "saveMessage": host.saveMessage,
+        "onEvent": host.onEvent,
+        "loadInjectionState": persistence.loadState,
+        "saveInjections": persistence.saveInjections,
+        "injectionSources": {"project_conventions": "先读 AGENTS.md"},
+        "permissionMode": "confirm"
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "done", "带注入的 Agent Loop 应正常收尾");
+    assertAgentLoop(persistence.inserted.length() == 1, "首轮全量注入应持久化一次");
+    assertAgentLoop(persistence.inserted[0]["metadata"]["injection"]["mode"] == "full",
+        "持久化消息应带 full 标记");
+    assertAgentLoop(host.lastMessages[0]["metadata"]["injection"]["name"] ==
+        "project_conventions", "注入应插在当前 user 消息前");
+    assertAgentLoop(__agent_count_type(host.events, "context_injection") == 1,
+        "有注入内容时应发送诊断事件");
+    assertAgentLoop(persistence.state["injection_permission_mode"] == "confirm",
+        "注入与审批模式应一起保存");
+
+    let nextMessages = result["messages"];
+    nextMessages.append({"role": "user", "content": "继续"});
+    let nextHost = new FakeAgentHost([__agent_firstRound("继续完成")]);
+    let nextOptions = {
+        "messages": nextMessages,
+        "openRound": nextHost.openRound,
+        "loadInjectionState": persistence.loadState,
+        "saveInjections": persistence.saveInjections,
+        "injectionSources": {"project_conventions": "先读 AGENTS.md"},
+        "permissionMode": "confirm"
+    };
+    let nextResult = nexora_agent_run(nextOptions);
+    assertAgentLoop(str(nextResult["status"]) == "done", "稳定基线下下一轮应正常收尾");
+    assertAgentLoop(persistence.inserted.length() == 1,
+        "内容不变且模式不变时不应重复落盘");
+    assertAgentLoop(host.lastMessages[0]["metadata"]["injection"]["name"] ==
+        "project_conventions", "首轮请求应在当前 user 前保留注入");
+}
+
+func testAgentLoopRebuildsInjectionAfterCompression() {
+    let oldBlock = nexora_plan_injection({"project_conventions": "旧约定"}, {});
+    let oldMessages = nexora_injection_build_messages(
+        oldBlock["blocks"], oldBlock["diagnostics"]);
+    let longText = __agent_repeat("0123456789", 3000);
+    let messages: Array = [
+        {"role": "system", "content": "固定 head"},
+        oldMessages[0],
+        {"role": "user", "content": "旧问题"},
+        {"role": "assistant", "content": longText},
+        {"role": "user", "content": "另一个问题"},
+        {"role": "assistant", "content": longText},
+        {"role": "user", "content": "当前问题"}
+    ];
+    let oldBaseline = oldBlock["baseline"];
+    let state = {
+        "injection_version": NEXORA_INJECTION_VERSION,
+        "injection_baseline": oldBaseline,
+        "injection_permission_mode": "confirm"
+    };
+    let host = new FakeAgentHost([__agent_firstRound("已压缩")]);
+    let persistence = new FakeInjectionPersistence(state);
+    let options = {
+        "messages": messages,
+        "openRound": host.openRound,
+        "onEvent": host.onEvent,
+        "loadInjectionState": persistence.loadState,
+        "saveInjections": persistence.saveInjections,
+        "saveContext": persistence.saveContext,
+        "injectionSources": {"project_conventions": "新约定"},
+        "permissionMode": "auto",
+        "contextWindow": 4000,
+        "maxOutputTokens": 200,
+        "maxRounds": 2
+    };
+
+    let result = nexora_agent_run(options);
+    assertAgentLoop(str(result["status"]) == "done", "注入重建后应正常收尾");
+    assertAgentLoop(str(result["compressed"]) == "folded", "用例应实际折叠历史");
+    assertAgentLoop(persistence.contextRecord != nil, "折叠后应提交摘要和注入");
+    assertAgentLoop(persistence.contextMessages.length() == 2,
+        "压缩提交应带完整项目约定和审批模式");
+    assertAgentLoop(persistence.contextExpectedMessages.length() >= messages.length() + 2,
+        "压缩提交应保留压缩前的历史和本轮注入用于并发检查");
+    assertAgentLoop(
+        persistence.contextExpectedMessages[persistence.contextExpectedMessages.length() - 1]["content"] == "当前问题",
+        "持久化并发检查必须覆盖当前用户消息");
+
+    let sent = host.lastMessages;
+    assertAgentLoop(str(sent[1]["content"]).index("压缩摘要") >= 0,
+        "重建消息应包含摘要");
+    assertAgentLoop(sent[2]["metadata"]["injection"]["mode"] == "full",
+        "摘要后应重新插入全量注入");
+    assertAgentLoop(sent[3]["metadata"]["injection"]["name"] == "permission_mode",
+        "当前审批模式应随压缩重建");
+    assertAgentLoop(sent[4]["content"] == "当前问题",
+        "当前 user 消息应保持在重建注入之后");
+}
+
+func testAgentLoopManySmallChunks() {
+    let frames: Array = [];
+    for (0..128) [const &index] {
+        frames.append(__agent_textFrame("x"));
+    }
+    frames.append({"type": "done"});
+    let host = new FakeAgentHost([frames]);
+    let result = nexora_agent_run({
+        "messages": [{"role": "user", "content": "stream test"}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "maxRounds": 1
+    });
+    let content: string = str(result["message"]["content"]);
+    assertAgentLoop(result["status"] == "done", "many small chunks must complete");
+    assertAgentLoop(content.length() == 128, "small chunks must join into full content");
+    assertAgentLoop(content[0] == "x" and content[127] == "x",
+        "joined content must preserve chunk order");
+    assertAgentLoop(string_join(["a", "b", "c"], ",") == "a,b,c",
+        "native string_join must preserve separators and values");
+}
+
+func testAgentLoopTransportRetryContinuesPartial() {
+    let host = new FakeAgentHost([
+        [__agent_textFrame("partial"),
+            {"type": "throw", "message": "socket interrupted"}],
+        [__agent_textFrame(" answer"), __agent_finishFrame("stop"), {"type": "done"}]
+    ]);
+    let result = nexora_agent_run({
+        "messages": [{"role": "user", "content": "answer"}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "onEvent": host.onEvent,
+        "autoRetryCount": 1,
+        "maxOutputTokens": 4096,
+        "maxRounds": 3
+    });
+
+    assertAgentLoop(result["status"] == "done", "transport retry must recover the round");
+    assertAgentLoop(result["rounds"] == 1, "transport retry must stay inside one agent round");
+    assertAgentLoop(result["message"]["content"] == "partial answer",
+        "partial content must be continued without being lost");
+    assertAgentLoop(host.opened == 2, "one configured retry means two stream attempts");
+    assertAgentLoop(host.sessions[0].closed == true and host.sessions[1].closed == true,
+        "failed and successful stream sessions must both close");
+    assertAgentLoop(host.lastMessages.length() == 3 and
+        host.lastMessages[1]["role"] == "assistant" and
+        host.lastMessages[1]["content"] == "partial" and
+        host.lastMessages[2]["role"] == "user",
+        "retry request must contain the partial assistant response and continuation instruction");
+    assertAgentLoop(host.lastMaxTokens < 4096,
+        "continuation input must reduce the output token allowance");
+    assertAgentLoop(__agent_count_type(host.events, "auto_retry") == 1 and
+        __agent_count_type(host.events, "text") == 2,
+        "retry metadata and each text fragment must be emitted once");
+    assertAgentLoop(result["autoRetries"].length() == 1,
+        "agent result must retain retry records");
+}
+
+func testAgentLoopTransportRetryLimitClosesSessions() {
+    let host = new FakeAgentHost([
+        [{"type": "throw", "message": "first socket error"}],
+        [{"type": "throw", "message": "second socket error"}]
+    ]);
+    let result = nexora_agent_run({
+        "messages": [{"role": "user", "content": "answer"}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "onEvent": host.onEvent,
+        "autoRetryCount": 1
+    });
+
+    assertAgentLoop(result["status"] == "error", "exhausted transport retry must fail the task");
+    assertAgentLoop(result["error"].index("second socket error") >= 0,
+        "final transport error must be preserved");
+    assertAgentLoop(host.opened == 2 and host.sessions.length() == 2,
+        "retry limit must bound provider attempts");
+    assertAgentLoop(host.sessions[0].closed == true and host.sessions[1].closed == true,
+        "sessions must close on every failed attempt");
+    assertAgentLoop(__agent_count_type(host.events, "auto_retry") == 1 and
+        __agent_count_type(host.events, "error") == 1,
+        "retry exhaustion must emit one retry event and one terminal error");
+}
+
+func testAgentLoopFinishBeforeTransportErrorDoesNotRetry() {
+    let host = new FakeAgentHost([[
+        __agent_textFrame("complete"), __agent_finishFrame("stop"),
+        {"type": "throw", "message": "connection closed after finish"}
+    ]]);
+    let result = nexora_agent_run({
+        "messages": [{"role": "user", "content": "answer"}],
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "onEvent": host.onEvent,
+        "autoRetryCount": 3
+    });
+
+    assertAgentLoop(result["status"] == "done" and
+        result["message"]["content"] == "complete",
+        "a transport close after finish must keep the completed response");
+    assertAgentLoop(host.opened == 1 and
+        __agent_count_type(host.events, "auto_retry") == 0,
+        "a finished response must not be retried");
+    assertAgentLoop(host.sessions[0].closed == true,
+        "the finished session must still close");
+}
+
+func testAgentLoopEmptyResponseRetryIsVolatile() {
+    let host = new FakeAgentHost([
+        [__agent_finishFrame("stop"), {"type": "done"}],
+        [__agent_textFrame("recovered"), __agent_finishFrame("stop"), {"type": "done"}]
+    ]);
+    let originalMessages = [{"role": "user", "content": "answer"}];
+    let result = nexora_agent_run({
+        "messages": originalMessages,
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "onEvent": host.onEvent,
+        "emptyResponseRetryCount": 1,
+        "maxOutputTokens": 4096,
+        "maxRounds": 3
+    });
+
+    assertAgentLoop(result["status"] == "done" and
+        result["message"]["content"] == "recovered",
+        "empty response retry must recover with a later visible answer");
+    assertAgentLoop(host.opened == 2 and result["rounds"] == 2,
+        "empty response retry must start one new agent round");
+    assertAgentLoop(host.lastMessages.length() == 2 and
+        host.lastMessages[1]["role"] == "system",
+        "retry instruction must be sent as a volatile system message");
+    assertAgentLoop(result["messages"].length() == 2 and
+        result["messages"][1]["content"] == "recovered",
+        "retry instruction and empty response must not enter conversation history");
+    assertAgentLoop(__agent_count_type(host.events, "auto_retry") == 1,
+        "empty response retry must emit one retry event");
+}
+
+func testAgentLoopEmptyResponseRetryLimitAndToolCallGuard() {
+    let emptyHost = new FakeAgentHost([
+        [__agent_finishFrame("stop"), {"type": "done"}],
+        [__agent_finishFrame("stop"), {"type": "done"}]
+    ]);
+    let emptyResult = nexora_agent_run({
+        "messages": [{"role": "user", "content": "answer"}],
+        "openRound": emptyHost.openRound,
+        "executeTool": emptyHost.executeTool,
+        "onEvent": emptyHost.onEvent,
+        "emptyResponseRetryCount": 1,
+        "maxRounds": 3
+    });
+    assertAgentLoop(emptyResult["status"] == "error" and emptyHost.opened == 2,
+        "empty-response retry limit must stop after the configured number");
+    assertAgentLoop(__agent_count_type(emptyHost.events, "auto_retry") == 1 and
+        __agent_count_type(emptyHost.events, "error") == 1,
+        "empty-response exhaustion must report one retry and one error");
+
+    let toolHost = new FakeAgentHost([
+        [__agent_finishFrame("tool_calls"), {"type": "done"}]
+    ]);
+    let toolResult = nexora_agent_run({
+        "messages": [{"role": "user", "content": "answer"}],
+        "openRound": toolHost.openRound,
+        "executeTool": toolHost.executeTool,
+        "onEvent": toolHost.onEvent,
+        "emptyResponseRetryCount": 2
+    });
+    assertAgentLoop(toolResult["status"] == "error" and toolHost.opened == 1,
+        "finish_reason tool_calls without a valid call must not be retried");
+    assertAgentLoop(__agent_count_type(toolHost.events, "auto_retry") == 0,
+        "invalid tool-call finish must skip empty-response retry");
+}
+
+func testAgentLoop() {
+    testAgentLoopSingleRound();
+    testAgentLoopToolRound();
+    testAgentLoopRoundEvents();
+    testAgentLoopTruncatedAnswer();
+    testAgentLoopToolOutputTruncation();
+    testAgentLoopToolOutputLimitKeepsUtf8Whole();
+    testAgentLoopCancelledBeforeStart();
+    testAgentLoopCancelledMidStream();
+    testAgentLoopCancelReachesSession();
+    testAgentLoopMaxRounds();
+    testAgentLoopNeedsToolExecutor();
+    testAgentLoopRequiresOpenRound();
+    testAgentLoopCompressesBeforeSending();
+    testAgentLoopContextGuard();
+    testAgentLoopContextFits();
+    testAgentLoopInjectsAndPersistsChangedSources();
+    testAgentLoopRebuildsInjectionAfterCompression();
+    testAgentLoopManySmallChunks();
+    testAgentLoopTransportRetryContinuesPartial();
+    testAgentLoopTransportRetryLimitClosesSessions();
+    testAgentLoopFinishBeforeTransportErrorDoesNotRetry();
+    testAgentLoopEmptyResponseRetryIsVolatile();
+    testAgentLoopEmptyResponseRetryLimitAndToolCallGuard();
+}

@@ -1,0 +1,99 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import samples.NexoraCodeCore.agent_events;
+
+func assertAgentEvents(condition, message: string) {
+    if (!condition) throw new Exception("Nexora agent events test failed: " + message);
+}
+
+func testGroupToolCalls() {
+    let events = [
+        {"index": 0, "id": "call_1", "name": "read_file", "arguments_delta": "{\"path"},
+        {"index": 0, "arguments_delta": "\": \"a.txt\"}"},
+        {"index": 1, "id": "call_2", "name": "run", "arguments_delta": "{}"}
+    ];
+    let grouped = nexora_group_tool_calls(events);
+    assertAgentEvents(grouped.length() == 2, "two indexes group into two calls");
+    assertAgentEvents(grouped[0]["id"] == "call_1", "first id kept");
+    assertAgentEvents(grouped[0]["name"] == "read_file", "first name kept");
+    assertAgentEvents(grouped[0]["arguments"]["path"] == "a.txt", "delta arguments joined");
+
+    let broken = nexora_group_tool_calls([{"index": 0, "arguments_delta": "{oops"}]);
+    assertAgentEvents(broken.length() == 1, "broken arguments still group");
+    assertAgentEvents(type(broken[0]["arguments"]) == "dict", "broken arguments fall back to dict");
+
+    let empty = nexora_group_tool_calls([{"index": 2}]);
+    assertAgentEvents(empty.length() == 1, "missing delta groups");
+    assertAgentEvents(empty[0]["id"] == "", "missing id is empty");
+}
+
+func testTranslateEvent() {
+    let call = nexora_translate_event({"type": "function_call", "name": "run",
+        "call_id": "c1", "arguments": {"cmd": "ls"}});
+    assertAgentEvents(call["type"] == "function_call", "call type kept");
+    assertAgentEvents(JSON.parse(call["arguments"])["cmd"] == "ls", "arguments serialized");
+
+    let result = nexora_translate_event({"type": "function_result", "name": "run",
+        "call_id": "c1", "result": "ok", "success": true});
+    assertAgentEvents(result["success"], "result success kept");
+
+    let question = nexora_translate_event({"type": "question", "question": {"a": 1}});
+    assertAgentEvents(question["await"], "question awaits");
+
+    let content = nexora_translate_event({"type": "content", "content": "hi"});
+    assertAgentEvents(content["content"] == "hi", "content kept");
+
+    let done = nexora_translate_event({"type": "done", "conversation_id": "x"});
+    assertAgentEvents(done["type"] == "done" and dict_get(done, "conversation_id", nil) == nil,
+        "done drops extra fields");
+
+    let noArgs = nexora_translate_event({"type": "function_call", "name": "run",
+        "call_id": "c9"});
+    assertAgentEvents(noArgs["arguments"] == "{}",
+        "missing arguments defaults to an empty dict");
+
+    let rejected = false;
+    try {
+        // dict_get 的返回值静态未知，能过编译期检查，运行时才被边界拦下。
+        nexora_translate_event(dict_get({"a": 1}, "missing", "fallback-string"));
+    } catch (&error) {
+        rejected = true;
+    }
+    assertAgentEvents(rejected, "a non-dict event is rejected at the boundary");
+
+    let unknown = {"type": "queue_state", "n": 1};
+    assertAgentEvents(nexora_translate_event(unknown)["n"] == 1, "unknown passes through");
+}
+
+func testUsageIo() {
+    let openai = nexora_extract_usage_io({"prompt_tokens": 100, "completion_tokens": 20,
+        "total_tokens": 120, "prompt_tokens_details": {"cached_tokens": 30}});
+    assertAgentEvents(openai["raw_input"] == 100, "openai raw kept");
+    assertAgentEvents(openai["cached_input"] == 30, "openai cached kept");
+    assertAgentEvents(openai["effective_input"] == 70, "openai effective derived");
+    assertAgentEvents(openai["total"] == 120, "openai total kept");
+
+    let anthropic = nexora_extract_usage_io({"input_tokens": 10,
+        "cache_read_input_tokens": 90, "cache_creation_input_tokens": 5,
+        "output_tokens": 7});
+    assertAgentEvents(anthropic["raw_input"] == 105, "anthropic raw restored");
+    assertAgentEvents(anthropic["output"] == 7, "anthropic output kept");
+    assertAgentEvents(anthropic["total"] == 112, "missing total completed");
+
+    let totals = {"raw_input": 0, "cached_input": 0, "effective_input": 0,
+        "output": 0, "total": 0, "cost": 0.0};
+    let io = nexora_accumulate_usage({"prompt_tokens": 10, "completion_tokens": 3,
+        "total_tokens": 13}, totals);
+    assertAgentEvents(io != nil and totals["raw_input"] == 10, "accumulate adds raw");
+    assertAgentEvents(totals["output"] == 3, "accumulate adds output");
+    assertAgentEvents(nexora_accumulate_usage(nil, totals) == nil, "nil usage returns nil");
+    assertAgentEvents(nexora_stringify_content([{"text": "a"}, {"text": "b"}]) == "ab",
+        "content parts joined");
+}
+
+func testAgentEvents() {
+    testGroupToolCalls();
+    testTranslateEvent();
+    testUsageIo();
+}

@@ -12,11 +12,28 @@ class Record {
     }
 
     func reset() {
-        @this = new Record();
+        this = new Record();
     }
 
     func replaceFrom(other) {
-        @this = other;
+        this = other;
+    }
+
+    func resetLegacy() {
+        @this = new Record();
+    }
+}
+
+class SelfRecord {
+    using &self;
+    var count = 0;
+
+    func resetSelf() {
+        self = new SelfRecord();
+    }
+
+    func resetThis() {
+        this = new SelfRecord();
     }
 }
 
@@ -36,3 +53,16 @@ a.replaceFrom(replacement);
 print(a.value);
 print(b.value);
 print(b.child.value);
+
+a.resetLegacy();
+print(a.value);
+
+let s1: SelfRecord = new SelfRecord();
+s1.count = 42;
+s1.resetSelf();
+print(s1.count);
+
+let s2: SelfRecord = new SelfRecord();
+s2.count = 99;
+s2.resetThis();
+print(s2.count);

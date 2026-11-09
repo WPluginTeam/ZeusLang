@@ -120,7 +120,7 @@ inline GeneratedIR generate(
         } else if (!fieldTypeName.empty() && fieldTypeName.front() == '&') {
             const std::string targetType = fieldTypeName.substr(1);
             generated.adapters += "  %native.address = load ptr, ptr %field.address\n";
-            if (targetType == "int" || targetType == "int32" || targetType == "int64") {
+            if (targetType == "int" || targetType == "int64") {
                 generated.adapters += "  call void @zeus_value_from_i64_ptr(ptr %out, ptr %native.address)\n";
             } else if (targetType == "bool") {
                 generated.adapters += "  call void @zeus_value_from_bool_ptr(ptr %out, ptr %native.address)\n";
@@ -138,6 +138,38 @@ inline GeneratedIR generate(
                 generated.error = "dynamic field '" + field.typeName + "." +
                     field.fieldName + "' cannot box reference type '&" + targetType + "'";
                 return generated;
+            }
+        } else if (ZeusBuiltins::isNativeFloatingPointType(fieldTypeName)) {
+            const auto* floatABI = ZeusBuiltins::findNativeTypeABI(fieldTypeName);
+            const std::string nativeType = floatABI
+                ? std::string(floatABI->llvmType) : "double";
+            const bool isFloat = nativeType == "float";
+            generated.adapters += "  %native.value = load " + nativeType + ", ptr %field.address\n";
+            generated.adapters += "  call void @zeus_value_init_" +
+                std::string(isFloat ? "float" : "double") +
+                "(ptr %out, " + nativeType + " %native.value)\n";
+        } else if (const auto* narrowABI = ZeusBuiltins::findNativeIntegerABI(fieldTypeName)) {
+            const std::string nativeType(narrowABI->llvmType);
+            generated.adapters += "  %native.value = load " + nativeType + ", ptr %field.address\n";
+            if (narrowABI->integerBits < 64) {
+                const bool isUnsigned = narrowABI->valueABI ==
+                    ZeusBuiltins::NativeValueABI::UnsignedInteger;
+                generated.adapters += "  %native.value.wide = " +
+                    std::string(isUnsigned ? "zext " : "sext ") + nativeType +
+                    " %native.value to i64\n";
+                if (isUnsigned) {
+                    generated.adapters += "  call void @zeus_value_init_unsigned_integer(ptr %out, i64 %native.value.wide, i32 " +
+                        std::to_string(narrowABI->integerBits) + ")\n";
+                } else {
+                    generated.adapters += "  call void @zeus_value_init_i64(ptr %out, i64 %native.value.wide)\n";
+                }
+            } else {
+                if (narrowABI->valueABI == ZeusBuiltins::NativeValueABI::UnsignedInteger) {
+                    generated.adapters += "  call void @zeus_value_init_unsigned_integer(ptr %out, i64 %native.value, i32 " +
+                        std::to_string(narrowABI->integerBits) + ")\n";
+                } else {
+                    generated.adapters += "  call void @zeus_value_init_i64(ptr %out, i64 %native.value)\n";
+                }
             }
         } else if (const auto* integerABI =
                        ZeusBuiltins::findNativeTypeABI(fieldTypeName);
@@ -192,6 +224,29 @@ inline GeneratedIR generate(
                 } else if (targetABI && targetABI->valueABI == ZeusBuiltins::NativeValueABI::Bool1) {
                     generated.adapters += "  %native.value = call ptr @zeus_value_require_bool_ptr(ptr %value)\n";
                     generated.adapters += "  store ptr %native.value, ptr %field.address\n";
+                }
+            } else if (ZeusBuiltins::isNativeFloatingPointType(fieldTypeName)) {
+                const auto* floatABI = ZeusBuiltins::findNativeTypeABI(fieldTypeName);
+                const std::string nativeType = floatABI
+                    ? std::string(floatABI->llvmType) : "double";
+                const bool isFloat = nativeType == "float";
+                generated.adapters += "  %native.value = call " + nativeType +
+                    " @zeus_value_require_" + std::string(isFloat ? "float" : "double") +
+                    "(ptr %value)\n";
+                generated.adapters += "  store " + nativeType + " %native.value, ptr %field.address\n";
+            } else if (const auto* narrowABI = ZeusBuiltins::findNativeIntegerABI(fieldTypeName)) {
+                const std::string nativeType(narrowABI->llvmType);
+                const bool isUnsigned = narrowABI->valueABI ==
+                    ZeusBuiltins::NativeValueABI::UnsignedInteger;
+                generated.adapters += "  %native.value.wide = call i64 @zeus_value_require_" +
+                    std::string(isUnsigned ? "unsigned_integer" : "signed_integer") +
+                    "(ptr %value, i32 " +
+                    std::to_string(narrowABI->integerBits) + ")\n";
+                if (narrowABI->integerBits < 64) {
+                    generated.adapters += "  %native.value = trunc i64 %native.value.wide to " + nativeType + "\n";
+                    generated.adapters += "  store " + nativeType + " %native.value, ptr %field.address\n";
+                } else {
+                    generated.adapters += "  store i64 %native.value.wide, ptr %field.address\n";
                 }
             } else if (const auto* integerABI =
                            ZeusBuiltins::findNativeTypeABI(fieldTypeName);

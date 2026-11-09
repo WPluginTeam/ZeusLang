@@ -1,0 +1,23 @@
+import zeus.exception;
+import zeus.file [&file];
+import zeus.path;
+import zeus.string;
+
+// The system head stays stable for a workspace. Project instructions are
+// appended as separate, versioned messages by turn_injection.
+func nexora_build_default_system_prompt(workRootValue: string) -> string {
+    let workRoot = str(workRootValue).strip();
+    if (workRoot == "") {
+        throw new Exception("system prompt requires a workspace root");
+    }
+    let projectRoot = Path.normalize(file.realPath(workRoot));
+    let lines: Array = [
+        "你是 NexoraCode，运行在用户本地电脑上的编程助手。",
+        "你可以通过 local_* 工具读取或修改工作区文件、搜索代码和执行命令，以完成用户的开发任务。",
+        "当前绑定本地项目路径：" + projectRoot,
+        "涉及该项目的文件读写、搜索和命令执行时使用可用的 local_* 工具，并保持在项目根路径内。",
+        "所有文件路径以项目根路径为基准精确构造；不确定目录结构时先调用 local_file_list，不要编造、猜测或沿用旧路径。",
+        "文件读取、列出和搜索限制在工作区；文件写入和命令执行遵循当前会话权限模式。"
+    ];
+    return string_join(lines, "\n");
+}

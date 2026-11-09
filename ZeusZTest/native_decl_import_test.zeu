@@ -1,0 +1,7 @@
+import native_decl_package;
+
+var value: PackageDouble = 1.25;
+var small: PackageInt8 = -123;
+if (packageDoubleSum(value, 2.5) != 3.75) throw "exported native alias signature";
+if (small != -123) throw "exported native alias local";
+print("NATIVE_DECL_IMPORT_PASS");

@@ -1,0 +1,60 @@
+import zeus.mem;
+import zeus.exception;
+
+// Raw struct layout is what a ctypes-style layer is built on: @faddr with an
+// explicit byte width must read and write exactly that many bytes, in
+// little-endian order, so fields can be placed by hand on malloc'd memory.
+
+func assertTrue(condition, message: string) {
+    if (!condition) {
+        throw new Exception("raw struct layout test failed: " + message);
+    }
+}
+
+let block = malloc(32);
+
+// 1, 2, 4 and 8 byte fields must not disturb each other.
+@faddr(block + 0, 1) -> int = 17;
+@faddr(block + 1, 2) -> int = 8755;
+@faddr(block + 3, 4) -> int = 1146441747;
+@faddr(block + 15, 8) -> int = 1234567890123;
+
+assertTrue(@faddr(block + 0, 1) -> int == 17, "1-byte write and read");
+assertTrue(@faddr(block + 1, 2) -> int == 8755, "2-byte write and read");
+assertTrue(@faddr(block + 3, 4) -> int == 1146441747, "4-byte write and read");
+assertTrue(@faddr(block + 15, 8) -> int == 1234567890123, "8-byte write and read");
+
+// Little-endian order is what every Win32 structure assumes, so a narrower
+// read must return the matching low-order bytes of the stored value.
+assertTrue(@faddr(block + 3, 1) -> int == 1146441747 % 256, "low byte");
+assertTrue(@faddr(block + 4, 1) -> int == (1146441747 / 256) % 256, "second byte");
+assertTrue(@faddr(block + 3, 2) -> int == 1146441747 % 65536, "low two bytes");
+
+// A neighbouring field outside the written range must stay intact.
+@faddr(block + 23, 4) -> int = 12345;
+assertTrue(@faddr(block + 15, 8) -> int == 1234567890123, "neighbour untouched");
+assertTrue(@faddr(block + 23, 4) -> int == 12345, "own field holds");
+
+// Bytes copy works across the same memory.
+let copy = malloc(8);
+memcpy(block + 3, 4, copy);
+assertTrue(@faddr(copy, 4) -> int == 1146441747, "memcpy of a struct field");
+free(copy);
+
+// A two-byte store is what a UTF-16 code unit needs; checking each unit shows
+// the store lands at the right offset and does not spill into its neighbour.
+let wide = malloc(16);
+@faddr(wide + 0, 2) -> int = 90;
+@faddr(wide + 2, 2) -> int = 101;
+@faddr(wide + 4, 2) -> int = 117;
+@faddr(wide + 6, 2) -> int = 115;
+@faddr(wide + 8, 2) -> int = 0;
+assertTrue(@faddr(wide + 0, 2) -> int == 90, "wide unit 0");
+assertTrue(@faddr(wide + 2, 2) -> int == 101, "wide unit 1");
+assertTrue(@faddr(wide + 4, 2) -> int == 117, "wide unit 2");
+assertTrue(@faddr(wide + 6, 2) -> int == 115, "wide unit 3");
+assertTrue(@faddr(wide + 8, 2) -> int == 0, "wide NUL terminator");
+free(wide);
+
+free(block);
+print("RAW_STRUCT_LAYOUT_PASS");

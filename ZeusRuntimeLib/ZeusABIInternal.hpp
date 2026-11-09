@@ -12,7 +12,9 @@
 #include "ZeusRuntimeDebug.hpp"
 
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <new>
 #include <utility>
 
@@ -124,7 +126,17 @@ private:
         try {
             if (graphReference) zeus_class_ref_release_edge(object);
             else zeus_class_ref_release(object);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr,
+                "[ZeusRuntime] fatal ZeusBox class reference release object=%p graph=%d reason=%s\n",
+                object, graphReference ? 1 : 0, error.what());
+            std::fflush(stderr);
+            std::abort();
         } catch (...) {
+            std::fprintf(stderr,
+                "[ZeusRuntime] fatal ZeusBox class reference release object=%p graph=%d reason=<non-standard exception>\n",
+                object, graphReference ? 1 : 0);
+            std::fflush(stderr);
             std::abort();
         }
     }

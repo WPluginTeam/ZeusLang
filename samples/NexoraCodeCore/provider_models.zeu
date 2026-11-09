@@ -1,0 +1,336 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.byte;
+import zeus.requests [&requests];
+import zeus.string;
+import zeus.url;
+
+import samples.NexoraCodeCore.provider_config;
+import samples.NexoraCodeCore.provider_settings;
+import samples.NexoraCodeCore.provider_templates;
+
+let NEXORA_PROVIDER_MODEL_LIST_TIMEOUT_SECONDS: int = 20;
+
+func __nexora_provider_models_result(status: int, message: string) {
+    return {"status": status, "body": {"success": false, "message": message}};
+}
+
+func __nexora_provider_models_http_get(url: string, headers: dict,
+        timeoutSeconds: int) {
+    let response = requests.get(url, nil, headers, nil, timeoutSeconds);
+    let result = {"status_code": response.status_code,
+        "payload": nil, "payload_valid": false};
+    if (response.status_code == 200) {
+        try {
+            result["payload"] = response.json();
+            result["payload_valid"] = true;
+        } catch (&invalidJson) {}
+    }
+    return result;
+}
+
+func __nexora_provider_models_custom_url(baseUrl: string) -> string {
+    let completionsUrl = nexora_completions_url(baseUrl);
+    let suffix = "/chat/completions";
+    if (!completionsUrl.endswith(suffix)) {
+        throw new Exception("Provider Chat Completions URL is invalid");
+    }
+    return completionsUrl.slice(0,
+        completionsUrl.length() - suffix.length()) + "/models";
+}
+
+func __nexora_provider_models_template_url(templateId: string) {
+    let template = nexora_find_provider_template(templateId);
+    if (template == nil) {
+        return {"ok": false, "status": 400,
+            "message": "unknown provider template"};
+    }
+    let url = str(dict_get(template, "model_list_url", ""));
+    if (url == "") {
+        return {"ok": false, "status": 400,
+            "message": str(dict_get(template, "model_list_hint",
+                "This provider does not expose a model catalog endpoint."))};
+    }
+    return {"ok": true, "url": url,
+        "base_url": str(dict_get(template, "base_url", "")),
+        "parser": str(dict_get(template, "model_list_parser", "")),
+        "allowed_model_ids": dict_get(template, "model_list_model_ids", nil)};
+}
+
+func __nexora_provider_models_ipv4_loopback(host: string) -> bool {
+    let parts = host.split(".");
+    if (parts.length() != 4) return false;
+    let values = [];
+    for (parts) [const &rawPart] {
+        let part = str(rawPart);
+        if (part.length() == 0 or
+                (part.length() > 1 and part.slice(0, 1) == "0")) return false;
+        let value = 0;
+        for (0..part.length()) [const &i] {
+            let digit = "0123456789".index(part.slice(i, i + 1));
+            if (digit < 0) return false;
+            value = value * 10 + digit;
+            if (value > 255) return false;
+        }
+        values.append(value);
+    }
+    return values[0] == 127;
+}
+
+func __nexora_provider_models_url_allowed(url: string,
+        templateId: string) -> bool {
+    let parsed: URLParts = URL.parse(url);
+    if (!parsed.hasAuthority or parsed.authority == "" or
+            parsed.authority.index("@") >= 0 or parsed.hasFragment) return false;
+    let firstColon = parsed.authority.index(":");
+    let lastColon = parsed.authority.rindex(":");
+    if (firstColon >= 0 and firstColon != lastColon) return false;
+
+    if (parsed.scheme == "https") {
+        if (parsed.hasQuery and !(templateId == "siliconflow" and
+                parsed.query == "sub_type=chat")) return false;
+        return true;
+    }
+    if (templateId != "custom" or parsed.scheme != "http" or parsed.hasQuery) {
+        return false;
+    }
+
+    let host = parsed.authority;
+    if (lastColon >= 0) host = parsed.authority.slice(0, lastColon);
+    host = host.lower();
+    return host == "localhost" or __nexora_provider_models_ipv4_loopback(host);
+}
+
+func __nexora_provider_models_array_has(values, expected) -> bool {
+    if (type(values) != "Array") return false;
+    for (values) [const &value] {
+        if (value == expected) return true;
+    }
+    return false;
+}
+
+func __nexora_provider_models_text_compare(left: string, right: string) -> int {
+    let leftBytes = bytes(left.lower());
+    let rightBytes = bytes(right.lower());
+    let sharedLength = leftBytes.length();
+    if (rightBytes.length() < sharedLength) sharedLength = rightBytes.length();
+    for (0..sharedLength) [const &i] {
+        let leftByte = __bytes_get(leftBytes, i);
+        let rightByte = __bytes_get(rightBytes, i);
+        if (leftByte < rightByte) return -1;
+        if (leftByte > rightByte) return 1;
+    }
+    if (leftBytes.length() < rightBytes.length()) return -1;
+    if (leftBytes.length() > rightBytes.length()) return 1;
+    return 0;
+}
+
+func __nexora_provider_models_before(left, right) -> bool {
+    let names = __nexora_provider_models_text_compare(
+        str(dict_get(left, "name", "")), str(dict_get(right, "name", "")));
+    if (names != 0) return names < 0;
+    let ids = __nexora_provider_models_text_compare(
+        str(dict_get(left, "id", "")), str(dict_get(right, "id", "")));
+    return ids <= 0;
+}
+
+func __nexora_provider_models_sort(rows) {
+    let count = rows.length();
+    if (count < 2) return rows;
+
+    let source = rows;
+    let target: Array = [];
+    for (0..count) [const &i] { target.append(nil); }
+
+    let width = 1;
+    for (width < count) {
+        let start = 0;
+        for (start < count) {
+            let middle = start + width;
+            if (middle > count) middle = count;
+            let end = start + width * 2;
+            if (end > count) end = count;
+            let left = start;
+            let right = middle;
+            let output = start;
+            for (left < middle and right < end) {
+                if (__nexora_provider_models_before(source[left], source[right])) {
+                    target[output] = source[left];
+                    left = left + 1;
+                } else {
+                    target[output] = source[right];
+                    right = right + 1;
+                }
+                output = output + 1;
+            }
+            for (left < middle) {
+                target[output] = source[left];
+                left = left + 1;
+                output = output + 1;
+            }
+            for (right < end) {
+                target[output] = source[right];
+                right = right + 1;
+                output = output + 1;
+            }
+            start = end;
+        }
+        let previous = source;
+        source = target;
+        target = previous;
+        width = width * 2;
+    }
+    return source;
+}
+
+func __nexora_provider_models_normalize(payload, parser: string,
+        allowedModelIds=nil) {
+    if (type(payload) != "dict" or
+            type(dict_get(payload, "data", nil)) != "Array") {
+        return {"ok": false};
+    }
+    if (parser == "opencode_chat" and type(allowedModelIds) != "Array") {
+        return {"ok": false};
+    }
+    if (parser != "openai" and parser != "openrouter" and
+            parser != "opencode_chat") return {"ok": false};
+
+    let rows = [];
+    let seen = {};
+    for (dict_get(payload, "data", [])) [const &item] {
+        if (type(item) != "dict") continue;
+        let idValue = dict_get(item, "id", nil);
+        if (idValue == nil) continue;
+        let modelId = str(idValue).strip();
+        if (modelId == "" or dict_get(seen, modelId, false)) continue;
+        if (parser == "opencode_chat" and
+                !__nexora_provider_models_array_has(allowedModelIds, modelId)) continue;
+
+        if (parser == "openrouter") {
+            let architecture = dict_get(item, "architecture", nil);
+            if (type(architecture) != "dict") return {"ok": false};
+            let inputModalities = dict_get(architecture, "input_modalities", nil);
+            let outputModalities = dict_get(architecture, "output_modalities", nil);
+            if (type(inputModalities) != "Array" or
+                    type(outputModalities) != "Array") return {"ok": false};
+            if (!__nexora_provider_models_array_has(inputModalities, "text") or
+                    !__nexora_provider_models_array_has(outputModalities, "text")) continue;
+        }
+
+        let nameValue = dict_get(item, "name", nil);
+        let modelName = modelId;
+        if (nameValue != nil) {
+            let providedName = str(nameValue).strip();
+            if (providedName != "") modelName = providedName;
+        }
+        rows.append({"id": modelId, "name": modelName});
+        dict_set(seen, modelId, true);
+    }
+    return {"ok": true, "models": __nexora_provider_models_sort(rows)};
+}
+
+func nexora_provider_models_discover(currentProviders: dict, source,
+        getFn=nil) {
+    if (type(source) != "dict") {
+        return __nexora_provider_models_result(400,
+            "model-list request body must be a JSON object");
+    }
+
+    let templateId = str(dict_get(source, "template_id", "custom")).strip();
+    if (templateId == "") templateId = "custom";
+    let modelsUrl = "";
+    let parser = "openai";
+    let allowedModelIds = nil;
+    let keyBaseUrl = str(dict_get(source, "base_url", "")).strip();
+
+    if (templateId == "custom") {
+        try {
+            modelsUrl = __nexora_provider_models_custom_url(keyBaseUrl);
+        } catch (&invalidUrl) {
+            return __nexora_provider_models_result(400,
+                "Provider Chat Completions URL is invalid");
+        }
+    } else {
+        let configured = __nexora_provider_models_template_url(templateId);
+        if (!dict_get(configured, "ok", false)) {
+            return __nexora_provider_models_result(
+                int(dict_get(configured, "status", 400)),
+                str(dict_get(configured, "message", "invalid provider template")));
+        }
+        modelsUrl = str(dict_get(configured, "url", ""));
+        parser = str(dict_get(configured, "parser", ""));
+        allowedModelIds = dict_get(configured, "allowed_model_ids", nil);
+        keyBaseUrl = str(dict_get(configured, "base_url", ""));
+    }
+
+    let apiKey = nexora_provider_settings_resolve_api_key(
+        currentProviders, source, templateId, keyBaseUrl);
+    if (templateId != "custom" and apiKey == "") {
+        return __nexora_provider_models_result(400,
+            "enter the API key for this provider before fetching its models");
+    }
+
+    if (!__nexora_provider_models_url_allowed(modelsUrl, templateId)) {
+        return __nexora_provider_models_result(500,
+            "provider model-list URL is invalid");
+    }
+
+    let headers = {};
+    if (apiKey != "") headers["Authorization"] = "Bearer " + apiKey;
+    let response = nil;
+    try {
+        if (getFn != nil) {
+            response = getFn(modelsUrl, headers,
+                NEXORA_PROVIDER_MODEL_LIST_TIMEOUT_SECONDS);
+        } else {
+            response = __nexora_provider_models_http_get(modelsUrl, headers,
+                NEXORA_PROVIDER_MODEL_LIST_TIMEOUT_SECONDS);
+        }
+    } catch (&networkError) {
+        return __nexora_provider_models_result(502,
+            "could not reach the provider model catalog");
+    }
+
+    if (type(response) != "dict") {
+        return __nexora_provider_models_result(502,
+            "provider returned an invalid model-catalog response");
+    }
+    let status = int(dict_get(response, "status_code", 0));
+    if (status >= 300 and status < 400) {
+        return __nexora_provider_models_result(502,
+            "provider model-catalog redirects are not followed");
+    }
+    if (status == 401 or status == 403) {
+        return __nexora_provider_models_result(401,
+            "API key is invalid or cannot read the model catalog");
+    }
+    if (status == 404) {
+        return __nexora_provider_models_result(404,
+            "provider model-catalog endpoint was not found");
+    }
+    if (status == 429) {
+        return __nexora_provider_models_result(429,
+            "provider model catalog is rate limited; try again later");
+    }
+    if (status != 200) {
+        return __nexora_provider_models_result(502,
+            "provider model catalog failed with HTTP " + str(status));
+    }
+    if (!dict_get(response, "payload_valid", false)) {
+        return __nexora_provider_models_result(502,
+            "provider returned an unsupported model-catalog format");
+    }
+
+    let normalized = __nexora_provider_models_normalize(
+        dict_get(response, "payload", nil), parser, allowedModelIds);
+    if (!dict_get(normalized, "ok", false)) {
+        return __nexora_provider_models_result(502,
+            "provider returned an unsupported model-catalog format");
+    }
+    let models = dict_get(normalized, "models", []);
+    if (models.length() == 0) {
+        return __nexora_provider_models_result(404,
+            "provider returned no Chat Completions models");
+    }
+    return {"status": 200, "body": {"success": true, "models": models}};
+}

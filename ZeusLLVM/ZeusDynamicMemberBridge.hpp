@@ -75,8 +75,10 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
 
     for (size_t methodIndex = 0; methodIndex < methods.size(); ++methodIndex) {
         const auto& method = methods[methodIndex];
+        const std::string expectedOwnerRef = "&" + method.typeName;
         if (method.parameterTypes.empty() ||
-            method.parameterTypes.front() != method.typeName) {
+            (method.parameterTypes.front() != method.typeName &&
+             method.parameterTypes.front() != expectedOwnerRef)) {
             generated.error = "dynamic method '" + method.typeName + "::" +
                 method.methodName + "' must use its owner type as the first parameter";
             return generated;
@@ -122,11 +124,32 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
         std::string receiverNative = "%receiver";
         if (rules.usesZeusValueABI(receiverType)) {
             // Dynamic-only native types are already represented by ZeusValue.
-        } else if (receiverType == "int" || receiverType == "int32" ||
-                   receiverType == "int64") {
+        } else if (receiverType == "int" || receiverType == "int64") {
             receiverNative = "%receiver.native";
             generated.adapters += "  " + receiverNative +
                 " = call i64 @zeus_value_require_i64(ptr %receiver)\n";
+        } else if (const auto* narrowABI = ZeusBuiltins::findNativeIntegerABI(receiverType)) {
+            receiverNative = "%receiver.native";
+            const bool isUnsigned = narrowABI->valueABI ==
+                ZeusBuiltins::NativeValueABI::UnsignedInteger;
+            generated.adapters += "  %receiver.wide = call i64 @zeus_value_require_" +
+                std::string(isUnsigned ? "unsigned_integer" : "signed_integer") + "(ptr %receiver, i32 " +
+                std::to_string(narrowABI->integerBits) + ")\n";
+            if (narrowABI->integerBits < 64) {
+                generated.adapters += "  " + receiverNative + " = trunc i64 %receiver.wide to " +
+                    std::string(narrowABI->llvmType) + "\n";
+            } else {
+                receiverNative = "%receiver.wide";
+            }
+        } else if (ZeusBuiltins::isNativeFloatingPointType(receiverType)) {
+            receiverNative = "%receiver.native";
+            const auto* floatABI = ZeusBuiltins::findNativeTypeABI(receiverType);
+            const std::string nativeType = floatABI
+                ? std::string(floatABI->llvmType) : "double";
+            const bool isFloat = nativeType == "float";
+            generated.adapters += "  " + receiverNative + " = call " + nativeType +
+                " @zeus_value_require_" + std::string(isFloat ? "float" : "double") +
+                "(ptr %receiver)\n";
         } else if (receiverType == "bool") {
             const std::string rawBool = "%receiver.bool.raw";
             receiverNative = "%receiver.native";
@@ -206,7 +229,21 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
             }
 
             std::string convertedValue = boxed;
-            if (!passedBoxed && (conversionType == "int" || conversionType == "int32" ||
+            if (nativeType == "%ZeusRawBytesRange") {
+                // A raw bytes range is a two word value, not a pointer, so it
+                // needs its own conversion. Reading it out of the boxed slot
+                // keeps the view copy free: the range still points at the
+                // buffer the caller owns.
+                const std::string storage = "%argument.range.slot." + suffix;
+                const std::string range = "%argument.range." + suffix;
+                generated.adapters += "  " + storage +
+                    " = alloca %ZeusRawBytesRange, align 8\n";
+                generated.adapters += "  call void @zeus_value_require_raw_bytes_range(ptr " +
+                    storage + ", ptr " + boxed + ")\n";
+                generated.adapters += "  " + range + " = load %ZeusRawBytesRange, ptr " +
+                    storage + ", align 8\n";
+                convertedValue = range;
+            } else if (!passedBoxed && (conversionType == "int" ||
                 conversionType == "int64")) {
                 if (isReferenceType(parameterType)) {
                     generated.adapters += "  " + converted +
@@ -215,6 +252,38 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
                     generated.adapters += "  " + converted +
                         " = call i64 @zeus_value_require_i64(ptr " + boxed + ")\n";
                 }
+                convertedValue = converted;
+            } else if (!passedBoxed && ZeusBuiltins::findNativeIntegerABI(conversionType)) {
+                if (isReferenceType(parameterType)) {
+                    generated.error = "native-width integer references cannot cross a dynamic method boundary";
+                    return generated;
+                }
+                const auto* narrowABI = ZeusBuiltins::findNativeIntegerABI(conversionType);
+                const bool isUnsigned = narrowABI->valueABI ==
+                    ZeusBuiltins::NativeValueABI::UnsignedInteger;
+                const std::string wide = converted + ".wide";
+                generated.adapters += "  " + wide + " = call i64 @zeus_value_require_" +
+                    std::string(isUnsigned ? "unsigned_integer" : "signed_integer") + "(ptr " +
+                    boxed + ", i32 " + std::to_string(narrowABI->integerBits) + ")\n";
+                if (narrowABI->integerBits < 64) {
+                    generated.adapters += "  " + converted + " = trunc i64 " + wide + " to " +
+                        std::string(narrowABI->llvmType) + "\n";
+                    convertedValue = converted;
+                } else {
+                    convertedValue = wide;
+                }
+            } else if (!passedBoxed && ZeusBuiltins::isNativeFloatingPointType(conversionType)) {
+                if (isReferenceType(parameterType)) {
+                    generated.error = "native double references cannot cross a dynamic method boundary";
+                    return generated;
+                }
+                const auto* floatABI = ZeusBuiltins::findNativeTypeABI(conversionType);
+                const std::string nativeType = floatABI
+                    ? std::string(floatABI->llvmType) : "double";
+                const bool isFloat = nativeType == "float";
+                generated.adapters += "  " + converted + " = call " + nativeType +
+                    " @zeus_value_require_" + std::string(isFloat ? "float" : "double") +
+                    "(ptr " + boxed + ")\n";
                 convertedValue = converted;
             } else if (!passedBoxed && conversionType == "bool") {
                 if (isReferenceType(parameterType)) {
@@ -271,7 +340,10 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
                     generated.adapters += "  br label %" + doneLabel + "\n";
                     placeholder = nativeType == "ptr"
                         ? "null"
-                        : (nativeType == "i1" ? "false" : "0");
+                        : (!nativeType.empty() && nativeType.front() == '%'
+                            ? "zeroinitializer"
+                            : (nativeType == "double" ? "0.000000e+00" :
+                               (nativeType == "i1" ? "false" : "0")));
                 }
                 generated.adapters += doneLabel + ":\n";
                 nativeValue = "%argument.optional.native." + suffix;
@@ -329,7 +401,7 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
             const std::string resultType = isReferenceType(method.returnType)
                 ? referencedType(method.returnType)
                 : method.returnType;
-            if (resultType == "int" || resultType == "int32" || resultType == "int64") {
+            if (resultType == "int" || resultType == "int64") {
                 if (isReferenceType(method.returnType)) {
                     generated.adapters += "  call void @zeus_value_from_i64_ptr(ptr %out, ptr " +
                         rawResult + ")\n";
@@ -337,6 +409,42 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
                     generated.adapters += "  call void @zeus_value_init_i64(ptr %out, i64 " +
                         rawResult + ")\n";
                 }
+            } else if (const auto* narrowABI = ZeusBuiltins::findNativeIntegerABI(resultType)) {
+                if (isReferenceType(method.returnType)) {
+                    generated.error = "native-width integer references cannot cross a dynamic method boundary";
+                    return generated;
+                }
+                const bool isUnsigned = narrowABI->valueABI ==
+                    ZeusBuiltins::NativeValueABI::UnsignedInteger;
+                const std::string extension = isUnsigned ? "zext " : "sext ";
+                if (narrowABI->integerBits < 64) {
+                    generated.adapters += "  %method.result.wide = " + extension +
+                        std::string(narrowABI->llvmType) + " " + rawResult + " to i64\n";
+                    if (isUnsigned) {
+                        generated.adapters += "  call void @zeus_value_init_unsigned_integer(ptr %out, i64 %method.result.wide, i32 " +
+                            std::to_string(narrowABI->integerBits) + ")\n";
+                    } else {
+                        generated.adapters += "  call void @zeus_value_init_i64(ptr %out, i64 %method.result.wide)\n";
+                    }
+                } else {
+                    if (isUnsigned) {
+                        generated.adapters += "  call void @zeus_value_init_unsigned_integer(ptr %out, i64 " + rawResult + ", i32 " +
+                            std::to_string(narrowABI->integerBits) + ")\n";
+                    } else {
+                        generated.adapters += "  call void @zeus_value_init_i64(ptr %out, i64 " + rawResult + ")\n";
+                    }
+                }
+            } else if (ZeusBuiltins::isNativeFloatingPointType(resultType)) {
+                if (isReferenceType(method.returnType)) {
+                    generated.error = "native double references cannot cross a dynamic method boundary";
+                    return generated;
+                }
+                const auto* floatABI = ZeusBuiltins::findNativeTypeABI(resultType);
+                const std::string nativeType = floatABI
+                    ? std::string(floatABI->llvmType) : "double";
+                generated.adapters += "  call void @zeus_value_init_" +
+                    std::string(nativeType == "float" ? "float" : "double") +
+                    "(ptr %out, " + nativeType + " " + rawResult + ")\n";
             } else if (resultType == "bool") {
                 if (isReferenceType(method.returnType)) {
                     generated.adapters += "  call void @zeus_value_from_bool_ptr(ptr %out, ptr " +
@@ -362,8 +470,12 @@ inline GeneratedIR generate(const std::vector<MethodBinding>& methods, const Typ
                     std::to_string(resultType.size() + 1) +
                     " x i8] c\"" + escapeBytes(resultType) +
                     "\\00\", align 1\n";
+                generated.adapters += "  call void @zeus_class_ref_require_managed_live(ptr " +
+                    rawResult + ")\n";
                 generated.adapters += "  call void @zeus_value_from_class_ptr(ptr %out, ptr " +
                     rawResult + ", ptr " + resultClassString + ")\n";
+                generated.adapters += "  call void @zeus_class_ref_release(ptr " +
+                    rawResult + ")\n";
             } else {
                 generated.error = "dynamic method '" + method.typeName + "::" +
                     method.methodName + "' cannot box return type '" +
@@ -396,7 +508,8 @@ inline bool emitRuntimeStackCall(
     const std::string& methodName,
     int32_t argumentCount,
     const RuntimeStackCallRules& rules,
-    std::string& error
+    std::string& error,
+    bool safeNavigation = false
 ) {
     if (methodName.empty() || argumentCount < 0 ||
         !rules.popValue || !rules.emitLine || !rules.freshTemporary ||
@@ -433,7 +546,10 @@ inline bool emitRuntimeStackCall(
 
     const std::string result = rules.freshTemporary();
     rules.emitLine(result + " = alloca %ZeusValue, align 8");
-    rules.emitLine("call void @zeus_value_dynamic_member_call(ptr " + result +
+    const std::string callSymbol = safeNavigation
+        ? "zeus_value_dynamic_safe_member_call"
+        : "zeus_value_dynamic_member_call";
+    rules.emitLine("call void @" + callSymbol + "(ptr " + result +
                    ", ptr " + receiver + ", ptr " + methodPointer + ", i32 " +
                    std::to_string(argumentCount) + ", ptr " + argumentArray + ")");
 

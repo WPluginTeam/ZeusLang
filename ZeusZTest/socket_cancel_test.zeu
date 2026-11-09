@@ -1,0 +1,138 @@
+import zeus.socket;
+import zeus.thread;
+import zeus.exception;
+
+func assertTrue(condition, message: string) {
+    if (!condition) throw new Exception("socket cancel test failed: " + message);
+}
+
+// Shared slots preserve the same wrapper between the main and worker VMs.
+// Event protects the rendezvous; the Python runner bounds the entire process
+// even if the native operation or join never returns.
+var shared listener: Socket = new Socket();
+var shared receiving: Socket = new Socket();
+var shared sending: Socket = new Socket();
+var shared entered: Event = new Event();
+var shared finished: Event = new Event();
+var shared acceptRejected = false;
+var shared receiveReturned = false;
+
+func blockedAccept() {
+    entered.set();
+    try {
+        let unexpected = listener.accept();
+        unexpected.close();
+    } catch (&error) {
+        acceptRejected = true;
+    }
+    finished.set();
+}
+
+func blockedRecv() {
+    entered.set();
+    try {
+        let result = receiving.recv(1);
+        receiveReturned = result.length() == 0;
+    } catch (&error) {
+        receiveReturned = true;
+    }
+    finished.set();
+}
+
+func sendDelayedChunks() {
+    sending.sendAll(b"first;");
+    entered.set();
+    // The reader starts after the first chunk exists, then blocks for this one.
+    thread_sleep(100);
+    sending.sendAll(b"second");
+    finished.set();
+}
+
+// Bound methods are supported as thread targets by both VM and AOT.
+class SocketWorkerContext {
+    using &this;
+    func accept() { blockedAccept(); }
+    func recv() { blockedRecv(); }
+    func chunks() { sendDelayedChunks(); }
+}
+
+func runAcceptCase() {
+    entered.clear();
+    finished.clear();
+    acceptRejected = false;
+    listener.bind("127.0.0.1", 0);
+    listener.listen();
+    let context = new SocketWorkerContext();
+    let target = context.accept;
+    let acceptWorker = new Thread(target);
+    acceptWorker.start();
+    entered.wait();
+    // Let the worker enter its blocking native call before closing it.
+    thread_sleep(100);
+    listener.requestClose();
+    acceptWorker.join();
+    assertTrue(finished.isSet() and acceptRejected, "close interrupts accept");
+    assertTrue(listener.isOpen, "requestClose leaves wrapper state unchanged");
+    listener.close();
+    delete acceptWorker;
+    delete context;
+    print("SOCKET_CANCEL_ACCEPT_PASS");
+}
+
+func runRecvCase() {
+    entered.clear();
+    finished.clear();
+    receiveReturned = false;
+    let server = new Socket();
+    server.bind("127.0.0.1", 0);
+    server.listen();
+    let sender = new Socket("127.0.0.1", server.localPort());
+    let accepted = server.accept();
+    receiving.adoptHandle(accepted.detachHandle());
+    let context = new SocketWorkerContext();
+    let target = context.recv;
+    let recvWorker = new Thread(target);
+    recvWorker.start();
+    entered.wait();
+    thread_sleep(100);
+    // Keep sender open: only local close can release this blocked receive.
+    receiving.requestClose();
+    recvWorker.join();
+    assertTrue(finished.isSet() and receiveReturned, "close interrupts recv");
+    assertTrue(receiving.isOpen, "requestClose leaves wrapper state unchanged");
+    receiving.close();
+    sender.close();
+    server.close();
+    delete recvWorker;
+    delete context;
+    print("SOCKET_CANCEL_RECV_PASS");
+}
+
+func runDelayedCase() {
+    entered.clear();
+    finished.clear();
+    let chunkListener = new Socket();
+    chunkListener.bind("127.0.0.1", 0);
+    chunkListener.listen();
+    sending.connect("127.0.0.1", chunkListener.localPort());
+    let chunkPeer = chunkListener.accept();
+    let context = new SocketWorkerContext();
+    let target = context.chunks;
+    let chunkWorker = new Thread(target);
+    chunkWorker.start();
+    entered.wait();
+    let combined = chunkPeer.recvExact(12);
+    chunkWorker.join();
+    assertTrue(finished.isSet(), "both delayed chunks were sent");
+    assertTrue(combined.length() == 12, "recvExact waits for all delayed chunks");
+    assertTrue(combined.decode() == "first;second", "delayed chunks preserve order");
+    chunkPeer.close();
+    chunkListener.close();
+    sending.close();
+    delete chunkWorker;
+    delete context;
+    print("SOCKET_RECV_EXACT_DELAYED_PASS");
+}
+
+// The runner selects one case per process to keep worker lifetime independent.
+runAcceptCase(); // SOCKET_TEST_ENTRYPOINT

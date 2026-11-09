@@ -1,0 +1,272 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import samples.NexoraCodeCore.task_stream;
+
+func assertStream(condition, message: string) {
+    if (!condition) throw new Exception("Nexora task stream test failed: " + message);
+}
+
+var const SUB_A = "0123456789abcdef0123456789abcdef";
+var const SUB_B = "fedcba9876543210fedcba9876543210";
+var const STREAM_RUNNING = "11111111111111111111111111111111";
+var const STREAM_DONE = "22222222222222222222222222222222";
+var const STREAM_GAP = "33333333333333333333333333333333";
+
+class FakeTaskStream {
+    using &this;
+
+    let metas = {};
+    let chunkSets = {};
+    let seenAfter = [];
+
+    func operator[@=]() -> &FakeTaskStream {
+        return this;
+    }
+
+    func getMeta(streamId) {
+        for (this.metas) [&key: &value] {
+            if (key == streamId) return value;
+        }
+        return nil;
+    }
+
+    func iterChunks(streamId, fromSeq) {
+        this.seenAfter.append(fromSeq);
+        for (this.chunkSets) [&key: &value] {
+            if (key == streamId) return value;
+        }
+        return [];
+    }
+}
+
+class FakeStreamConnection {
+    using &this;
+
+    let sent = [];
+
+    func operator[@=]() -> &FakeStreamConnection {
+        return this;
+    }
+
+    func sendText(text: string) {
+        this.sent.append(text);
+    }
+}
+
+func frameAt(connection, index: int) {
+    return JSON.parse(connection.sent[index]);
+}
+
+func lastFrame(connection) {
+    return frameAt(connection, connection.sent.length() - 1);
+}
+
+func streamFixture() {
+    let taskStream = new FakeTaskStream();
+
+    let runningMeta = {"stream_id": STREAM_RUNNING, "status": "running", "title": "跑着的任务"};
+    let doneMeta = {"stream_id": STREAM_DONE, "status": "finished", "title": "做完的任务"};
+    let gapMeta = {"stream_id": STREAM_GAP, "status": "finished", "title": "缺了一段的任务"};
+    taskStream.metas[STREAM_RUNNING] = runningMeta;
+    taskStream.metas[STREAM_DONE] = doneMeta;
+    taskStream.metas[STREAM_GAP] = gapMeta;
+
+    let runningChunks = [
+        {"seq": 1, "event": {"type": "text", "text": "第一段"}},
+        {"seq": 2, "event": {"type": "text", "text": "第二段"}}
+    ];
+    let doneChunks = [
+        {"seq": 1, "event": {"type": "text", "text": "只有一段"}}
+    ];
+    let gapChunks = [
+        {"seq": 4, "event": {"type": "task_stream_gap", "head_seq": 9}}
+    ];
+    taskStream.chunkSets[STREAM_RUNNING] = runningChunks;
+    taskStream.chunkSets[STREAM_DONE] = doneChunks;
+    taskStream.chunkSets[STREAM_GAP] = gapChunks;
+
+    return taskStream;
+}
+
+func subscribeFrame(subscriptionId: string, streamId: string) {
+    let frame = {"type": "task_subscribe", "subscription_id": subscriptionId, "stream_id": streamId};
+    return frame;
+}
+
+// 运行中的流：先一条 task_state(meta)，再逐条 task_event，最后一条收尾 task_state。
+func testTaskStreamRelayRunning() {
+    let taskStream = streamFixture();
+    let handler = new NexoraCoreTaskStreamHandler(taskStream);
+    let connection = new FakeStreamConnection();
+
+    let handled = handler.handleSubscribe(subscribeFrame(SUB_A, STREAM_RUNNING), connection);
+
+    assertStream(handled, "a valid subscribe is handled");
+    assertStream(connection.sent.length() == 4, "meta + two events + closing state");
+    assertStream(frameAt(connection, 0)["type"] == "task_state", "the first frame is task_state");
+    assertStream(frameAt(connection, 0)["session"]["status"] == "running", "the state carries the meta");
+    assertStream(frameAt(connection, 1)["type"] == "task_event", "events follow");
+    assertStream(frameAt(connection, 1)["event"]["text"] == "第一段", "the event payload survives");
+    assertStream(frameAt(connection, 2)["event"]["text"] == "第二段", "the second event follows");
+    assertStream(frameAt(connection, 3)["type"] == "task_state", "the relay closes with a state");
+    assertStream(frameAt(connection, 1)["subscription_id"] == SUB_A, "frames echo the subscription");
+    assertStream(frameAt(connection, 1)["stream_id"] == STREAM_RUNNING, "frames echo the stream");
+}
+
+// 已完成的任务不先发状态：直接事件，再收尾状态。
+func testTaskStreamRelayFinished() {
+    let taskStream = streamFixture();
+    let handler = new NexoraCoreTaskStreamHandler(taskStream);
+    let connection = new FakeStreamConnection();
+
+    handler.handleSubscribe(subscribeFrame(SUB_A, STREAM_DONE), connection);
+
+    assertStream(connection.sent.length() == 2, "one event plus the closing state");
+    assertStream(frameAt(connection, 0)["type"] == "task_event", "no leading state for a finished stream");
+    assertStream(frameAt(connection, 1)["type"] == "task_state", "the closing state still goes out");
+}
+
+// 未知流：一条 task_stream_error，不注册订阅。
+func testTaskStreamMissing() {
+    let taskStream = streamFixture();
+    let handler = new NexoraCoreTaskStreamHandler(taskStream);
+    let connection = new FakeStreamConnection();
+
+    let handled = handler.handleSubscribe(subscribeFrame(SUB_A, "44444444444444444444444444444444"), connection);
+
+    assertStream(handled, "the subscribe is still accepted for bookkeeping");
+    assertStream(connection.sent.length() == 1, "only the error frame goes out");
+    let frame = lastFrame(connection);
+    assertStream(frame["type"] == "task_stream_error", "the frame is a task_stream_error");
+    assertStream(frame["message"] == "任务不存在或已清理", "the baseline message is kept");
+}
+
+// 游标空洞：发一条 task_stream_gap 就结束这一轮，不再发收尾状态。
+func testTaskStreamGap() {
+    let taskStream = streamFixture();
+    let handler = new NexoraCoreTaskStreamHandler(taskStream);
+    let connection = new FakeStreamConnection();
+
+    handler.handleSubscribe(subscribeFrame(SUB_A, STREAM_GAP), connection);
+
+    assertStream(connection.sent.length() == 1, "a gap ends the relay immediately");
+    let frame = lastFrame(connection);
+    assertStream(frame["type"] == "task_stream_gap", "the frame is a task_stream_gap");
+    assertStream(frame["head_seq"] == 9, "the gap carries the head sequence");
+}
+
+// 订阅号/流号必须是 32 位小写十六进制，否则整帧丢弃。
+func testTaskStreamRejectsBadIds() {
+    let taskStream = streamFixture();
+    let handler = new NexoraCoreTaskStreamHandler(taskStream);
+    let connection = new FakeStreamConnection();
+
+    assertStream(!handler.handleSubscribe(subscribeFrame("short", STREAM_RUNNING), connection),
+        "a short subscription id is rejected");
+    assertStream(!handler.handleSubscribe(subscribeFrame(SUB_A, "XYZ"), connection),
+        "a non-hex stream id is rejected");
+    assertStream(connection.sent.length() == 0, "nothing is sent for a rejected frame");
+    assertStream(handler.count() == 0, "no subscription is registered");
+}
+
+// after_seq 原样交给宿主，负数按 0 处理。
+func testTaskStreamAfterSeq() {
+    let taskStream = streamFixture();
+    let handler = new NexoraCoreTaskStreamHandler(taskStream);
+    let connection = new FakeStreamConnection();
+
+    let frame = subscribeFrame(SUB_A, STREAM_DONE);
+    frame["after_seq"] = 5;
+    handler.handleSubscribe(frame, connection);
+    assertStream(taskStream.seenAfter[0] == 5, "after_seq reaches the host");
+
+    let negative = subscribeFrame(SUB_B, STREAM_DONE);
+    negative["after_seq"] = -3;
+    handler.handleSubscribe(negative, connection);
+    assertStream(taskStream.seenAfter[1] == 0, "a negative after_seq is clamped to zero");
+}
+
+// 退订：移除记录，之后 pump 不再为它推帧。
+func testTaskStreamUnsubscribe() {
+    let taskStream = streamFixture();
+    let handler = new NexoraCoreTaskStreamHandler(taskStream);
+    let connection = new FakeStreamConnection();
+
+    handler.handleSubscribe(subscribeFrame(SUB_A, STREAM_DONE), connection);
+    handler.handleSubscribe(subscribeFrame(SUB_B, STREAM_DONE), connection);
+    assertStream(handler.count() == 2, "two subscriptions are registered");
+
+    let before = connection.sent.length();
+    let removed = handler.handleUnsubscribe({"type": "task_unsubscribe", "subscription_id": SUB_A}, connection);
+
+    assertStream(removed, "unsubscribe finds the record");
+    assertStream(handler.count() == 1, "only one subscription is left");
+
+    handler.pump(connection);
+    let afterPump = connection.sent.length() - before;
+    assertStream(afterPump == 2, "pump only serves the remaining subscription");
+
+    assertStream(!handler.handleUnsubscribe({"subscription_id": SUB_A}, connection),
+        "a second unsubscribe for the same id does nothing");
+}
+
+// 重复订阅同一个订阅号：忽略第二次，不重复推帧。
+func testTaskStreamDuplicate() {
+    let taskStream = streamFixture();
+    let handler = new NexoraCoreTaskStreamHandler(taskStream);
+    let connection = new FakeStreamConnection();
+
+    handler.handleSubscribe(subscribeFrame(SUB_A, STREAM_DONE), connection);
+    let framesAfterFirst = connection.sent.length();
+
+    let accepted = handler.handleSubscribe(subscribeFrame(SUB_A, STREAM_DONE), connection);
+
+    assertStream(!accepted, "a duplicate subscription is ignored");
+    assertStream(connection.sent.length() == framesAfterFirst, "the duplicate sends nothing");
+    assertStream(handler.count() == 1, "the registry keeps one record");
+}
+
+// 断线：stopAll 清空订阅，pump 变成空转。
+func testTaskStreamStopAll() {
+    let taskStream = streamFixture();
+    let handler = new NexoraCoreTaskStreamHandler(taskStream);
+    let connection = new FakeStreamConnection();
+
+    handler.handleSubscribe(subscribeFrame(SUB_A, STREAM_DONE), connection);
+    handler.handleSubscribe(subscribeFrame(SUB_B, STREAM_RUNNING), connection);
+    handler.stopAll();
+
+    assertStream(handler.count() == 0, "stopAll clears the registry");
+
+    let before = connection.sent.length();
+    let sent = handler.pump(connection);
+    assertStream(sent == 0, "pump sends nothing after stopAll");
+    assertStream(connection.sent.length() == before, "no frames leave after stopAll");
+}
+
+// 游标推进：一轮推完后 pump 从最后一条 seq 继续，不重发旧块。
+func testTaskStreamCursorAdvances() {
+    let taskStream = streamFixture();
+    let handler = new NexoraCoreTaskStreamHandler(taskStream);
+    let connection = new FakeStreamConnection();
+
+    handler.handleSubscribe(subscribeFrame(SUB_A, STREAM_DONE), connection);
+    assertStream(taskStream.seenAfter[0] == 0, "the first pass starts at after_seq 0");
+
+    handler.pump(connection);
+    assertStream(taskStream.seenAfter[1] == 1, "the next pass resumes after the last seq");
+}
+
+func testTaskStreamRelay() {
+    testTaskStreamRelayRunning();
+    testTaskStreamRelayFinished();
+    testTaskStreamMissing();
+    testTaskStreamGap();
+    testTaskStreamRejectsBadIds();
+    testTaskStreamAfterSeq();
+    testTaskStreamUnsubscribe();
+    testTaskStreamDuplicate();
+    testTaskStreamCursorAdvances();
+    testTaskStreamStopAll();
+}

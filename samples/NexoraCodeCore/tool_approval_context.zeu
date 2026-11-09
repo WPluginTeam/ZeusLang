@@ -1,0 +1,137 @@
+import zeus.dict;
+import zeus.string;
+
+import samples.NexoraCodeCore.text_utils;
+
+let NEXORA_APPROVAL_CONTEXT_MESSAGE_CHARS: int = 1600;
+let NEXORA_APPROVAL_CONTEXT_HISTORY_CHARS: int = 1200;
+let NEXORA_APPROVAL_CONTEXT_ACTIONS: int = 8;
+
+func __nexora_approval_clip(value) -> string {
+    let text = str(value);
+    if (text.length() <= NEXORA_APPROVAL_CONTEXT_MESSAGE_CHARS) return text;
+    return nexora_text_truncate_utf8_chars(text,
+        NEXORA_APPROVAL_CONTEXT_MESSAGE_CHARS) + "[审批上下文已截断]";
+}
+
+func __nexora_approval_recent(values: Array, limit: int) -> Array {
+    let output: Array = [];
+    let start = values.length() - limit;
+    if (start < 0) start = 0;
+    let index = start;
+    for (index < values.length()) {
+        output.append(__nexora_approval_clip(values[index]));
+        index = index + 1;
+    }
+    return output;
+}
+
+func nexora_tool_approval_context(messages, currentAssistant, actions) -> dict {
+    let userRequests: Array = [];
+    let agentReplies: Array = [];
+    if (type(messages) == "Array") {
+        for (messages) [message] {
+            if (type(message) != "dict") continue;
+            let role = str(dict_get(message, "role", ""));
+            let content = dict_get(message, "content", nil);
+            if (type(content) != "string" or content == "") continue;
+            if (role == "user") userRequests.append(content);
+            if (role == "assistant" and
+                    type(dict_get(message, "tool_calls", nil)) != "Array") {
+                agentReplies.append(content);
+            }
+        }
+    }
+
+    let currentUserIndex = userRequests.length() - 1;
+    let userIntent = "";
+    let initialUserRequest = "";
+    let previousUserRequests: Array = [];
+    let earlierUserRequests: Array = [];
+    if (userRequests.length() > 0) {
+        userIntent = __nexora_approval_clip(userRequests[currentUserIndex]);
+        initialUserRequest = __nexora_approval_clip(userRequests[0]);
+        let previousStart = currentUserIndex - 2;
+        if (previousStart < 0) previousStart = 0;
+        let index = previousStart;
+        for (index < currentUserIndex) {
+            previousUserRequests.append(__nexora_approval_clip(userRequests[index]));
+            index = index + 1;
+        }
+        let earlierEnd = previousStart;
+        if (earlierEnd > 1) {
+            index = 1;
+            for (index < earlierEnd) {
+                earlierUserRequests.append(userRequests[index]);
+                index = index + 1;
+            }
+        }
+    }
+
+    let previousAgentReplies = __nexora_approval_recent(agentReplies, 2);
+    let earlierAgentReplies: Array = [];
+    let olderUserCount = earlierUserRequests.length();
+    let olderAgentCount = agentReplies.length() - previousAgentReplies.length();
+    let historyBudget = NEXORA_APPROVAL_CONTEXT_HISTORY_CHARS;
+    let userBudget = historyBudget / 2;
+    let boundedOlderUsers: Array = [];
+    for (earlierUserRequests) [request] {
+        let clipped = __nexora_approval_clip(request);
+        if (clipped.length() > userBudget) break;
+        boundedOlderUsers.append(clipped);
+        userBudget = userBudget - clipped.length();
+    }
+    let olderReplies: Array = [];
+    if (olderAgentCount > 0) {
+        let replyIndex = 0;
+        for (replyIndex < olderAgentCount) {
+            olderReplies.append(agentReplies[replyIndex]);
+            replyIndex = replyIndex + 1;
+        }
+    }
+    let replyBudget = NEXORA_APPROVAL_CONTEXT_HISTORY_CHARS / 2;
+    for (olderReplies) [reply] {
+        let clipped = __nexora_approval_clip(reply);
+        if (clipped.length() > replyBudget) break;
+        earlierAgentReplies.append(clipped);
+        replyBudget = replyBudget - clipped.length();
+        if (replyBudget <= 0) break;
+    }
+    let omitted = olderUserCount - boundedOlderUsers.length();
+    if (omitted < 0) omitted = 0;
+    let omittedReplies = olderAgentCount - earlierAgentReplies.length();
+    if (omittedReplies > 0) omitted = omitted + omittedReplies;
+
+    let explanation = "";
+    if (type(currentAssistant) == "dict") {
+        explanation = __nexora_approval_clip(
+            dict_get(currentAssistant, "content", ""));
+    }
+
+    let previousActions: Array = [];
+    if (type(actions) == "Array") {
+        let actionStart = actions.length() - NEXORA_APPROVAL_CONTEXT_ACTIONS;
+        if (actionStart < 0) actionStart = 0;
+        let actionIndex = actionStart;
+        for (actionIndex < actions.length()) {
+            previousActions.append(actions[actionIndex]);
+            actionIndex = actionIndex + 1;
+        }
+    }
+
+    let omittedNote = "";
+    if (omitted > 0) {
+        omittedNote = "省略了 " + str(omitted) + " 条较早的对话消息";
+    }
+    return {
+        "user_intent": userIntent,
+        "previous_user_requests": previousUserRequests,
+        "assistant_explanation": explanation,
+        "previous_agent_replies": previousAgentReplies,
+        "previous_actions": previousActions,
+        "initial_user_request": initialUserRequest,
+        "earlier_user_requests": boundedOlderUsers,
+        "earlier_agent_replies": earlierAgentReplies,
+        "omitted_history_note": omittedNote
+    };
+}

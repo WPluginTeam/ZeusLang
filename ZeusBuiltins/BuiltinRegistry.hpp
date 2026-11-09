@@ -6,6 +6,22 @@
 
 namespace ZeusBuiltins {
 
+// How many parameters an @native(from=...) declaration may take. Win32 entry
+// points routinely need more than a hand-rolled helper does, for example
+// CreateProcessW has ten. The runtime rebuilds the callee signature by
+// recursion, so the practical limit is only how deep that recursion may go
+// before template instantiation becomes untenable. The parser enforces the
+// same number so a declaration is rejected before it reaches the runtime.
+constexpr size_t kDynamicNativeMaxParameters = 16;
+
+// A pointer is a 64-bit address on every target Zeus supports, so an int
+// parameter already carries one. Naming it explicitly keeps declarations
+// readable without adding a type the dispatch table has to know about: raw
+// addresses from zeus.mem or @faddr pass straight to the callee.
+inline bool isNativePointerTypeName(const std::string& type) {
+    return type == "ptr" || type == "void*" || type == "pointer";
+}
+
 enum class ImportTrigger {
     Always,
     BytesLiteral
@@ -77,7 +93,8 @@ inline const std::vector<ImplementationModule>& implementationModules() {
         {"zeus.string", true, true, true, ImportTrigger::Always, 0},
         {"zeus.dict", true, true, true, ImportTrigger::Always, 2},
         {"zeus.io", true, false, false, ImportTrigger::Always, -1},
-        {"zeus.byte", true, true, true, ImportTrigger::BytesLiteral, 2}
+        {"zeus.byte", true, true, true, ImportTrigger::BytesLiteral, 2},
+        {"zeus.native_runtime", true, true, true, ImportTrigger::Always, 3}
     };
     return modules;
 }

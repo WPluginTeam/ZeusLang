@@ -7,8 +7,8 @@
 // 所有权规则：
 // - 所有返回 ZeusBox* 的函数都返回新装箱，调用方拥有（zeus_box_release）。
 // - zeus_global_store 拷贝值入槽并吃掉传入的 box。
-// - VM ObjectHandle/闭包句柄仍不跨 ABI 传递；LLVM class 指针只通过非拥有的
-//   typed handle 在动态 ZeusValue 与原生 class ptr 之间往返。
+// - VM ObjectHandle crosses the LLVM class ABI as a typed, non-owning value.
+//   It carries {id, generation}; it does not point to a ZeusBox or class ptr.
 
 #include "ZeusABI.hpp"
 #include "ZeusLValueABI.hpp"
@@ -16,8 +16,10 @@
 #include "ZeusRuntimeType.hpp"
 
 #include "ZeusABIInternal.hpp"
+#include "ZeusRuntimeDebug.hpp"
 #include "ZeusDynamicBinaryABI.hpp"
 #include "ZeusDynamicMemberABI.hpp"
+#include "ZeusDynamicABI.hpp"
 
 #include "ZeusVariant.hpp"
 #include "ZeusSharedHeap.hpp"
@@ -26,6 +28,7 @@
 #include "ZeusCell.hpp"
 #include "ZeusNativeAddress.hpp"
 #include "ZeusMemoryABI.hpp"
+#include "ZeusFloatingPointABI.hpp"
 
 #include <cstdio>
 #include <cerrno>
@@ -35,6 +38,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -47,12 +51,21 @@
 #include <vector>
 #include <exception>
 #include <functional>
+#include <iterator>
 #include <stdexcept>
 #include <new>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 #ifdef _WIN32
 #include <io.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #else
 #include <unistd.h>
+#include <dlfcn.h>
 #endif
 
 namespace {
@@ -232,8 +245,34 @@ void setNilValue(ZeusValue* out) {
     out->payload = 0;
 }
 
+bool zeus_value_is_nil(const ZeusValue* value) {
+    return value != nullptr && value->tag == ZEUS_VALUE_TAG_NIL;
+}
+
 bool isOwnedBufferTag(uint32_t tag) noexcept {
     return tag == ZEUS_VALUE_TAG_STRING || tag == ZEUS_VALUE_TAG_BYTES;
+}
+
+// Class instance handles carry {id, generation} for the VM object table and
+// never own the instance, so they validate like the scalar references and
+// release like them: by doing nothing.
+ZeusObjectHandle requireObjectHandle(const ZeusValue* value) {
+    if (!value || value->tag != ZEUS_VALUE_TAG_OBJECT || value->flags != 0) {
+        dynamicValuePanic("invalid class instance handle value");
+    }
+    ZeusObjectHandle handle{};
+    std::memcpy(&handle, &value->payload, sizeof(handle));
+    return handle;
+}
+
+void initObjectHandle(ZeusValue* out, int id, int generation) {
+    if (!out) dynamicValuePanic("null output pointer");
+    if (id < 0) dynamicValuePanic("negative class instance handle id");
+    const ZeusObjectHandle handle{
+        static_cast<uint32_t>(id), static_cast<uint32_t>(generation)};
+    out->tag = ZEUS_VALUE_TAG_OBJECT;
+    out->flags = 0;
+    std::memcpy(&out->payload, &handle, sizeof(handle));
 }
 
 uint8_t* requireOwnedBufferData(
@@ -461,50 +500,106 @@ std::mutex& nativeStringPoolMutex() {
     return mutex;
 }
 
+constexpr uint64_t kImmortalNativeStringReferences =
+    std::numeric_limits<uint64_t>::max();
+
+struct NativeStringHeader {
+    std::atomic<uint64_t> references{0};
+    uint64_t length = 0;
+    char data[1] = {'\0'};
+};
+
+static_assert(offsetof(NativeStringHeader, data) == 2 * sizeof(uint64_t),
+    "NativeString keeps its length at data - 8 and reference count at data - 16");
+
+NativeStringHeader* nativeStringHeader(ZeusNativeString value) noexcept {
+    return reinterpret_cast<NativeStringHeader*>(
+        const_cast<char*>(value) - offsetof(NativeStringHeader, data));
+}
+
+void destroyNativeStringStorage(NativeStringHeader* header) noexcept {
+    if (!header) return;
+    header->~NativeStringHeader();
+    ::operator delete(header);
+}
+
+NativeStringHeader* allocateNativeStringStorage(
+    std::string_view text,
+    uint64_t references
+) {
+    if (text.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        dynamicValuePanic("native string result is too large");
+    }
+    const size_t dataOffset = offsetof(NativeStringHeader, data);
+    if (text.size() > std::numeric_limits<size_t>::max() - dataOffset - 1) {
+        dynamicValuePanic("native string result is too large");
+    }
+    const size_t allocationSize = std::max(
+        sizeof(NativeStringHeader), dataOffset + text.size() + 1);
+    void* allocation = ::operator new(allocationSize);
+    NativeStringHeader* header = nullptr;
+    try {
+        header = new (allocation) NativeStringHeader();
+        header->references.store(references, std::memory_order_relaxed);
+        header->length = static_cast<uint64_t>(text.size());
+        if (!text.empty()) std::memcpy(header->data, text.data(), text.size());
+        header->data[text.size()] = '\0';
+        return header;
+    } catch (...) {
+        if (header) header->~NativeStringHeader();
+        ::operator delete(allocation);
+        throw;
+    }
+}
+
+size_t nativeStringStorageSize(uint64_t length) noexcept {
+    const size_t dataOffset = offsetof(NativeStringHeader, data);
+    if (length > std::numeric_limits<size_t>::max() - dataOffset - 1) {
+        return 0;
+    }
+    return std::max(sizeof(NativeStringHeader),
+        dataOffset + static_cast<size_t>(length) + 1);
+}
+
 struct NativeStringPoolEntry {
-    std::string originalBytes;
-    std::vector<uint64_t> allocation;
+    NativeStringHeader* storage = nullptr;
+
+    ~NativeStringPoolEntry() {
+        destroyNativeStringStorage(storage);
+    }
 
     ZeusNativeString address() const noexcept {
-        if (allocation.empty()) return nullptr;
-        return reinterpret_cast<const char*>(allocation.data()) + sizeof(uint64_t);
+        return storage ? storage->data : nullptr;
     }
 
     std::string_view contents() const noexcept {
-        const char* data = address();
-        if (!data) return {};
-        uint64_t length = 0;
-        std::memcpy(&length, data - sizeof(uint64_t), sizeof(length));
-        return std::string_view(data, static_cast<size_t>(length));
+        if (!storage) return {};
+        return std::string_view(storage->data,
+            static_cast<size_t>(storage->length));
     }
 
     void assign(std::string text) {
-        originalBytes = std::move(text);
-        if (originalBytes.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
-            dynamicValuePanic("native string result is too large");
-        }
-        const size_t byteCount = sizeof(uint64_t) + originalBytes.size() + 1;
-        allocation.assign((byteCount + sizeof(uint64_t) - 1) / sizeof(uint64_t), 0);
-        const uint64_t length = static_cast<uint64_t>(originalBytes.size());
-        std::memcpy(allocation.data(), &length, sizeof(length));
-        char* characters = reinterpret_cast<char*>(allocation.data()) + sizeof(uint64_t);
-        if (!originalBytes.empty()) {
-            std::memcpy(characters, originalBytes.data(), originalBytes.size());
-        }
-        characters[originalBytes.size()] = '\0';
+        storage = allocateNativeStringStorage(
+            text, kImmortalNativeStringReferences);
     }
 };
 
 std::unordered_map<size_t, std::vector<std::unique_ptr<NativeStringPoolEntry>>>&
-nativeStringPool() {
+nativeStringLiteralPool() {
     static std::unordered_map<
         size_t, std::vector<std::unique_ptr<NativeStringPoolEntry>>> strings;
     return strings;
 }
 
-std::vector<std::unique_ptr<NativeStringPoolEntry>>& nativeStringCopies() {
-    static std::vector<std::unique_ptr<NativeStringPoolEntry>> strings;
+std::unordered_map<size_t, std::vector<ZeusNativeString>>&
+nativeStringWeakInternPool() {
+    static std::unordered_map<size_t, std::vector<ZeusNativeString>> strings;
     return strings;
+}
+
+std::unordered_map<ZeusNativeString, size_t>& nativeStringWeakInternHashes() {
+    static std::unordered_map<ZeusNativeString, size_t> hashes;
+    return hashes;
 }
 
 std::unordered_set<const char*>& nativeStringAddresses() {
@@ -512,7 +607,9 @@ std::unordered_set<const char*>& nativeStringAddresses() {
     return addresses;
 }
 
-std::string_view nativeStringContents(ZeusNativeString value) {
+void nativeStringValidateImpl(ZeusNativeString value);
+
+std::string_view nativeStringContentsUnchecked(ZeusNativeString value) {
     if (!value) dynamicValuePanic("null native string pointer");
     uint64_t length = 0;
     std::memcpy(&length, value - sizeof(uint64_t), sizeof(length));
@@ -523,17 +620,38 @@ std::string_view nativeStringContents(ZeusNativeString value) {
     return std::string_view(value, static_cast<size_t>(length));
 }
 
+std::string_view nativeStringContents(ZeusNativeString value) {
+    nativeStringValidateImpl(value);
+    return nativeStringContentsUnchecked(value);
+}
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
 void nativeStringValidateImpl(ZeusNativeString value) {
     if (!value) dynamicValuePanic("null native string pointer");
     std::lock_guard<std::mutex> lock(nativeStringPoolMutex());
     if (nativeStringAddresses().find(value) == nativeStringAddresses().end()) {
-        dynamicValuePanic("native string pointer is not owned by the string pool");
+#if defined(_MSC_VER)
+        void* caller = _ReturnAddress();
+#elif defined(__GNUC__) || defined(__clang__)
+        void* caller = __builtin_return_address(0);
+#else
+        void* caller = nullptr;
+#endif
+        std::fprintf(stderr,
+            "[ZeusRuntime] invalid native string pointer=%p caller=%p tracked=%zu\n",
+            static_cast<const void*>(value), caller, nativeStringAddresses().size());
+        std::fflush(stderr);
+        dynamicValuePanic("native string pointer is not live or immortal");
     }
 }
 
-ZeusNativeString internNativeString(std::string text) {
+ZeusNativeString internImmortalNativeString(std::string text) {
     std::lock_guard<std::mutex> lock(nativeStringPoolMutex());
-    auto& pool = nativeStringPool();
+    auto& pool = nativeStringLiteralPool();
     const size_t hash = std::hash<std::string_view>{}(text);
     auto& candidates = pool[hash];
     for (const auto& candidate : candidates) {
@@ -542,20 +660,150 @@ ZeusNativeString internNativeString(std::string text) {
     auto entry = std::make_unique<NativeStringPoolEntry>();
     entry->assign(std::move(text));
     const ZeusNativeString value = entry->address();
-    nativeStringAddresses().insert(value);
-    candidates.push_back(std::move(entry));
+    try {
+        nativeStringAddresses().insert(value);
+        candidates.push_back(std::move(entry));
+    } catch (...) {
+        nativeStringAddresses().erase(value);
+        throw;
+    }
     return value;
 }
 
-ZeusNativeString copyNativeString(std::string text) {
+ZeusNativeString internNativeString(std::string text) {
     std::lock_guard<std::mutex> lock(nativeStringPoolMutex());
-    auto entry = std::make_unique<NativeStringPoolEntry>();
-    entry->assign(std::move(text));
-    const ZeusNativeString value = entry->address();
-    nativeStringAddresses().insert(value);
-    nativeStringCopies().push_back(std::move(entry));
+    auto& pool = nativeStringWeakInternPool();
+    const size_t hash = std::hash<std::string_view>{}(text);
+    auto& candidates = pool[hash];
+    for (const ZeusNativeString candidate : candidates) {
+        if (nativeStringContentsUnchecked(candidate) != text) continue;
+        NativeStringHeader* header = nativeStringHeader(candidate);
+        const uint64_t references = header->references.load(
+            std::memory_order_relaxed);
+        if (references == 0 || references == kImmortalNativeStringReferences) {
+            dynamicValuePanic("invalid weak native string entry");
+        }
+        if (references == kImmortalNativeStringReferences - 1) {
+            dynamicValuePanic("native string reference count overflow");
+        }
+        header->references.store(references + 1, std::memory_order_relaxed);
+        return candidate;
+    }
+
+    NativeStringHeader* header = allocateNativeStringStorage(text, 1);
+    const ZeusNativeString value = header->data;
+    try {
+        nativeStringAddresses().insert(value);
+        nativeStringWeakInternHashes().emplace(value, hash);
+        candidates.push_back(value);
+        ZeusRuntimeDebug::trackCreated(
+            ZeusRuntimeDebug::ResourceKind::NativeString,
+            value, "owned-native-string", __FILE__, __LINE__,
+            nativeStringStorageSize(header->length));
+    } catch (...) {
+        nativeStringAddresses().erase(value);
+        nativeStringWeakInternHashes().erase(value);
+        destroyNativeStringStorage(header);
+        if (candidates.empty()) pool.erase(hash);
+        throw;
+    }
     return value;
 }
+
+ZeusNativeString allocateNativeString(std::string_view text) {
+    NativeStringHeader* header = allocateNativeStringStorage(
+        text, 1);
+    const ZeusNativeString value = header->data;
+    try {
+        std::lock_guard<std::mutex> lock(nativeStringPoolMutex());
+        nativeStringAddresses().insert(value);
+        ZeusRuntimeDebug::trackCreated(
+            ZeusRuntimeDebug::ResourceKind::NativeString,
+            value, "owned-native-string", __FILE__, __LINE__,
+            nativeStringStorageSize(header->length));
+    } catch (...) {
+        destroyNativeStringStorage(header);
+        throw;
+    }
+    return value;
+}
+
+void retainNativeString(ZeusNativeString value) {
+    if (!value) return;
+    std::lock_guard<std::mutex> lock(nativeStringPoolMutex());
+    if (nativeStringAddresses().find(value) == nativeStringAddresses().end()) {
+        dynamicValuePanic("cannot retain a released native string");
+    }
+    NativeStringHeader* header = nativeStringHeader(value);
+    uint64_t current = header->references.load(std::memory_order_relaxed);
+    while (current != kImmortalNativeStringReferences) {
+        if (current == 0 || current == kImmortalNativeStringReferences - 1) {
+            dynamicValuePanic("invalid native string reference count");
+        }
+        if (header->references.compare_exchange_weak(
+                current, current + 1, std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
+void releaseNativeString(ZeusNativeString value) {
+    if (!value) return;
+    NativeStringHeader* released = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(nativeStringPoolMutex());
+        auto& addresses = nativeStringAddresses();
+        const auto found = addresses.find(value);
+        if (found == addresses.end()) {
+            dynamicValuePanic("cannot release an unowned native string");
+        }
+        NativeStringHeader* header = nativeStringHeader(value);
+        uint64_t current = header->references.load(std::memory_order_relaxed);
+        if (current == kImmortalNativeStringReferences) return;
+        if (current == 0) {
+            dynamicValuePanic("native string reference count is already zero");
+        }
+        if (current > 1) {
+            header->references.store(current - 1, std::memory_order_relaxed);
+            return;
+        }
+        header->references.store(0, std::memory_order_relaxed);
+        addresses.erase(found);
+        const auto interned = nativeStringWeakInternHashes().find(value);
+        if (interned != nativeStringWeakInternHashes().end()) {
+            auto& pool = nativeStringWeakInternPool();
+            const auto bucket = pool.find(interned->second);
+            if (bucket != pool.end()) {
+                auto& candidates = bucket->second;
+                candidates.erase(std::remove(candidates.begin(),
+                    candidates.end(), value), candidates.end());
+                if (candidates.empty()) pool.erase(bucket);
+            }
+            nativeStringWeakInternHashes().erase(interned);
+        }
+        released = header;
+    }
+    const size_t releasedSize = nativeStringStorageSize(released->length);
+    zeus_lvalue_unregister_revealed(const_cast<char*>(value));
+    ZeusRuntimeDebug::trackDestroyed(
+        ZeusRuntimeDebug::ResourceKind::NativeString, value, releasedSize);
+    destroyNativeStringStorage(released);
+}
+
+class OwnedNativeString {
+public:
+    explicit OwnedNativeString(ZeusNativeString value) noexcept : value_(value) {}
+    OwnedNativeString(const OwnedNativeString&) = delete;
+    OwnedNativeString& operator=(const OwnedNativeString&) = delete;
+    ~OwnedNativeString() {
+        if (value_) releaseNativeString(value_);
+    }
+    ZeusNativeString get() const noexcept { return value_; }
+
+private:
+    ZeusNativeString value_ = nullptr;
+};
 
 template <typename Builder>
 ZeusNativeString buildNativeString(Builder&& builder) {
@@ -564,7 +812,7 @@ ZeusNativeString buildNativeString(Builder&& builder) {
         if (result.size() > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
             dynamicValuePanic("native string result is too large");
         }
-        return internNativeString(result);
+        return allocateNativeString(result);
     } catch (...) {
         dynamicValuePanic("failed to build native string result");
     }
@@ -744,6 +992,68 @@ void destroyLLVMClassValue(const ZeusType::UniversalVariant& value) {
 
 ZeusBox* valueReference(const ZeusValue* value);
 
+struct OwnedZeusValue {
+    ZeusValue value{};
+
+    OwnedZeusValue() { zeus_value_init_nil(&value); }
+    ~OwnedZeusValue() { zeus_value_release(&value); }
+};
+
+template <typename Create>
+ZeusNativeString nativeStringFromValue(
+    const ZeusValue* value,
+    Create&& create
+) {
+    if (!value) {
+        dynamicValuePanic("expected an owned string value for native string ABI");
+    }
+
+    if (value->tag == ZEUS_VALUE_TAG_STRING) {
+        uint64_t length = 0;
+        const uint8_t* data = requireOwnedBufferData(
+            value, ZEUS_VALUE_TAG_STRING, &length);
+        return create(std::string_view(
+            reinterpret_cast<const char*>(data), static_cast<size_t>(length)));
+    }
+    if (value->tag != ZEUS_VALUE_TAG_BOXED ||
+        value->flags != ZEUS_VALUE_FLAG_OWNS_BOX) {
+        dynamicValuePanic("expected an owned string value for native string ABI");
+    }
+
+    const auto* box = valueReference(value);
+    const auto* classHandle = std::get_if<ZeusType::LLVMClassHandle>(&box->v);
+    if (classHandle) {
+        if (!classHandle->state || classHandle->state->typeName != "String") {
+            dynamicValuePanic("boxed class is not a native string or String object");
+        }
+
+        OwnedZeusValue rendered;
+        if (!zeus_value_try_dynamic_member_call(
+                &rendered.value, value, "toString", 0, nullptr)) {
+            dynamicValuePanic("String object has no registered toString method");
+        }
+        if (rendered.value.tag == ZEUS_VALUE_TAG_STRING) {
+            return nativeStringFromValue(&rendered.value,
+                std::forward<Create>(create));
+        }
+        if (rendered.value.tag != ZEUS_VALUE_TAG_BOXED ||
+            rendered.value.flags != ZEUS_VALUE_FLAG_OWNS_BOX) {
+            dynamicValuePanic("String.toString must return a string value");
+        }
+
+        const auto* renderedText = stringUniversalValue(
+            valueReference(&rendered.value)->v);
+        if (!renderedText) {
+            dynamicValuePanic("String.toString returned a non-string value");
+        }
+        return create(*renderedText);
+    }
+
+    const auto* text = stringUniversalValue(box->v);
+    if (!text) dynamicValuePanic("boxed value is not a string");
+    return create(*text);
+}
+
 // A native String instance and a boxed string are both usable as text, but the
 // native one only exposes its bytes through the registered toString method, so
 // it has to travel the string ABI instead of the numeric fast paths.
@@ -760,9 +1070,38 @@ bool isNativeStringValue(const ZeusValue* value) {
            classHandle->state->typeName == "String";
 }
 
+std::string nativeStringValueText(const ZeusValue* value) {
+    if (!value) dynamicValuePanic("null value while reading native string text");
+    if (value->tag == ZEUS_VALUE_TAG_STRING) {
+        uint64_t length = 0;
+        const uint8_t* data = requireOwnedBufferData(
+            value, ZEUS_VALUE_TAG_STRING, &length);
+        return std::string(reinterpret_cast<const char*>(data),
+            static_cast<size_t>(length));
+    }
+    if (value->tag != ZEUS_VALUE_TAG_BOXED ||
+        value->flags != ZEUS_VALUE_FLAG_OWNS_BOX) {
+        dynamicValuePanic("expected an owned string value");
+    }
+
+    const ZeusType::UniversalVariant& boxed = valueReference(value)->v;
+    if (const auto* text = stringUniversalValue(boxed)) return *text;
+    const auto* classHandle = std::get_if<ZeusType::LLVMClassHandle>(&boxed);
+    if (classHandle && classHandle->state &&
+        classHandle->state->typeName == "String") {
+        OwnedZeusValue rendered;
+        if (!zeus_value_try_dynamic_member_call(
+                &rendered.value, value, "toString", 0, nullptr)) {
+            dynamicValuePanic("String object has no registered toString method");
+        }
+        return nativeStringValueText(&rendered.value);
+    }
+    dynamicValuePanic("value is not a string");
+}
+
 void concatNativeStrings(ZeusValue* out, const ZeusValue* lhs, const ZeusValue* rhs) {
-    const std::string_view left = nativeStringContents(zeus_value_intern_string(lhs));
-    const std::string_view right = nativeStringContents(zeus_value_intern_string(rhs));
+    const std::string left = nativeStringValueText(lhs);
+    const std::string right = nativeStringValueText(rhs);
     try {
         std::string joined;
         joined.reserve(left.size() + right.size());
@@ -781,6 +1120,125 @@ bool tryNativeStringConcat(ZeusValue* out, const ZeusValue* lhs, const ZeusValue
     if (!isNativeStringValue(lhs) || !isNativeStringValue(rhs)) return false;
     concatNativeStrings(out, lhs, rhs);
     return true;
+}
+
+// Two inline integers are the common case of a dynamic operation, and the
+// generic path would box both operands and the result to compute them. The
+// result stays inline when it fits into an int64, and everything else falls
+// through to the generic path, so the arithmetic keeps the semantics of the
+// boxed path: an overflowing result is promoted to an arbitrary precision
+// integer there, and a division by zero still reports the same error.
+inline bool nativeIntAddOverflow(int64_t left, int64_t right, int64_t& out) {
+    if (right > 0) {
+        if (left > (std::numeric_limits<int64_t>::max)() - right) return true;
+    } else if (right < 0) {
+        if (left < (std::numeric_limits<int64_t>::min)() - right) return true;
+    }
+    out = left + right;
+    return false;
+}
+
+inline bool nativeIntSubOverflow(int64_t left, int64_t right, int64_t& out) {
+    if (right < 0) {
+        if (left > (std::numeric_limits<int64_t>::max)() + right) return true;
+    } else if (right > 0) {
+        if (left < (std::numeric_limits<int64_t>::min)() + right) return true;
+    }
+    out = left - right;
+    return false;
+}
+
+inline bool nativeIntMulOverflow(int64_t left, int64_t right, int64_t& out) {
+    if (left == 0 || right == 0) {
+        out = 0;
+        return false;
+    }
+    if (left == -1) {
+        if (right == (std::numeric_limits<int64_t>::min)()) return true;
+        out = -right;
+        return false;
+    }
+    if (right == -1) {
+        if (left == (std::numeric_limits<int64_t>::min)()) return true;
+        out = -left;
+        return false;
+    }
+    if (left > 0) {
+        if (right > 0) {
+            if (left > (std::numeric_limits<int64_t>::max)() / right) return true;
+        } else {
+            if (right < (std::numeric_limits<int64_t>::min)() / left) return true;
+        }
+    } else {
+        if (right > 0) {
+            if (left < (std::numeric_limits<int64_t>::min)() / right) return true;
+        } else {
+            if (left < (std::numeric_limits<int64_t>::max)() / right) return true;
+        }
+    }
+    out = left * right;
+    return false;
+}
+
+bool tryNativeIntArithmetic(
+    ZeusValue* out,
+    int32_t opcode,
+    const ZeusValue* lhs,
+    const ZeusValue* rhs
+) {
+    if (!lhs || !rhs) return false;
+    if (lhs->tag != ZEUS_VALUE_TAG_INT64 || rhs->tag != ZEUS_VALUE_TAG_INT64) {
+        return false;
+    }
+    const int64_t left = lhs->int64_payload;
+    const int64_t right = rhs->int64_payload;
+    int64_t result = 0;
+    switch (opcode) {
+        case ZEUS_BINARY_ADD:
+            if (nativeIntAddOverflow(left, right, result)) return false;
+            zeus_value_init_i64(out, result);
+            return true;
+        case ZEUS_BINARY_SUBTRACT:
+            if (nativeIntSubOverflow(left, right, result)) return false;
+            zeus_value_init_i64(out, result);
+            return true;
+        case ZEUS_BINARY_MULTIPLY:
+            if (nativeIntMulOverflow(left, right, result)) return false;
+            zeus_value_init_i64(out, result);
+            return true;
+        case ZEUS_BINARY_DIVIDE:
+            // The generic path reports the division by zero, and the one
+            // overflowing case has no int64 result at all.
+            if (right == 0) return false;
+            if (left == (std::numeric_limits<int64_t>::min)() && right == -1) return false;
+            zeus_value_init_i64(out, left / right);
+            return true;
+        case ZEUS_BINARY_MODULUS:
+            if (right == 0) return false;
+            if (left == (std::numeric_limits<int64_t>::min)() && right == -1) return false;
+            zeus_value_init_i64(out, left % right);
+            return true;
+        case ZEUS_BINARY_LESS_THAN:
+            zeus_value_init_bool(out, left < right ? 1 : 0);
+            return true;
+        case ZEUS_BINARY_GREATER_THAN:
+            zeus_value_init_bool(out, left > right ? 1 : 0);
+            return true;
+        case ZEUS_BINARY_LESS_EQUAL:
+            zeus_value_init_bool(out, left <= right ? 1 : 0);
+            return true;
+        case ZEUS_BINARY_GREATER_EQUAL:
+            zeus_value_init_bool(out, left >= right ? 1 : 0);
+            return true;
+        case ZEUS_BINARY_EQUAL:
+            zeus_value_init_bool(out, left == right ? 1 : 0);
+            return true;
+        case ZEUS_BINARY_NOT_EQUAL:
+            zeus_value_init_bool(out, left != right ? 1 : 0);
+            return true;
+        default:
+            return false;
+    }
 }
 
 // A native class handle is a non-owning typed pointer, so equality is identity
@@ -817,7 +1275,8 @@ bool boxedStringText(const ZeusValue* value, std::string& out) {
 }
 
 bool nativeStringEqualsText(const ZeusValue* value, const std::string& text) {
-    return nativeStringContents(zeus_value_intern_string(value)) == text;
+    OwnedNativeString native(zeus_value_to_native_string(value));
+    return nativeStringContents(native.get()) == text;
 }
 
 bool tryNativeClassEquality(ZeusValue* out, int32_t opcode,
@@ -921,7 +1380,10 @@ std::string universalValueTypeName(const ZeusType::UniversalVariant& value) {
         if (std::holds_alternative<ZeusType::Null>(variant)) return "nil";
         if (std::holds_alternative<ZeusType::Array>(variant)) return "Array";
         if (std::holds_alternative<ZeusType::Bytes>(variant)) return "bytes";
-        if (std::holds_alternative<ZeusType::Object>(variant)) return "object";
+        // Dictionary literals use ObjectData storage in both backends; report
+        // the source type like the VM's typeImplementationName does, so AOT
+        // typed-call validation agrees with type().
+        if (std::holds_alternative<ZeusType::Object>(variant)) return "dict";
     }
     if (std::holds_alternative<ZeusType::ClosureHandle>(value) ||
         std::holds_alternative<ZeusType::NativeClosureHandle>(value) ||
@@ -971,6 +1433,8 @@ std::string dynamicValueTypeName(const ZeusValue* value) {
             return "string";
         case ZEUS_VALUE_TAG_BYTES:
             return "bytes";
+        case ZEUS_VALUE_TAG_OBJECT:
+            return "object";
         case ZEUS_VALUE_TAG_BOXED:
             if (value->flags == ZEUS_VALUE_FLAG_OWNS_BOX) {
                 return universalValueTypeName(valueReference(value)->v);
@@ -1011,13 +1475,6 @@ void printUniversalValue(const ZeusType::UniversalVariant& value) {
     }
 }
 
-struct OwnedZeusValue {
-    ZeusValue value{};
-
-    OwnedZeusValue() { zeus_value_init_nil(&value); }
-    ~OwnedZeusValue() { zeus_value_release(&value); }
-};
-
 void printDynamicValue(const ZeusValue* value) {
     if (!value) dynamicValuePanic("null value pointer while printing");
 
@@ -1028,8 +1485,9 @@ void printDynamicValue(const ZeusValue* value) {
         OwnedZeusValue stringified;
         if (zeus_value_try_dynamic_member_call(
                 &stringified.value, value, "toString", 0, nullptr)) {
-            const std::string_view rendered =
-                nativeStringContents(zeus_value_intern_string(&stringified.value));
+            OwnedNativeString native(
+                zeus_value_to_native_string(&stringified.value));
+            const std::string_view rendered = nativeStringContents(native.get());
             std::cout.write(rendered.data(),
                             static_cast<std::streamsize>(rendered.size()));
             return;
@@ -1166,6 +1624,12 @@ static void cloneDynamicValue(ZeusValue* out, const ZeusValue* value, bool roote
                 }
                 *out = *value;
                 return;
+            case ZEUS_VALUE_TAG_OBJECT:
+                // Copying a handle copies the name, never the instance: the
+                // instance's lifetime keeps belonging to the reference count.
+                (void)requireObjectHandle(value);
+                *out = *value;
+                return;
             case ZEUS_VALUE_TAG_STRING:
             case ZEUS_VALUE_TAG_BYTES:
                 cloneOwnedBuffer(out, value);
@@ -1291,6 +1755,12 @@ void zeus_value_from_box(ZeusValue* out, const ZeusBox* box) {
                 *decimal, lexerValue(box->v) != nullptr);
             return;
         }
+        if (const auto* object = std::get_if<ZeusType::ObjectHandle>(&box->v)) {
+            // A class instance handle crosses the ABI as itself instead of a
+            // heap box; it still names the instance rather than owning it.
+            initObjectHandle(out, object->id, object->generation);
+            return;
+        }
 
         uint32_t tag = ZEUS_VALUE_TAG_BOXED;
 
@@ -1322,6 +1792,16 @@ void zeus_value_from_class_handle(ZeusValue* out, int32_t class_id) {
     } catch (...) {
         dynamicValuePanic("failed to box class handle");
     }
+}
+
+void zeus_value_from_named_class_handle(
+    ZeusValue* out, int32_t class_id, const char* class_name
+) {
+    if (!class_name || !*class_name) {
+        dynamicValuePanic("named class handle requires a class name");
+    }
+    ZeusVMUtils::registerClassHandleName(class_id, class_name);
+    zeus_value_from_class_handle(out, class_id);
 }
 
 int32_t zeus_value_require_class_handle(
@@ -1420,7 +1900,36 @@ void zeus_value_validate_argument_type(
     if (!value || !functionName || !expectedType || argumentIndex < 0) {
         dynamicValuePanic("invalid typed-call argument validation input");
     }
-    const std::string expected = ZeusRuntimeType::canonicalTypeName(expectedType);
+    if (const auto* integerABI = ZeusBuiltins::findNativeSignedIntegerABI(expectedType)) {
+        (void)zeus_value_require_signed_integer(value, integerABI->integerBits);
+        return;
+    }
+    if (const auto* integerABI = ZeusBuiltins::findNativeUnsignedIntegerABI(expectedType)) {
+        (void)zeus_value_require_unsigned_integer(value, integerABI->integerBits);
+        return;
+    }
+    if (ZeusBuiltins::isNativeFloatingPointType(expectedType)) {
+        // The declared width decides whether the value has to fit into a
+        // binary32 or a binary64, so a float that is out of range for the
+        // declared type cannot reach the callee.
+        if (ZeusBuiltins::nativeFloatingPointBits(expectedType) == 32) {
+            (void)zeus_value_require_float(value);
+        } else {
+            (void)zeus_value_require_double(value);
+        }
+        return;
+    }
+    std::string expectedName = expectedType;
+    bool expectedNullable = false;
+    if (!expectedName.empty() && expectedName.back() == '?') {
+        expectedNullable = true;
+        expectedName.pop_back();
+    }
+    if (expectedNullable && value != nullptr &&
+        value->tag == ZEUS_VALUE_TAG_NIL) {
+        return;
+    }
+    const std::string expected = ZeusRuntimeType::canonicalTypeName(expectedName);
     const std::string actual = ZeusRuntimeType::canonicalTypeName(
         dynamicValueTypeName(value));
     if (ZeusRuntimeType::isCompatible(expected, actual)) return;
@@ -1462,6 +1971,33 @@ int64_t zeus_value_require_i64(const ZeusValue* value) {
     if (value && value->tag == ZEUS_VALUE_TAG_DELETED) {
         throw std::runtime_error("read from deleted variable");
     }
+    if (value && value->tag == ZEUS_VALUE_TAG_BOXED) {
+        // Dynamic integers arrive boxed (e.g. a JSON number that went through
+        // a dynamic reassignment then lands in a native int position). Unbox
+        // small values; anything else stays rejected, mirroring the VM:
+        // floats never truncate implicitly, use int() first.
+        const ZeusBox* box = valueReference(value);
+        if (box) {
+            if (const auto* integer = std::get_if<ZeusType::BigInteger>(&box->v)) {
+                try {
+                    return integer->toInt64();
+                } catch (const std::overflow_error&) {
+                    dynamicValuePanic("integer value is out of int64 range");
+                }
+            }
+            if (const auto* literal = std::get_if<LexerType::Value>(&box->v)) {
+                if (const auto* integer =
+                        std::get_if<ZeusType::BigInteger>(&literal->data)) {
+                    try {
+                        return integer->toInt64();
+                    } catch (const std::overflow_error&) {
+                        dynamicValuePanic("integer value is out of int64 range");
+                    }
+                }
+            }
+        }
+        dynamicValuePanic("expected an inline int64 value");
+    }
     if (!value || value->flags != 0 ||
         (value->tag != ZEUS_VALUE_TAG_INT64 && value->tag != ZEUS_VALUE_TAG_REF_INT64)) {
         dynamicValuePanic("expected an inline int64 value");
@@ -1494,10 +2030,16 @@ int64_t zeus_value_require_argument_i64(
     int32_t argument_index,
     const char* expected_type
 ) {
+    if (expected_type) {
+        if (const auto* integerABI = ZeusBuiltins::findNativeSignedIntegerABI(expected_type)) {
+            return zeus_value_require_signed_integer(value, integerABI->integerBits);
+        }
+    }
     const bool expectsInteger = expected_type &&
         (std::strcmp(expected_type, "int") == 0 ||
          std::strcmp(expected_type, "int32") == 0 ||
-         std::strcmp(expected_type, "int64") == 0);
+         std::strcmp(expected_type, "int64") == 0 ||
+         ZeusBuiltins::isNativePointerTypeName(expected_type));
     if (value && function_name && expectsInteger && argument_index >= 0 &&
         value->flags == 0) {
         if (value->tag == ZEUS_VALUE_TAG_INT64) {
@@ -1563,66 +2105,22 @@ void zeus_value_from_char(ZeusValue* out, int32_t value) {
 }
 
 ZeusNativeString zeus_value_intern_string(const ZeusValue* value) {
-    if (!value) {
-        dynamicValuePanic("expected an owned string value for native string ABI");
-    }
-
-    if (value->tag == ZEUS_VALUE_TAG_STRING) {
-        uint64_t length = 0;
-        const uint8_t* data = requireOwnedBufferData(
-            value, ZEUS_VALUE_TAG_STRING, &length);
-        try {
-            return internNativeString(std::string(
-                reinterpret_cast<const char*>(data), static_cast<size_t>(length)));
-        } catch (...) {
-            dynamicValuePanic("failed to intern native string");
-        }
-    }
-    if (value->tag != ZEUS_VALUE_TAG_BOXED ||
-        value->flags != ZEUS_VALUE_FLAG_OWNS_BOX) {
-        dynamicValuePanic("expected an owned string value for native string ABI");
-    }
-
-    const auto* box = valueReference(value);
-    const auto* classHandle = std::get_if<ZeusType::LLVMClassHandle>(&box->v);
-    if (classHandle) {
-        if (!classHandle->state || classHandle->state->typeName != "String") {
-            dynamicValuePanic("boxed class is not a native string or String object");
-        }
-
-        OwnedZeusValue rendered;
-        if (!zeus_value_try_dynamic_member_call(
-                &rendered.value, value, "toString", 0, nullptr)) {
-            dynamicValuePanic("String object has no registered toString method");
-        }
-        if (rendered.value.tag == ZEUS_VALUE_TAG_STRING) {
-            return zeus_value_intern_string(&rendered.value);
-        }
-        if (rendered.value.tag != ZEUS_VALUE_TAG_BOXED ||
-            rendered.value.flags != ZEUS_VALUE_FLAG_OWNS_BOX) {
-            dynamicValuePanic("String.toString must return a string value");
-        }
-
-        const auto* renderedText = stringUniversalValue(
-            valueReference(&rendered.value)->v);
-        if (!renderedText) {
-            dynamicValuePanic("String.toString returned a non-string value");
-        }
-        try {
-            return internNativeString(*renderedText);
-        } catch (...) {
-            dynamicValuePanic("failed to intern String object contents");
-        }
-    }
-
-    const auto* text = stringUniversalValue(box->v);
-    if (!text) dynamicValuePanic("boxed value is not a string");
-
     try {
-        // Native pointers use the same data pointer and prefix as string literals.
-        return internNativeString(*text);
+        return nativeStringFromValue(value, [](std::string_view text) {
+            return internNativeString(std::string(text));
+        });
     } catch (...) {
         dynamicValuePanic("failed to intern native string");
+    }
+}
+
+ZeusNativeString zeus_value_to_native_string(const ZeusValue* value) {
+    try {
+        return nativeStringFromValue(value, [](std::string_view text) {
+            return internNativeString(std::string(text));
+        });
+    } catch (...) {
+        dynamicValuePanic("failed to create owned native string");
     }
 }
 
@@ -1656,6 +2154,10 @@ void* zeus_value_native_address(const ZeusValue* value, int32_t reveal) {
         case ZEUS_VALUE_TAG_STRING:
         case ZEUS_VALUE_TAG_BYTES:
             return requireOwnedBufferData(value, value->tag);
+        case ZEUS_VALUE_TAG_OBJECT:
+            (void)requireObjectHandle(value);
+            dynamicValuePanic(
+                "class instance handle has no addressable native representation");
         case ZEUS_VALUE_TAG_BIGINT:
             return requireOwnedNativePayload<ZeusType::BigInteger>(
                 value, ZEUS_VALUE_TAG_BIGINT);
@@ -1715,6 +2217,52 @@ ZeusNativeString zeus_string_intern(ZeusNativeString value) {
     }
 }
 
+ZeusNativeString zeus_string_literal_from_data(
+    const char* data, int64_t length
+) {
+    if (length < 0 ||
+        static_cast<uint64_t>(length) >
+            static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        (length > 0 && !data)) {
+        dynamicValuePanic("invalid native string literal data");
+    }
+    try {
+        return internImmortalNativeString(std::string(
+            data ? data : "", static_cast<size_t>(length)));
+    } catch (...) {
+        dynamicValuePanic("failed to intern native string literal");
+    }
+}
+
+ZeusNativeString zeus_string_retain(ZeusNativeString value) {
+    try {
+        retainNativeString(value);
+        return value;
+    } catch (...) {
+        dynamicValuePanic("failed to retain native string");
+    }
+}
+
+void zeus_string_release(ZeusNativeString value) {
+    try {
+        releaseNativeString(value);
+    } catch (...) {
+        dynamicValuePanic("failed to release native string");
+    }
+}
+
+ZeusNativeString zeus_string_clone(ZeusNativeString value) {
+    return zeus_string_retain(value);
+}
+
+void zeus_string_store_slot(ZeusNativeString* slot, ZeusNativeString value) {
+    if (!slot) dynamicValuePanic("null native string slot");
+    if (value) zeus_string_retain(value);
+    const ZeusNativeString previous = *slot;
+    *slot = value;
+    if (previous) zeus_string_release(previous);
+}
+
 ZeusNativeString zeus_string_from_data(const char* data, int64_t length) {
     if (length < 0 ||
         static_cast<uint64_t>(length) >
@@ -1723,11 +2271,283 @@ ZeusNativeString zeus_string_from_data(const char* data, int64_t length) {
         dynamicValuePanic("invalid native string data");
     }
     try {
-        std::string text(data ? data : "", static_cast<size_t>(length));
-        return internNativeString(std::move(text));
+        return allocateNativeString(std::string_view(
+            data ? data : "", static_cast<size_t>(length)));
     } catch (...) {
-        dynamicValuePanic("failed to intern native string data");
+        dynamicValuePanic("failed to allocate native string data");
     }
+}
+
+ZeusNativeString zeus_string_from_cstr(const char* data) {
+    if (!data) {
+        dynamicValuePanic("native import returned a null C string");
+    }
+    const size_t length = std::strlen(data);
+    if (length > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        dynamicValuePanic("native import returned a C string that is too long");
+    }
+    return zeus_string_from_data(data, static_cast<int64_t>(length));
+}
+
+#ifdef _WIN32
+namespace {
+
+constexpr WORD kZeusNativeRuntimeResourceId = 0x5A55;
+
+struct EmbeddedRuntimeModule {
+    HMODULE module = nullptr;
+    std::wstring path;
+};
+
+struct EmbeddedRuntimeFailure {
+    DWORD code = ERROR_SUCCESS;
+    const char* stage = "unknown";
+    std::wstring path;
+};
+
+std::vector<EmbeddedRuntimeModule>& embeddedRuntimeModules() {
+    static std::vector<EmbeddedRuntimeModule> modules;
+    return modules;
+}
+
+void cleanupEmbeddedRuntimeModules() noexcept {
+    for (auto& entry : embeddedRuntimeModules()) {
+        if (entry.module) FreeLibrary(entry.module);
+        if (!entry.path.empty()) DeleteFileW(entry.path.c_str());
+    }
+    embeddedRuntimeModules().clear();
+}
+
+bool isZeusNativeRuntimeLibrary(const char* libraryPath) {
+    if (!libraryPath) return false;
+    std::string name(libraryPath);
+    const size_t separator = name.find_last_of("/\\");
+    if (separator != std::string::npos) name.erase(0, separator + 1);
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (name.size() >= 4 && name.compare(name.size() - 4, 4, ".dll") == 0) {
+        name.erase(name.size() - 4);
+    }
+    return name == "zeusnativeruntime";
+}
+
+HMODULE loadEmbeddedZeusNativeRuntime(
+    bool& found,
+    EmbeddedRuntimeFailure& failure
+) {
+    found = false;
+    failure = {};
+    HMODULE executable = GetModuleHandleW(nullptr);
+    if (!executable) {
+        failure = {GetLastError(), "get-executable-module", {}};
+        return nullptr;
+    }
+    HRSRC resource = FindResourceW(executable,
+        MAKEINTRESOURCEW(kZeusNativeRuntimeResourceId), MAKEINTRESOURCEW(10));
+    if (!resource) return nullptr;
+    found = true;
+
+    const DWORD byteCount = SizeofResource(executable, resource);
+    if (byteCount == 0) {
+        DWORD error = GetLastError();
+        if (error == ERROR_SUCCESS) error = ERROR_RESOURCE_DATA_NOT_FOUND;
+        failure = {error, "size-resource", {}};
+        return nullptr;
+    }
+    HGLOBAL loaded = LoadResource(executable, resource);
+    const void* data = loaded ? LockResource(loaded) : nullptr;
+    if (!data) {
+        DWORD error = GetLastError();
+        if (error == ERROR_SUCCESS) error = ERROR_RESOURCE_DATA_NOT_FOUND;
+        failure = {error, loaded ? "lock-resource" : "load-resource", {}};
+        return nullptr;
+    }
+
+    std::vector<wchar_t> temporaryDirectory(32768);
+    const DWORD directoryLength = GetTempPathW(
+        static_cast<DWORD>(temporaryDirectory.size()), temporaryDirectory.data());
+    if (directoryLength == 0 || directoryLength >= temporaryDirectory.size()) {
+        DWORD error = GetLastError();
+        if (error == ERROR_SUCCESS) error = ERROR_BUFFER_OVERFLOW;
+        failure = {error, "get-temp-path", std::wstring(
+            temporaryDirectory.data(), directoryLength < temporaryDirectory.size()
+                ? directoryLength : temporaryDirectory.size() - 1)};
+        return nullptr;
+    }
+
+    std::wstring temporaryDirectoryPath(
+        temporaryDirectory.data(), directoryLength);
+    if (!temporaryDirectoryPath.empty() &&
+        temporaryDirectoryPath.back() != L'\\' &&
+        temporaryDirectoryPath.back() != L'/') {
+        temporaryDirectoryPath.push_back(L'\\');
+    }
+
+    static std::atomic<uint64_t> temporaryFileSequence{0};
+    std::wstring temporaryFile;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    DWORD createFailure = ERROR_SUCCESS;
+    for (unsigned attempt = 0; attempt < 128; ++attempt) {
+        const uint64_t sequence = temporaryFileSequence.fetch_add(
+            1, std::memory_order_relaxed);
+        temporaryFile = temporaryDirectoryPath + L"zeus-native-runtime-" +
+            std::to_wstring(GetCurrentProcessId()) + L"-" +
+            std::to_wstring(GetTickCount64()) + L"-" +
+            std::to_wstring(sequence) + L".dll";
+        file = CreateFileW(temporaryFile.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+            nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) break;
+        createFailure = GetLastError();
+        if (createFailure != ERROR_FILE_EXISTS &&
+            createFailure != ERROR_ALREADY_EXISTS) {
+            break;
+        }
+    }
+    if (file == INVALID_HANDLE_VALUE) {
+        failure = {createFailure, "create-temp-file",
+            temporaryFile.empty() ? temporaryDirectoryPath : temporaryFile};
+        return nullptr;
+    }
+
+    DWORD written = 0;
+    const BOOL writeSucceeded = WriteFile(file, data, byteCount, &written, nullptr);
+    const DWORD writeFailure = writeSucceeded ? ERROR_SUCCESS : GetLastError();
+    const BOOL closeSucceeded = CloseHandle(file);
+    const DWORD closeFailure = closeSucceeded ? ERROR_SUCCESS : GetLastError();
+    if (!writeSucceeded || written != byteCount) {
+        const DWORD error = writeFailure == ERROR_SUCCESS
+            ? ERROR_WRITE_FAULT : writeFailure;
+        failure = {error, "write-temp-file", temporaryFile};
+        DeleteFileW(temporaryFile.c_str());
+        return nullptr;
+    }
+    if (!closeSucceeded) {
+        failure = {closeFailure, "close-temp-file", temporaryFile};
+        DeleteFileW(temporaryFile.c_str());
+        return nullptr;
+    }
+
+    HMODULE module = LoadLibraryW(temporaryFile.c_str());
+    if (!module) {
+        failure = {GetLastError(), "load-extracted-dll", temporaryFile};
+        DeleteFileW(temporaryFile.c_str());
+        return nullptr;
+    }
+
+    try {
+        embeddedRuntimeModules().push_back({module, temporaryFile});
+        static std::once_flag cleanupRegistered;
+        std::call_once(cleanupRegistered, [] {
+            std::atexit(cleanupEmbeddedRuntimeModules);
+        });
+    } catch (...) {
+        FreeLibrary(module);
+        DeleteFileW(temporaryFile.c_str());
+        failure = {ERROR_NOT_ENOUGH_MEMORY, "register-cleanup", temporaryFile};
+        return nullptr;
+    }
+    return module;
+}
+
+} // namespace
+#endif
+
+void* zeus_native_library_symbol(const char* libraryPath, const char* symbol) {
+    if (!libraryPath || !*libraryPath || !symbol || !*symbol) {
+        dynamicValuePanic("native import requires a library path and symbol");
+    }
+
+    static std::mutex nativeLibraryMutex;
+    static std::unordered_map<std::string, void*> nativeLibraries;
+    std::lock_guard<std::mutex> lock(nativeLibraryMutex);
+
+    const std::string path(libraryPath);
+    void* library = nullptr;
+    const auto cached = nativeLibraries.find(path);
+    if (cached != nativeLibraries.end()) {
+        library = cached->second;
+    } else {
+#ifdef _WIN32
+        HMODULE module = nullptr;
+        if (isZeusNativeRuntimeLibrary(libraryPath)) {
+            bool embeddedResourceFound = false;
+            EmbeddedRuntimeFailure embeddedFailure;
+            module = loadEmbeddedZeusNativeRuntime(
+                embeddedResourceFound, embeddedFailure);
+            if (!module && embeddedResourceFound) {
+                std::string pathText;
+                if (!embeddedFailure.path.empty()) {
+                    const int byteCount = WideCharToMultiByte(CP_UTF8, 0,
+                        embeddedFailure.path.c_str(), -1, nullptr, 0,
+                        nullptr, nullptr);
+                    if (byteCount > 1) {
+                        pathText.resize(static_cast<size_t>(byteCount));
+                        WideCharToMultiByte(CP_UTF8, 0,
+                            embeddedFailure.path.c_str(), -1,
+                            pathText.data(), byteCount, nullptr, nullptr);
+                        pathText.pop_back();
+                    }
+                }
+                std::fprintf(stderr,
+                    "[Zeus] cannot extract embedded native runtime "
+                    "(stage=%s, Windows error %lu%s%s%s)\n",
+                    embeddedFailure.stage,
+                    static_cast<unsigned long>(embeddedFailure.code),
+                    pathText.empty() ? "" : ", path=\"",
+                    pathText.c_str(),
+                    pathText.empty() ? "" : "\"");
+                std::abort();
+            }
+        }
+        if (!module) module = LoadLibraryA(libraryPath);
+        if (!module) {
+            std::fprintf(stderr, "[Zeus] cannot load native library '%s' (Windows error %lu)\n",
+                         libraryPath, static_cast<unsigned long>(GetLastError()));
+            std::abort();
+        }
+        library = reinterpret_cast<void*>(module);
+#else
+        dlerror();
+        library = dlopen(libraryPath, RTLD_NOW | RTLD_LOCAL);
+        if (!library && (std::strcmp(libraryPath, "c") == 0 || std::strcmp(libraryPath, "libc") == 0)) {
+            library = dlopen("libc.so.6", RTLD_NOW | RTLD_LOCAL);
+            if (!library) library = dlopen(nullptr, RTLD_NOW | RTLD_LOCAL);
+        }
+        if (!library && (std::strcmp(libraryPath, "ssl") == 0 || std::strcmp(libraryPath, "libssl") == 0)) {
+            library = dlopen("libssl.so.3", RTLD_NOW | RTLD_LOCAL);
+            if (!library) library = dlopen("libssl.so.1.1", RTLD_NOW | RTLD_LOCAL);
+            if (!library) library = dlopen("libssl.so", RTLD_NOW | RTLD_LOCAL);
+        }
+        if (!library) {
+            const char* message = dlerror();
+            std::fprintf(stderr, "[Zeus] cannot load native library '%s': %s\n",
+                         libraryPath, message ? message : "unknown loader error");
+            std::abort();
+        }
+#endif
+        nativeLibraries.emplace(path, library);
+    }
+
+#ifdef _WIN32
+    FARPROC address = GetProcAddress(reinterpret_cast<HMODULE>(library), symbol);
+    if (!address) {
+        std::fprintf(stderr, "[Zeus] native symbol '%s' was not found in '%s'\n",
+                     symbol, libraryPath);
+        std::abort();
+    }
+    return reinterpret_cast<void*>(address);
+#else
+    dlerror();
+    void* address = dlsym(library, symbol);
+    const char* message = dlerror();
+    if (message || !address) {
+        std::fprintf(stderr, "[Zeus] native symbol '%s' was not found in '%s': %s\n",
+                     symbol, libraryPath, message ? message : "unknown loader error");
+        std::abort();
+    }
+    return address;
+#endif
 }
 
 ZeusNativeString zeus_string_from_address(int64_t dataAddress, int64_t length) {
@@ -1937,6 +2757,13 @@ void zeus_raw_bytes_range_set(
     *byte = static_cast<uint8_t>(value);
 }
 
+// Reads the {id, generation} pair from a validated non-owning object value.
+// The VM reference count remains responsible for instance lifetime.
+//
+ZeusObjectHandle zeus_value_require_object_handle(const ZeusValue* value) {
+    return requireObjectHandle(value);
+}
+
 void* zeus_value_require_i64_ptr(const ZeusValue* value) {
     if (!value || value->tag != ZEUS_VALUE_TAG_REF_INT64 ||
         value->flags != 0 || value->payload == 0) {
@@ -2002,8 +2829,8 @@ ZeusNativeString zeus_string_copy_from_data(
         dynamicValuePanic("invalid native string copy data");
     }
     try {
-        std::string text(data ? data : "", static_cast<size_t>(length));
-        return copyNativeString(std::move(text));
+        return allocateNativeString(std::string_view(
+            data ? data : "", static_cast<size_t>(length)));
     } catch (...) {
         dynamicValuePanic("failed to copy native string data");
     }
@@ -2147,6 +2974,13 @@ ZeusBox* zeus_value_to_box(const ZeusValue* value) {
                 }
                 return box.release();
             }
+            case ZEUS_VALUE_TAG_OBJECT: {
+                const ZeusObjectHandle handle = requireObjectHandle(value);
+                auto* box = ZEUS_NEW_BOX();
+                box->assignVariant(ZeusType::ObjectHandle{
+                    static_cast<int>(handle.id), static_cast<int>(handle.generation)});
+                return box;
+            }
             case ZEUS_VALUE_TAG_BOXED:
                 return ZEUS_NEW_BOX(*valueReference(value));
             default:
@@ -2186,6 +3020,10 @@ void zeus_value_release_internal(ZeusValue* value) {
         if (value->flags != 0 || value->payload == 0) {
             dynamicValuePanic("invalid non-owning reference value");
         }
+    } else if (value->tag == ZEUS_VALUE_TAG_OBJECT) {
+        // The handle names an object-table slot; releasing it must not touch
+        // the instance, whose lifetime belongs to the reference count alone.
+        (void)requireObjectHandle(value);
     } else if (value->flags != 0) {
         dynamicValuePanic("invalid value ownership flags");
     }
@@ -2223,7 +3061,36 @@ void zeus_value_from_string_data(ZeusValue* out, const char* data, int64_t lengt
 
 void zeus_value_from_native_string(ZeusValue* out, ZeusNativeString value) {
     if (!out) dynamicValuePanic("null dynamic string output pointer");
-    const std::string_view text = nativeStringContents(value);
+    std::string_view text;
+    try {
+        text = nativeStringContents(value);
+    } catch (const std::exception& error) {
+#if defined(_MSC_VER)
+        void* caller = _ReturnAddress();
+#elif defined(__GNUC__) || defined(__clang__)
+        void* caller = __builtin_return_address(0);
+#else
+        void* caller = nullptr;
+#endif
+        std::fprintf(stderr,
+            "[ZeusRuntime] native string to dynamic value failed pointer=%p caller=%p reason=%s\n",
+            static_cast<const void*>(value), caller, error.what());
+        std::fflush(stderr);
+        throw;
+    } catch (...) {
+#if defined(_MSC_VER)
+        void* caller = _ReturnAddress();
+#elif defined(__GNUC__) || defined(__clang__)
+        void* caller = __builtin_return_address(0);
+#else
+        void* caller = nullptr;
+#endif
+        std::fprintf(stderr,
+            "[ZeusRuntime] native string to dynamic value failed pointer=%p caller=%p reason=<non-standard exception>\n",
+            static_cast<const void*>(value), caller);
+        std::fflush(stderr);
+        throw;
+    }
     try {
         initializeOwnedBuffer(out, ZEUS_VALUE_TAG_STRING,
             reinterpret_cast<const uint8_t*>(text.data()), text.size());
@@ -2345,7 +3212,7 @@ ZeusNativeString zeus_bytes_decode(
         std::string text(
             length == 0 ? "" : reinterpret_cast<const char*>(bytes),
             static_cast<size_t>(length));
-        return internNativeString(std::move(text));
+        return allocateNativeString(text);
     } catch (...) {
         dynamicValuePanic("failed to decode native Bytes");
     }
@@ -2373,6 +3240,44 @@ void zeus_bytes_to_list(ZeusValue* out, ZeusNativeBytes bytes) {
 
 int64_t zeus_string_length(ZeusNativeString value) {
     return static_cast<int64_t>(nativeStringContents(value).size());
+}
+
+ZeusNativeString zeus_string_join_values(
+    const ZeusValue* values,
+    ZeusNativeString separator
+) {
+    if (!values || zeus_value_is_array(values) != 1) {
+        dynamicValuePanic("string_join expects an Array of strings");
+    }
+    const int64_t count = zeus_value_array_length_i64(values);
+    if (count < 0) dynamicValuePanic("string_join received an invalid Array length");
+    const std::string_view separatorText = nativeStringContents(separator);
+
+    try {
+        std::string result;
+        const size_t maxLength = static_cast<size_t>(std::min<uint64_t>(
+            std::numeric_limits<size_t>::max(),
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+        const auto append = [&](std::string_view text) {
+            if (text.size() > maxLength - result.size()) {
+                dynamicValuePanic("string_join result is too large");
+            }
+            result.append(text.data(), text.size());
+        };
+        for (int64_t index = 0; index < count; ++index) {
+            if (index != 0) append(separatorText);
+            OwnedZeusValue part;
+            zeus_value_array_load_i64(&part.value, values, index);
+            const std::string text = nativeStringValueText(&part.value);
+            append(text);
+        }
+        return zeus_string_from_data(result.data(),
+            static_cast<int64_t>(result.size()));
+    } catch (const std::exception&) {
+        throw;
+    } catch (...) {
+        dynamicValuePanic("failed to join native strings");
+    }
 }
 
 ZeusNativeString zeus_native_string_concat(
@@ -2852,6 +3757,7 @@ void zeus_value_dynamic_binary(
     if (!out) dynamicValuePanic("null output pointer");
     setNilValue(out);
     if (opcode == ZEUS_BINARY_ADD && tryNativeStringConcat(out, lhs, rhs)) return;
+    if (tryNativeIntArithmetic(out, opcode, lhs, rhs)) return;
     if ((opcode == ZEUS_BINARY_EQUAL || opcode == ZEUS_BINARY_NOT_EQUAL) &&
         tryNativeClassEquality(out, opcode, lhs, rhs)) {
         return;
@@ -3100,6 +4006,9 @@ void abiRetireNativeStringGlobalSlot(int idx) {
     void* address = &slot->value;
     zeus_lvalue_unregister(address);
     nativeStringGlobalIndexByNativeSlot().erase(address);
+    zeus_lvalue_unregister_revealed(address);
+    if (slot->value) zeus_string_release(slot->value);
+    slot->value = nullptr;
     nativeStringGlobalSlots()[static_cast<size_t>(idx)] = nullptr;
     retiredNativeStringGlobalSlots().push_back(slot);
 }
@@ -3124,17 +4033,17 @@ ZeusNativeString nativeStringFromGlobalValue(const ZeusValue* value) {
     if (value->tag == ZEUS_VALUE_TAG_NIL && value->flags == 0) return nullptr;
     if (value->tag == ZEUS_VALUE_TAG_STRING &&
         value->flags == ZEUS_VALUE_FLAG_OWNS_BUFFER) {
-        return zeus_value_intern_string(value);
+        return zeus_value_to_native_string(value);
     }
     if (value->tag != ZEUS_VALUE_TAG_BOXED ||
         value->flags != ZEUS_VALUE_FLAG_OWNS_BOX) {
         throw std::runtime_error("typed string global received a non-string value");
     }
     const ZeusBox* box = valueReference(value);
-    if (stringUniversalValue(box->v)) return zeus_value_intern_string(value);
+    if (stringUniversalValue(box->v)) return zeus_value_to_native_string(value);
     const auto* classHandle = std::get_if<ZeusType::LLVMClassHandle>(&box->v);
     if (classHandle && classHandle->state && classHandle->state->typeName == "String") {
-        return zeus_value_intern_string(value);
+        return zeus_value_to_native_string(value);
     }
     throw std::runtime_error("typed string global received a non-string value");
 }
@@ -3145,7 +4054,11 @@ void abiSyncNativeStringGlobalSlotFromValue(int idx, const ZeusValue* value) {
     const ZeusNativeString nextValue = nativeStringFromGlobalValue(value);
     if (nativeSlot->value != nextValue) {
         zeus_lvalue_unregister_revealed(&nativeSlot->value);
+        const ZeusNativeString previous = nativeSlot->value;
         nativeSlot->value = nextValue;
+        if (previous) zeus_string_release(previous);
+    } else if (nextValue) {
+        zeus_string_release(nextValue);
     }
 }
 
@@ -3165,7 +4078,8 @@ void abiSyncNativeBytesGlobalSlotFromValue(int idx, const ZeusValue* value) {
 void abiValidateNativeStringGlobalStore(const ZeusValue* slot, const ZeusValue* value) {
     const auto found = nativeStringGlobalIndexByValueSlot().find(slot);
     if (found == nativeStringGlobalIndexByValueSlot().end()) return;
-    (void)nativeStringFromGlobalValue(value);
+    const ZeusNativeString checked = nativeStringFromGlobalValue(value);
+    if (checked) zeus_string_release(checked);
 }
 
 void abiSyncNativeStringGlobalValueSlot(const ZeusValue* slot) {
@@ -3245,6 +4159,7 @@ void abiClearGlobalValue(int idx) {
     if (globals[idx]->value.tag == ZEUS_VALUE_TAG_DELETED) return;
     if (NativeStringGlobalSlot* nativeString = abiFindNativeStringGlobalSlot(idx)) {
         zeus_lvalue_unregister_revealed(&nativeString->value);
+        if (nativeString->value) zeus_string_release(nativeString->value);
         nativeString->value = nullptr;
     }
     if (NativeBytesGlobalSlot* nativeBytes = abiFindNativeBytesGlobalSlot(idx)) {
@@ -3324,6 +4239,15 @@ void zeus_value_delete_object(ZeusValue* value) {
     std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> boxed(
         zeus_value_to_box(value), &zeus_box_release);
     if (boxed) destroyLLVMClassValue(boxed->v);
+}
+
+void zeus_shared_values_release(void) {
+    // Remove one root at a time, newest first, while ordinary module globals
+    // remain available. User finalizers run after takeNewest releases heapMutex.
+    // Aliases retain their normal ownership and are released by entry cleanup.
+    while (auto cell = ZeusShared::getGlobalHeap().takeNewest()) {
+        cell->write(nullVariant());
+    }
 }
 
 void zeus_shared_value_store(const char* name, const ZeusValue* value) {
@@ -3502,17 +4426,12 @@ int32_t zeus_global_load_bool(int idx) {
 void zeus_global_store_string(int idx, ZeusNativeString value) {
     if (idx < 0) dynamicValuePanic("invalid native string global index");
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-    const ZeusNativeString interned = zeus_string_intern(value);
     NativeStringGlobalSlot* slot = abiEnsureNativeStringGlobalSlot(idx);
     if (!slot) dynamicValuePanic("native string global slot is unavailable");
-    if (slot->value != interned) {
-        zeus_lvalue_unregister_revealed(&slot->value);
-        slot->value = interned;
-    }
 
     ZeusValue dynamicValue{};
     zeus_value_init_nil(&dynamicValue);
-    zeus_value_from_native_string(&dynamicValue, interned);
+    zeus_value_from_native_string(&dynamicValue, value);
     abiStoreGlobalValue(idx, &dynamicValue);
 }
 
@@ -3520,19 +4439,23 @@ ZeusNativeString zeus_global_load_string(int idx) {
     if (idx < 0) dynamicValuePanic("invalid native string global index");
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     NativeStringGlobalSlot* slot = abiFindNativeStringGlobalSlot(idx);
-    if (slot && slot->value) return slot->value;
+    if (slot && slot->value) return zeus_string_clone(slot->value);
 
     OwnedZeusValue dynamicValue;
     abiLoadGlobalValue(&dynamicValue.value, idx);
-    const ZeusNativeString interned = zeus_value_intern_string(&dynamicValue.value);
+    const ZeusNativeString owned = nativeStringFromGlobalValue(&dynamicValue.value);
     slot = abiEnsureNativeStringGlobalSlot(idx);
-    if (!slot) dynamicValuePanic("native string global slot is unavailable");
-    slot->value = interned;
-    return interned;
+    if (!slot) {
+        zeus_string_release(owned);
+        dynamicValuePanic("native string global slot is unavailable");
+    }
+    slot->value = owned;
+    return zeus_string_clone(owned);
 }
 
 ZeusNativeString* zeus_global_string_slot(int idx) {
-    (void)zeus_global_load_string(idx);
+    const ZeusNativeString loaded = zeus_global_load_string(idx);
+    if (loaded) zeus_string_release(loaded);
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     NativeStringGlobalSlot* slot = abiFindNativeStringGlobalSlot(idx);
     if (!slot) dynamicValuePanic("native string global slot is unavailable");
@@ -3766,3 +4689,5 @@ int32_t zeus_truthy(const ZeusBox* box) {
 
     return truthyImpl(box->v) ? 1 : 0;
 }
+
+#include "ZeusFloatingPointABI.inl"

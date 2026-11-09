@@ -18,6 +18,10 @@ namespace ZeusTypeInfer {
         InferredType kind = InferredType::Unknown;
         std::string namedType;
         bool isReference = false;
+        // Trailing `?` on the annotation: the value may be nil. This is a
+        // compile-time contract only; the runtime representation is unchanged
+        // (nullable pointer for classes, dynamic box for nullable values).
+        bool nullable = false;
         std::vector<std::string> namedTypeArguments;
         std::vector<TypeRef> parameterTypes;
         std::shared_ptr<TypeRef> returnType;
@@ -49,14 +53,16 @@ namespace ZeusTypeInfer {
                     }
                     name += ">";
                 }
+                if (nullable) name += "?";
                 return isReference ? "&" + name : name;
             }
             if (!isFunction()) {
                 const std::string baseName = typeName(kind);
-                return isReference ? "&" + baseName : baseName;
+                const std::string name = nullable ? baseName + "?" : baseName;
+                return isReference ? "&" + name : name;
             }
 
-            std::string result = "func(";
+            std::string result = "func(";  
             for (size_t i = 0; i < parameterTypes.size(); ++i) {
                 if (i > 0) result += ", ";
                 result += parameterTypes[i].toString();
@@ -72,7 +78,10 @@ namespace ZeusTypeInfer {
         }
 
         // IR 使用的规范类型名。基础类型与源代码注解保持一致，函数类型保留完整签名。
+        // 可空类型在 phase 1 一律擦除为动态：nil 没有原生表示，只有动态槽
+        // 能容纳它（类可空指针与 {payload, flag} 槽位是后续优化）。
         std::string toIRTypeName() const {
+            if (nullable) return "unknown";
             if (!namedType.empty() && !namedTypeArguments.empty()) {
                 const std::string specialized = genericSpecializationName(
                     namedType, namedTypeArguments);
@@ -107,8 +116,22 @@ namespace ZeusTypeInfer {
 
     inline TypeRef parseTypeRef(const std::string& name) {
         TypeRef result(parseTypeName(name));
+        if (ZeusBuiltins::findNativeIntegerABI(name) ||
+            ZeusBuiltins::isNativeFloatingPointType(name)) result.namedType = name;
         result.isReference = !name.empty() && name.front() == '&' &&
             result.kind != InferredType::RawBytesRange;
+        if (result.isReference) {
+            const std::string targetType = name.substr(1);
+            if (ZeusBuiltins::findNativeIntegerABI(targetType) ||
+                ZeusBuiltins::isNativeFloatingPointType(targetType)) result.namedType = targetType;
+            if (const auto* builtin =
+                    ZeusBuiltins::findTypeImplementation(targetType)) {
+                if (builtin->category == ZeusBuiltins::TypeCategory::Opaque &&
+                    builtin->inheritable) {
+                    result.namedType = builtin->canonicalName;
+                }
+            }
+        }
         return result;
     }
 

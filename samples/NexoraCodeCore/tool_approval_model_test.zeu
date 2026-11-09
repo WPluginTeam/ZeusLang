@@ -1,0 +1,207 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+
+import samples.NexoraCodeCore.tool_approval_context;
+import samples.NexoraCodeCore.tool_approval_model;
+import samples.NexoraCodeCore.tool_permission_events;
+import samples.NexoraCodeCore.tool_permissions;
+import samples.NexoraCodeCore.backend_agent;
+import samples.NexoraCodeCore.storage;
+import zeus.file [&file];
+
+func __nexora_approval_model_assert(value: bool, message: string) {
+    if (!value) throw new Exception("approval model test: " + message);
+}
+
+class NexoraApprovalFakeRequest {
+    using &this;
+
+    let responses: Array = [];
+    let calls = 0;
+    let lastModelId = "";
+    let lastMessages: Array = [];
+
+    func operator[@=]() -> &NexoraApprovalFakeRequest { return this; }
+
+    func request(modelId: string, messages: Array, shouldCancel) {
+        this.calls = this.calls + 1;
+        this.lastModelId = modelId;
+        this.lastMessages = messages;
+        if (this.calls > this.responses.length()) {
+            return {"ok": false, "error_type": "unexpected_request"};
+        }
+        return this.responses[this.calls - 1];
+    }
+}
+
+class NexoraApprovalFakeRunContext {
+    using &this;
+
+    func operator[@=]() -> &NexoraApprovalFakeRunContext { return this; }
+
+    func shouldCancel() -> bool { return false; }
+}
+
+func __nexora_approval_model_cancelled() -> bool { return true; }
+
+func __nexora_approval_model_messages() -> Array {
+    return [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "initial request"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "older request"},
+        {"role": "assistant", "content": "second answer"},
+        {"role": "user", "content": "recent request one"},
+        {"role": "assistant", "content": "third answer"},
+        {"role": "user", "content": "recent request two"},
+        {"role": "assistant", "content": "latest answer"},
+        {"role": "user", "content": "current intent"},
+        {"role": "assistant", "content": "checking the requested item",
+            "tool_calls": [{"id": "call-1"}]}
+    ];
+}
+
+func testNexoraToolApprovalModel(root: string) {
+    let approvedJson = nexora_tool_approval_parse(
+        "{\"decision\":\"APPROVE\",\"reason\":\"user requested it\"}");
+    let deniedChinese = nexora_tool_approval_parse("0，operation is unrelated");
+    let fenced = nexora_tool_approval_parse("```text\n1,approved\n```");
+    __nexora_approval_model_assert(
+        dict_get(approvedJson, "ok", false) and
+        dict_get(approvedJson, "decision", "") == "allow" and
+        dict_get(deniedChinese, "decision", "") == "deny" and
+        dict_get(fenced, "decision", "") == "allow" and
+        !dict_get(nexora_tool_approval_parse("unclear"), "ok", false),
+        "approval parser must accept JSON, plain decisions, and fenced output while rejecting ambiguity");
+
+    let actions: Array = [];
+    for (0..10) [const &index] {
+        actions.append({"tool_name": "tool-" + str(index),
+            "operation": "read", "decision": "allow", "success": true});
+    }
+    let context = nexora_tool_approval_context(__nexora_approval_model_messages(),
+        {"content": "current explanation"}, actions);
+    __nexora_approval_model_assert(
+        dict_get(context, "user_intent", "") == "current intent" and
+        dict_get(context, "initial_user_request", "") == "initial request" and
+        dict_get(context, "previous_actions", []).length() == 8 and
+        dict_get(context, "assistant_explanation", "") == "current explanation",
+        "approval context must retain current intent, bounded action history, and the current explanation");
+
+    let requester = new NexoraApprovalFakeRequest();
+    requester.responses = [
+        {"ok": true, "text": "maybe"},
+        {"ok": true, "text": "1,clearly requested", "usage": {
+            "raw_input": 12, "cached_input": 3, "output": 4, "total": 16}}
+    ];
+    let approved = nexora_tool_approval_evaluate({}, "provider/model-a", context,
+        "local_shell_exec", "command", {"command": "echo fixture"}, nil,
+        requester.request);
+    __nexora_approval_model_assert(
+        dict_get(approved, "decision", "") == "allow" and
+        dict_get(approved, "error_type", "x") == "" and
+        requester.calls == 2 and requester.lastModelId == "provider/model-a" and
+        requester.lastMessages.length() == 3 and
+        dict_get(dict_get(approved, "usage", {}), "raw_input", 0) == 12,
+        "invalid output must trigger one strict-format retry and keep the final request usage");
+
+    let denyRequester = new NexoraApprovalFakeRequest();
+    denyRequester.responses = [{"ok": true, "text": "0,not requested"}];
+    let denied = nexora_tool_approval_evaluate({}, "provider/model-a", context,
+        "local_shell_exec", "command", {}, nil, denyRequester.request);
+    __nexora_approval_model_assert(
+        dict_get(denied, "decision", "allow") == "deny" and
+        denyRequester.calls == 1,
+        "an explicit model denial must not be retried or allowed");
+
+    let failingRequester = new NexoraApprovalFakeRequest();
+    failingRequester.responses = [{"ok": false,
+        "error_type": "approval_request_failed"}];
+    let failed = nexora_tool_approval_evaluate({}, "provider/model-a", context,
+        "local_shell_exec", "command", {}, nil, failingRequester.request);
+    __nexora_approval_model_assert(
+        dict_get(failed, "decision", "allow") == "deny" and
+        dict_get(failed, "error_type", "") == "approval_request_failed" and
+        failingRequester.calls == 1,
+        "approval request failures must fail closed without a format retry");
+
+    let cancelRequester = new NexoraApprovalFakeRequest();
+    let cancelled = nexora_tool_approval_evaluate({}, "provider/model-a", context,
+        "local_shell_exec", "command", {}, __nexora_approval_model_cancelled,
+        cancelRequester.request);
+    __nexora_approval_model_assert(
+        dict_get(cancelled, "decision", "allow") == "deny" and
+        dict_get(cancelled, "error_type", "") == "cancelled" and
+        cancelRequester.calls == 0,
+        "cancellation must deny the operation before contacting the approval model");
+
+    let provider = {"id": "test-provider", "name": "test",
+        "model": "chat-model", "base_url": "http://127.0.0.1:1/v1",
+        "api_key": ""};
+    let providers = {"providers": [provider]};
+    let jobEventPath = root + "/job-approval-events.jsonl";
+    let deniedRequester = new NexoraApprovalFakeRequest();
+    deniedRequester.responses = [{"ok": true, "text": "0,not requested"}];
+    let deniedJob = new NexoraCoreChatJob(nil, provider, "conversation-test",
+        root, "", [], nil, "auto", false, {},
+        "test-provider/approval-model", jobEventPath,
+        providers, deniedRequester.request);
+    deniedJob.bindExecutionContext(new NexoraApprovalFakeRunContext());
+    deniedJob.setApprovalContext(context);
+    let deniedTool = deniedJob.executeTool({"id": "denied-write",
+        "name": "local_file_write", "arguments": {
+            "path": "auto-denied.txt", "content": "must not be written"
+        }});
+    __nexora_approval_model_assert(
+        dict_get(deniedTool, "error", "") != "" and
+        !file.exists(root + "/auto-denied.txt") and
+        dict_get(deniedJob.getApprovalAction(), "decision", "") == "deny",
+        "a denied automatic approval must prevent the tool handler from writing");
+
+    let allowedRequester = new NexoraApprovalFakeRequest();
+    allowedRequester.responses = [{"ok": true, "text": "1,user requested it"}];
+    let allowedJob = new NexoraCoreChatJob(nil, provider, "conversation-test",
+        root, "", [], nil, "auto", false, {},
+        "test-provider/approval-model", jobEventPath,
+        providers, allowedRequester.request);
+    allowedJob.bindExecutionContext(new NexoraApprovalFakeRunContext());
+    allowedJob.setApprovalContext(context);
+    let allowedTool = allowedJob.executeTool({"id": "allowed-write",
+        "name": "local_file_write", "arguments": {
+            "path": "auto-approved.txt", "content": "approved content"
+        }});
+    __nexora_approval_model_assert(
+        dict_get(allowedTool, "error", nil) == nil and
+        file.exists(root + "/auto-approved.txt") and
+        dict_get(allowedJob.getApprovalAction(), "decision", "") == "allow" and
+        allowedRequester.calls == 1,
+        "an allowed automatic approval must execute the prepared tool exactly once");
+    let jobEvents = nexora_tool_permission_events_read(jobEventPath, 20);
+    __nexora_approval_model_assert(jobEvents.length() == 2 and
+        str(dict_get(jobEvents[0], "decision", "")) == "allow" and
+        str(dict_get(jobEvents[1], "decision", "")) == "deny" and
+        JSON.stringify(jobEvents).index("must not be written") < 0,
+        "automatic tool outcomes must be audited without logging tool arguments");
+
+    let eventPath = root + "/approval-events.jsonl";
+    let saved = nexora_tool_permission_event_record(eventPath, {
+        "timestamp": 10, "operation": "command", "tool": "local_shell_exec",
+        "mode": "auto", "decision": "allow", "stage": "auto_model",
+        "approval_model_id": "provider/model-a", "reason": "requested"
+    });
+    let ignored = nexora_tool_permission_event_record(eventPath, {
+        "timestamp": 11, "operation": "read", "tool": "local_file_read",
+        "mode": "auto", "decision": "allow", "stage": "auto_model"
+    });
+    let events = nexora_tool_permission_events_read(eventPath, 20);
+    __nexora_approval_model_assert(saved and !ignored and events.length() == 1 and
+        dict_get(events[0], "approval_model_id", "") == "provider/model-a",
+        "audit storage must keep only automatic side-effect decisions and return recent entries");
+    __nexora_approval_model_assert(
+        nexora_tool_permission_mode_valid("auto") and
+        nexora_tool_permission_decision("auto", "command") == "auto" and
+        nexora_tool_permission_decision("auto", "read") == "allow" and
+        nexora_tool_permission_decision("auto", "unknown") == "deny",
+        "auto policy must gate side effects while keeping reads available and unknown operations denied");
+}

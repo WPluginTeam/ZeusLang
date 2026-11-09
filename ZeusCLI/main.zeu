@@ -1,0 +1,6 @@
+import cli;
+
+@native("zeus_runtime_set_exit_code")
+decl func __zeus_cli_set_exit_code(status: int32);
+
+__zeus_cli_set_exit_code(zeus_cli_main());

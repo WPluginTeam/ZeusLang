@@ -1,0 +1,10 @@
+import zeus.byte;
+import zeus.string;
+import zeus.exception;
+
+let result = "a\\b".replace("\\", "/");
+if (result != "a/b") {
+    throw new Exception("string and byte module imports corrupted a local value");
+}
+
+print("PASS string/byte package globals");

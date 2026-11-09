@@ -1,0 +1,174 @@
+import zeus.exception;
+
+func assertTrue(cond: bool, msg: string) {
+    if (!cond) {
+        print("FAIL: ", msg);
+        throw new Exception("Assertion failed: " + msg);
+    }
+}
+
+// 1. 基础匿名函数赋值与调用
+func testBasicAnonFunc() {
+    let add = func(x, y) {
+        return x + y;
+    };
+    assertTrue(add(3, 4) == 7, "basic anonymous function add(3, 4) == 7");
+    print("[PASS] testBasicAnonFunc");
+}
+
+// 2. 显式引用捕获 [&a]
+func testRefCapture() {
+    let count = 10;
+    let inc = func(delta) [&count] {
+        count = count + delta;
+        return count;
+    };
+    assertTrue(inc(5) == 15, "ref capture first call returns 15");
+    assertTrue(count == 15, "ref capture mutates outer count to 15");
+    assertTrue(inc(10) == 25, "ref capture second call returns 25");
+    assertTrue(count == 25, "ref capture mutates outer count to 25");
+    print("[PASS] testRefCapture");
+}
+
+// 3. 显式拷贝捕获 [val]
+func testCopyCapture() {
+    let base = 100;
+    let getBase = func() [base] {
+        return base;
+    };
+    base = 999;
+    assertTrue(getBase() == 100, "copy capture maintains snapshot 100 even after base=999");
+    print("[PASS] testCopyCapture");
+}
+
+// 4. 混合捕获 [&a, b]
+func testMixedCaptureCorrect() {
+    let a = 1;
+    let b = 10;
+    let step = func(delta) [&a, b] {
+        a = a + delta;
+        return a + b;
+    };
+    let res = step(5);
+    assertTrue(res == 16, "step(5): a becomes 6, a+b=16");
+    assertTrue(a == 6, "outer a is updated to 6");
+    print("[PASS] testMixedCapture");
+}
+
+// 5. 作为函数实参直接传递
+func helperApply(x, callback) {
+    return callback(x);
+}
+
+func testPassAsArgument() {
+    let res = helperApply(10, func(n) {
+        return n * 3;
+    });
+    assertTrue(res == 30, "pass anonymous function as argument: 10 * 3 == 30");
+    print("[PASS] testPassAsArgument");
+}
+
+// 6. 匿名函数作为返回值
+func helperMakeAdder(base) {
+    return func(x) [base] {
+        return base + x;
+    };
+}
+
+func testReturnAnonFunc() {
+    let add5 = helperMakeAdder(5);
+    let add20 = helperMakeAdder(20);
+    assertTrue(add5(10) == 15, "returned closure add5(10) == 15");
+    assertTrue(add20(10) == 30, "returned closure add20(10) == 30");
+    print("[PASS] testReturnAnonFunc");
+}
+
+// 7. 立即执行匿名函数 IIFE
+func testIIFE() {
+    let val = (func(x, y) {
+        return x * y;
+    })(6, 7);
+    assertTrue(val == 42, "IIFE (func(x, y){ return x * y; })(6, 7) == 42");
+    print("[PASS] testIIFE");
+}
+
+// 8. 嵌套匿名函数 (柯里化)
+func testNestedAnonFunc() {
+    let curried = func(x) {
+        return func(y) [x] {
+            return x + y;
+        };
+    };
+    let add100 = curried(100);
+    assertTrue(add100(23) == 123, "nested closure curried(100)(23) == 123");
+    assertTrue(curried(10)(20) == 30, "curried(10)(20) == 30");
+    print("[PASS] testNestedAnonFunc");
+}
+
+// 9. 容器字面量中的匿名函数 (List & Dict)
+func testAnonInContainers() {
+    let funcs = [
+        func(x) { return x + 1; },
+        func(x) { return x * 2; }
+    ];
+    assertTrue(funcs[0](10) == 11, "funcs[0](10) == 11");
+    assertTrue(funcs[1](10) == 20, "funcs[1](10) == 20");
+
+    let opMap = {
+        "square": func(n) { return n * n; },
+        "cube": func(n) { return n * n * n; }
+    };
+    assertTrue(opMap["square"](5) == 25, "opMap square(5) == 25");
+    assertTrue(opMap["cube"](3) == 27, "opMap cube(3) == 27");
+    print("[PASS] testAnonInContainers");
+}
+
+// 10. 类型标注 (参数类型、返回值类型、捕获列表混合)
+func testTypedAnonFunc() {
+    // 参数类型与返回值类型标注
+    let add = func(x: int, y: int) -> int {
+        return x + y;
+    };
+    assertTrue(add(10, 20) == 30, "typed params add(10, 20) == 30");
+
+    // 带捕获列表与返回类型 (-> int [multiplier])
+    let multiplier: int = 5;
+    let scale = func(val: int) -> int [multiplier] {
+        return val * multiplier;
+    };
+    assertTrue(scale(6) == 30, "scale(6) == 30 with capture");
+
+    // 捕获列表在返回类型之前 ([multiplier] -> int)
+    let factor: int = 3;
+    let mul = func(n: int) [factor] -> int {
+        return n * factor;
+    };
+    assertTrue(mul(7) == 21, "mul(7) == 21 with capture before arrow");
+
+    // 引用捕获类型标注
+    let total: int = 100;
+    let accumulate = func(delta: int) -> int [&total] {
+        total = total + delta;
+        return total;
+    };
+    assertTrue(accumulate(25) == 125, "accumulate(25) == 125");
+    assertTrue(total == 125, "total == 125");
+
+    print("[PASS] testTypedAnonFunc");
+}
+
+func main() {
+    testBasicAnonFunc();
+    testRefCapture();
+    testCopyCapture();
+    testMixedCaptureCorrect();
+    testPassAsArgument();
+    testReturnAnonFunc();
+    testIIFE();
+    testNestedAnonFunc();
+    testAnonInContainers();
+    testTypedAnonFunc();
+    print("ALL_ANON_FUNC_TESTS_PASS");
+}
+
+main();

@@ -3,3 +3,16 @@ let addr: int = @reveal(a);
 
 print(@faddr(addr)->string); // 123
 print(@faddr(addr-8, 8)->int); // 3
+
+class B {
+    let a = 123;
+}
+
+import zeus.mem;
+
+let ptr = malloc(16);
+print(ptr);
+@faddr(ptr)->int = 123;
+@faddr(ptr+8)->int = 456;
+print(@faddr(ptr)->int); // 123
+print(@faddr(ptr+8)->int); // 456

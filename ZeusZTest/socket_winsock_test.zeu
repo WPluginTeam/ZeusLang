@@ -1,0 +1,152 @@
+import zeus.socket;
+import zeus.exception;
+
+func assertTrue(condition, message: string) {
+    if (!condition) throw new Exception("socket test failed: " + message);
+}
+
+func expectSocketFailure(socket, operation: int, message: string) {
+    let failed = false;
+    try {
+        if (operation == 0) socket.recv(1);
+        if (operation == 1) socket.recvExact(1);
+        if (operation == 2) socket.sendAll(b"x");
+        if (operation == 3) socket.listen();
+        if (operation == 4) socket.accept();
+        if (operation == 5) socket.localPort();
+        if (operation == 6) socket.detachHandle();
+        if (operation == 7) socket.recvExact(-1);
+    } catch (&error) {
+        failed = true;
+    }
+    assertTrue(failed, message);
+}
+
+func assertBytes(actual: bytes, expected: bytes) {
+    assertTrue(actual.length() == expected.length(), "binary length");
+    let index = 0;
+    for (index < expected.length()) {
+        assertTrue(actual[index] == expected[index], "binary byte order");
+        index = index + 1;
+    }
+}
+
+func exchange(host: string) {
+    let listener = new Socket();
+    assertTrue(listener.isOpen, "fresh socket is open");
+    assertTrue(!listener.getConnected(), "fresh socket is disconnected");
+    listener.bind("127.0.0.1", 0);
+    listener.listen(8);
+    let port = listener.localPort();
+    assertTrue(port > 0 and port <= 65535, "ephemeral port is valid");
+
+    let moved = listener.detachHandle();
+    assertTrue(!listener.isOpen, "detach releases wrapper ownership");
+    listener.adoptHandle(moved);
+    assertTrue(listener.localPort() == port, "adopt preserves listener");
+
+    // The backlog lets connect finish before accept, without another thread.
+    let client = new Socket(host, port);
+    let peer = listener.accept();
+    assertTrue(peer.handle == client.handle + 1,
+        "accept does not allocate an unused socket handle");
+    assertTrue(client.getConnected(), "client native connected state");
+    assertTrue(peer.getConnected(), "accepted native connected state");
+    assertTrue(!listener.getConnected(), "listener is not a connected peer");
+
+    let binary = bytes([0, 1, 127, 128, 254, 255, 0]);
+    assertTrue(client.sendAll(binary) == 7, "sendAll reports complete length");
+    assertBytes(peer.recvExact(7), binary);
+    peer.sendAll(bytes([255, 0, 128]));
+    assertBytes(client.recvExact(3), bytes([255, 0, 128]));
+
+    client.sendAll(b"part-one;");
+    client.sendAll(b"part-two");
+    assertBytes(peer.recvExact(17), b"part-one;part-two");
+    assertBytes(peer.recv(0), b"");
+    assertBytes(peer.recvExact(0), b"");
+    expectSocketFailure(peer, 7, "negative exact read size");
+
+    // EOF may end an exact read early; a subsequent read must stay empty.
+    client.sendAll(b"tail");
+    client.close();
+    assertBytes(peer.recvExact(8), b"tail");
+    assertBytes(peer.recv(1), b"");
+    peer.close();
+    listener.close();
+    print("SOCKET_EXCHANGE_PASS " + host);
+}
+
+exchange("127.0.0.1");
+exchange("localhost");
+
+// An unconnected native socket fails immediately with WSAENOTCONN. This must
+// remain an exception rather than being confused with a successful EOF read.
+func checkNativeReceiveError(exact: bool) {
+    let unconnected = new Socket();
+    let failure = "";
+    try {
+        if (exact) unconnected.recvExact(1);
+        else unconnected.recv(1);
+    } catch (&error) {
+        failure = error.getMessage();
+    }
+    unconnected.close();
+    let operation = "recv";
+    if (exact) operation = "recvExact";
+    assertTrue(failure == "socket: " + operation + " failed with socket error 10057",
+        "unconnected receive preserves operation and WSAENOTCONN");
+}
+checkNativeReceiveError(false);
+checkNativeReceiveError(true);
+print("SOCKET_RECV_ERROR_PASS");
+
+let closed = new Socket();
+closed.close();
+closed.close();
+assertTrue(!closed.isOpen and !closed.getConnected(), "closed state");
+expectSocketFailure(closed, 0, "closed recv throws");
+expectSocketFailure(closed, 1, "closed recvExact throws");
+expectSocketFailure(closed, 2, "closed send throws");
+expectSocketFailure(closed, 3, "closed listen throws");
+expectSocketFailure(closed, 4, "closed accept throws");
+expectSocketFailure(closed, 5, "closed localPort throws");
+expectSocketFailure(closed, 6, "closed detach throws");
+
+let firstSocket = new Socket();
+let retired = firstSocket.detachHandle();
+let owner = new Socket();
+owner.adoptHandle(retired);
+owner.close();
+let newer = new Socket();
+assertTrue(newer.handle != retired, "retired IDs are never reused");
+let rejected = new Socket();
+let staleRejected = false;
+try {
+    rejected.adoptHandle(retired);
+    rejected.sendAll(b"stale");
+} catch (&error) {
+    staleRejected = true;
+}
+assertTrue(staleRejected, "adopting or using a retired ID throws");
+rejected.close();
+newer.close();
+
+func invalidAddress(host: string, port: int) {
+    let candidate = new Socket();
+    let failed = false;
+    try {
+        candidate.bind(host, port);
+    } catch (&error) {
+        failed = true;
+    }
+    assertTrue(failed, "invalid address is rejected");
+    candidate.close();
+}
+
+invalidAddress("127.0.0.1", -1);
+invalidAddress("127.0.0.1", 65536);
+invalidAddress("256.0.0.1", 0);
+invalidAddress("127..0.1", 0);
+invalidAddress("127.0.0.999", 0);
+print("SOCKET_WINSOCK_PASS");

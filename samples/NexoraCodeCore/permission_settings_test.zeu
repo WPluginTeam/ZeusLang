@@ -1,0 +1,163 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.http;
+import zeus.json;
+
+import samples.NexoraCodeCore.agent_settings;
+import samples.NexoraCodeCore.backend_api;
+import samples.NexoraCodeCore.conversation_store;
+import samples.NexoraCodeCore.journal;
+import samples.NexoraCodeCore.storage;
+import samples.NexoraCodeCore.stream_runtime;
+import samples.NexoraCodeCore.tool_permission_events;
+
+func __nexora_permission_settings_assert(value: bool, message: string) {
+    if (!value) throw new Exception("permission settings test: " + message);
+}
+
+func __nexora_permission_settings_status(result, expected: int,
+        message: string) {
+    __nexora_permission_settings_assert(
+        dict_get(result, "status", 0) == expected, message);
+}
+
+func testNexoraPermissionSettings(root: string) {
+    let settingsPath = root + "/permission-settings.json";
+    let configFile = file.open(settingsPath, "w");
+    configFile.write(JSON.stringify({
+        "local_tool_permission_mode": "confirm",
+        "local_tool_approval_model_id": "",
+        "custom_setting": "preserved"
+    }));
+    configFile.close();
+
+    let providers = {"providers": [
+        {"id": "configured", "name": "Local Provider",
+            "base_url": "http://127.0.0.1:9000/v1",
+            "model": "model-a", "api_key": "synthetic-do-not-return"},
+        {"id": "missing-model", "name": "No Model",
+            "base_url": "https://provider.example/v1", "model": ""},
+        {"id": "missing-url", "name": "No URL",
+            "base_url": "", "model": "model-b"}
+    ]};
+    let store = new NexoraCoreConversationStore(root + "/permission-conversations");
+    let runtime = new NexoraCoreStreamRuntime(
+        new NexoraCoreTaskJournal(root + "/permission-tasks"), 16, 4);
+    let api = new NexoraCoreBackendApi(store, runtime, providers, root,
+        nexora_load_agent_settings(settingsPath), settingsPath, "", nil,
+        root + "/auto-approval-events.jsonl");
+
+    let initial = api.dispatch("GET", "/api/local/permissions", "", nil);
+    __nexora_permission_settings_status(initial, 200,
+        "global permission settings should be readable");
+    let initialBody = dict_get(initial, "body", {});
+    let models = dict_get(initialBody, "models", []);
+    __nexora_permission_settings_assert(
+        dict_get(initialBody, "mode", "") == "confirm" and
+        dict_get(initialBody, "scope", "") == "global" and
+        dict_get(initialBody, "supported_modes", []).length() == 4 and
+        models.length() == 1 and
+        dict_get(models[0], "id", "") == "configured/model-a" and
+        dict_get(models[0], "provider", "") == "Local Provider",
+        "global settings should expose supported modes and configured approval models");
+    __nexora_permission_settings_assert(
+        JSON.stringify(initialBody).index("synthetic-do-not-return") < 0,
+        "approval model choices must never expose provider credentials");
+
+    let savedGlobal = api.dispatch("POST", "/api/local/permissions", "", {
+        "mode": "full", "approval_model_id": "configured/model-a"
+    });
+    __nexora_permission_settings_status(savedGlobal, 200,
+        "global permission mode and approval model should save");
+    let persisted = JSON.parse(nexora_core_read_text(settingsPath));
+    __nexora_permission_settings_assert(
+        dict_get(persisted, "local_tool_permission_mode", "") == "full" and
+        dict_get(persisted, "local_tool_approval_model_id", "") ==
+            "configured/model-a" and
+        dict_get(persisted, "custom_setting", "") == "preserved",
+        "permission saves must preserve unrelated local config values");
+
+    let autoMissingModel = api.dispatch("POST", "/api/local/permissions", "", {
+        "mode": "auto", "approval_model_id": ""
+    });
+    __nexora_permission_settings_status(autoMissingModel, 400,
+        "automatic approval must require a configured approval model");
+    __nexora_permission_settings_assert(
+        dict_get(JSON.parse(nexora_core_read_text(settingsPath)),
+            "local_tool_permission_mode", "") == "full",
+        "invalid automatic settings must not change the saved permission mode");
+
+    let autoSaved = api.dispatch("POST", "/api/local/permissions", "", {
+        "mode": "auto", "approval_model_id": "configured/model-a"
+    });
+    __nexora_permission_settings_status(autoSaved, 200,
+        "automatic approval should save when a model is configured");
+    __nexora_permission_settings_assert(
+        dict_get(JSON.parse(nexora_core_read_text(settingsPath)),
+            "local_tool_permission_mode", "") == "auto",
+        "automatic approval mode should persist");
+
+    __nexora_permission_settings_status(api.dispatch(
+        "POST", "/api/local/permissions", "", {
+            "mode": "confirm", "approval_model_id": "missing/model"
+        }), 400, "approval models must belong to a configured provider");
+
+    let created = api.dispatch("POST", "/api/conversations", "", {
+        "title": "permission defaults"
+    });
+    __nexora_permission_settings_status(created, 201,
+        "conversation creation should use current global permission defaults");
+    let conversation = dict_get(dict_get(created, "body", {}), "conversation", {});
+    let conversationId = str(dict_get(conversation, "conversation_id", ""));
+    let conversationSettings = store.getSettings(conversationId);
+    __nexora_permission_settings_assert(
+        dict_get(conversationSettings, "permission_mode", "") == "auto" and
+        dict_get(conversationSettings, "approval_model_id", "") ==
+            "configured/model-a",
+        "new conversations must snapshot the selected global defaults");
+
+    let savedConversation = api.dispatch("POST", "/api/local/permissions", "", {
+        "conversation_id": conversationId,
+        "mode": "read_only", "approval_model_id": ""
+    });
+    __nexora_permission_settings_status(savedConversation, 200,
+        "conversation-specific permissions should save independently");
+    let readConversation = api.dispatch("GET", "/api/local/permissions",
+        "conversation_id=" + conversationId, nil);
+    let readConversationBody = dict_get(readConversation, "body", {});
+    __nexora_permission_settings_status(readConversation, 200,
+        "conversation permission settings should be readable");
+    __nexora_permission_settings_assert(
+        dict_get(readConversationBody, "scope", "") == "conversation" and
+        dict_get(readConversationBody, "mode", "") == "read_only" and
+        dict_get(readConversationBody, "approval_model_id", "x") == "",
+        "conversation changes must not affect global settings");
+    __nexora_permission_settings_assert(
+        dict_get(api.dispatch("GET", "/api/local/permissions", "", nil),
+            "body", {})["mode"] == "auto",
+        "conversation permission changes must leave global defaults unchanged");
+
+    nexora_tool_permission_event_record(root + "/auto-approval-events.jsonl", {
+        "timestamp": 1, "operation": "command", "tool": "local_shell_exec",
+        "mode": "auto", "decision": "allow", "stage": "auto_model",
+        "approval_model_id": "configured/model-a"
+    });
+    let events = api.dispatch("GET",
+        "/api/local/permissions/auto-approval-events", "limit=1", nil);
+    __nexora_permission_settings_status(events, 200,
+        "automatic approval events should be available through the local API");
+    __nexora_permission_settings_assert(
+        dict_get(dict_get(events, "body", {}), "events", []).length() == 1,
+        "automatic approval audit events should be returned newest first");
+
+    let foreignRequest = new HTTPRequest();
+    foreignRequest.method = "POST";
+    foreignRequest.path = "/api/local/permissions";
+    foreignRequest.rawHeaders = "POST /api/local/permissions HTTP/1.1\r\n" +
+        "Host: 127.0.0.1:8765\r\nOrigin: https://foreign.example\r\n\r\n";
+    foreignRequest.body = bytes(JSON.stringify({"mode": "confirm"}));
+    let foreignResponse: HTTPResponse = api.handleRequest(foreignRequest);
+    __nexora_permission_settings_assert(foreignResponse.status == 403,
+        "cross-origin permission changes must be rejected");
+}

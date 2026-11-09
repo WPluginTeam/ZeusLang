@@ -23,6 +23,19 @@ func main() {
     assertWebSocket(Crypto.base64Encode(decoded) == "AQIDBA==", "Base64 round trip");
     assertWebSocket(Crypto.randomBytes(16).length() == 16, "secure random byte length");
 
+    let plainURL = __ws_parse_url("ws://example.test/events?client=zeus#ignored");
+    assertWebSocket(!plainURL.secure and plainURL.port == 80 and
+        plainURL.target == "/events?client=zeus", "ws URL defaults to port 80");
+    let secureURL = __ws_parse_url("wss://example.test/events?client=zeus#ignored");
+    assertWebSocket(secureURL.secure and secureURL.port == 443 and
+        secureURL.target == "/events?client=zeus", "wss URL defaults to port 443");
+    let explicitSecureURL = __ws_parse_url("wss://example.test:9443");
+    assertWebSocket(explicitSecureURL.secure and explicitSecureURL.port == 9443 and
+        explicitSecureURL.target == "/", "wss URL accepts an explicit port");
+    let uppercaseSchemeURL = __ws_parse_url("WSS://example.test/path");
+    assertWebSocket(uppercaseSchemeURL.secure and uppercaseSchemeURL.port == 443,
+        "URL scheme matching is case insensitive");
+
     let noContent = __http_response_bytes(new HTTPResponse("ignored", 204), true).decode();
     assertWebSocket(noContent.index("Content-Length:") < 0,
         "204 response omits Content-Length");

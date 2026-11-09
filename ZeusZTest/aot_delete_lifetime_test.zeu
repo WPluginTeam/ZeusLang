@@ -1,0 +1,66 @@
+import zeus.exception;
+
+var destroyed = 0;
+
+class DeleteLifetimeProbe {
+    using &this;
+    var value: int = 0;
+
+    func init(value: int) { this.value = value; }
+    func get() -> int { return this.value; }
+    func alias() -> &DeleteLifetimeProbe { return this; }
+    func operator[~]() { destroyed = destroyed + 1; }
+}
+
+func assertTrue(condition, message: string) {
+    if (!condition) throw new Exception("delete lifetime test failed: " + message);
+}
+
+func localDeleteCases() {
+    let owner = new DeleteLifetimeProbe(1);
+    let alias = owner.alias();
+    delete owner;
+    delete owner;
+    assertTrue(destroyed == 1, "repeated local delete destroys once");
+    let deadAlias = false;
+    try { alias.get(); } catch (&error) { deadAlias = true; }
+    assertTrue(deadAlias, "retained local alias detects deleted object");
+
+    let owner = new DeleteLifetimeProbe(2);
+    assertTrue(owner.get() == 2, "deleted local name can be redeclared");
+    deadAlias = false;
+    try { alias.get(); } catch (&error) { deadAlias = true; }
+    assertTrue(deadAlias, "rebinding local leaves old alias deleted");
+    delete alias;
+    assertTrue(destroyed == 1, "deleting dead alias does not repeat destructor");
+    delete owner;
+    assertTrue(destroyed == 2, "rebound local destroys its own instance once");
+}
+
+func deleteBeforeThrow() {
+    let owner = new DeleteLifetimeProbe(5);
+    delete owner;
+    throw "expected unwind after delete";
+}
+
+let globalOwner = new DeleteLifetimeProbe(3);
+let globalAlias = globalOwner.alias();
+localDeleteCases();
+assertTrue(destroyed == 2, "local scope cleanup preserves destructor counts");
+delete globalOwner;
+delete globalOwner;
+assertTrue(destroyed == 3, "repeated global delete destroys once");
+let deadGlobalAlias = false;
+try { globalAlias.get(); } catch (&error) { deadGlobalAlias = true; }
+assertTrue(deadGlobalAlias, "global alias retains deleted identity");
+let globalOwner = new DeleteLifetimeProbe(4);
+assertTrue(globalOwner.get() == 4, "deleted global name can be redeclared");
+deadGlobalAlias = false;
+try { globalAlias.get(); } catch (&error) { deadGlobalAlias = true; }
+assertTrue(deadGlobalAlias, "global rebind does not revive old alias");
+delete globalOwner;
+assertTrue(destroyed == 4, "rebound global destroys once");
+let unwindCaught = false;
+try { deleteBeforeThrow(); } catch (&error) { unwindCaught = true; }
+assertTrue(unwindCaught and destroyed == 5, "unwind releases dead local without repeated destruction");
+print("AOT_DELETE_LIFETIME_PASS");

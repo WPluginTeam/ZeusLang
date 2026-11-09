@@ -1,0 +1,313 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.process;
+import zeus.string;
+import zeus.thread;
+import zeus.time [&terminalTime];
+
+import samples.NexoraCodeCore.command_tools;
+
+let NEXORA_TERMINAL_CAPTURE_BYTES = 200000;
+let __nexora_core_terminal_lock = create_shared_lock();
+
+class NexoraCoreTerminalSessions {
+    using &this;
+
+    let sessions: dict = {};
+    var nextId = 1;
+
+    func operator[@=]() -> &NexoraCoreTerminalSessions {
+        return this;
+    }
+
+    func start(commandValue: string, workingDirectory: string,
+            waitSeconds: int) {
+        let command = commandValue.strip();
+        if (command == "") return {"success": false,
+            "error": "command is required."};
+
+        let process = nil;
+        let failure = "";
+        try {
+            process = Process.run("cmd.exe /D /C " + command, true,
+                workingDirectory, NEXORA_TERMINAL_CAPTURE_BYTES);
+        } catch (&error) {
+            failure = str(error);
+        }
+        if (failure != "") {
+            return {"success": false, "error": "Could not start terminal: " +
+                failure};
+        }
+
+        lock_acquire(__nexora_core_terminal_lock);
+        let terminalId = "terminal-" + str(process.processId) + "-" +
+            str(this.nextId);
+        this.nextId = this.nextId + 1;
+        dict_set(this.sessions, terminalId, {
+            "process": process,
+            "offset": 0,
+            "closed": false,
+            "terminating": false,
+            "status": "running",
+            "returncode": nil,
+            "buffer_bytes": 0,
+            "output_lost": false,
+            "done": false
+        });
+        lock_release(__nexora_core_terminal_lock);
+
+        let exited = this.waitForExit(process, waitSeconds);
+        let result = this.read(terminalId);
+        dict_set(result, "wait_expired", !exited);
+        return result;
+    }
+
+    func read(terminalIdValue: string) -> dict {
+        let terminalId = terminalIdValue.strip();
+        if (terminalId == "") {
+            return {"success": false, "error": "terminal_id is required."};
+        }
+
+        lock_acquire(__nexora_core_terminal_lock);
+        let record = dict_get(this.sessions, terminalId, nil);
+        if (record == nil) {
+            lock_release(__nexora_core_terminal_lock);
+            return {"success": false,
+                "error": "Unknown terminal_id: " + terminalId + "."};
+        }
+        if (dict_get(record, "closed", false)) {
+            let closedResult = {"success": true, "terminal_id": terminalId,
+                "status": dict_get(record, "status", "exited"),
+                "returncode": dict_get(record, "returncode", nil),
+                "output": "", "truncated": dict_get(record, "output_lost", false),
+                "output_lost": dict_get(record, "output_lost", false),
+                "has_more": false, "done": true,
+                "buffer_bytes": dict_get(record, "buffer_bytes", 0)};
+            lock_release(__nexora_core_terminal_lock);
+            return closedResult;
+        }
+
+        let process = dict_get(record, "process", nil);
+        if (process == nil) {
+            lock_release(__nexora_core_terminal_lock);
+            return {"success": false,
+                "error": "Terminal process state is unavailable."};
+        }
+
+        let result = {};
+        let failure = "";
+        try {
+            let running = process.running();
+            let returnCode = nil;
+            let status = "running";
+            if (!running) {
+                status = "exited";
+                returnCode = process.exitCodeOf();
+            }
+
+            let offset = int(dict_get(record, "offset", 0));
+            let chunk = process.outputChunk(offset, 8000);
+            let nextOffset = int(dict_get(chunk, "next_offset", offset));
+            let bufferBytes = int(dict_get(chunk, "buffer_bytes", 0));
+            let hasMore = dict_get(chunk, "has_more", false);
+            let captureDone = dict_get(chunk, "done", false);
+            let outputLost = dict_get(record, "output_lost", false);
+            if (dict_get(chunk, "output_lost", false)) outputLost = true;
+            let captureError = int(dict_get(chunk, "capture_error", 0));
+            dict_set(record, "offset", nextOffset);
+            dict_set(record, "buffer_bytes", bufferBytes);
+            dict_set(record, "status", status);
+            dict_set(record, "returncode", returnCode);
+            dict_set(record, "output_lost", outputLost);
+            dict_set(record, "done", captureDone);
+
+            if (!running and captureDone and !hasMore) {
+                process.close();
+                dict_set(record, "closed", true);
+            }
+            dict_set(this.sessions, terminalId, record);
+            result = {"success": true, "terminal_id": terminalId,
+                "status": status, "returncode": returnCode,
+                "output": str(dict_get(chunk, "text", "")),
+                "truncated": outputLost, "output_lost": outputLost,
+                "lost_bytes": int(dict_get(chunk, "lost_bytes", 0)),
+                "has_more": hasMore, "done": captureDone,
+                "capture_error": captureError,
+                "buffer_bytes": bufferBytes};
+        } catch (&error) {
+            failure = str(error);
+        }
+        lock_release(__nexora_core_terminal_lock);
+        if (failure != "") {
+            return {"success": false, "terminal_id": terminalId,
+                "error": "Could not read terminal output: " + failure};
+        }
+        return result;
+    }
+
+    func terminate(terminalIdValue: string) {
+        let terminalId = terminalIdValue.strip();
+        if (terminalId == "") {
+            return {"success": false, "error": "terminal_id is required."};
+        }
+        lock_acquire(__nexora_core_terminal_lock);
+        let record = dict_get(this.sessions, terminalId, nil);
+        if (record == nil) {
+            lock_release(__nexora_core_terminal_lock);
+            return {"success": false,
+                "error": "Unknown terminal_id: " + terminalId + "."};
+        }
+        if (dict_get(record, "closed", false)) {
+            lock_release(__nexora_core_terminal_lock);
+            return this.read(terminalId);
+        }
+        if (dict_get(record, "terminating", false)) {
+            lock_release(__nexora_core_terminal_lock);
+            return {"success": true, "terminal_id": terminalId,
+                "status": "terminating"};
+        }
+
+        let process = dict_get(record, "process", nil);
+        if (process == nil) {
+            lock_release(__nexora_core_terminal_lock);
+            return {"success": false,
+                "error": "Terminal process state is unavailable."};
+        }
+        let processRunning = false;
+        let runningFailure = "";
+        try {
+            processRunning = process.running();
+        } catch (&error) {
+            runningFailure = str(error);
+        }
+        if (runningFailure != "") {
+            lock_release(__nexora_core_terminal_lock);
+            return {"success": false, "terminal_id": terminalId,
+                "error": "Could not inspect terminal process: " + runningFailure};
+        }
+        if (!processRunning) {
+            lock_release(__nexora_core_terminal_lock);
+            return this.read(terminalId);
+        }
+        dict_set(record, "terminating", true);
+        dict_set(this.sessions, terminalId, record);
+        lock_release(__nexora_core_terminal_lock);
+
+        let killer = nil;
+        let failure = "";
+        let stoppedByTaskkill = false;
+        try {
+            killer = Process.run("cmd.exe /D /C taskkill /PID " +
+                str(process.processId) + " /T /F", true, ".");
+            if (!killer.wait(5000)) {
+                killer.terminate();
+                killer.wait(1000);
+                failure = "taskkill did not finish within 5 seconds.";
+            } else {
+                let taskkillCode = killer.exitCodeOf();
+                stoppedByTaskkill = taskkillCode == 0;
+                if (taskkillCode != 0 and process.running()) {
+                    let diagnostic = killer.outputChunk(0, 2000);
+                    failure = "taskkill failed with exit code " +
+                        str(taskkillCode) + ": " +
+                        str(dict_get(diagnostic, "text", ""));
+                }
+            }
+        } catch (&error) {
+            failure = str(error);
+        }
+        if (killer != nil) killer.close();
+        if (failure != "") {
+            this.setTerminating(terminalId, false);
+            return {"success": false, "terminal_id": terminalId,
+                "error": "Could not terminate process tree: " + failure};
+        }
+        if (!process.wait(5000)) {
+            this.setTerminating(terminalId, false);
+            return {"success": false, "terminal_id": terminalId,
+                "error": "The terminal process is still running after taskkill."};
+        }
+
+        this.setTerminating(terminalId, false);
+        let result = this.read(terminalId);
+        if (dict_get(result, "success", false) and stoppedByTaskkill) {
+            dict_set(result, "status", "terminated");
+            dict_set(result, "stopped_by", "taskkill");
+        }
+        return result;
+    }
+
+    func setTerminating(terminalId: string, value: bool) {
+        lock_acquire(__nexora_core_terminal_lock);
+        let record = dict_get(this.sessions, terminalId, nil);
+        if (record != nil) {
+            dict_set(record, "terminating", value);
+            dict_set(this.sessions, terminalId, record);
+        }
+        lock_release(__nexora_core_terminal_lock);
+    }
+
+    func waitForExit(process, waitSeconds: int) -> bool {
+        if (waitSeconds <= 0) return process.wait(0);
+        let deadline = terminalTime.monotonic() + float(waitSeconds);
+        for (true) {
+            if (process.wait(100)) return true;
+            if (terminalTime.monotonic() >= deadline) return false;
+        }
+        return false;
+    }
+}
+
+let __nexora_core_terminal_sessions = new NexoraCoreTerminalSessions();
+
+class NexoraCoreTerminalTools {
+    using &this;
+
+    let root = ".";
+    let commandTools = nil;
+    let sessions = __nexora_core_terminal_sessions;
+
+    func operator[@=]() -> &NexoraCoreTerminalTools {
+        return this;
+    }
+
+    func init(rootValue: string) {
+        this.commandTools = new NexoraCoreCommandTools(rootValue);
+        this.root = rootValue;
+    }
+
+    func run(args: dict) {
+        let action = str(dict_get(args, "action", "")).strip().lower();
+        if (action == "run") return this.runTerminal(args);
+        if (action == "read") {
+            return this.sessions.read(str(dict_get(args, "terminal_id", "")));
+        }
+        if (action == "terminate") {
+            return this.sessions.terminate(
+                str(dict_get(args, "terminal_id", "")));
+        }
+        return {"success": false,
+            "error": "action must be run, read, or terminate."};
+    }
+
+    func runTerminal(args: dict) {
+        let command = str(dict_get(args, "command", "")).strip();
+        if (command == "") {
+            return {"success": false, "error": "command is required."};
+        }
+
+        let workingDirectory = this.commandTools.resolveWorkingDirectory(
+            str(dict_get(args, "cwd", "")));
+        if (workingDirectory == "") {
+            return {"success": false,
+                "error": "cwd must be an existing directory"};
+        }
+
+        let waitSeconds = int(dict_get(args, "wait_seconds", 10));
+        if (waitSeconds < 0 or waitSeconds > 86400) {
+            return {"success": false,
+                "error": "wait_seconds must be between 0 and 86400."};
+        }
+        return this.sessions.start(command, workingDirectory, waitSeconds);
+    }
+}

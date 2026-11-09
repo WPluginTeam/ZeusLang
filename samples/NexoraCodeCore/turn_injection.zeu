@@ -1,0 +1,313 @@
+import zeus.crypto;
+import zeus.string;
+
+let NEXORA_INJECTION_VERSION = 2;
+let NEXORA_PROJECT_CONVENTIONS_MARKER = "## Project conventions";
+let NEXORA_CUSTOM_INSTRUCTIONS_MARKER = "## Custom instructions";
+let NEXORA_PERMISSION_MODE_MARKER = "## Permission mode";
+let NEXORA_INJECTION_MAX_DIFF_LINES = 40;
+
+// Strip line-ending whitespace without changing indentation or line order.
+func __nexora_injection_rstrip(line: string) -> string {
+    let result = line;
+
+    for (result.length() > 0) {
+        let last = result.slice(result.length() - 1, result.length());
+        if (last != " " and last != "\t") break;
+        result = result.slice(0, result.length() - 1);
+    }
+
+    return result;
+}
+
+func nexora_injection_normalize_lines(value: string) -> Array {
+    let text = value.replace("\r\n", "\n").replace("\r", "\n");
+    let splitLines = text.split("\n");
+    let trimmedLines: Array = [];
+
+    for (splitLines) [line] {
+        trimmedLines.append(__nexora_injection_rstrip(line));
+    }
+
+    let first = 0;
+    for (first < trimmedLines.length()) {
+        if (trimmedLines[first] != "") break;
+        first = first + 1;
+    }
+
+    let last = trimmedLines.length();
+    for (last > first) {
+        if (trimmedLines[last - 1] != "") break;
+        last = last - 1;
+    }
+
+    let lines: Array = [];
+    for (first..last) [const &index] {
+        lines.append(trimmedLines[index]);
+    }
+
+    return lines;
+}
+
+func __nexora_injection_join_lines(lines: Array) -> string {
+    return string_join(lines, "\n");
+}
+
+// The digest is metadata only; equality always checks the stored lines exactly.
+func __nexora_injection_hash(lines: Array) -> string {
+    if (lines.length() == 0) return "";
+    return Crypto.base64Encode(Crypto.sha1(bytes(__nexora_injection_join_lines(lines))));
+}
+
+func __nexora_injection_diff_rows(oldLines: Array, newLines: Array) -> Array {
+    let oldCount = oldLines.length();
+    let newCount = newLines.length();
+    let rowCount = oldCount + 1;
+    let columnCount = newCount + 1;
+    let scores: Array = [];
+
+    for (0..rowCount) {
+        let row: Array = [];
+        for (0..columnCount) [const &column] {
+            row.append(0);
+        }
+        scores.append(row);
+    }
+
+    // LCS keeps unchanged lines in order, so disjoint edits do not become one
+    // large replacement block.
+    for (0..oldCount) [const &oldIndex] {
+        let currentRow = scores[oldIndex + 1];
+        let previousRow = scores[oldIndex];
+
+        for (0..newCount) [const &newIndex] {
+            if (oldLines[oldIndex] == newLines[newIndex]) {
+                currentRow[newIndex + 1] = previousRow[newIndex] + 1;
+            } else if (previousRow[newIndex + 1] >= currentRow[newIndex]) {
+                currentRow[newIndex + 1] = previousRow[newIndex + 1];
+            } else {
+                currentRow[newIndex + 1] = currentRow[newIndex];
+            }
+        }
+    }
+
+    let reverseRows: Array = [];
+    let oldPosition = oldCount;
+    let newPosition = newCount;
+
+    for (oldPosition > 0 or newPosition > 0) {
+        if (oldPosition == 0) {
+            reverseRows.append({"kind": "added", "text": newLines[newPosition - 1]});
+            newPosition = newPosition - 1;
+        } else if (newPosition == 0) {
+            reverseRows.append({"kind": "removed", "text": oldLines[oldPosition - 1]});
+            oldPosition = oldPosition - 1;
+        } else if (oldLines[oldPosition - 1] == newLines[newPosition - 1]) {
+            oldPosition = oldPosition - 1;
+            newPosition = newPosition - 1;
+        } else if (scores[oldPosition - 1][newPosition] > scores[oldPosition][newPosition - 1]) {
+            reverseRows.append({"kind": "removed", "text": oldLines[oldPosition - 1]});
+            oldPosition = oldPosition - 1;
+        } else {
+            reverseRows.append({"kind": "added", "text": newLines[newPosition - 1]});
+            newPosition = newPosition - 1;
+        }
+    }
+
+    let rows: Array = [];
+    for (0..reverseRows.length()) [const &index] {
+        rows.append(reverseRows[reverseRows.length() - index - 1]);
+    }
+
+    return rows;
+}
+
+func __nexora_injection_limit_diff_rows(rows: Array) -> Array {
+    if (rows.length() <= NEXORA_INJECTION_MAX_DIFF_LINES) return rows;
+
+    let limited: Array = [];
+    for (0..NEXORA_INJECTION_MAX_DIFF_LINES) [const &index] {
+        limited.append(rows[index]);
+    }
+    limited.append({"kind": "note", "text": "... 另有变更行未展示"});
+    return limited;
+}
+
+func __nexora_injection_render_rows(rows: Array) -> Array {
+    let lines: Array = [];
+
+    for (rows) [row] {
+        let kind: string = row.get("kind", "");
+        let text: string = row.get("text", "");
+        if (kind == "added") {
+            lines.append("+ " + text);
+        } else if (kind == "removed") {
+            lines.append("- " + text);
+        } else {
+            lines.append(text);
+        }
+    }
+
+    return lines;
+}
+
+func __nexora_injection_format_block(marker: string, lead: string, bodyLines: Array) -> string {
+    if (bodyLines.length() == 0) return "";
+    return marker + "\n" + lead + "\n" + __nexora_injection_join_lines(bodyLines);
+}
+
+func nexora_injection_state_baseline(state) -> dict {
+    if (type(state) != "dict") return {};
+    let version = int(state.get("injection_version", 0));
+    if (version < NEXORA_INJECTION_VERSION) return {};
+    let baseline = state.get("injection_baseline", nil);
+    if (type(baseline) != "dict") return {};
+    return baseline;
+}
+
+func nexora_plan_injection(sources: dict, baseline: dict,
+        forceFull: bool = false) -> dict {
+    let keys = ["project_conventions", "custom_instructions"];
+    let blocks: Array = [];
+    let diagnostics: Array = [];
+    let newBaseline = {};
+
+    for (keys) [key] {
+        let marker = NEXORA_PROJECT_CONVENTIONS_MARKER;
+        let fullLead = "以下是当前项目根目录 AGENTS.md 中的项目约定，请在本项目内遵守：";
+        let diffLead = "项目约定（AGENTS.md）已更新：";
+        if (key == "custom_instructions") {
+            marker = NEXORA_CUSTOM_INSTRUCTIONS_MARKER;
+            fullLead = "以下是用户自定义要求，请在不违反上述安全与路径规则的前提下遵守：";
+            diffLead = "用户自定义要求已更新：";
+        }
+
+        let lines = nexora_injection_normalize_lines(sources.get(key, ""));
+        let previous = baseline.get(key, nil);
+        let oldLines = nil;
+        if (type(previous) == "dict") {
+            let previousLines = previous?.get("lines", nil);
+            if (type(previousLines) == "Array") oldLines = previousLines;
+        }
+        if (forceFull) oldLines = nil;
+
+        if (lines.length() > 0) {
+            newBaseline[key] = {"hash": __nexora_injection_hash(lines), "lines": lines};
+        }
+
+        if (lines.length() == 0 and oldLines == nil) continue;
+
+        let rows: Array = [];
+        let mode = "diff";
+        let block = "";
+        if (oldLines == nil) {
+            mode = "full";
+            for (lines) [line] {
+                rows.append({"kind": "added", "text": line});
+            }
+            block = __nexora_injection_format_block(marker, fullLead, lines);
+        } else {
+            rows = __nexora_injection_limit_diff_rows(
+                __nexora_injection_diff_rows(oldLines, lines));
+            let body = __nexora_injection_render_rows(rows);
+            block = __nexora_injection_format_block(marker, diffLead, body);
+        }
+
+        if (block != "") {
+            blocks.append(block);
+            diagnostics.append({"name": key, "chars": block.length(), "mode": mode, "rows": rows});
+        }
+    }
+
+    return {"blocks": blocks, "baseline": newBaseline, "diagnostics": diagnostics};
+}
+
+func nexora_injection_build_message(name: string, block: string, mode: string) -> dict {
+    return {"role": "system", "content": block,
+        "metadata": {"injection": {"name": name, "mode": mode}}};
+}
+
+func nexora_injection_build_messages(blocks: Array, diagnostics: Array) -> Array {
+    let messages: Array = [];
+    let count = blocks.length();
+    if (diagnostics.length() < count) count = diagnostics.length();
+
+    for (0..count) [const &index] {
+        let diagnostic = diagnostics[index];
+        let name: string = diagnostic.get("name", "");
+        let block: string = blocks[index];
+        let mode: string = diagnostic.get("mode", "");
+        messages.append(nexora_injection_build_message(name, block, mode));
+    }
+
+    return messages;
+}
+
+func nexora_injection_is_message(message) -> bool {
+    if (type(message) != "dict") return false;
+    let role: string = message.get("role", "");
+    if (role != "system") return false;
+    let metadata = message.get("metadata", nil);
+    if (type(metadata) != "dict") return false;
+    return type(metadata?.get("injection", nil)) == "dict";
+}
+
+func nexora_injection_permission_message(mode: string) -> dict {
+    let cleanMode = mode.strip().lower();
+    let body = "";
+    if (cleanMode == "auto") {
+        body = "当前本会话为自动审批：调用写入、命令、网络或进程变更工具前，先用一句话说明准备执行什么以及它如何对应当前用户请求，不要输出内部推理。";
+    } else if (cleanMode == "read_only") {
+        body = "当前本会话为只读模式：可以读取和搜索；不要调用写入、命令或插件变更工具。";
+    } else if (cleanMode == "full") {
+        body = "当前本会话为完全权限模式：按用户请求执行读取、写入、命令和插件操作，无需等待权限审批；执行前简要说明操作目标。";
+    } else {
+        let label = cleanMode;
+        if (label == "") label = "confirm";
+        body = "当前本会话审批模式为 " + label + "：读取操作可直接使用；写入、命令和插件操作会向用户请求确认，按确认结果继续即可。";
+    }
+
+    return nexora_injection_build_message("permission_mode",
+        NEXORA_PERMISSION_MODE_MARKER + "\n（审批模式以本块为准，覆盖更早的模式描述。）\n" + body,
+        "full");
+}
+
+func nexora_injection_messages_insert(values: Array, index: int, additions: Array) -> Array {
+    let result: Array = [];
+    let position = index;
+    if (position < 0) position = 0;
+    if (position > values.length()) position = values.length();
+
+    let cursorCount = values.length() + 1;
+    for (0..cursorCount) [const &cursor] {
+        if (cursor == position) {
+            for (additions) [addition] {
+                result.append(addition);
+            }
+        }
+        if (cursor < values.length()) result.append(values[cursor]);
+    }
+
+    return result;
+}
+
+func nexora_injection_collapse_steps(steps: Array) -> Array {
+    let collapsed: Array = [];
+    let injectionIndex = -1;
+    let latestInjection = nil;
+
+    for (steps) [step] {
+        if (type(step) == "dict") {
+            let stepType: string = step?.get("type", "");
+            if (stepType == "context_injection") {
+                if (injectionIndex < 0) injectionIndex = collapsed.length();
+                latestInjection = step;
+                continue;
+            }
+        }
+        collapsed.append(step);
+    }
+
+    if (latestInjection == nil) return collapsed;
+    return nexora_injection_messages_insert(collapsed, injectionIndex, [latestInjection]);
+}

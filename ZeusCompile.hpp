@@ -2,15 +2,18 @@
 #define ZEUS_COMPILE_HPP
 
 #include <string>
+#include "./ZeusParser/NativeTypeDeclarationResolver.hpp"
 #include <vector>
 #include <fstream>
 #include <chrono>
+#include <functional>
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
 #include "./ZeusParser/LexerParser.hpp"
 #include "./ZeusParser/TreeParser.hpp"
 #include "./ZeusParser/BackendBlockSelector.hpp"
+#include "./ZeusParser/PlatformBlockSelector.hpp"
 #include "./ZeusParser/SyntaxValidator.hpp"
 #include "./ZeusParser/InterfaceConformance.hpp"
 #include "./ZeusTyping/TypeChecker.hpp"
@@ -40,10 +43,15 @@ namespace ZeusCompile {
     struct Result {
         std::vector<std::vector<IRType::IRInstr>> program;
         std::vector<std::string> globalNames;
+        size_t packageGlobalCount = 0;
+        size_t mainGlobalStart = 0; // Root program slots after namespace import aliases.
+        size_t mainGlobalEnd = 0;   // Root globals end before package-only aliases.
+        bool hasGlobalTeardownLayout = false;
         std::vector<ZeusDiagnostics::Diagnostic> diagnostics;
         std::vector<ZeusDiagnostics::Diagnostic> warnings;
         bool hasReportedErrors = false;
         bool strictDecl = false; // 记录是否严格模式（影响 VM 行为：禁用 late resolve）
+        bool mcuTarget = false;  // 是否针对单片机裸机目标（开启内置微运行时）
         std::string sourceFilePath; // 源文件路径（用于错误信息）
         std::string sourceCode;     // 源代码（用于错误信息显示行内容）
         // 统计信息（毫秒）
@@ -138,7 +146,9 @@ namespace ZeusCompile {
         const std::string& sourceFilePath={},
         ZeusParser::BackendTarget target = ZeusParser::BackendTarget::VirtualMachine,
         bool deferUnresolvedGenericClasses = false,
-        const ZeusParser::InterfaceContractRegistry& importedInterfaceContracts = {}
+        const ZeusParser::InterfaceContractRegistry& importedInterfaceContracts = {},
+        const std::function<void(ZeusTypeInfer::TypeChecker&)>&
+            configureTypeChecker = {}
     ) {
         // 注意：源文件信息的清除应在整个编译流程开始前进行（在 Zeus.cpp 中）
         // 这样包编译期间注册的源文件信息不会被清除
@@ -148,9 +158,10 @@ namespace ZeusCompile {
         r.sourceFilePath = sourceFilePath;
         r.sourceCode = src;
         ZeusDiagnostics::setSourceContext(sourceFilePath, src);
+        IRImport::setWorkingDirectory(sourceFilePath);
 
         auto t0 = std::chrono::steady_clock::now();
-        std::vector<LexerType::Token> tokens = LexerParser::parse(src, &r.diagnostics);
+        std::vector<LexerType::Token> tokens = ZeusParser::parseNativeTypeSource(src, sourceFilePath, r.diagnostics);
         auto t1 = std::chrono::steady_clock::now();
         ZeusDiagnostics::append(r.diagnostics, ZeusParser::validateSyntax(tokens));
         if (!r.diagnostics.empty()) {
@@ -159,8 +170,67 @@ namespace ZeusCompile {
         }
         std::vector<TreeParser::NodeAndBlock> ast = TreeParser::parse(tokens, &r.diagnostics);
         auto t2 = std::chrono::steady_clock::now();
+        ZeusParser::selectPlatformBlocks(ast);
         ZeusParser::selectBackendBlocks(ast, target, &r.warnings);
-        ZeusDiagnostics::append(r.diagnostics, ZeusParser::validateParsedSyntax(ast));
+        if (target == ZeusParser::BackendTarget::VirtualMachine) {
+            bool hasStaticFile = false;
+            bool hasNativeImport = false;
+            int staticLine = 1, staticCol = 1;
+            int nativeLine = 1, nativeCol = 1;
+
+            const auto inspectElements = [&](const auto& self, const std::vector<TreeParser::NodeAndBlock>& elements) -> void {
+                for (const auto& item : elements) {
+                    if (std::holds_alternative<TreeParser::Node>(item)) {
+                        const auto& node = std::get<TreeParser::Node>(item);
+                        if (node.type == NodeType::STATIC_FILE_STMT) {
+                            hasStaticFile = true;
+                            staticLine = node.sourceLine;
+                            staticCol = node.sourceColumn;
+                        }
+                        if (node.type == NodeType::IMPORT_STMT && !node.tokens.empty() &&
+                            std::holds_alternative<LexerType::Operator>(node.tokens.front()) &&
+                            std::get<LexerType::Operator>(node.tokens.front()).symbol == "@") {
+                            hasNativeImport = true;
+                            nativeLine = node.sourceLine;
+                            nativeCol = node.sourceColumn;
+                        }
+                    } else if (std::holds_alternative<std::unique_ptr<TreeParser::CodeBlock>>(item)) {
+                        const auto& blk = std::get<std::unique_ptr<TreeParser::CodeBlock>>(item);
+                        if (blk) {
+                            if (blk->isStaticOnlyFile) {
+                                hasStaticFile = true;
+                                staticLine = blk->sourceLine;
+                                staticCol = blk->sourceColumn;
+                            }
+                            self(self, blk->nodes);
+                        }
+                    }
+                }
+            };
+            inspectElements(inspectElements, ast);
+
+            if (hasStaticFile) {
+                r.diagnostics.push_back({
+                    "E_STATIC_VM",
+                    "File is marked with '@static;' and can only be compiled via AOT, not in VM",
+                    staticLine,
+                    staticCol
+                });
+                return r;
+            }
+            if (hasNativeImport) {
+                r.diagnostics.push_back({
+                    "E_NATIVE_IMPORT_VM",
+                    "@native header import is only supported in AOT compilation",
+                    nativeLine,
+                    nativeCol
+                });
+                return r;
+            }
+        }
+        ZeusDiagnostics::append(
+            r.diagnostics,
+            ZeusParser::validateParsedSyntax(ast, &r.warnings));
         if (r.diagnostics.empty()) {
             ZeusDiagnostics::append(
                 r.diagnostics,
@@ -173,6 +243,7 @@ namespace ZeusCompile {
             return r;
         }
         ZeusTypeInfer::TypeChecker returnTypeChecker(ast);
+        if (configureTypeChecker) configureTypeChecker(returnTypeChecker);
         returnTypeChecker.check(target == ZeusParser::BackendTarget::LLVM
             ? ZeusTypeInfer::TypeCheckOptions::llvm()
             : ZeusTypeInfer::TypeCheckOptions::dynamic());
@@ -182,7 +253,8 @@ namespace ZeusCompile {
                 diagnostic.code != ZeusTypeInfer::TypeCheckDiagnosticCode::GenericTypeArgumentMismatch &&
                 diagnostic.code != ZeusTypeInfer::TypeCheckDiagnosticCode::GenericTypeArgumentUnknown &&
                 diagnostic.code != ZeusTypeInfer::TypeCheckDiagnosticCode::GenericTypeParameterNameInvalid &&
-                diagnostic.code != ZeusTypeInfer::TypeCheckDiagnosticCode::GenericTypeParameterUnsupportedContext) {
+                diagnostic.code != ZeusTypeInfer::TypeCheckDiagnosticCode::GenericTypeParameterUnsupportedContext &&
+                diagnostic.code != ZeusTypeInfer::TypeCheckDiagnosticCode::ReceiverReturnTypeAmbiguous) {
                 continue;
             }
             hasCallArgumentTypeErrors = true;
@@ -312,7 +384,12 @@ namespace ZeusCompile {
     }
 
     inline bool write(const Result& r, const std::string& outPath, std::string* err) {
-        return IRBinary::writeIRProgram(r.program, outPath, &r.globalNames, nullptr, err);
+        IRBinary::IRMeta meta = IRBinary::getDefaultMeta();
+        meta.packageGlobalCount = static_cast<uint32_t>(r.packageGlobalCount);
+        meta.mainGlobalStart = static_cast<uint32_t>(r.mainGlobalStart);
+        meta.mainGlobalEnd = static_cast<uint32_t>(r.mainGlobalEnd);
+        meta.hasGlobalTeardownLayout = r.hasGlobalTeardownLayout;
+        return IRBinary::writeIRProgram(r.program, outPath, &r.globalNames, &meta, err);
     }
 
     inline Result read(const std::string& path, std::string* err, bool enableHotspot=true) {
@@ -332,6 +409,10 @@ namespace ZeusCompile {
         Result r;
         r.program = std::move(programVec);
         r.globalNames = std::move(globalNames);
+        r.packageGlobalCount = meta.packageGlobalCount;
+        r.mainGlobalStart = meta.mainGlobalStart;
+        r.mainGlobalEnd = meta.mainGlobalEnd;
+        r.hasGlobalTeardownLayout = meta.hasGlobalTeardownLayout;
 
         if (enableHotspot && !r.program.empty() && !containsHotspot(r.program)) {
             optimizeHotspots(r);
@@ -399,6 +480,27 @@ namespace ZeusCompile {
             }
             return -1;
         });
+
+        ZeusThread::setGlobalClosureSnapshotResolver(
+            [&vm](int closureId) -> std::optional<ZeusThread::ClosureSnapshot> {
+                std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+                std::shared_lock<std::shared_mutex> lock(vm.closuresMutex);
+                if (closureId < 0 || closureId >= static_cast<int>(vm.closures.size())) {
+                    return std::nullopt;
+                }
+
+                const auto& closure = vm.closures[static_cast<size_t>(closureId)];
+                if (closure.isFreed()) return std::nullopt;
+
+                ZeusThread::ClosureSnapshot snapshot;
+                snapshot.protoId = closure.protoId;
+                snapshot.boundThis = closure.boundThis;
+                snapshot.upvalues.reserve(closure.upvalues.size());
+                for (Cell* capture : closure.upvalues) {
+                    snapshot.upvalues.push_back(static_cast<void*>(capture));
+                }
+                return snapshot;
+            });
         
         // 设置 BoundThis 解析器（用于线程支持绑定方法，线程安全）
         ZeusThread::setGlobalBoundThisResolver([&vm](int closureId) -> std::optional<ZeusType::ObjectHandle> {
@@ -412,6 +514,9 @@ namespace ZeusCompile {
         // 设置共享对象系统解析器（用于线程访问主 VM 的完整环境）
         ZeusThread::setGlobalSharedObjectResolver([&vm]() -> ZeusThread::SharedObjectSystem {
             ZeusThread::SharedObjectSystem shared;
+            // Reserve the peer before exposing the table. The lease bridges
+            // thread launch until its VM registers the shared domain.
+            shared.rootPeerLease = vm.reserveVMRootPeer();
             
             // 原有共享
              shared.classes = &vm.classes;
@@ -447,6 +552,10 @@ namespace ZeusCompile {
 
         if (!r.globalNames.empty()) {
             vm.setGlobalNames(r.globalNames);
+        }
+        if (r.hasGlobalTeardownLayout) {
+            vm.setGlobalTeardownLayout(
+                r.packageGlobalCount, r.mainGlobalStart, r.mainGlobalEnd);
         }
 
         if (r.strictDecl) {

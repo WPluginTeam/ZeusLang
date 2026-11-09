@@ -1,0 +1,280 @@
+import zeus.exception;
+import zeus.json;
+import zeus.string;
+import zeus.thread;
+import zeus.time [&zeusTime];
+import samples.NexoraCodeCore.policy;
+import samples.NexoraCodeCore.task_events;
+
+func assertNexoraCore(condition, message: string) {
+    if (!condition) throw new Exception("NexoraCodeCore test failed: " + message);
+}
+
+func assertServerUrlRejected(value: string, label: string) {
+    let rejected = false;
+    try {
+        nexora_core_normalize_server_url(value);
+    } catch (&error) {
+        rejected = true;
+    }
+    assertNexoraCore(rejected, "server URL policy rejects " + label);
+}
+
+func testRemotePolicy() {
+    assertNexoraCore(
+        nexora_core_normalize_server_url(" https://Example.COM/ ") == "https://Example.COM",
+        "HTTPS server URL is trimmed and its root slash is removed"
+    );
+    assertNexoraCore(
+        nexora_core_normalize_server_url("http://localhost:5000/") == "http://localhost:5000",
+        "localhost HTTP is allowed for local development"
+    );
+    assertNexoraCore(
+        nexora_core_websocket_url("https://example.com") == "wss://example.com/ws/nexoracode",
+        "HTTPS server URL maps to the secure WebSocket endpoint"
+    );
+    assertNexoraCore(
+        nexora_core_websocket_url("http://127.0.0.1:5000") == "ws://127.0.0.1:5000/ws/nexoracode",
+        "loopback HTTP maps to the local WebSocket endpoint"
+    );
+    assertServerUrlRejected("http://example.com", "non-loopback HTTP");
+    assertServerUrlRejected("https://example.com/base", "a non-root path");
+    assertServerUrlRejected("https://user:pass@example.com", "userinfo");
+    assertServerUrlRejected("https://example.com/?token=x", "a query");
+    assertServerUrlRejected("https://example.com/#fragment", "a fragment");
+    assertServerUrlRejected("https:///missing-host", "a missing host");
+
+    assertNexoraCore(
+        nexora_core_allowed_request("GET", "/api/conversations/conv_0123456789/messages"),
+        "conversation reads are on the remote allowlist"
+    );
+    assertNexoraCore(
+        nexora_core_allowed_request("GET", "/api/local/tasks/0123456789abcdef0123456789abcdef/events"),
+        "task event reads are on the remote allowlist"
+    );
+    assertNexoraCore(
+        nexora_core_allowed_request("POST", "/api/chat/queue/item_01/steer") and
+        nexora_core_allowed_request("PATCH", "/api/chat/queue/item_01") and
+        nexora_core_allowed_request("DELETE", "/api/chat/queue/item_01"),
+        "queue operations retain the supported methods"
+    );
+    assertNexoraCore(
+        !nexora_core_allowed_request("PATCH", "/api/chat/queue/item.01") and
+        !nexora_core_allowed_request("GET", "/api/chat/queue/item_01") and
+        !nexora_core_allowed_request("POST", "/api/local/exec") and
+        !nexora_core_allowed_request("GET", "/api/config/secret"),
+        "path traversal and sensitive routes stay outside the allowlist"
+    );
+}
+
+func runJsonBenchmarks() {
+    let wire = "{\"type\":\"rpc_result\",\"request_id\":\"req-42\",\"result\":{" +
+        "\"status\":200,\"body\":{\"ok\":true,\"message\":\"Zeus JSON bench\"}}}";
+    let iterations = 5000;
+    let parseChecksum = 0;
+
+    for (0..100) [const &index] {
+        JSON.parse(wire);
+    }
+    let started = zeusTime.monotonic_ns();
+    for (0..iterations) [const &index] {
+        let parsed = JSON.parse(wire);
+        parseChecksum = parseChecksum + parsed["result"]["status"];
+    }
+    let parseElapsed = zeusTime.monotonic_ns() - started;
+    print("NEXORA_JSON_PARSE_BENCH_NS", parseElapsed, "OPS", iterations, "CHECKSUM", parseChecksum);
+
+    let value = JSON.parse(wire);
+    let stringifyChecksum = 0;
+    for (0..100) [const &index] {
+        JSON.stringify(value);
+    }
+    let stringifyStarted = zeusTime.monotonic_ns();
+    for (0..iterations) [const &index] {
+        let encoded = JSON.stringify(value);
+        stringifyChecksum = stringifyChecksum + encoded.length();
+    }
+    let stringifyElapsed = zeusTime.monotonic_ns() - stringifyStarted;
+    print("NEXORA_JSON_STRINGIFY_BENCH_NS", stringifyElapsed, "OPS", iterations, "CHECKSUM", stringifyChecksum);
+}
+
+func testJsonUnicode() {
+    let source = "{\"message\":\"Nexora 远程控制\"}";
+    let parsed = JSON.parse(source);
+    assertNexoraCore(parsed["message"] == "Nexora 远程控制",
+        "JSON parser preserves Unicode values");
+    let encoded = JSON.stringify(parsed);
+    assertNexoraCore(JSON.parse(encoded)["message"] == "Nexora 远程控制",
+        "JSON stringify preserves Unicode values");
+}
+
+// The lifecycle buffer only asks its host lock for acquire/release, so the
+// offline test records those calls instead of taking a real mutex and can
+// assert the balance itself. The socket recorder stands in for the connection
+// and keeps the exact text the flush would have put on the wire.
+class RecordingTaskEventLock {
+    using &this;
+
+    let acquires = 0;
+    let releases = 0;
+    let held = false;
+
+    func acquire() {
+        this.acquires = this.acquires + 1;
+        this.held = true;
+    }
+
+    func release() {
+        this.releases = this.releases + 1;
+        this.held = false;
+    }
+
+    func isHeld() -> bool {
+        return this.held;
+    }
+
+    func isBalanced() -> bool {
+        return this.acquires == this.releases and !this.held;
+    }
+}
+
+class RecordingTaskEventSocket {
+    using &this;
+
+    let frames = [];
+    let failAfter = -1;
+    let lock = nil;
+
+    func sendText(text: string) {
+        if (this.failAfter >= 0 and this.frames.length() >= this.failAfter) {
+            throw new Exception("recorded socket rejected the write");
+        }
+        if (this.lock != nil) {
+            let queueLock = this.lock;
+            if (queueLock.isHeld()) {
+                throw new Exception("task-event flush wrote while holding the queue lock");
+            }
+        }
+        this.frames.append(text);
+    }
+
+    func framesAsJson() -> Array {
+        let decoded: Array = [];
+        for (this.frames) [&text] {
+            decoded.append(JSON.parse(text));
+        }
+        return decoded;
+    }
+}
+
+func testTaskLifecycleBuffer() {
+    let lock = new RecordingTaskEventLock();
+    let buffer = nexora_core_task_event_buffer(lock);
+    let socket = new RecordingTaskEventSocket();
+    socket.lock = lock;
+
+    assertNexoraCore(nexora_core_task_event_length(buffer) == 0,
+        "a new lifecycle buffer is empty");
+    assertNexoraCore(lock.isBalanced(), "length() releases the host lock");
+
+    let rejected = {"type": "task_event", "stream_id": "stream-1"};
+    assertNexoraCore(!nexora_core_task_event_enqueue(buffer, rejected),
+        "non-lifecycle task events never enter the buffer");
+    assertNexoraCore(!nexora_core_task_event_enqueue(buffer, {"type": "conversation_changed"}),
+        "conversation changes are not lifecycle frames");
+    assertNexoraCore(!nexora_core_task_event_enqueue(buffer, {"stream_id": "no-type"}),
+        "a payload without a type is not a lifecycle frame");
+    assertNexoraCore(nexora_core_task_event_length(buffer) == 0 and lock.isBalanced(),
+        "rejected payloads leave the buffer untouched and the lock released");
+
+    let started = {
+        "type": "task_started",
+        "stream_id": "0123456789abcdef0123456789abcdef",
+        "conversation_id": "conv_0123456789",
+        "status": "running"
+    };
+    let finished = {"type": "task_finished", "stream_id": "fedcba9876543210fedcba9876543210"};
+    assertNexoraCore(nexora_core_task_event_enqueue(buffer, started),
+        "task_started enters the buffer");
+    assertNexoraCore(nexora_core_task_event_enqueue(buffer, finished),
+        "task_finished with omitted optional fields enters the buffer");
+    assertNexoraCore(nexora_core_task_event_length(buffer) == 2,
+        "both lifecycle events are queued");
+    assertNexoraCore(lock.isBalanced(), "enqueue and length balance the host lock");
+
+    assertNexoraCore(nexora_core_flush_task_events(socket, buffer) == 2,
+        "flush reports every frame it wrote");
+    assertNexoraCore(socket.frames.length() == 2, "flush writes one frame per pending event");
+    assertNexoraCore(nexora_core_task_event_length(buffer) == 0, "flush drains the buffer");
+    assertNexoraCore(lock.isBalanced(), "flush drains under the lock and releases it");
+
+    let frames = socket.framesAsJson();
+    assertNexoraCore(frames[0]["type"] == "task_lifecycle",
+        "lifecycle frames are tagged task_lifecycle");
+    assertNexoraCore(frames[0]["event"] == "task_started", "the frame keeps the event type");
+    assertNexoraCore(frames[0]["stream_id"] == "0123456789abcdef0123456789abcdef",
+        "the frame keeps the stream ID");
+    assertNexoraCore(frames[0]["conversation_id"] == "conv_0123456789",
+        "the frame keeps the conversation ID");
+    assertNexoraCore(frames[0]["status"] == "running", "the frame keeps the status");
+    assertNexoraCore(frames[1]["event"] == "task_finished",
+        "frames keep their arrival order");
+    assertNexoraCore(frames[1]["conversation_id"] == "" and frames[1]["status"] == "",
+        "omitted payload fields become empty strings");
+
+    assertNexoraCore(nexora_core_flush_task_events(socket, buffer) == 0,
+        "an empty buffer reports no writes");
+    assertNexoraCore(socket.frames.length() == 2, "an empty flush does not touch the socket");
+
+    let overflowLock = new RecordingTaskEventLock();
+    let overflow = nexora_core_task_event_buffer(overflowLock);
+    let overflowSocket = new RecordingTaskEventSocket();
+    overflowSocket.lock = overflowLock;
+    for (0..70) [const &index] {
+        let payload = {"type": "task_started", "stream_id": "s" + str(index)};
+        nexora_core_task_event_enqueue(overflow, payload);
+    }
+    assertNexoraCore(nexora_core_task_event_length(overflow) == 64,
+        "the buffer keeps the newest 64 lifecycle frames");
+    assertNexoraCore(nexora_core_flush_task_events(overflowSocket, overflow) == 64,
+        "a saturated buffer flushes exactly the retained frames");
+    let overflowFrames = overflowSocket.framesAsJson();
+    assertNexoraCore(overflowFrames[0]["stream_id"] == "s6",
+        "overflow drops the oldest frames first");
+    assertNexoraCore(overflowFrames[63]["stream_id"] == "s69",
+        "overflow retains the newest frame");
+
+    let failingLock = new RecordingTaskEventLock();
+    let failing = nexora_core_task_event_buffer(failingLock);
+    let failingSocket = new RecordingTaskEventSocket();
+    failingSocket.lock = failingLock;
+    failingSocket.failAfter = 1;
+    let failingPayload = {"type": "task_finished", "stream_id": "x"};
+    nexora_core_task_event_enqueue(failing, failingPayload);
+    nexora_core_task_event_enqueue(failing, failingPayload);
+    let flushFailed = false;
+    try {
+        nexora_core_flush_task_events(failingSocket, failing);
+    } catch (&error) {
+        flushFailed = true;
+    }
+    assertNexoraCore(flushFailed, "a rejected write propagates to the socket loop");
+    assertNexoraCore(failingSocket.frames.length() == 1,
+        "the failed flush keeps the frame it already wrote");
+    assertNexoraCore(nexora_core_task_event_length(failing) == 0,
+        "the failed flush drops the unsent frames with the connection");
+    assertNexoraCore(failingLock.isBalanced(), "a failed flush still releases the host lock");
+
+    failingSocket.failAfter = -1;
+    nexora_core_task_event_enqueue(failing, failingPayload);
+    assertNexoraCore(nexora_core_flush_task_events(failingSocket, failing) == 1,
+        "the buffer stays usable after a failed flush");
+
+    let realLock = new Lock();
+    let realBuffer = nexora_core_task_event_buffer(realLock);
+    nexora_core_task_event_enqueue(realBuffer, failingPayload);
+    assertNexoraCore(nexora_core_task_event_length(realBuffer) == 1,
+        "zeus.thread.Lock satisfies the host lock contract");
+    assertNexoraCore(nexora_core_flush_task_events(socket, realBuffer) == 1,
+        "a real host lock drives the queue the same way a recorder does");
+}

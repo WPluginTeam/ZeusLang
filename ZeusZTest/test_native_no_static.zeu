@@ -1,0 +1,5 @@
+@native("./test_mcu.h") import mcu [&];
+
+func main() -> int {
+    return 0;
+}

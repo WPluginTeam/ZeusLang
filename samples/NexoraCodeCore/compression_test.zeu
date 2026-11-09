@@ -1,0 +1,168 @@
+import zeus.byte;
+import zeus.dict;
+import zeus.exception;
+import samples.NexoraCodeCore.compression;
+import samples.NexoraCodeCore.context;
+
+// 上下文压缩的离线测试：不联网、不调模型，只验预算与裁剪策略。
+
+func assertCompression(condition, message: string) {
+    if (!condition) throw new Exception("compression 测试失败: " + message);
+}
+
+func __compression_repeat(piece: string, times: int) -> string {
+    let text = "";
+    for (0..times) [const &i] {
+        text = text + piece;
+    }
+    return text;
+}
+
+// 宿主的摘要缝：AOT 不接受「裸函数名」当参数，用绑定方法包一层。
+class FakeSummarizer {
+    using &this;
+
+    func operator[@=]() -> &FakeSummarizer {
+        return this;
+    }
+
+    func summarize(dropped) {
+        return "自定义摘要(" + str(dropped.length()) + " 条)";
+    }
+}
+
+func __compression_turns(count: int, size: int) -> Array {
+    let messages: Array = [{"role": "system", "content": "系统提示"}];
+    let filler = __compression_repeat("x", size);
+    for (0..count) [const &i] {
+        messages.append({"role": "user", "content": "问题 " + str(i) + " " + filler});
+        messages.append({"role": "assistant", "content": "回答 " + str(i) + " " + filler});
+    }
+    return messages;
+}
+
+func testCompressionBudget() {
+    // 边际 = min(512, max(64, ceil(window*5%)))
+    assertCompression(nexora_input_safety_margin(1000) == 64, "1000 窗口的边际应是下限 64");
+    assertCompression(nexora_input_safety_margin(4000) == 200, "4000 窗口的边际应是 200");
+    assertCompression(nexora_input_safety_margin(100) == 64, "小窗口也保底 64");
+    assertCompression(nexora_input_safety_margin(100000) == 512, "大窗口封顶 512");
+
+    // 输入上限 = 窗口 - min(output,256) - 边际
+    assertCompression(nexora_adaptive_input_limit(4000, 200) == 3600, "4000/200 的输入上限算错");
+    assertCompression(nexora_adaptive_input_limit(4000, 2000) == 4000 - 256 - 200,
+        "输出上限超过 256 时应只保留 256 给回答");
+}
+
+func testCompressionDirect() {
+    let messages = __compression_turns(1, 20);
+    let result = nexora_compress(messages, 262144, 4096);
+    assertCompression(str(result["status"]) == "direct", "小请求应直接放行");
+    assertCompression(type(result["messages"]) == "Array", "direct 应回传原消息表");
+    assertCompression(int(result["before"]) == int(result["estimate"]), "direct 不该改变估算");
+    assertCompression(int(result["droppedMessages"]) == 0, "direct 不该丢消息");
+    assertCompression(str(result["summary"]) == "", "direct 不该产出摘要");
+}
+
+func testCompressionTrimsToolResults() {
+    let huge = __compression_repeat("0123456789", 3000);
+    let messages: Array = [
+        {"role": "system", "content": "系统提示"},
+        {"role": "user", "content": "读一下大文件"},
+        {"role": "assistant", "content": ""},
+        {"role": "tool", "tool_call_id": "call_a", "content": huge},
+        {"role": "user", "content": "总结一下"}
+    ];
+
+    let result = nexora_compress(messages, 4000, 200);
+    assertCompression(str(result["status"]) == "trimmed", "超长工具结果应走裁剪分支");
+    assertCompression(int(result["droppedMessages"]) == 0, "裁剪不该丢消息");
+    assertCompression(int(result["estimate"]) < int(result["budget"]),
+        "裁剪后应装进预算");
+    assertCompression(int(result["estimate"]) < int(result["before"]), "裁剪应降低估算");
+
+    let trimmed = str(result["messages"][3]["content"]);
+    assertCompression(trimmed.length() < huge.length(), "工具结果应被截短");
+    assertCompression(trimmed.index("已省略中间") >= 0, "应留下省略说明");
+    assertCompression(trimmed.index("0123456789") == 0, "应保留开头");
+    assertCompression(str(result["messages"][4]["content"]) == "总结一下",
+        "当前轮必须原样保留");
+
+    // 调用方的历史不能被改：压缩只作用于本次发送副本。
+    assertCompression(str(messages[3]["content"]) == huge, "原始工具结果不应被修改");
+}
+
+func testCompressionFoldsHistory() {
+    let messages = __compression_turns(12, 600);
+    let lastUser = {"role": "user", "content": "最后一问"};
+    messages.append(lastUser);
+
+    let result = nexora_compress(messages, 4000, 200);
+    assertCompression(str(result["status"]) == "folded", "历史过多时应折叠成摘要");
+    assertCompression(int(result["droppedMessages"]) > 0, "应报出被折掉的消息数");
+    assertCompression(str(result["summary"]) != "", "应产出摘要文本");
+    assertCompression(int(result["estimate"]) < int(result["budget"]), "折叠后应装进预算");
+
+    let rebuilt = result["messages"];
+    assertCompression(str(rebuilt[0]["role"]) == "system", "system 前缀应保留在最前");
+    assertCompression(str(rebuilt[1]["role"]) == "user", "摘要应作为一条 user 消息插入");
+    assertCompression(str(rebuilt[1]["content"]).index("压缩摘要") >= 0, "摘要消息应带说明");
+    assertCompression(str(rebuilt[rebuilt.length() - 1]["content"]) == "最后一问",
+        "当前轮必须原样保留");
+    assertCompression(rebuilt.length() < messages.length(), "折叠后消息数应减少");
+}
+
+func testCompressionUsesSummarizeSeam() {
+    let messages = __compression_turns(12, 600);
+    messages.append({"role": "user", "content": "最后一问"});
+
+    let summarizer = new FakeSummarizer();
+    let result = nexora_compress(messages, 4000, 200, nil, summarizer.summarize);
+    assertCompression(str(result["status"]) == "folded", "接了摘要缝也应折叠");
+    assertCompression(str(result["summary"]) == "自定义摘要(24 条)",
+        "应使用宿主提供的摘要文本");
+    assertCompression(str(result["messages"][1]["content"]).index("自定义摘要(24 条)") >= 0,
+        "摘要消息应包含宿主摘要");
+}
+
+func testCompressionOverflow() {
+    // 当前轮自己就超窗，没有可折叠的历史。
+    let messages: Array = [{"role": "user", "content": __compression_repeat("y", 5000)}];
+    let result = nexora_compress(messages, 1000, 100);
+    assertCompression(str(result["status"]) == "overflow", "单条超长 user 消息应判定溢出");
+    assertCompression(result["messages"] == nil, "溢出时不该回传消息表");
+}
+
+func testCompressionKeepsUtf8Whole() {
+    // 逐字节砍半会劈开汉字，头尾都必须落在字符边界上。
+    let huge = __compression_repeat("中", 5000);
+    let messages: Array = [
+        {"role": "user", "content": "读文件"},
+        {"role": "tool", "tool_call_id": "call_a", "content": huge},
+        {"role": "user", "content": "继续"}
+    ];
+
+    let result = nexora_compress(messages, 4000, 200);
+    assertCompression(str(result["status"]) == "trimmed", "应走裁剪分支");
+    let trimmed = str(result["messages"][1]["content"]);
+    let markerAt = trimmed.index("\n\n[");
+    assertCompression(markerAt > 0, "应留下省略说明");
+    assertCompression(bytes(trimmed.slice(0, markerAt)).length() % 3 == 0,
+        "保留的头部字节数应是 3 的倍数（不劈开汉字）");
+    assertCompression(trimmed.index("中") == 0, "头部应仍是完整汉字");
+
+    assertCompression(str(nexora_truncate_utf8("中文字", 4)) == "中",
+        "截断点应回退到字符边界");
+    assertCompression(bytes(nexora_truncate_utf8("中文字", 7)).length() == 6,
+        "第二个截断点应回退到两个字");
+}
+
+func testCompression() {
+    testCompressionBudget();
+    testCompressionDirect();
+    testCompressionTrimsToolResults();
+    testCompressionFoldsHistory();
+    testCompressionUsesSummarizeSeam();
+    testCompressionOverflow();
+    testCompressionKeepsUtf8Whole();
+}

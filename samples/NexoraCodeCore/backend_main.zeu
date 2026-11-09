@@ -1,0 +1,58 @@
+import zeus.exception;
+import zeus.http;
+
+import samples.NexoraCodeCore.backend_api;
+import samples.NexoraCodeCore.agent_settings;
+import samples.NexoraCodeCore.conversation_store;
+import samples.NexoraCodeCore.journal;
+import samples.NexoraCodeCore.provider_config;
+import samples.NexoraCodeCore.stream_runtime;
+
+// Runtime paths are relative to the process working directory. Keep provider
+// credentials in the existing local data file; the HTTP API never returns them.
+var const NEXORA_BACKEND_HOST = "127.0.0.1";
+var const NEXORA_BACKEND_PORT = 8765;
+var const NEXORA_BACKEND_DATA_ROOT = "./data/nexoracode_core";
+var const NEXORA_BACKEND_PROVIDERS = "./data/providers.json";
+var const NEXORA_BACKEND_CONFIG = "./data/config.json";
+var const NEXORA_BACKEND_WORK_ROOT = ".";
+
+func main() -> int {
+    let server = nil;
+    let startupStage = "provider configuration";
+    try {
+        let providers = nexora_load_providers(NEXORA_BACKEND_PROVIDERS);
+        startupStage = "agent settings";
+        let agentSettings = nexora_load_agent_settings(NEXORA_BACKEND_CONFIG);
+
+        startupStage = "conversation store";
+        let conversations = new NexoraCoreConversationStore(
+            NEXORA_BACKEND_DATA_ROOT + "/conversations");
+        startupStage = "task journal";
+        let journal = new NexoraCoreTaskJournal(NEXORA_BACKEND_DATA_ROOT + "/tasks");
+        startupStage = "stream runtime and API";
+        let runtime = new NexoraCoreStreamRuntime(journal);
+        let api = new NexoraCoreBackendApi(conversations, runtime, providers,
+            NEXORA_BACKEND_WORK_ROOT, agentSettings, NEXORA_BACKEND_CONFIG,
+            NEXORA_BACKEND_PROVIDERS, nil,
+            NEXORA_BACKEND_DATA_ROOT + "/tool_permission_events.jsonl");
+
+        startupStage = "HTTP server registration";
+        server = new HTTPServer(NEXORA_BACKEND_HOST, NEXORA_BACKEND_PORT);
+        api.register(server);
+
+        startupStage = "HTTP listener";
+        print("NEXORA_CORE_BACKEND_LISTENING http://" + NEXORA_BACKEND_HOST +
+            ":" + str(NEXORA_BACKEND_PORT));
+        let serverThread = server.startAsync(4);
+        serverThread.join();
+    } catch (&error) {
+        if (server != nil) server.close();
+        print("NEXORA_CORE_BACKEND_ERROR stage=" + startupStage + " " + str(error));
+        return 1;
+    }
+    if (server != nil) server.close();
+    return 0;
+}
+
+main();

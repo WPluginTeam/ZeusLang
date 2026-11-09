@@ -1,0 +1,84 @@
+import zeus.byte;
+import zeus.dict;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.json;
+import zeus.path;
+
+import samples.NexoraCodeCore.agent_settings;
+
+func __nexora_agent_settings_assert(value: bool, message: string) {
+    if (!value) throw new Exception("agent settings test: " + message);
+}
+
+func __nexora_agent_settings_write(path: string, text: string) {
+    let handle = file.open(path, "w");
+    handle.write(text);
+    handle.close();
+}
+
+func testNexoraAgentSettings(rootValue: string) {
+    let root = Path.join(rootValue, "agent-settings-test");
+    file.mkdirs(root);
+
+    let defaults = nexora_load_agent_settings(Path.join(root, "missing.json"));
+    __nexora_agent_settings_assert(
+        dict_get(defaults, "local_custom_system_prompt", "missing") == "" and
+        dict_get(defaults, "local_read_agents_md", false) == true and
+        dict_get(defaults, "local_username", "") == "local" and
+        dict_get(defaults, "local_tool_auto_expand", false) == true and
+        dict_get(defaults, "local_telemetry_enabled", false) == true and
+        dict_get(defaults, "local_theme", "") == "system" and
+        dict_get(defaults, "local_auto_retry_count", 0) == 5 and
+        dict_get(defaults, "local_empty_response_retry_count", 0) == 2,
+        "missing config must use the NexoraCode local settings defaults");
+
+    let configPath = Path.join(root, "config.json");
+    __nexora_agent_settings_write(configPath, JSON.stringify({
+        "local_custom_system_prompt": "  Keep this custom instruction.  ",
+        "local_read_agents_md": false,
+        "api_key": "synthetic-provider-secret"
+    }));
+    let configured = nexora_load_agent_settings(configPath);
+    __nexora_agent_settings_assert(
+        dict_get(configured, "local_custom_system_prompt", "") ==
+            "  Keep this custom instruction.  ",
+        "settings reads must preserve the stored prompt text");
+    __nexora_agent_settings_assert(
+        nexora_agent_settings_injection_prompt(configured) ==
+            "Keep this custom instruction.",
+        "prompt injection must trim surrounding whitespace");
+    __nexora_agent_settings_assert(
+        dict_get(configured, "local_read_agents_md", true) == false,
+        "the AGENTS.md toggle must be loaded");
+    __nexora_agent_settings_assert(
+        dict_get(configured, "local_theme", "") == "system" and
+        nexora_agent_settings_normalize_retry_count(" 4 ") == 4,
+        "theme and retry settings must normalize consistently");
+    __nexora_agent_settings_assert(
+        JSON.stringify(configured).index("synthetic-provider-secret") < 0,
+        "agent settings must not copy provider configuration fields");
+
+    let longPrompt = "";
+    for (0..8001) [const &index] {
+        longPrompt = longPrompt + "界";
+    }
+    let limited = nexora_update_agent_settings(configPath,
+        {"local_custom_system_prompt": longPrompt});
+    __nexora_agent_settings_assert(
+        bytes(dict_get(limited, "local_custom_system_prompt", "")).length() ==
+            8000 * 3,
+        "custom prompt must use the Python 8000-codepoint limit");
+
+    __nexora_agent_settings_write(configPath, "{");
+    let invalidJsonFailed = false;
+    try {
+        nexora_load_agent_settings(configPath);
+    } catch (&error) {
+        invalidJsonFailed = true;
+    }
+    __nexora_agent_settings_assert(invalidJsonFailed,
+        "malformed config JSON must surface instead of being treated as defaults");
+
+    print("NEXORA_AGENT_SETTINGS_TESTS_PASS");
+}

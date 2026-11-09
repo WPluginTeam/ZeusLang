@@ -1,0 +1,17 @@
+// The 'static' modifier may precede the 'func' keyword. The parser must
+// still classify such a statement as a function declaration, otherwise the
+// method is silently dropped and the class has no such member.
+class Maker {
+    using &this;
+    static func build() -> int { return 7; }
+    func static make() -> int { return 9; }
+}
+
+static func topLevel() -> int { return 11; }
+
+func main() {
+    print(Maker.build());
+    print(Maker.make());
+    print(topLevel());
+}
+main();

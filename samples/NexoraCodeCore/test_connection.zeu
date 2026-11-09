@@ -1,0 +1,106 @@
+import zeus.exception;
+import zeus.ssl;
+import zeus.thread;
+import samples.NexoraCodeCore.connection;
+import samples.NexoraCodeCore.rpc;
+import samples.NexoraCodeCore.task_events;
+import samples.NexoraCodeCore.task_stream;
+
+func assertWire(condition, message: string) {
+    if (!condition) throw new Exception("Nexora connection wire test failed: " + message);
+}
+
+// 宿主本地接口的替身：只证明请求被转到了这里，并把 path 原样带回去。
+class SampleLocalApi {
+    using &this;
+
+    let calls = 0;
+    let lastPath = "";
+
+    func operator[@=]() -> &SampleLocalApi {
+        return this;
+    }
+
+    func dispatch(method, path, query, body) {
+        this.calls = this.calls + 1;
+        this.lastPath = path;
+        let answer = {"status": 200, "body": {"path": path, "method": method}};
+        return answer;
+    }
+}
+
+// 宿主任务流的替身：一条已完成的流、两段内容。
+class SampleTaskStream {
+    using &this;
+
+    let streamId = "22222222222222222222222222222222";
+
+    func operator[@=]() -> &SampleTaskStream {
+        return this;
+    }
+
+    func getMeta(requested) {
+        if (requested != this.streamId) return nil;
+        let meta = {"stream_id": this.streamId, "status": "finished", "title": "样例任务"};
+        return meta;
+    }
+
+    func iterChunks(requested, fromSeq) {
+        if (requested != this.streamId) return [];
+        let chunks = [
+            {"seq": 1, "event": {"type": "text", "text": "第一段"}},
+            {"seq": 2, "event": {"type": "text", "text": "第二段"}}
+        ];
+        return chunks;
+    }
+}
+
+let lock = new Lock();
+let buffer = nexora_core_task_event_buffer(lock);
+let handlers = new NexoraCoreHandlers();
+let api = new SampleLocalApi();
+let rpcHandler = new NexoraCoreRpcHandler(api);
+handlers.onRpc = rpcHandler.handle;
+
+let taskStream = new SampleTaskStream();
+let streamHandler = new NexoraCoreTaskStreamHandler(taskStream);
+handlers.onTaskSubscribe = streamHandler.handleSubscribe;
+handlers.onTaskUnsubscribe = streamHandler.handleUnsubscribe;
+
+let pending = {
+    "type": "task_started",
+    "stream_id": "stream-wire",
+    "conversation_id": "conv_0123456789",
+    "status": "running"
+};
+nexora_core_task_event_enqueue(buffer, pending);
+
+let client = new NexoraCoreClient(
+    "https://127.0.0.1:__PORT__",
+    "sample-device",
+    "sample-token",
+    createInsecureContext(),
+    buffer,
+    handlers
+);
+client.heartbeatMillis = 100;
+client.receiveMillis = 50;
+client.backoffStartMillis = 50;
+client.backoffMillis = 50;
+client.backoffCapMillis = 100;
+
+client.start();
+thread_sleep(900);
+client.requestStop();
+client.join();
+
+print("NEXORA_WIRE_ATTEMPTS", client.getAttempts());
+print("NEXORA_WIRE_RPC_CALLS", api.calls);
+print("NEXORA_WIRE_RPC_PATH", api.lastPath);
+print("NEXORA_WIRE_SUBSCRIPTIONS", streamHandler.count());
+assertWire(client.getAttempts() == 1, "a healthy connection is not re-established");
+assertWire(!client.isOnline(), "the client is offline after stop");
+assertWire(api.calls == 1, "the rpc frame reached the local api");
+assertWire(api.lastPath == "/api/chat/queue", "the local api saw the whitelisted path");
+assertWire(streamHandler.count() == 1, "the task_subscribe frame registered a relay");
+print("NEXORA_CONNECTION_WIRE_TEST_PASS");

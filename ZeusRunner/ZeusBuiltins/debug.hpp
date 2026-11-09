@@ -7,7 +7,8 @@
 #include "gc.hpp"
 #include "../ZeusThread.hpp"
 #include "../../ZeusRuntimeLib/ZeusCell.hpp"
-#include "../../ZeusRuntimeLib/ZeusSocketABI.hpp"
+// The socket library is loaded at run time, so nothing here includes its ABI.
+// The Socket health dump below works off the class name and its fields.
 
 #ifdef _WIN32
     #ifndef NOMINMAX
@@ -44,7 +45,11 @@ namespace ZeusBuiltins {
         return ZeusType::UniversalVariant(std::string("No VM dump callback"));
     }
 
-    // __vm_stats: 输出 VM 关键结构统计信息（对象、闭包、socket、原型、全局名、内存等）
+    // __vm_stats: 输出 VM 关键结构统计信息（对象、闭包、原型、全局名、内存等）
+    //
+    // Socket counts are deliberately absent: the socket library is loaded at
+    // run time rather than linked in, so the runtime has no counters to read.
+    // zeus.socket reports its own open and connected totals.
     inline ZeusType::UniversalVariant builtin_vm_stats(const std::vector<ZeusType::UniversalVariant>& args) {
         // memory
 #ifdef _WIN32
@@ -61,16 +66,12 @@ namespace ZeusBuiltins {
         size_t freeObjects = g_vmFreeObjectSlotsSize ? *g_vmFreeObjectSlotsSize : 0;
         size_t closures = g_vmClosuresSize ? *g_vmClosuresSize : 0;
         size_t freeClosures = g_vmGetFreeClosureSlotsSize ? g_vmGetFreeClosureSlotsSize() : 0;
-        const size_t sockets = static_cast<size_t>(zeus_socket_open_count());
-        const size_t connectedSockets =
-            static_cast<size_t>(zeus_socket_connected_count());
         size_t prototypesCount = g_vmPrototypesSize ? *g_vmPrototypesSize : 0;
         size_t globalNames = g_vmGlobalNames ? g_vmGlobalNames->size() : 0;
 
         std::ostringstream oss;
         oss << "VM STATS: Memory=" << memoryMB << "MB, Objects=" << objects << ", FreeObjSlots=" << freeObjects
             << ", ClosuresCreated=" << closures << ", FreeClosSlots=" << freeClosures
-            << ", Sockets(total=" << sockets << ", connected=" << connectedSockets << ")"
             << ", Prototypes=" << prototypesCount << ", GlobalNames=" << globalNames;
 
         std::string info = oss.str();
@@ -197,14 +198,14 @@ namespace ZeusBuiltins {
         }
 
         // Recursively scan a UniversalVariant for ObjectHandle references (including inside Variant(Array/Object) and NamedArg).
-        auto scanForObjectHandles = [&](const ZeusType::UniversalVariant& v, const auto& self, const auto& onObjId) -> void {
+        auto scanForObjectHandles = [&](const ZeusType::UniversalVariant& v, const auto& self, const auto& onObjectHandle) -> void {
             if (std::holds_alternative<ZeusType::ObjectHandle>(v)) {
-                onObjId(std::get<ZeusType::ObjectHandle>(v).id);
+                onObjectHandle(std::get<ZeusType::ObjectHandle>(v));
                 return;
             }
             if (std::holds_alternative<std::shared_ptr<ZeusType::NamedArg>>(v)) {
                 auto ptr = std::get<std::shared_ptr<ZeusType::NamedArg>>(v);
-                if (ptr) self(ptr->value, self, onObjId);
+                if (ptr) self(ptr->value, self, onObjectHandle);
                 return;
             }
             if (!std::holds_alternative<ZeusType::Variant>(v)) return;
@@ -214,10 +215,10 @@ namespace ZeusBuiltins {
                 using T = std::decay_t<decltype(inner)>;
                 if constexpr (std::is_same_v<T, ZeusType::Array>) {
                     if (!inner.impl) return;
-                    for (const auto& it : inner.impl->data) self(it, self, onObjId);
+                    for (const auto& it : inner.impl->data) self(it, self, onObjectHandle);
                 } else if constexpr (std::is_same_v<T, ZeusType::Object>) {
                     if (!inner.impl) return;
-                    for (const auto& kv : inner.impl->data) self(kv.second, self, onObjId);
+                    for (const auto& kv : inner.impl->data) self(kv.second, self, onObjectHandle);
                 } else {
                     // primitives / Bytes / Function / Null: no-op
                 }
@@ -296,25 +297,21 @@ namespace ZeusBuiltins {
             for (const auto& kv : ZeusType::snapshotObjectFields(fromObj, classInfo)) {
                 const auto& v = kv.second;
                 // Direct field edges (ObjectHandle only)
-                if (std::holds_alternative<ZeusType::ObjectHandle>(v)) {
-                    int toId = std::get<ZeusType::ObjectHandle>(v).id;
-                    if (toId >= 0 && toId < (int)g_vmObjects->size()) {
-                        const auto& toObj = (*g_vmObjects)[toId];
-                        if (toObj.classId >= 0 && !toObj.markedForDeletion) {
-                            inboundByField[(size_t)toId]++;
-                            if (clientResClassId >= 0 && fromObj.classId == clientResClassId && kv.first == "thread") {
-                                inboundDetail.fromClientResThreadField++;
-                            }
+                if (const auto* objectHandle = std::get_if<ZeusType::ObjectHandle>(&v)) {
+                    const auto* toObj = ZeusVMUtils::getValidObject(*g_vmObjects, *objectHandle);
+                    if (toObj) {
+                        const int toId = objectHandle->id;
+                        inboundByField[(size_t)toId]++;
+                        if (clientResClassId >= 0 && fromObj.classId == clientResClassId && kv.first == "thread") {
+                            inboundDetail.fromClientResThreadField++;
                         }
                     }
                 }
 
                 // Deep field edges (ObjectHandle nested inside containers)
-                scanForObjectHandles(v, scanForObjectHandles, [&](int toId) {
-                    if (toId < 0 || toId >= (int)g_vmObjects->size()) return;
-                    const auto& toObj = (*g_vmObjects)[toId];
-                    if (toObj.classId < 0 || toObj.markedForDeletion) return;
-                    inboundByFieldDeep[(size_t)toId]++;
+                scanForObjectHandles(v, scanForObjectHandles, [&](const ZeusType::ObjectHandle& objectHandle) {
+                    if (!ZeusVMUtils::getValidObject(*g_vmObjects, objectHandle)) return;
+                    inboundByFieldDeep[(size_t)objectHandle.id]++;
                 });
             }
         }
@@ -325,11 +322,9 @@ namespace ZeusBuiltins {
             for (Cell* c : live) {
                 if (!c) continue;
                 const auto value = c->readValue();
-                scanForObjectHandles(value, scanForObjectHandles, [&](int toId) {
-                    if (toId < 0 || toId >= (int)g_vmObjects->size()) return;
-                    const auto& toObj = (*g_vmObjects)[toId];
-                    if (toObj.classId < 0 || toObj.markedForDeletion) return;
-                    inboundByCellDeep[(size_t)toId]++;
+                scanForObjectHandles(value, scanForObjectHandles, [&](const ZeusType::ObjectHandle& objectHandle) {
+                    if (!ZeusVMUtils::getValidObject(*g_vmObjects, objectHandle)) return;
+                    inboundByCellDeep[(size_t)objectHandle.id]++;
                 });
             }
         }

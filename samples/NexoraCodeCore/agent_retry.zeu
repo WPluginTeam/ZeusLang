@@ -1,0 +1,54 @@
+import zeus.thread;
+
+func nexora_agent_retry_copy_messages(messages: Array) -> Array {
+    let copy: Array = [];
+    for (messages) [message] {
+        copy.append(message);
+    }
+    return copy;
+}
+
+func nexora_agent_retry_continuation_messages(messages: Array,
+        partialContent: string) -> Array {
+    let retryMessages = nexora_agent_retry_copy_messages(messages);
+    if (partialContent == "") return retryMessages;
+
+    retryMessages.append({"role": "assistant", "content": partialContent});
+    retryMessages.append({"role": "user", "content":
+        "上一条 assistant 回复在生成中断前未完成。请从中断处继续，不要重复已经输出的内容；只补上尚未完成的部分。必要时可以继续调用工具。"});
+    return retryMessages;
+}
+
+func nexora_agent_retry_empty_messages(messages: Array, hasToolResults: bool) -> Array {
+    let retryMessages = nexora_agent_retry_copy_messages(messages);
+    let instruction = "上一轮没有生成可见正文。请直接回答用户请求，给出完整内容，不要只输出思考过程。";
+    if (hasToolResults) {
+        instruction = "工具结果已经返回，但上一轮没有生成可见正文。请直接使用工具结果回答用户请求；只有确实需要时才继续调用工具，不要重复工具输出。";
+    }
+    retryMessages.append({"role": "system", "content": instruction});
+    return retryMessages;
+}
+
+func nexora_agent_retry_delay_millis(attempt: int) -> int {
+    if (attempt <= 1) return 250;
+    if (attempt == 2) return 500;
+    return 1000;
+}
+
+func nexora_agent_retry_wait(delayMillis: int, shouldCancel) -> bool {
+    let waited = 0;
+    for (waited < delayMillis) {
+        if (__nexora_agent_retry_cancelled(shouldCancel)) return false;
+        let slice = delayMillis - waited;
+        if (slice > 50) slice = 50;
+        thread_sleep(slice);
+        waited = waited + slice;
+    }
+    return !__nexora_agent_retry_cancelled(shouldCancel);
+}
+
+func __nexora_agent_retry_cancelled(shouldCancel) -> bool {
+    if (shouldCancel == nil) return false;
+    let value = shouldCancel();
+    return value != nil and value != false;
+}

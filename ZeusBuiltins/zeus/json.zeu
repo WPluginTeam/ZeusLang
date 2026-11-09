@@ -1,21 +1,624 @@
+// JSON parsing and serialization implemented in Zeus. Strings are scanned as
+// UTF-8 bytes so the JSON grammar stays independent of the host locale.
+using original;
+import zeus.exception;
+import zeus.list;
+import zeus.string;
 
-// JSON class 
+@native("zeus_bytes_get")
+decl func __bytes_get(data: bytes, index: int) -> int;
 
+@native("zeus_bytes_len")
+decl func __bytes_len(data: bytes) -> int;
+
+@native("zeus_bytes_decode")
+decl func __bytes_decode(data: bytes, encoding: string) -> string;
+
+func __json_is_digit(value: int) -> bool {
+    return value >= 48 and value <= 57;
+}
+
+func __json_is_hex_digit(value: int) -> int {
+    if (value >= 48 and value <= 57) return value - 48;
+    if (value >= 65 and value <= 70) return value - 55;
+    if (value >= 97 and value <= 102) return value - 87;
+    return -1;
+}
+
+func __json_is_continuation(value: int) -> bool {
+    return value >= 128 and value <= 191;
+}
+
+// Return the byte width for a valid UTF-8 scalar beginning at index, or zero.
+func __json_utf8_sequence_length(data: bytes, index: int, total: int) -> int {
+    if (index < 0 or index >= total) return 0;
+    let first: int = __bytes_get(data, index);
+    if (first < 128) return 1;
+
+    if (first >= 194 and first <= 223) {
+        if (index + 1 >= total) return 0;
+        if (!__json_is_continuation(__bytes_get(data, index + 1))) return 0;
+        return 2;
+    }
+
+    if (first >= 224 and first <= 239) {
+        if (index + 2 >= total) return 0;
+        let second: int = __bytes_get(data, index + 1);
+        let third: int = __bytes_get(data, index + 2);
+        if (!__json_is_continuation(third)) return 0;
+        if (first == 224) {
+            if (second < 160 or second > 191) return 0;
+        } else if (first == 237) {
+            if (second < 128 or second > 159) return 0;
+        } else if (!__json_is_continuation(second)) {
+            return 0;
+        }
+        return 3;
+    }
+
+    if (first >= 240 and first <= 244) {
+        if (index + 3 >= total) return 0;
+        let second: int = __bytes_get(data, index + 1);
+        if (!__json_is_continuation(__bytes_get(data, index + 2)) or
+            !__json_is_continuation(__bytes_get(data, index + 3))) return 0;
+        if (first == 240) {
+            if (second < 144 or second > 191) return 0;
+        } else if (first == 244) {
+            if (second < 128 or second > 143) return 0;
+        } else if (!__json_is_continuation(second)) {
+            return 0;
+        }
+        return 4;
+    }
+    return 0;
+}
+
+func __json_codepoint_string(codepoint: int) -> string {
+    if (codepoint < 0 or codepoint > 1114111 or
+        (codepoint >= 55296 and codepoint <= 57343)) {
+        throw new Exception("Invalid Unicode code point in JSON string");
+    }
+
+    let encoded: bytes = bytes();
+    if (codepoint <= 127) {
+        encoded = bytes([codepoint]);
+    } else if (codepoint <= 2047) {
+        encoded = bytes([
+            192 + int(codepoint / 64),
+            128 + codepoint % 64
+        ]);
+    } else if (codepoint <= 65535) {
+        encoded = bytes([
+            224 + int(codepoint / 4096),
+            128 + int(codepoint / 64) % 64,
+            128 + codepoint % 64
+        ]);
+    } else {
+        encoded = bytes([
+            240 + int(codepoint / 262144),
+            128 + int(codepoint / 4096) % 64,
+            128 + int(codepoint / 64) % 64,
+            128 + codepoint % 64
+        ]);
+    }
+    return __bytes_decode(encoded, "utf-8");
+}
+
+class JSONParser {
+    using &this;
+
+    let source: string = "";
+    let sourceBytes: bytes = bytes();
+    let index: int = 0;
+    let byteLength: int = 0;
+
+    func init(text: string) {
+        this.source = text;
+        this.sourceBytes = bytes(text);
+        this.index = 0;
+        this.byteLength = __bytes_len(this.sourceBytes);
+    }
+
+    func fail(message: string) {
+        throw new Exception(
+            "JSON parse error at byte " + __builtin_str(this.index) + ": " + message);
+    }
+
+    // The scanner reads the cursor once per input byte. A field read costs a
+    // map lookup, a copy of the value and a liveness check, so the hot loops
+    // keep the cursor in a local and write it back when they return.
+    func skipWhitespace() {
+        let index: int = this.index;
+        for (index < this.byteLength) {
+            let current: int = __bytes_get(this.sourceBytes, index);
+            if (current != 32 and current != 9 and current != 10 and current != 13) {
+                break;
+            }
+            index = index + 1;
+        }
+        this.index = index;
+    }
+
+    func readHex4() -> int {
+        if (this.index + 4 > this.byteLength) {
+            this.fail("incomplete Unicode escape");
+        }
+        let value: int = 0;
+        for (0..4) [const &i] {
+            let digit: int = __json_is_hex_digit(__bytes_get(this.sourceBytes, this.index));
+            if (digit < 0) this.fail("invalid hexadecimal digit in Unicode escape");
+            value = value * 16 + digit;
+            this.index = this.index + 1;
+        }
+        return value;
+    }
+
+    func parseString() -> string {
+        let index: int = this.index;
+        let source: string = this.source;
+        if (index >= this.byteLength or __bytes_get(this.sourceBytes, index) != 34) {
+            this.index = index;
+            this.fail("expected a string");
+        }
+        index = index + 1;
+
+        let result: string = "";
+        let segmentStart: int = index;
+        let hasEscapes: bool = false;
+        for (true) {
+            if (index >= this.byteLength) {
+                this.index = index;
+                this.fail("unterminated string");
+            }
+            let current: int = __bytes_get(this.sourceBytes, index);
+            if (current == 34) {
+                let tail: string = __str_slice(source, segmentStart, index);
+                index = index + 1;
+                this.index = index;
+                if (!hasEscapes) return tail;
+                return result + tail;
+            }
+            if (current < 32) {
+                this.index = index;
+                this.fail("unescaped control character in string");
+            }
+
+            if (current == 92) {
+                hasEscapes = true;
+                result = result + __str_slice(source, segmentStart, index);
+                index = index + 1;
+                if (index >= this.byteLength) {
+                    this.index = index;
+                    this.fail("incomplete escape sequence");
+                }
+
+                let escape: int = __bytes_get(this.sourceBytes, index);
+                index = index + 1;
+                when (escape) {
+                    34: result = result + "\"";
+                    92: result = result + "\\";
+                    47: result = result + "/";
+                    98: result = result + __json_codepoint_string(8);
+                    102: result = result + __json_codepoint_string(12);
+                    110: result = result + __json_codepoint_string(10);
+                    114: result = result + __json_codepoint_string(13);
+                    116: result = result + __json_codepoint_string(9);
+                    117: {
+                        // A Unicode escape is rare, so that path keeps using the
+                        // field cursor and the caller picks the cursor back up.
+                        this.index = index;
+                        let codepoint: int = this.readHex4();
+                        index = this.index;
+                        if (codepoint >= 55296 and codepoint <= 56319) {
+                            if (index + 6 > this.byteLength or
+                                __bytes_get(this.sourceBytes, index) != 92 or
+                                __bytes_get(this.sourceBytes, index + 1) != 117) {
+                                this.index = index;
+                                this.fail("high surrogate must be followed by a low surrogate");
+                            }
+                            index = index + 2;
+                            this.index = index;
+                            let lowSurrogate: int = this.readHex4();
+                            index = this.index;
+                            if (lowSurrogate < 56320 or lowSurrogate > 57343) {
+                                this.index = index;
+                                this.fail("invalid low surrogate");
+                            }
+                            codepoint = 65536 + (codepoint - 55296) * 1024 +
+                                (lowSurrogate - 56320);
+                        } else if (codepoint >= 56320 and codepoint <= 57343) {
+                            this.index = index;
+                            this.fail("unexpected low surrogate");
+                        }
+                        result = result + __json_codepoint_string(codepoint);
+                    }
+                    else: {
+                        this.index = index;
+                        this.fail("invalid escape sequence");
+                    }
+                }
+                segmentStart = index;
+            } else if (current >= 128) {
+                let width: int = __json_utf8_sequence_length(
+                    this.sourceBytes, index, this.byteLength);
+                if (width == 0) {
+                    this.index = index;
+                    this.fail("invalid UTF-8 in string");
+                }
+                index = index + width;
+            } else {
+                index = index + 1;
+            }
+        }
+        return "";
+    }
+
+    func expandExponent(token: string) -> string {
+        let tokenBytes: bytes = bytes(token);
+        let tokenLength: int = __bytes_len(tokenBytes);
+        let exponentMarker: int = -1;
+        let decimalPoint: int = -1;
+        for (0..tokenLength) [const &i] {
+            let current: int = __bytes_get(tokenBytes, i);
+            if (current == 69 or current == 101) {
+                exponentMarker = i;
+                break;
+            }
+            if (current == 46) decimalPoint = i;
+        }
+        if (exponentMarker < 0) return token;
+
+        let negative: bool = __bytes_get(tokenBytes, 0) == 45;
+        let mantissaStart: int = 0;
+        if (negative) mantissaStart = 1;
+
+        // The mantissa is taken in one slice. Collecting it digit by digit
+        // copied the accumulator once per digit.
+        let mantissa: string = __str_slice(token, mantissaStart, exponentMarker);
+        let digits: string = mantissa;
+        let integerDigits: int = exponentMarker - mantissaStart;
+        if (decimalPoint >= 0) {
+            digits = __str_replace(mantissa, ".", "");
+            integerDigits = decimalPoint - mantissaStart;
+        }
+
+        let exponentIndex: int = exponentMarker + 1;
+        let exponentNegative: bool = false;
+        if (__bytes_get(tokenBytes, exponentIndex) == 45) {
+            exponentNegative = true;
+            exponentIndex = exponentIndex + 1;
+        } else if (__bytes_get(tokenBytes, exponentIndex) == 43) {
+            exponentIndex = exponentIndex + 1;
+        }
+        let exponent: int = 0;
+        for (exponentIndex..tokenLength) [const &i] {
+            let digit: int = __bytes_get(tokenBytes, i) - 48;
+            if (exponent > 10000) this.fail("number exponent magnitude exceeds 100000");
+            exponent = exponent * 10 + digit;
+            if (exponent > 100000) this.fail("number exponent magnitude exceeds 100000");
+        }
+        if (exponentNegative) exponent = 0 - exponent;
+
+        let decimalPosition: int = integerDigits + exponent;
+        let result: string = "";
+        if (negative) result = "-";
+        if (decimalPosition <= 0) {
+            result = result + "0.";
+            for (0..(0 - decimalPosition)) [const &i] {
+                result = result + "0";
+            }
+            return result + digits;
+        }
+        if (decimalPosition >= digits.length()) {
+            result = result + digits;
+            for (0..(decimalPosition - digits.length())) [const &i] {
+                result = result + "0";
+            }
+            return result;
+        }
+        return result + __str_slice(digits, 0, decimalPosition) + "." +
+            __str_slice(digits, decimalPosition, digits.length());
+    }
+
+    func parseNumber() {
+        let index: int = this.index;
+        let source: string = this.source;
+        let start: int = index;
+        let hasFraction: bool = false;
+        let hasExponent: bool = false;
+
+        if (__bytes_get(this.sourceBytes, index) == 45) {
+            index = index + 1;
+            if (index >= this.byteLength) {
+                this.index = index;
+                this.fail("incomplete number");
+            }
+        }
+
+        let current: int = __bytes_get(this.sourceBytes, index);
+        if (current == 48) {
+            index = index + 1;
+            if (index < this.byteLength and
+                __json_is_digit(__bytes_get(this.sourceBytes, index))) {
+                this.index = index;
+                this.fail("leading zero in number");
+            }
+        } else if (current >= 49 and current <= 57) {
+            for (index < this.byteLength and
+                __json_is_digit(__bytes_get(this.sourceBytes, index))) {
+                index = index + 1;
+            }
+        } else {
+            this.index = index;
+            this.fail("expected a digit");
+        }
+
+        if (index < this.byteLength and __bytes_get(this.sourceBytes, index) == 46) {
+            hasFraction = true;
+            index = index + 1;
+            if (index >= this.byteLength or
+                !__json_is_digit(__bytes_get(this.sourceBytes, index))) {
+                this.index = index;
+                this.fail("fraction requires at least one digit");
+            }
+            for (index < this.byteLength and
+                __json_is_digit(__bytes_get(this.sourceBytes, index))) {
+                index = index + 1;
+            }
+        }
+
+        if (index < this.byteLength) {
+            current = __bytes_get(this.sourceBytes, index);
+            if (current == 69 or current == 101) {
+                hasExponent = true;
+                index = index + 1;
+                if (index < this.byteLength and
+                    (__bytes_get(this.sourceBytes, index) == 43 or
+                     __bytes_get(this.sourceBytes, index) == 45)) {
+                    index = index + 1;
+                }
+                if (index >= this.byteLength or
+                    !__json_is_digit(__bytes_get(this.sourceBytes, index))) {
+                    this.index = index;
+                    this.fail("exponent requires at least one digit");
+                }
+                for (index < this.byteLength and
+                    __json_is_digit(__bytes_get(this.sourceBytes, index))) {
+                    index = index + 1;
+                }
+            }
+        }
+
+        this.index = index;
+        let token: string = __str_slice(source, start, index);
+        if (hasExponent) return float(this.expandExponent(token));
+        if (hasFraction) return float(token);
+        return int(token);
+    }
+
+    func parseArray(depth: int) {
+        this.index = this.index + 1;
+        this.skipWhitespace();
+        let result: list = [];
+        if (this.index < this.byteLength and
+            __bytes_get(this.sourceBytes, this.index) == 93) {
+            this.index = this.index + 1;
+            return result;
+        }
+
+        for (true) {
+            result.append(this.parseValue(depth + 1));
+            this.skipWhitespace();
+            if (this.index >= this.byteLength) this.fail("unterminated array");
+            let current: int = __bytes_get(this.sourceBytes, this.index);
+            if (current == 93) {
+                this.index = this.index + 1;
+                return result;
+            }
+            if (current != 44) this.fail("expected ',' or ']' in array");
+            this.index = this.index + 1;
+            this.skipWhitespace();
+        }
+    }
+
+    func parseObject(depth: int) {
+        this.index = this.index + 1;
+        this.skipWhitespace();
+        let result: dict = {};
+        if (this.index < this.byteLength and
+            __bytes_get(this.sourceBytes, this.index) == 125) {
+            this.index = this.index + 1;
+            return result;
+        }
+
+        for (true) {
+            if (this.index >= this.byteLength or
+                __bytes_get(this.sourceBytes, this.index) != 34) {
+                this.fail("object keys must be strings");
+            }
+            let key: string = this.parseString();
+            this.skipWhitespace();
+            if (this.index >= this.byteLength or
+                __bytes_get(this.sourceBytes, this.index) != 58) {
+                this.fail("expected ':' after object key");
+            }
+            this.index = this.index + 1;
+            this.skipWhitespace();
+            result[key] = this.parseValue(depth + 1);
+            this.skipWhitespace();
+            if (this.index >= this.byteLength) this.fail("unterminated object");
+            let current: int = __bytes_get(this.sourceBytes, this.index);
+            if (current == 125) {
+                this.index = this.index + 1;
+                return result;
+            }
+            if (current != 44) this.fail("expected ',' or '}' in object");
+            this.index = this.index + 1;
+            this.skipWhitespace();
+        }
+    }
+
+    func parseLiteral(word: string, value) {
+        let wordLength: int = word.length();
+        if (this.index + wordLength > this.byteLength or
+            __str_slice(this.source, this.index, this.index + wordLength) != word) {
+            this.fail("invalid literal");
+        }
+        this.index = this.index + wordLength;
+        return value;
+    }
+
+    func parseValue(depth: int) {
+        if (depth > 256) this.fail("maximum nesting depth exceeded");
+        this.skipWhitespace();
+        if (this.index >= this.byteLength) this.fail("expected a value");
+
+        let current: int = __bytes_get(this.sourceBytes, this.index);
+        when (current) {
+            34: return this.parseString();
+            123: return this.parseObject(depth);
+            91: return this.parseArray(depth);
+            116: return this.parseLiteral("true", true);
+            102: return this.parseLiteral("false", false);
+            110: return this.parseLiteral("null", nil);
+            45, 48..57: return this.parseNumber();
+            else: this.fail("unexpected character while reading value");
+        }
+    }
+
+    func parse() {
+        this.skipWhitespace();
+        let value = this.parseValue(0);
+        this.skipWhitespace();
+        if (this.index != this.byteLength) this.fail("trailing content after value");
+        return value;
+    }
+}
+
+func __json_hex_character(value: int) -> string {
+    return __str_slice("0123456789abcdef", value, value + 1);
+}
+
+func __json_write_string(parts: Array, value: string) {
+    let data: bytes = bytes(value);
+    let length: int = __bytes_len(data);
+    let segmentStart: int = 0;
+    let index: int = 0;
+    parts.append("\"");
+    for (index < length) {
+        let current: int = __bytes_get(data, index);
+        if (current == 34 or current == 92 or current < 32) {
+            if (index > segmentStart) {
+                parts.append(__str_slice(value, segmentStart, index));
+            }
+            if (current == 34) {
+                parts.append("\\\"");
+            } else if (current == 92) {
+                parts.append("\\\\");
+            } else if (current == 8) {
+                parts.append("\\b");
+            } else if (current == 9) {
+                parts.append("\\t");
+            } else if (current == 10) {
+                parts.append("\\n");
+            } else if (current == 12) {
+                parts.append("\\f");
+            } else if (current == 13) {
+                parts.append("\\r");
+            } else {
+                parts.append("\\u00");
+                parts.append(__json_hex_character(int(current / 16)));
+                parts.append(__json_hex_character(current % 16));
+            }
+            index = index + 1;
+            segmentStart = index;
+        } else if (current >= 128) {
+            let width: int = __json_utf8_sequence_length(data, index, length);
+            if (width == 0) throw new Exception("Cannot stringify invalid UTF-8 text");
+            index = index + width;
+        } else {
+            index = index + 1;
+        }
+    }
+    if (length > segmentStart) {
+        parts.append(__str_slice(value, segmentStart, length));
+    }
+    parts.append("\"");
+}
+
+func __json_write_value(parts: Array, value, depth: int) {
+    if (depth > 256) throw new Exception("JSON value exceeds maximum nesting depth");
+    let actual = value;
+    let valueType: string = type(actual);
+
+    when (valueType) {
+        "nil": parts.append("null");
+        "bool": {
+            if (actual) {
+                parts.append("true");
+            } else {
+                parts.append("false");
+            }
+        }
+        "int", "float": parts.append(__builtin_str(actual));
+        "string": __json_write_string(parts, actual);
+        "Array": {
+            parts.append("[");
+            let count: int = len(actual);
+            for (0..count) [const &index] {
+                if (index > 0) parts.append(",");
+                __json_write_value(parts, actual[index], depth + 1);
+            }
+            parts.append("]");
+        }
+        "dict", "object": {
+            parts.append("{");
+            let first: bool = true;
+            for (actual) [key: item] {
+                if (!first) parts.append(",");
+                first = false;
+                __json_write_string(parts, __builtin_str(key));
+                parts.append(":");
+                __json_write_value(parts, item, depth + 1);
+            }
+            parts.append("}");
+        }
+        else: throw new Exception("Cannot stringify value of type " + valueType);
+    }
+}
+
+func __json_join_fragments(parts: Array, start: int, end: int) -> string {
+    let count: int = end - start;
+    if (count <= 0) return "";
+    if (count == 1) return parts[start];
+    let middle: int = start + int(count / 2);
+    return __json_join_fragments(parts, start, middle) +
+        __json_join_fragments(parts, middle, end);
+}
+
+func __json_stringify(value) -> string {
+    let parts: list = [];
+    __json_write_value(parts, value, 0);
+    return __json_join_fragments(parts, 0, parts.length());
+}
 
 class JSON {
     using &this;
-    
-    let data = {};
 
-    func init (jsonDict) {
-        setattr(this, "data", jsonDict);
+    let data: dict = {};
+
+    func init(jsonDict) {
+        this.data = jsonDict;
     }
 
-    func toString () {
-        let s = "{";
-        let data = getattr(this, "data");
+    func toString() {
+        // The field is read through the receiver rather than getattr: AOT has no
+        // native handle for getattr, so emitting this method broke every
+        // ahead-of-time build that printed a JSON value.
+        let entries: dict = this.data;
+        let s: string = "{";
 
-        for (data) [&key: &value] {
+        for (entries) [&key: &value] {
             s = s + str(key) + ": " + str(value) + ", ";
         }
         s = s + "}";
@@ -23,29 +626,43 @@ class JSON {
     }
 
     func operator[.] (key) {
-        // 使用__objget直接从this.data获取key，零拷贝
-        return __objget(this, "data", key);
+        return this.data[key];
     }
 
     func operator[.=] (key, value) {
-        // 使用__objset直接设置this.data[key]，零拷贝
-        __objset(this, "data", key, value);
+        this.data[key] = value;
         return value;
     }
 
     func operator[[]] (key) {
-        // 使用__objget直接从this.data获取key，零拷贝
-        return __objget(this, "data", key);
+        return this.data[key];
     }
 
     func operator[[]=] (key, value) {
-        // 使用__objset直接设置this.data[key]，零拷贝
-        __objset(this, "data", key, value);
+        this.data[key] = value;
         return value;
     }
 
-    func copy () {
-        let a = (new JSON(this.data));
-        return a;
+    func copy() {
+        return new JSON(this.data);
+    }
+
+    // Return native Zeus values: dictionaries, Arrays, strings, numbers, bools or nil.
+    func static parse(text: string) {
+        let parser: JSONParser = new JSONParser(text);
+        return parser.parse();
+    }
+
+    func static parseValue(text: string) {
+        let parser: JSONParser = new JSONParser(text);
+        return parser.parse();
+    }
+
+    func static stringify(value) -> string {
+        return __json_stringify(value);
+    }
+
+    func static encode(value) -> string {
+        return __json_stringify(value);
     }
 }

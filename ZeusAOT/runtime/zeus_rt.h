@@ -12,6 +12,10 @@ extern "C" {
 // 由生成的 .ll 定义：对应 .zeu 顶层代码。
 int zeus_entry(void);
 
+// Lets a Zeus-authored executable driver return a child process status through
+// the native main() without calling ExitProcess from generated code.
+void zeus_runtime_set_exit_code(ZeusValue* result, int code);
+
 #ifdef __cplusplus
 }
 #endif

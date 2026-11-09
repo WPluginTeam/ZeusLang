@@ -1,0 +1,60 @@
+// Fixed-width native spellings: i8/i16/i32/i64, u8/u16/u32/u64, f32/f64.
+// int32 is a true 32-bit type (reclaimed from the old int alias); int64 stays
+// an int alias. Runs unmodified on the VM and under AOT.
+
+func add32(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+func addU64(a: u64, b: u64) -> u64 {
+    return a + b;
+}
+
+func addF32(a: f32, b: f32) -> f32 {
+    return a + b;
+}
+
+func narrowIt(v: int) -> int32 {
+    return 42;
+}
+
+let x: i32 = 100000;
+let y: i32 = 23;
+if (add32(x, y) != 100023) throw "i32 add";
+if (add32(x, 1) != 100001) throw "i32 literal second";
+if (add32(1, y) != 24) throw "i32 literal first";
+if (add32(-5, 3) != -2) throw "i32 negative";
+
+let big: i64 = 4294967296;
+if (big != 4294967296) throw "i64 wide";
+
+let u: u32 = 4294967295;
+if (u != 4294967295) throw "u32 max";
+let u16max: u16 = 65535;
+if (u16max != 65535) throw "u16 max";
+let u64max: u64 = 18446744073709551615;
+if (u64max != 18446744073709551615) throw "u64 max";
+let u8max: u8 = 255;
+if (u8max != 255) throw "u8 max";
+
+let b8: i8 = -128;
+if (b8 != -128) throw "i8 min";
+let s: i16 = -32768;
+if (s != -32768) throw "i16 min";
+
+let f: f32 = 0.5;
+if (addF32(f, 0.25) != 0.75) throw "f32 add";
+let d: f64 = 0.5;
+if (d + 0.25 != 0.75) throw "f64 add";
+
+if (narrowIt(7) != 42) throw "int32 reclaim";
+
+let e: i32 = -5;
+let w: u32 = 4000000000;
+if (str(e) != "-5") throw "str i32";
+if (str(w) != "4000000000") throw "str u32";
+if (e + 10 != 5) throw "i32 arith";
+if (e == 0) throw "i32 cmp";
+if (w == 0) throw "u32 cmp";
+
+print("FIXED_WIDTH_SPELLINGS_PASS");

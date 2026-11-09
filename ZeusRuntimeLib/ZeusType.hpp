@@ -1016,6 +1016,9 @@ namespace ZeusType {
     
     // 面向对象：类与对象句柄（仅保存 id，便于在 VM 内部查表）
     struct ClassHandle  { int id; };
+    // 与 ABI 的 ZeusObjectHandle 同宽同构：可无损打包进 ZeusValue 的 payload
+    // （tag = ZEUS_VALUE_TAG_OBJECT）。句柄只命名对象表槽位，不代表所有权，
+    // 实例生死仍完全由引用计数决定。
     struct ObjectHandle { 
         int id; 
         int generation = 0;  // generation 用于检测 slot 复用后的悬空引用

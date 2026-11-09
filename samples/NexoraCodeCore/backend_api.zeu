@@ -1,0 +1,806 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.http;
+import zeus.json;
+import zeus.string;
+import zeus.thread;
+import zeus.url;
+import zeus.time [&zeusTime];
+
+import samples.NexoraCodeCore.backend_agent;
+import samples.NexoraCodeCore.agent_settings;
+import samples.NexoraCodeCore.agent_loop;
+import samples.NexoraCodeCore.conversation_store;
+import samples.NexoraCodeCore.permission_settings;
+import samples.NexoraCodeCore.provider_config;
+import samples.NexoraCodeCore.provider_models;
+import samples.NexoraCodeCore.provider_settings;
+import samples.NexoraCodeCore.provider_templates;
+import samples.NexoraCodeCore.system_prompt;
+import samples.NexoraCodeCore.storage;
+import samples.NexoraCodeCore.stream_runtime;
+import samples.NexoraCodeCore.tool_approval_store;
+import samples.NexoraCodeCore.tool_permission_events;
+import samples.NexoraCodeCore.tool_permissions;
+
+let __nexora_backend_settings_lock: RLock = new RLock();
+
+func __nexora_backend_result(status: int, body) {
+    return {"status": status, "body": body};
+}
+
+func __nexora_backend_local_settings_origin_allowed(request) -> bool {
+    let origin = str(request.getHeader("Origin", ""));
+    if (origin == "") return true;
+    let host = str(request.getHeader("Host", ""));
+    if (host == "") return false;
+    for (origin.endswith("/") and origin.length() > 0) {
+        origin = origin.slice(0, origin.length() - 1);
+    }
+    return origin == "http://" + host;
+}
+
+func __nexora_backend_parse_body(body) {
+    if (type(body) == "dict") return {"ok": true, "body": body};
+    if (body == nil) return {"ok": true, "body": {}};
+    if (type(body) != "string") {
+        return {"ok": false, "message": "request body must be a JSON object"};
+    }
+    let text = body.strip();
+    if (text == "") return {"ok": true, "body": {}};
+    let parsed = nil;
+    try {
+        parsed = JSON.parse(text);
+    } catch (&error) {
+        return {"ok": false, "message": "request body is not valid JSON"};
+    }
+    if (type(parsed) != "dict") {
+        return {"ok": false, "message": "request body must be a JSON object"};
+    }
+    return {"ok": true, "body": parsed};
+}
+
+func __nexora_backend_query(source) {
+    if (type(source) == "QueryParams") return source;
+    if (type(source) == "string") return URL.parseQuery(source);
+    return new QueryParams();
+}
+
+func __nexora_backend_safe_int(value, fallback: int) -> int {
+    if (type(value) == "int") return value;
+    if (type(value) == "string") {
+        let parsed = nil;
+        try {
+            parsed = int(value);
+        } catch (&error) {
+            return fallback;
+        }
+        if (type(parsed) == "int") return parsed;
+    }
+    return fallback;
+}
+
+func __nexora_backend_public_message(message) {
+    if (type(message) != "dict") return message;
+    let public = {};
+    for (message) [&key: &value] {
+        if (key == "_stream_seq") continue;
+        dict_set(public, key, value);
+    }
+    return public;
+}
+
+func __nexora_backend_tool_content(output) -> string {
+    if (output == nil) return "";
+    if (type(output) == "string") return output;
+    if (type(output) == "dict") {
+        let content = dict_get(output, "content", nil);
+        if (content != nil) return str(content);
+        let error = dict_get(output, "error", nil);
+        if (error != nil) return str(error);
+    }
+    return str(output);
+}
+
+class NexoraCoreBackendApi {
+    using &this;
+
+    let store = nil;
+    let runtime = nil;
+    let providers = nil;
+    let approvalStore = nil;
+    let workDir = ".";
+    let systemPrompt = "";
+    let agentSettings = nil;
+    let settingsPath = "";
+    let providersPath = "";
+    let settingsLock = nil;
+    let providerModelsGetFn = nil;
+    let permissionEventsPath = "";
+
+    func init(storeValue, runtimeValue, providersValue, workDirValue: string=".",
+            agentSettingsValue=nil, settingsPathValue: string="",
+            providersPathValue: string="", providerModelsGetFnValue=nil,
+            permissionEventsPathValue: string="") {
+        this.store = storeValue;
+        this.runtime = runtimeValue;
+        this.providers = providersValue;
+        this.workDir = workDirValue;
+        this.agentSettings = agentSettingsValue;
+        if (this.agentSettings == nil) {
+            this.agentSettings = nexora_default_agent_settings();
+        }
+        this.settingsPath = settingsPathValue;
+        this.providersPath = providersPathValue;
+        this.providerModelsGetFn = providerModelsGetFnValue;
+        this.permissionEventsPath = permissionEventsPathValue;
+        this.systemPrompt = nexora_build_default_system_prompt(this.workDir);
+        this.approvalStore = new NexoraCoreToolApprovalStore();
+        this.settingsLock = __nexora_backend_settings_lock;
+    }
+
+    func operator[@=]() -> &NexoraCoreBackendApi {
+        return this;
+    }
+
+    func register(server) {
+        server.get("/health", this.handleRequest);
+        server.get("/api/models", this.handleRequest);
+        server.get("/api/local/settings", this.handleRequest);
+        server.post("/api/local/settings", this.handleRequest);
+        server.get("/api/local/permissions", this.handleRequest);
+        server.post("/api/local/permissions", this.handleRequest);
+        server.get("/api/local/permissions/auto-approval-events", this.handleRequest);
+        server.get("/api/local/provider-templates", this.handleRequest);
+        server.post("/api/local/provider-models", this.handleRequest);
+        server.get("/api/conversations", this.handleRequest);
+        server.post("/api/conversations", this.handleRequest);
+        server.get("/api/conversations/get", this.handleRequest);
+        server.post("/api/conversations/settings", this.handleRequest);
+        server.post("/api/chat", this.handleRequest);
+        server.get("/api/tasks", this.handleRequest);
+        server.post("/api/tasks/cancel", this.handleRequest);
+        server.post("/api/tasks/approval", this.handleRequest);
+        return server;
+    }
+
+    func handleRequest(request) {
+        let query = request.query;
+        let body = "";
+        if (request.method == "POST") body = request.text();
+        let result = nil;
+        if (request.method == "POST" and
+                (request.path == "/api/local/settings" or
+                    request.path == "/api/local/permissions" or
+                    request.path == "/api/local/provider-models") and
+                !__nexora_backend_local_settings_origin_allowed(request)) {
+            result = __nexora_backend_result(403, {
+                "success": false,
+                "message": "cross-origin local API requests are not allowed"
+            });
+        } else {
+            result = this.dispatch(request.method, request.path, query, body);
+        }
+        let response = new HTTPResponse(bytes(JSON.stringify(dict_get(result, "body", {}))),
+            dict_get(result, "status", 500));
+        response.setHeader("Content-Type", "application/json; charset=utf-8");
+        response.setHeader("Cache-Control", "no-store");
+        return response;
+    }
+
+    func dispatch(method: string, path: string, query="", body=nil) {
+        let verb = method.upper();
+        if (verb == "GET" and path == "/health") {
+            return __nexora_backend_result(200, {"ok": true, "service": "NexoraCodeCore"});
+        }
+        if (verb == "GET" and path == "/api/models") return this.listModels();
+        if (verb == "GET" and path == "/api/local/settings") {
+            return this.readLocalSettings();
+        }
+        if (verb == "POST" and path == "/api/local/settings") {
+            return this.updateLocalSettings(body);
+        }
+        if (verb == "GET" and path == "/api/local/permissions") {
+            return this.readLocalPermissionSettings(query);
+        }
+        if (verb == "GET" and path == "/api/local/permissions/auto-approval-events") {
+            return this.readAutoApprovalEvents(query);
+        }
+        if (verb == "POST" and path == "/api/local/permissions") {
+            return this.updateLocalPermissionSettings(body);
+        }
+        if (verb == "GET" and path == "/api/local/provider-templates") {
+            return __nexora_backend_result(200, {
+                "success": true, "templates": nexora_provider_templates_public()
+            });
+        }
+        if (verb == "POST" and path == "/api/local/provider-models") {
+            return this.discoverProviderModels(body);
+        }
+        if (verb == "GET" and path == "/api/conversations") {
+            return __nexora_backend_result(200, {"items": this.store.list()});
+        }
+        if (verb == "POST" and path == "/api/conversations") return this.createConversation(body);
+        if (verb == "GET" and path == "/api/conversations/get") return this.getConversation(query);
+        if (verb == "POST" and path == "/api/conversations/settings") {
+            return this.updateConversationSettings(body);
+        }
+        if (verb == "POST" and path == "/api/chat") return this.startChat(body);
+        if (verb == "GET" and path == "/api/tasks") return this.readTask(query);
+        if (verb == "POST" and path == "/api/tasks/cancel") return this.cancelTask(body);
+        if (verb == "POST" and path == "/api/tasks/approval") return this.resolveApproval(body);
+        return __nexora_backend_result(404, {"message": "route not found"});
+    }
+
+    func listModels() {
+        let items = [];
+        let entries = dict_get(this.providers, "providers", []);
+        for (entries) [entry] {
+            if (type(entry) != "dict") continue;
+            let item = {"name": dict_get(entry, "name", ""),
+                "model": dict_get(entry, "model", "")};
+            let contextWindow = dict_get(entry, "context_window", nil);
+            let maxTokens = dict_get(entry, "max_tokens", nil);
+            if (contextWindow != nil) dict_set(item, "context_window", contextWindow);
+            if (maxTokens != nil) dict_set(item, "max_tokens", maxTokens);
+            items.append(item);
+        }
+        return __nexora_backend_result(200, {"items": items});
+    }
+
+    func readLocalSettings() {
+        let result = nil;
+        with (this.settingsLock) {
+            result = this.readLocalSettingsLocked();
+        }
+        return result;
+    }
+
+    func readLocalSettingsLocked() {
+        let general = nil;
+        try {
+            general = {
+                "username": dict_get(this.agentSettings, "local_username", "local"),
+                "custom_system_prompt": dict_get(this.agentSettings,
+                    "local_custom_system_prompt", ""),
+                "read_agents_md": dict_get(this.agentSettings,
+                    "local_read_agents_md", true),
+                "tool_auto_expand": dict_get(this.agentSettings,
+                    "local_tool_auto_expand", true),
+                "telemetry_enabled": dict_get(this.agentSettings,
+                    "local_telemetry_enabled", true),
+                "theme": nexora_agent_settings_normalize_theme(
+                    dict_get(this.agentSettings, "local_theme", "system")),
+                "auto_retry_count": nexora_agent_settings_normalize_retry_count(
+                    dict_get(this.agentSettings, "local_auto_retry_count", 5)),
+                "empty_response_retry_count":
+                    nexora_agent_settings_normalize_retry_count(dict_get(
+                        this.agentSettings, "local_empty_response_retry_count", 2))
+            };
+        } catch (&invalidSettings) {
+            return __nexora_backend_result(500, {
+                "success": false, "message": "local settings contain invalid values"
+            });
+        }
+        return __nexora_backend_result(200, {
+            "success": true, "general": general,
+            "provider": nexora_provider_settings_public(this.providers)
+        });
+    }
+
+    func updateLocalSettings(source) {
+        let parsed = __nexora_backend_parse_body(source);
+        if (!dict_get(parsed, "ok", false)) {
+            return __nexora_backend_result(400, {
+                "success": false,
+                "message": dict_get(parsed, "message", "invalid body")
+            });
+        }
+
+        let body = dict_get(parsed, "body", {});
+        let general = dict_get(body, "general", {});
+        if (type(general) != "dict") general = {};
+        let providerPayload = dict_get(body, "provider", nil);
+        let updateProviders = type(providerPayload) == "dict" and
+            type(dict_get(providerPayload, "providers", nil)) == "Array";
+        let preparedProviders = nil;
+        if (updateProviders) {
+            preparedProviders = nexora_provider_settings_prepare(
+                this.providers, providerPayload);
+            if (!dict_get(preparedProviders, "ok", false)) {
+                return __nexora_backend_result(400, {
+                    "success": false,
+                    "message": dict_get(preparedProviders, "message",
+                        "invalid provider settings")
+                });
+            }
+        }
+        let prepared = nexora_agent_settings_prepare_update(general);
+        if (!dict_get(prepared, "ok", false)) {
+            return __nexora_backend_result(400, {
+                "success": false,
+                "message": dict_get(prepared, "message", "invalid local settings")
+            });
+        }
+        let updates = dict_get(prepared, "updates", {});
+
+        let hasUpdates = false;
+        for (updates) [&key: &value] {
+            hasUpdates = true;
+            break;
+        }
+        if (!hasUpdates and !updateProviders) {
+            return __nexora_backend_result(200, {
+                "success": true, "message": "Settings saved"
+            });
+        }
+        if (updateProviders and this.providersPath.strip() == "") {
+            return __nexora_backend_result(500, {
+                "success": false, "message": "provider settings path is not configured"
+            });
+        }
+        if (hasUpdates and this.settingsPath.strip() == "") {
+            return __nexora_backend_result(500, {
+                "success": false, "message": "local settings path is not configured"
+            });
+        }
+
+        try {
+            with (this.settingsLock) {
+                if (updateProviders) {
+                    let providerDocument = dict_get(preparedProviders,
+                        "document", {});
+                    nexora_core_write_json_atomic(this.providersPath,
+                        providerDocument);
+                    this.providers = providerDocument;
+                }
+                if (hasUpdates) {
+                    let updatedSettings = nexora_update_agent_settings(
+                        this.settingsPath, updates);
+                    this.agentSettings = updatedSettings;
+                }
+            }
+        } catch (&error) {
+            return __nexora_backend_result(500, {
+                "success": false, "message": "could not save local settings"
+            });
+        }
+        return __nexora_backend_result(200, {
+            "success": true, "message": "Settings saved"
+        });
+    }
+
+    func discoverProviderModels(source) {
+        let parsed = __nexora_backend_parse_body(source);
+        if (!dict_get(parsed, "ok", false)) {
+            return __nexora_backend_result(400, {
+                "success": false,
+                "message": dict_get(parsed, "message", "invalid body")
+            });
+        }
+        return nexora_provider_models_discover(this.providers,
+            dict_get(parsed, "body", {}), this.providerModelsGetFn);
+    }
+
+    func conversationPermissionDefaults(modelName: string="") {
+        let defaults = nexora_permission_settings_defaults(this.agentSettings);
+        return {"model_name": modelName,
+            "permission_mode": dict_get(defaults, "mode", "confirm"),
+            "approval_model_id": dict_get(defaults, "approval_model_id", "")};
+    }
+
+    func readLocalPermissionSettings(source) {
+        let query = __nexora_backend_query(source);
+        let conversationId = str(query.get("conversation_id", "")).strip();
+        let scope = "global";
+        let settings = nexora_permission_settings_defaults(this.agentSettings);
+        if (conversationId != "") {
+            if (this.store.get(conversationId) == nil) {
+                return __nexora_backend_result(404, {
+                    "success": false, "message": "conversation not found"
+                });
+            }
+            try {
+                settings = this.store.ensureSettings(conversationId,
+                    this.conversationPermissionDefaults());
+            } catch (&error) {
+                return __nexora_backend_result(500, {
+                    "success": false, "message": "could not read conversation permissions"
+                });
+            }
+            let mode = str(dict_get(settings, "permission_mode", "")).strip().lower();
+            if (mode == "") mode = "confirm";
+            settings = {"mode": mode, "approval_model_id": str(dict_get(
+                settings, "approval_model_id", "")).strip()};
+            scope = "conversation";
+        }
+        return __nexora_backend_result(200, {
+            "success": true,
+            "mode": dict_get(settings, "mode", "confirm"),
+            "approval_model_id": dict_get(settings, "approval_model_id", ""),
+            "models": nexora_permission_settings_models(this.providers),
+            "supported_modes": ["read_only", "confirm", "full", "auto"],
+            "scope": scope
+        });
+    }
+
+    func updateLocalPermissionSettings(source) {
+        let parsed = __nexora_backend_parse_body(source);
+        if (!dict_get(parsed, "ok", false)) {
+            return __nexora_backend_result(400, {
+                "success": false,
+                "message": dict_get(parsed, "message", "invalid body")
+            });
+        }
+        let body = dict_get(parsed, "body", {});
+        let prepared = nexora_permission_settings_prepare(this.providers, body);
+        if (!dict_get(prepared, "ok", false)) {
+            return __nexora_backend_result(400, {
+                "success": false,
+                "message": dict_get(prepared, "message", "invalid permission settings")
+            });
+        }
+        let conversationId = str(dict_get(body, "conversation_id", "")).strip();
+        let mode = str(dict_get(prepared, "mode", "confirm"));
+        let approvalModelId = str(dict_get(prepared, "approval_model_id", ""));
+        if (conversationId == "" and this.settingsPath.strip() == "") {
+            return __nexora_backend_result(500, {
+                "success": false, "message": "local settings path is not configured"
+            });
+        }
+
+        try {
+            if (conversationId != "") {
+                if (this.store.get(conversationId) == nil) {
+                    return __nexora_backend_result(404, {
+                        "success": false, "message": "conversation not found"
+                    });
+                }
+                this.store.saveSettings(conversationId, {
+                    "permission_mode": mode,
+                    "approval_model_id": approvalModelId
+                });
+            } else {
+                with (this.settingsLock) {
+                    this.agentSettings = nexora_update_agent_settings(
+                        this.settingsPath, {
+                            "local_tool_permission_mode": mode,
+                            "local_tool_approval_model_id": approvalModelId
+                        });
+                }
+            }
+        } catch (&error) {
+            return __nexora_backend_result(500, {
+                "success": false, "message": "could not save permission settings"
+            });
+        }
+        let scope = "global";
+        if (conversationId != "") scope = "conversation";
+        return __nexora_backend_result(200, {
+            "success": true, "message": "Permission settings saved",
+            "scope": scope
+        });
+    }
+
+    func createConversation(source) {
+        let parsed = __nexora_backend_parse_body(source);
+        if (!dict_get(parsed, "ok", false)) {
+            return __nexora_backend_result(400, {"message": dict_get(parsed, "message", "invalid body")});
+        }
+        let body = dict_get(parsed, "body", {});
+        let title = str(dict_get(body, "title", ""));
+        let conversation = this.store.create(title);
+        let conversationId = str(dict_get(conversation, "conversation_id", ""));
+        this.store.ensureSettings(conversationId,
+            this.conversationPermissionDefaults());
+        return __nexora_backend_result(201, {"conversation": this.store.get(conversationId)});
+    }
+
+    func getConversation(source) {
+        let query = __nexora_backend_query(source);
+        let conversationId = str(query.get("conversation_id", ""));
+        if (conversationId == "") {
+            return __nexora_backend_result(400, {"message": "conversation_id is required"});
+        }
+        let conversation = this.store.get(conversationId);
+        if (conversation == nil) return __nexora_backend_result(404, {"message": "conversation not found"});
+        return __nexora_backend_result(200, {"conversation": conversation});
+    }
+
+    func permissionModeFor(conversationId: string) -> string {
+        let settings = this.store.getSettings(conversationId);
+        let mode = str(dict_get(settings, "permission_mode", "confirm")).strip().lower();
+        if (mode == "") return "confirm";
+        if (!nexora_tool_permission_mode_valid(mode)) {
+            throw new Exception("conversation has an invalid permission mode");
+        }
+        return mode;
+    }
+
+    func approvalModelFor(conversationId: string) -> string {
+        let settings = this.store.getSettings(conversationId);
+        return str(dict_get(settings, "approval_model_id", "")).strip();
+    }
+
+    func readAutoApprovalEvents(source) {
+        let query = __nexora_backend_query(source);
+        let limit = __nexora_backend_safe_int(query.get("limit", 50), 50);
+        if (limit < 1) limit = 1;
+        if (limit > 100) limit = 100;
+        return __nexora_backend_result(200, {
+            "success": true,
+            "events": nexora_tool_permission_events_read(
+                this.permissionEventsPath, limit)
+        });
+    }
+
+    func updateConversationSettings(source) {
+        let parsed = __nexora_backend_parse_body(source);
+        if (!dict_get(parsed, "ok", false)) {
+            return __nexora_backend_result(400, {"message": dict_get(parsed, "message", "invalid body")});
+        }
+        let body = dict_get(parsed, "body", {});
+        let conversationId = str(dict_get(body, "conversation_id", "")).strip();
+        let mode = str(dict_get(body, "permission_mode", "")).strip().lower();
+        if (conversationId == "") {
+            return __nexora_backend_result(400, {"message": "conversation_id is required"});
+        }
+        if (!nexora_tool_permission_mode_valid(mode)) {
+            return __nexora_backend_result(422, {"message": "permission_mode must be read_only, confirm, full, or auto"});
+        }
+        if (this.store.get(conversationId) == nil) {
+            return __nexora_backend_result(404, {"message": "conversation not found"});
+        }
+        if (mode == "auto" and this.approvalModelFor(conversationId) == "") {
+            return __nexora_backend_result(422, {
+                "message": "automatic approval requires an approval model; configure it in local permission settings"
+            });
+        }
+        let settings = this.store.saveSettings(conversationId,
+            {"permission_mode": mode});
+        return __nexora_backend_result(200, {"settings": settings});
+    }
+
+    func startChat(source) {
+        let parsed = __nexora_backend_parse_body(source);
+        if (!dict_get(parsed, "ok", false)) {
+            return __nexora_backend_result(400, {"message": dict_get(parsed, "message", "invalid body")});
+        }
+        let body = dict_get(parsed, "body", {});
+        let prompt = str(dict_get(body, "message", ""));
+        if (prompt.strip() == "") {
+            return __nexora_backend_result(400, {"message": "message is required"});
+        }
+        let providerName = str(dict_get(body, "provider", ""));
+        if (providerName == "") {
+            return __nexora_backend_result(400, {"message": "provider is required"});
+        }
+        let provider = nexora_find_provider(this.providers, providerName);
+        if (provider == nil) {
+            return __nexora_backend_result(404, {"message": "provider not found"});
+        }
+        let model = str(dict_get(provider, "model", ""));
+        if (model == "") {
+            return __nexora_backend_result(422, {"message": "provider has no model"});
+        }
+
+        let conversationId = str(dict_get(body, "conversation_id", ""));
+        let created = false;
+        if (conversationId == "") {
+            let conversation = this.store.create(str(dict_get(body, "title", "")));
+            conversationId = str(dict_get(conversation, "conversation_id", ""));
+            created = true;
+        } else if (this.store.get(conversationId) == nil) {
+            return __nexora_backend_result(404, {"message": "conversation not found"});
+        }
+
+        let settings = this.store.ensureSettings(conversationId,
+            this.conversationPermissionDefaults(model));
+        let permissionMode = str(dict_get(settings, "permission_mode", "confirm")).strip().lower();
+        let approvalModelId = str(dict_get(settings, "approval_model_id", "")).strip();
+        if (permissionMode == "") permissionMode = "confirm";
+        if (!nexora_tool_permission_mode_valid(permissionMode)) {
+            return __nexora_backend_result(422, {"message": "conversation has an invalid permission mode"});
+        }
+        if (permissionMode == "auto" and approvalModelId == "") {
+            return __nexora_backend_result(422, {
+                "message": "automatic approval requires an approval model"
+            });
+        }
+
+        this.store.repairDanglingToolCalls(conversationId);
+        let userMessage = {"role": "user", "content": prompt, "timestamp": zeusTime.time()};
+        if (!this.store.appendMessage(conversationId, userMessage)) {
+            return __nexora_backend_result(404, {"message": "conversation not found"});
+        }
+        let conversation = this.store.get(conversationId);
+        let history = dict_get(conversation, "messages", []);
+        let messages = [{"role": "system", "content": this.systemPrompt}];
+        for (history) [message] {
+            messages.append(message);
+        }
+
+        let job = new NexoraCoreChatJob(this.store, provider, conversationId,
+            this.workDir, this.systemPrompt, messages,
+            this.approvalStore, permissionMode, false, this.agentSettings,
+            approvalModelId, this.permissionEventsPath, this.providers);
+        let streamId = "";
+        try {
+            streamId = this.runtime.startSession(conversationId, job.run,
+                {"provider": providerName, "model": model, "kind": "chat"});
+        } catch (&error) {
+            return __nexora_backend_result(500, {"message": "could not start chat task",
+                "conversation_id": conversationId, "created": created});
+        }
+        return __nexora_backend_result(202, {"stream_id": streamId,
+            "conversation_id": conversationId, "provider": providerName,
+            "model": model, "permission_mode": permissionMode, "created": created});
+    }
+
+    func readTask(source) {
+        this.runtime.cleanupSessionsIfDue();
+        let query = __nexora_backend_query(source);
+        let streamId = str(query.get("stream_id", ""));
+        if (streamId == "") {
+            let limit = __nexora_backend_safe_int(query.get("limit", 100), 100);
+            if (limit < 1) limit = 1;
+            if (limit > 500) limit = 500;
+            return __nexora_backend_result(200, {"items": this.runtime.listSessions(limit)});
+        }
+        let afterSeq = __nexora_backend_safe_int(query.get("after_seq", 0), 0);
+        let read = this.runtime.readSessionChunks(streamId, afterSeq, 500);
+        let meta = dict_get(read, "meta", nil);
+        if (meta == nil) return __nexora_backend_result(404, {"message": "task not found"});
+        let events = [];
+        for (dict_get(read, "chunks", [])) [chunk] {
+            events.append({"seq": dict_get(chunk, "_stream_seq", 0),
+                "event": __nexora_backend_public_message(chunk)});
+        }
+        let gap = dict_get(read, "gap", false);
+        let response = {"session": meta, "events": events,
+            "gap": gap, "head_seq": dict_get(read, "head_seq", 1)};
+        if (gap) dict_set(response, "content",
+            this.runtime.getAccumulatedContent(streamId));
+        let approval = this.approvalStore.publicPending(streamId);
+        if (approval != nil) dict_set(response, "approval", approval);
+        return __nexora_backend_result(200, response);
+    }
+
+    func cancelTask(source) {
+        let parsed = __nexora_backend_parse_body(source);
+        if (!dict_get(parsed, "ok", false)) {
+            return __nexora_backend_result(400, {"message": dict_get(parsed, "message", "invalid body")});
+        }
+        let streamId = str(dict_get(dict_get(parsed, "body", {}), "stream_id", ""));
+        if (streamId == "") {
+            return __nexora_backend_result(400, {"message": "stream_id is required"});
+        }
+        let meta = this.runtime.getSessionMeta(streamId);
+        if (meta == nil) return __nexora_backend_result(404, {"message": "task not found"});
+        let status = str(dict_get(meta, "status", ""));
+        if (__nexora_runtime_terminal_status(status)) {
+            return __nexora_backend_result(409, {"message": "task is already finished", "session": meta});
+        }
+        let accepted = this.runtime.requestCancel(streamId);
+        return __nexora_backend_result(202, {"accepted": accepted, "stream_id": streamId});
+    }
+
+    func continuationStream(conversationId: string, provider, parentStreamId: string,
+            permissionMode: string, approvalModelId: string) -> string {
+        let conversation = this.store.get(conversationId);
+        if (conversation == nil) throw new Exception("conversation not found");
+        let messages = [{"role": "system", "content": this.systemPrompt}];
+        for (dict_get(conversation, "messages", [])) [message] {
+            messages.append(message);
+        }
+        let job = new NexoraCoreChatJob(this.store, provider, conversationId,
+            this.workDir, this.systemPrompt, messages,
+            this.approvalStore, permissionMode, true, this.agentSettings,
+            approvalModelId, this.permissionEventsPath, this.providers);
+        return this.runtime.startSession(conversationId, job.run,
+            {"provider": str(dict_get(provider, "name", "")),
+                "model": str(dict_get(provider, "model", "")),
+                "kind": "chat_resume", "parent_stream_id": parentStreamId});
+    }
+
+    func resolveApproval(source) {
+        let parsed = __nexora_backend_parse_body(source);
+        if (!dict_get(parsed, "ok", false)) {
+            return __nexora_backend_result(400, {"message": dict_get(parsed, "message", "invalid body")});
+        }
+        let body = dict_get(parsed, "body", {});
+        let streamId = str(dict_get(body, "stream_id", "")).strip();
+        let approvalId = str(dict_get(body, "approval_id", "")).strip();
+        let decision = str(dict_get(body, "decision", "")).strip().lower();
+        if (streamId == "" or approvalId == "") {
+            return __nexora_backend_result(400, {"message": "stream_id and approval_id are required"});
+        }
+        if (decision != "approve" and decision != "deny") {
+            return __nexora_backend_result(422, {"message": "decision must be approve or deny"});
+        }
+
+        let parentMeta = this.runtime.getSessionMeta(streamId);
+        if (parentMeta == nil) return __nexora_backend_result(404, {"message": "task not found"});
+        let parentStatus = str(dict_get(parentMeta, "status", ""));
+        if (parentStatus != "awaiting_approval" and parentStatus != "running") {
+            return __nexora_backend_result(409, {"message": "task is not awaiting approval"});
+        }
+
+        let claim = this.approvalStore.beginResolve(streamId, approvalId, decision);
+        let claimStatus = str(dict_get(claim, "status", "not_found"));
+        if (claimStatus == "resolved") return dict_get(claim, "response", {});
+        if (claimStatus == "conflict") {
+            return __nexora_backend_result(409, {"message": "approval was already resolved differently"});
+        }
+        if (claimStatus == "resolving") {
+            return __nexora_backend_result(409, {"message": "approval is already being processed"});
+        }
+        if (claimStatus != "pending") {
+            return __nexora_backend_result(404, {"message": "approval request expired or not found"});
+        }
+
+        let request = dict_get(claim, "request", {});
+        let conversationId = str(dict_get(request, "conversation_id", ""));
+        if (conversationId == "" or conversationId !=
+                str(dict_get(parentMeta, "conversation_id", ""))) {
+            let rejected = __nexora_backend_result(404, {"message": "approval request not found"});
+            this.approvalStore.completeResolve(approvalId, rejected);
+            return rejected;
+        }
+
+        let response = nil;
+        try {
+            let conversation = this.store.get(conversationId);
+            if (conversation == nil) {
+                response = __nexora_backend_result(404, {"message": "conversation not found"});
+            } else {
+                let call = dict_get(request, "call", {});
+                let callId = str(dict_get(call, "id", ""));
+                let providerName = str(dict_get(request, "provider_name", ""));
+                let provider = nexora_find_provider(this.providers, providerName);
+                if (provider == nil) {
+                    response = __nexora_backend_result(404, {"message": "provider not found"});
+                } else {
+                    let toolContent = "Tool call denied by user.";
+                    if (decision == "approve") {
+                        let permissionMode = this.permissionModeFor(conversationId);
+                        let permission = nexora_tool_permission_decision(permissionMode,
+                            str(dict_get(request, "operation", "")));
+                        if (permission == "deny") {
+                            toolContent = "The current permission mode denies this tool operation.";
+                        } else {
+                            let job = new NexoraCoreChatJob(this.store, provider,
+                                conversationId, this.workDir, this.systemPrompt, [],
+                                this.approvalStore, permissionMode, false,
+                                this.agentSettings,
+                                this.approvalModelFor(conversationId),
+                                this.permissionEventsPath, this.providers);
+                            toolContent = __nexora_backend_tool_content(
+                                job.executeApprovedTool(call));
+                        }
+                    }
+
+                    if (!this.store.replaceToolResult(conversationId, callId, toolContent)) {
+                        response = __nexora_backend_result(409,
+                            {"message": "pending tool result was not found"});
+                    } else {
+                        let permissionMode = this.permissionModeFor(conversationId);
+                        let approvalModelId = this.approvalModelFor(conversationId);
+                        let continuationId = this.continuationStream(conversationId,
+                            provider, streamId, permissionMode, approvalModelId);
+                        response = __nexora_backend_result(202, {
+                            "continuation_stream_id": continuationId,
+                            "conversation_id": conversationId,
+                            "decision": decision
+                        });
+                    }
+                }
+            }
+        } catch (&error) {
+            response = __nexora_backend_result(500,
+                {"message": "approval resolution failed: " + str(error)});
+        }
+        this.approvalStore.completeResolve(approvalId, response);
+        return response;
+    }
+}

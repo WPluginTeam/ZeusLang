@@ -1,0 +1,90 @@
+import zeus.ctypes [&ctypes];
+
+@native decl Double = ctypes.DOUBLE;
+@native decl LongLong = ctypes.LONGLONG;
+@native decl Int32 = ctypes.INT32;
+@native decl Int8 = ctypes.INT8;
+@native decl DoubleNumber = 1;
+@native decl LongLongNumber = 2;
+@native decl Int32Number = 3;
+@native decl Int8Number = 4;
+
+func doubleSum(left: Double, right: DoubleNumber) -> Double {
+    return left + right;
+}
+func integerSum(left: Int32, right: Int8) -> LongLong {
+    return left + right;
+}
+func checkedLongLong(value: LongLong) -> LongLong {
+    return value;
+}
+func divideLocals() -> Double {
+    var numerator: Double = 2;
+    var denominator: Double = 1.5;
+    return numerator / denominator;
+}
+func divideParameters(numerator: Double, denominator: Double) -> Double {
+    numerator = numerator + 0;
+    return numerator / denominator;
+}
+func dynamicIdentity(value) { return value; }
+func dynamicField(value) { return value.real; }
+func setDynamicField(value, real) { value.real = real; }
+
+class NativeNumbers {
+    var real: Double = 1.5;
+    var wide: LongLong = 4294967296;
+    var medium: Int32 = -2147483648;
+    var small: Int8 = -128;
+}
+
+var real: Double = 1.5;
+var numberedReal: DoubleNumber = 2;
+if (doubleSum(real, numberedReal) != 3.5) throw "native double parameters or return";
+if (real * numberedReal != 3.0) throw "native double multiplication";
+if (numberedReal / real != 1.3333333333333333) throw "native double division";
+var inferredReal = numberedReal / real;
+if (inferredReal != 1.3333333333333333) throw "native double inferred arithmetic result";
+if (divideLocals() != 1.3333333333333333) throw "native local double precision";
+if (divideParameters(2, 1.5) != 1.3333333333333333) throw "native parameter double precision";
+if (real >= numberedReal or real == numberedReal) throw "native double comparison";
+real = real - 0.5;
+if (real != 1.0) throw "native double assignment";
+if (-real != -1.0 or real + 2 != 3.0) throw "native double unary or mixed arithmetic";
+
+var wide: LongLongNumber = 4294967296;
+var arbitraryPrecision = 9223372036854775808;
+var representable = arbitraryPrecision - 1;
+var convertedWide: LongLong = representable;
+convertedWide = representable;
+if (convertedWide != 9223372036854775807 or checkedLongLong(representable) != 9223372036854775807) {
+    throw "native long long conversion from arbitrary precision integer";
+}
+var medium: Int32Number = 2147483647;
+var small: Int8Number = -128;
+if (wide != 4294967296) throw "native long long width";
+if (integerSum(medium, small) != 2147483519) throw "native signed integer parameters";
+
+var boxed = dynamicIdentity(1.5);
+var unboxed: Double = boxed;
+if (unboxed != 1.5) throw "dynamic to native double";
+if (dynamicIdentity(unboxed) != 1.5) throw "native double to dynamic";
+var unboxedInteger: Int32 = dynamicIdentity(-123456);
+if (unboxedInteger != -123456) throw "dynamic to native signed integer";
+
+let numbers = new NativeNumbers();
+if (numbers.real != 1.5 or numbers.wide != 4294967296) throw "native field defaults";
+if (numbers.medium != -2147483648 or numbers.small != -128) throw "native integer field defaults";
+numbers.real = doubleSum(2.5, 1.0);
+if (numbers.real != 3.5) throw "native double field assignment";
+if (dynamicField(numbers) != 3.5) throw "native double dynamic field read";
+setDynamicField(numbers, 4.5);
+if (numbers.real != 4.5) throw "native double dynamic field write";
+
+print("NATIVE_DECL_PASS");
+
+using LLVM {
+    if (sizeof(Double) != 8 or sizeof(LongLong) != 8 or sizeof(Int32) != 4 or sizeof(Int8) != 1) {
+        throw "native scalar physical widths";
+    }
+}

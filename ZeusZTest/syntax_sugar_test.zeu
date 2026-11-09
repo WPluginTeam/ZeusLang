@@ -1,0 +1,165 @@
+import zeus.exception;
+
+func assertTrue(cond: bool, msg: string) {
+    if (!cond) {
+        print("FAIL: ", msg);
+        throw new Exception("Assertion failed: " + msg);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 1. 测试字符串插值 ($"..." 与 f"...")
+// -----------------------------------------------------------------------------
+func testStringInterpolation() {
+    let name = "Zeus";
+    let version = 2;
+    let s1 = $"Hello {name} v{version + 1}!";
+    assertTrue(s1 == "Hello Zeus v3!", "basic string interpolation");
+
+    let a = 10;
+    let b = 20;
+    let s2 = f"sum={a + b}, diff={b - a}";
+    assertTrue(s2 == "sum=30, diff=10", "f-string prefix interpolation");
+
+    // 转义测试: \{ 和 \}
+    let s3 = $"test \{brace\} and \"quote\"";
+    assertTrue(s3 == "test {brace} and \"quote\"", "escaped braces and quotes");
+
+    // 纯表达式
+    let s4 = $"{a}";
+    assertTrue(s4 == "10", "pure expression interpolation");
+
+    let s5 = $"{a}{b}";
+    assertTrue(s5 == "1020", "consecutive expressions");
+
+    print("[PASS] testStringInterpolation");
+}
+
+// -----------------------------------------------------------------------------
+// 2. 测试字典无值 key 简写 / Set 字面量 ({x, y} => {x: nil, y: nil})
+// -----------------------------------------------------------------------------
+func testDictKeyShorthand() {
+    // 纯无值 key
+    let s = {"apple", "banana", "cherry"};
+    assertTrue(s["apple"] == nil, "dict shorthand apple is nil");
+    assertTrue(s["banana"] == nil, "dict shorthand banana is nil");
+    assertTrue(s["cherry"] == nil, "dict shorthand cherry is nil");
+
+    // 混合常规 key: value
+    let cfg = {
+        "timeout": 30,
+        "debug",
+        "verbose",
+        "retries": 3
+    };
+    assertTrue(cfg["timeout"] == 30, "cfg timeout is 30");
+    assertTrue(cfg["debug"] == nil, "cfg debug is nil");
+    assertTrue(cfg["verbose"] == nil, "cfg verbose is nil");
+    assertTrue(cfg["retries"] == 3, "cfg retries is 3");
+
+    // 嵌套字典中的简写
+    let nested = {
+        "groupA": {"user1", "user2"},
+        "groupB": {"admin": true, "guest"}
+    };
+    assertTrue(nested["groupA"]["user1"] == nil, "nested groupA user1 is nil");
+    assertTrue(nested["groupB"]["admin"] == true, "nested groupB admin is true");
+    assertTrue(nested["groupB"]["guest"] == nil, "nested groupB guest is nil");
+
+    print("[PASS] testDictKeyShorthand");
+}
+
+// -----------------------------------------------------------------------------
+// 3. 测试范围关系判断 (x in start..end 与 x in start..=end)
+// -----------------------------------------------------------------------------
+func testRangeMembership() {
+    let score = 85;
+    assertTrue(score in 60..100, "85 in 60..100 (semi-open)");
+    assertTrue(!(score in 90..100), "85 not in 90..100");
+    assertTrue(!(100 in 60..100), "100 not in 60..100 (semi-open: < 100)");
+
+    // 包含式范围 ..=
+    assertTrue(100 in 60..=100, "100 in 60..=100 (inclusive: <= 100)");
+    assertTrue(60 in 60..=100, "60 in 60..=100");
+    assertTrue(!(59 in 60..=100), "59 not in 60..=100");
+    assertTrue(!(101 in 60..=100), "101 not in 60..=100");
+
+    // 配合 if 条件
+    let passed = false;
+    if (score in 60..=100) {
+        passed = true;
+    }
+    assertTrue(passed, "score passed in range");
+
+    print("[PASS] testRangeMembership");
+}
+
+// -----------------------------------------------------------------------------
+// 4. 测试独立范围值表达式 (0..5 与 1..=5)
+// -----------------------------------------------------------------------------
+func testRangeValueExpression() {
+    // 纯整数字面量: 编译期展开为数组
+    let r1 = 0..5;
+    assertTrue(r1.length() == 5, "0..5 length should be 5");
+    assertTrue(r1[0] == 0, "r1[0] == 0");
+    assertTrue(r1[4] == 4, "r1[4] == 4");
+
+    let r2 = 1..=5;
+    assertTrue(r2.length() == 5, "1..=5 length should be 5");
+    assertTrue(r2[0] == 1, "r2[0] == 1");
+    assertTrue(r2[4] == 5, "r2[4] == 5");
+
+    // 动态变量范围: 展开为 range() 调用
+    let a = 2;
+    let b = 6;
+    let r3 = a..b;
+    assertTrue(r3.length() == 4, "a..b length should be 4");
+    assertTrue(r3[0] == 2, "r3[0] == 2");
+    assertTrue(r3[3] == 5, "r3[3] == 5");
+
+    let r4 = a..=b;
+    assertTrue(r4.length() == 5, "a..=b length should be 5");
+    assertTrue(r4[0] == 2, "r4[0] == 2");
+    assertTrue(r4[4] == 6, "r4[4] == 6");
+
+    // 直接调用内置 range()
+    let r5 = range(1, 4);
+    assertTrue(r5.length() == 3, "range(1, 4) length should be 3");
+
+    print("[PASS] testRangeValueExpression");
+}
+
+// -----------------------------------------------------------------------------
+// 5. 测试现有 for 与 when 范围兼容性
+// -----------------------------------------------------------------------------
+func testCompatibility() {
+    // for (0..3) 必须不受影响
+    let count = 0;
+    for (0..3) [&i] {
+        count = count + 1;
+    }
+    assertTrue(count == 3, "for loop range compatibility");
+
+    // when (x) { 1..5: ... } 必须不受影响
+    let tag = "";
+    let val = 3;
+    when (val) {
+        1..5: { tag = "small"; }
+        6..10: { tag = "large"; }
+        else: { tag = "other"; }
+    }
+    assertTrue(tag == "small", "when pattern matching range compatibility");
+
+    print("[PASS] testCompatibility");
+}
+
+func main() {
+    testStringInterpolation();
+    testDictKeyShorthand();
+    testRangeMembership();
+    testRangeValueExpression();
+    testCompatibility();
+    print("ALL_SYNTAX_SUGAR_TESTS_PASS");
+}
+
+main();

@@ -102,6 +102,53 @@ class Container {
 }
 ```
 
+### 4. 绑定/拷贝协议 `operator[@=]`
+
+类的默认语义是**值语义**：`let b = a;`、`a = b`、读字段、读数组下标都会复制对象
+（标量字段逐个复制，数组/字典字段共享同一个底层容器）。函数传参与返回则共享。
+
+要改掉这个行为，就在类里定义 `operator[@=]`，它决定“把这个对象绑定到另一个名字
+时返回什么”：
+
+```zeus
+class Shared {
+    using &this;
+    var value = 0;
+
+    // 返回引用：绑定别名，两边是同一个对象（多线程状态机必须这样）
+    func operator[@=]() -> &Shared {
+        return this;
+    }
+}
+
+class Custom {
+    using &this;
+    var value = 0;
+
+    // 返回新对象：自定义拷贝（默认行为就是复制一份）
+    func operator[@=]() -> Custom {
+        let copy = new Custom();
+        copy.value = this.value + 1;
+        return copy;
+    }
+}
+```
+
+规则：
+
+- `-> &T { return this; }` 给出**引用语义**；不写 `&` 的 `-> T { return this; }` 仍是
+  拷贝（返回的对象会再被拷贝一次）。
+- 没有 `operator[@=]` 的类保持默认值语义。
+- **带 `operator[~]` 的类必须声明 `operator[@=]`。** 默认值语义下连「读字段」都会
+  复制一份，每个副本析构都会执行一次 `[~]`，于是同一个资源被释放两次（double
+  free，或关掉别的副本还在用的句柄）。`-> &T` 表示绑定同一实例，`-> T` 表示显式
+  拷贝。没写时编译器给出 `P0045` 警告，回归见
+  `ZeusZTest/run_destructor_copy_warning_test.py`。
+- 常见坑：把状态机对象交给工作线程后，`let client = ...` 的复制品上写的状态别处
+  看不见——这时就该给类加引用钩子，而不是把状态塞进数组/字典里绕。
+
+参考实现：`ZeusZTest/class_copy_core_test.zeu`、`samples/NexoraCodeCore/connection.zeu`。
+
 ## 使用示例
 
 ```zeus

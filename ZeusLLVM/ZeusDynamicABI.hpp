@@ -29,6 +29,7 @@ inline bool isDynamicOperator(VMOperator op) {
 
 inline void appendLLVMDeclarations(std::string& out) {
     out += "declare void @zeus_value_from_class_handle(ptr, i32)\n";
+    out += "declare void @zeus_value_from_named_class_handle(ptr, i32, ptr)\n";
     out += "declare i32 @zeus_value_require_class_handle(ptr, i32)\n";
     out += "declare ptr @zeus_lvalue_register(ptr, ptr, i32, i64, i32)\n";
     out += "declare void @zeus_lvalue_register_raw(ptr, i64, i32)\n";

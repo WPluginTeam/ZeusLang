@@ -1,0 +1,216 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import zeus.string;
+
+import samples.NexoraCodeCore.agent_loop;
+import samples.NexoraCodeCore.context;
+import samples.NexoraCodeCore.provider_config;
+import samples.NexoraCodeCore.provider_stream;
+import samples.NexoraCodeCore.storage;
+import samples.NexoraCodeCore.stream_session;
+
+// 真机烟囱：流式 agent 循环 + 一个真工具（read_file），打真实供应商。
+// 运行器把五个占位换成一次性值：
+//   __PROVIDERS__  providers.json 绝对路径
+//   __PROVIDER__   供应商名（如 USST）
+//   __SYSTEM__     system 提示
+//   __QUESTION__   用户问题
+//   __WORKDIR__    工具可读的根目录
+//   __MAXROUNDS__  轮数上限
+var const PROVIDERS_PATH = "__PROVIDERS__";
+var const PROVIDER_NAME = "__PROVIDER__";
+var const SYSTEM_PROMPT = "__SYSTEM__";
+var const QUESTION = "__QUESTION__";
+var const WORK_DIR = "__WORKDIR__";
+var const MAX_ROUNDS = "__MAXROUNDS__";
+
+// 只暴露一个工具：读工作目录下的文本文件。路径逃出工作目录就拒绝，
+// 越权和压缩执行一样留给后面的切片。
+func __agent_tools() {
+    return [{
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "读取工作目录下的一个文本文件并返回全文。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string",
+                        "description": "相对工作目录的文件路径，例如 note.txt"}
+                },
+                "required": ["path"]
+            }
+        }
+    }];
+}
+
+func __agent_resolve_path(root: string, relative: string) -> string {
+    let trimmed = relative.strip();
+    if (trimmed == "") return "";
+    if (trimmed.index("..") >= 0) return "";
+    if (trimmed.index(":") >= 0) return "";
+    if (trimmed.startswith("/") or trimmed.startswith("\\")) return "";
+    return root + "/" + trimmed;
+}
+
+// provider 的 timeout_seconds 是秒（可能带小数）。int() 拒收带小数的 float，
+// 所以小数走 context 里的纯比较版 ceil，避免把动态 float 送进原生 int 位置。
+func __agent_seconds(value) -> int {
+    if (type(value) != "int" and type(value) != "float") return 120;
+    if (value <= 0) return 120;
+    if (type(value) == "int") return value;
+    let seconds = __nexora_ceil_nonneg(value);
+    if (seconds < 1) return 1;
+    return seconds;
+}
+
+class NexoraCliAgentHost {
+    using &this;
+
+    let endpoint = "";
+    let model = "";
+    let headers = nil;
+    let temperature = 0.7;
+    let maxTokens = 4096;
+    let timeoutSeconds = 120;
+    let tools = nil;
+    let workDir = "";
+
+    func operator[@=]() -> &NexoraCliAgentHost {
+        return this;
+    }
+
+    // 宿主缝 1：发一轮流式请求。
+    func openRound(messages, maxTokens: int=-1) {
+        let requestMaxTokens = this.maxTokens;
+        if (maxTokens > 0) requestMaxTokens = maxTokens;
+        let payload = nexora_chat_stream_payload(this.model, messages, this.tools,
+            this.temperature, requestMaxTokens);
+        return nexora_open_chat_session(this.endpoint, payload, this.headers,
+            this.timeoutSeconds);
+    }
+
+    // 宿主缝 2：执行工具。
+    func executeTool(call) {
+        let name = str(call["name"]);
+        if (name != "read_file") return {"error": "未知工具: " + name};
+        let arguments = call["arguments"];
+        if (type(arguments) != "dict") return {"error": "工具参数不是对象"};
+        let path = str(arguments.get("path", ""));
+        let target = __agent_resolve_path(this.workDir, path);
+        if (target == "") return {"error": "路径不合法: " + path};
+        try {
+            return {"content": nexora_core_read_text(target)};
+        } catch (&error) {
+            return {"error": "读取失败: " + str(error)};
+        }
+    }
+
+    // 观察缝：正文增量边到边打；思考增量只累计长度（推理模型会吐出很多），
+    // 每轮收尾时一起报，避免把终端刷爆。
+    let thinkingBytes = 0;
+
+    func onEvent(event) {
+        let eventType = str(event["type"]);
+        if (eventType == "round_start") {
+            this.thinkingBytes = 0;
+            print("NEXORA_AGENT_ROUND_START " + str(event["round"]));
+        }
+        if (eventType == "context_compression") {
+            print("NEXORA_AGENT_COMPRESS status=" + str(event["status"]) +
+                " before=" + str(event["before"]) +
+                " after=" + str(event["estimate"]) +
+                " budget=" + str(event["budget"]) +
+                " dropped=" + str(event["droppedMessages"]));
+        }
+        if (eventType == "thinking") {
+            this.thinkingBytes = this.thinkingBytes + str(event["text"]).length();
+        }
+        if (eventType == "text") {
+            print("NEXORA_AGENT_DELTA " + str(event["text"]));
+        }
+        if (eventType == "round_end") {
+            print("NEXORA_AGENT_ROUND_END " + str(event["round"]) +
+                " status=" + str(event["status"]) +
+                " finish=" + str(event["finishReason"]) +
+                " tools=" + str(event["toolCalls"]) +
+                " chars=" + str(event["textLength"]) +
+                " thinking=" + str(this.thinkingBytes) +
+                " truncated=" + str(event["truncated"]));
+        }
+        if (eventType == "function_result") {
+            print("NEXORA_AGENT_TOOL " + str(event["name"]) + " -> " +
+                str(event["content"]) + " (truncated=" + str(event["truncated"]) + ")");
+        }
+    }
+}
+
+func main() {
+    let providersDoc = nexora_load_providers(PROVIDERS_PATH);
+    let provider = nexora_find_provider(providersDoc, PROVIDER_NAME);
+    if (provider == nil) {
+        print("NEXORA_AGENT_ERROR 找不到供应商 " + PROVIDER_NAME);
+        return 1;
+    }
+
+    let model = str(provider.get("model", ""));
+    if (model == "") {
+        print("NEXORA_AGENT_ERROR 供应商缺少 model");
+        return 1;
+    }
+
+    let maxTokens = provider.get("max_tokens", 4096);
+    if (type(maxTokens) != "int") maxTokens = 4096;
+    let temperature = provider.get("temperature", 0.7);
+    if (type(temperature) != "int" and type(temperature) != "float") temperature = 0.7;
+
+    let host = new NexoraCliAgentHost();
+    host.endpoint = nexora_completions_url(str(provider.get("base_url", "")));
+    host.model = model;
+    host.headers = nexora_provider_headers(str(provider.get("api_key", "")));
+    host.temperature = temperature;
+    host.maxTokens = maxTokens;
+    host.timeoutSeconds = __agent_seconds(provider.get("timeout_seconds", 120));
+    host.tools = __agent_tools();
+    host.workDir = WORK_DIR;
+
+    let messages: Array = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": QUESTION}
+    ];
+
+    print("NEXORA_AGENT_REQUEST model=" + model + " workdir=" + WORK_DIR);
+    let result = nexora_agent_run({
+        "messages": messages,
+        "openRound": host.openRound,
+        "executeTool": host.executeTool,
+        "onEvent": host.onEvent,
+        "tools": host.tools,
+        "contextWindow": provider.get("context_window", 0),
+        "maxOutputTokens": maxTokens,
+        "maxRounds": int(MAX_ROUNDS),
+        "sliceMillis": 1000,
+        "maxToolOutput": 20000
+    });
+
+    let usage = result["usage"];
+    print("NEXORA_AGENT_USAGE status=" + str(result["status"]) +
+        " rounds=" + str(result["rounds"]) +
+        " tools=" + str(result["toolCalls"]) +
+        " truncated=" + str(result["truncated"]) +
+        " input=" + str(usage.get("raw_input", 0)) +
+        " output=" + str(usage.get("output", 0)));
+    if (str(result["error"]) != "") {
+        print("NEXORA_AGENT_ERROR " + str(result["error"]));
+    }
+
+    let message = result["message"];
+    if (type(message) == "dict") {
+        print("NEXORA_AGENT_REPLY " + str(message.get("content", "")));
+    }
+    print("NEXORA_AGENT_CLI_PASS");
+    return 0;
+}
+
+main();

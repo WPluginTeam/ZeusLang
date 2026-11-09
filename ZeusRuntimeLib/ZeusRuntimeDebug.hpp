@@ -10,6 +10,7 @@ enum class ResourceKind : uint32_t {
     ZeusBox = 0,
     ManagedClosure,
     CaptureCell,
+    NativeString,
     ClassObject,
     ThreadRecord,
     SocketRecord,
@@ -23,6 +24,8 @@ struct ResourceCounter {
     uint64_t live = 0;
     uint64_t peak = 0;
     uint64_t unmatchedDestroy = 0;
+    uint64_t liveBytes = 0;
+    uint64_t peakBytes = 0;
 };
 
 // Counters are always enabled. ZEUS_RUNTIME_DEBUG_DETAILS adds a live-object
@@ -37,10 +40,15 @@ void trackCreated(
     uint32_t sourceLine,
     std::size_t bytes = 0
 ) noexcept;
-void trackDestroyed(ResourceKind kind, const void* pointer) noexcept;
+void trackDestroyed(
+    ResourceKind kind,
+    const void* pointer,
+    std::size_t bytes = 0
+) noexcept;
 void writeReport(FILE* output = stderr) noexcept;
 
 } // namespace ZeusRuntimeDebug
 
 extern "C" int64_t zeus_runtime_debug_dump(void) noexcept;
 extern "C" int64_t zeus_runtime_debug_dump_at_exit(void) noexcept;
+extern "C" int64_t zeus_runtime_debug_native_string_live_bytes() noexcept;

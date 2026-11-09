@@ -1,0 +1,67 @@
+import zeus.dict;
+import zeus.string;
+
+import samples.NexoraCodeCore.tool_permissions;
+
+func nexora_permission_settings_defaults(agentSettings: dict) -> dict {
+    let mode = str(dict_get(agentSettings,
+        "local_tool_permission_mode", "confirm")).strip().lower();
+    if (mode == "") mode = "confirm";
+    return {
+        "mode": mode,
+        "approval_model_id": str(dict_get(agentSettings,
+            "local_tool_approval_model_id", "")).strip()
+    };
+}
+
+func nexora_permission_settings_models(providers: dict) -> Array {
+    let models: Array = [];
+    for (dict_get(providers, "providers", [])) [const &provider] {
+        if (type(provider) != "dict") continue;
+        let baseUrl = str(dict_get(provider, "base_url", "")).strip();
+        let model = str(dict_get(provider, "model", "")).strip();
+        let providerId = str(dict_get(provider, "id", "")).strip();
+        if (baseUrl == "" or model == "" or providerId == "") continue;
+        models.append({
+            "id": providerId + "/" + model,
+            "name": model,
+            "provider": str(dict_get(provider, "name", ""))
+        });
+    }
+    return models;
+}
+
+func nexora_permission_settings_prepare(providers: dict, source: dict) -> dict {
+    if (type(source) != "dict") {
+        return {"ok": false, "message": "permission settings must be an object"};
+    }
+
+    let mode = str(dict_get(source, "mode", "")).strip().lower();
+    if (!nexora_tool_permission_mode_valid(mode)) {
+        return {"ok": false,
+            "message": "mode must be read_only, confirm, full, or auto"};
+    }
+
+    let approvalModelId = str(dict_get(source, "approval_model_id", "")).strip();
+    if (approvalModelId != "") {
+        let found = false;
+        for (nexora_permission_settings_models(providers)) [const &model] {
+            if (str(dict_get(model, "id", "")) == approvalModelId) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            return {"ok": false,
+                "message": "approval model is not configured or no longer available"};
+        }
+    }
+
+    if (mode == "auto" and approvalModelId == "") {
+        return {"ok": false,
+            "message": "automatic approval requires an approval model"};
+    }
+
+    return {"ok": true, "mode": mode,
+        "approval_model_id": approvalModelId};
+}

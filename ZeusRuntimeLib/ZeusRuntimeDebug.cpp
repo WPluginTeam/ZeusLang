@@ -25,6 +25,8 @@ struct AtomicCounter {
     std::atomic<uint64_t> live{0};
     std::atomic<uint64_t> peak{0};
     std::atomic<uint64_t> unmatchedDestroy{0};
+    std::atomic<uint64_t> liveBytes{0};
+    std::atomic<uint64_t> peakBytes{0};
 };
 
 std::array<AtomicCounter, kindCount>& counters() noexcept {
@@ -37,6 +39,7 @@ const char* kindName(ResourceKind kind) noexcept {
     case ResourceKind::ZeusBox: return "ZeusBox(heap)";
     case ResourceKind::ManagedClosure: return "managed-closure-record";
     case ResourceKind::CaptureCell: return "capture-cell";
+    case ResourceKind::NativeString: return "owned-native-string";
     case ResourceKind::ClassObject: return "native-class-object";
     case ResourceKind::ThreadRecord: return "runtime-thread-record";
     case ResourceKind::SocketRecord: return "runtime-socket-record";
@@ -149,7 +152,9 @@ ResourceCounter counter(ResourceKind kind) noexcept {
         source.destroyed.load(std::memory_order_relaxed),
         source.live.load(std::memory_order_relaxed),
         source.peak.load(std::memory_order_relaxed),
-        source.unmatchedDestroy.load(std::memory_order_relaxed)
+        source.unmatchedDestroy.load(std::memory_order_relaxed),
+        source.liveBytes.load(std::memory_order_relaxed),
+        source.peakBytes.load(std::memory_order_relaxed)
     };
 }
 
@@ -175,6 +180,12 @@ void trackCreated(
     value.created.fetch_add(1, std::memory_order_relaxed);
     const uint64_t live = value.live.fetch_add(1, std::memory_order_relaxed) + 1;
     updatePeak(value.peak, live);
+    if (kind == ResourceKind::NativeString) {
+        const uint64_t liveBytes = value.liveBytes.fetch_add(
+            static_cast<uint64_t>(bytes), std::memory_order_relaxed) +
+            static_cast<uint64_t>(bytes);
+        updatePeak(value.peakBytes, liveBytes);
+    }
 
 #ifdef ZEUS_RUNTIME_DEBUG_DETAILS
     try {
@@ -206,7 +217,7 @@ void trackCreated(
 #endif
 }
 
-void trackDestroyed(ResourceKind kind, const void* pointer) noexcept {
+void trackDestroyed(ResourceKind kind, const void* pointer, std::size_t bytes) noexcept {
     if (!validKind(kind) || !pointer) return;
 
     auto& value = counters()[static_cast<std::size_t>(kind)];
@@ -217,6 +228,16 @@ void trackDestroyed(ResourceKind kind, const void* pointer) noexcept {
     }
     if (live == 0) {
         value.unmatchedDestroy.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (kind == ResourceKind::NativeString) {
+        uint64_t liveBytes = value.liveBytes.load(std::memory_order_relaxed);
+        while (liveBytes >= bytes && !value.liveBytes.compare_exchange_weak(
+            liveBytes, liveBytes - static_cast<uint64_t>(bytes),
+            std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+        if (liveBytes < bytes) {
+            value.unmatchedDestroy.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
 #ifdef ZEUS_RUNTIME_DEBUG_DETAILS
@@ -249,13 +270,15 @@ void writeReport(FILE* output) noexcept {
         const auto kind = static_cast<ResourceKind>(i);
         const auto value = counter(kind);
         std::fprintf(output,
-            "[ZeusRuntimeDebug] %-26s created=%llu destroyed=%llu live=%llu peak=%llu unmatched_destroy=%llu\n",
+            "[ZeusRuntimeDebug] %-26s created=%llu destroyed=%llu live=%llu peak=%llu unmatched_destroy=%llu live_bytes=%llu peak_bytes=%llu\n",
             kindName(kind),
             static_cast<unsigned long long>(value.created),
             static_cast<unsigned long long>(value.destroyed),
             static_cast<unsigned long long>(value.live),
             static_cast<unsigned long long>(value.peak),
-            static_cast<unsigned long long>(value.unmatchedDestroy));
+            static_cast<unsigned long long>(value.unmatchedDestroy),
+            static_cast<unsigned long long>(value.liveBytes),
+            static_cast<unsigned long long>(value.peakBytes));
     }
 
 #ifdef ZEUS_RUNTIME_DEBUG_DETAILS
@@ -300,4 +323,9 @@ extern "C" int64_t zeus_runtime_debug_dump_at_exit(void) noexcept {
         registrationResult = std::atexit(writeRuntimeDebugReportAtExit);
     });
     return registrationResult == 0 ? 0 : -1;
+}
+
+extern "C" int64_t zeus_runtime_debug_native_string_live_bytes() noexcept {
+    return static_cast<int64_t>(ZeusRuntimeDebug::counter(
+        ZeusRuntimeDebug::ResourceKind::NativeString).liveBytes);
 }

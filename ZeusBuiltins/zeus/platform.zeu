@@ -1,0 +1,333 @@
+// platform.zeu - platform data read the way Python's platform module presents it.
+//
+// Every answer comes from the platform's own entry points: ntdll for the
+// version blocks, kernel32 for the machine description, so nothing is guessed
+// from environment variables that a caller could have rewritten. Where Python
+// leaves the same data as a named tuple, this module speaks in Dict values,
+// and where it returns a tuple this module returns a list, keeping one
+// container kind for both.
+
+import zeus.ctypes;
+import zeus.dict;
+
+using windows {
+
+// Version block: major, minor, build, service pack. RtlGetVersion is the call
+// that is not lied to by an application manifest, unlike GetVersionEx.
+@native("RtlGetVersion", from="ntdll")
+decl func rtlGetVersion(info: ptr) -> int32;
+
+// OSVERSIONINFOW typed out: five DWORDs, then 128 WCHAR for the service pack
+// name, the block sized to the struct's four byte alignment.
+let __OSVERSION_CSD_OFFSET: int = 20;
+let __OSVERSION_CSD_WCHAR: int = 128;
+let __OSVERSION_SIZE: int = 276;
+
+// The machine description block. A 32 bit caller under the WOW64 layer still
+// gets the true hardware answer here, which the plain GetSystemInfo call
+// would not give.
+@native("GetNativeSystemInfo", from="kernel32")
+decl func nativeSystemInfo(info: ptr);
+
+// SYSTEM_INFO, x64 layout: wProcessorArchitecture shares the first DWORD with
+// the page-size union member, pointers occupy 8 byte slots, the counting
+// fields close the block out.
+let __INFO_ARCH: int = 0;
+let __INFO_PROC_COUNT: int = 32;
+let __SYSTEM_INFO_SIZE: int = 48;
+
+// Host name. 260 WCHAR covers every name the DNS format could answer with.
+@native("GetComputerNameExW", from="kernel32")
+decl func computerName(kind: int32, buffer: ptr, size: ptr) -> int32;
+
+let __COMPUTER_NAME_DNS_HOSTNAME: int32 = 1;
+let __COMPUTER_NAME_WCHAR: int = 256;
+
+// Environment read for processor(): Python winds up with the same string
+// through the registry's PROCESSOR_IDENTIFIER value.
+@native("GetEnvironmentVariableW", from="kernel32")
+decl func environmentValue(name: ptr, buffer: ptr, size: int32) -> int32;
+
+let __ENV_NAME: string = "PROCESSOR_IDENTIFIER";
+let __ENV_WCHAR: int = 512;
+
+// ---------------------------------------------------------------- internals
+
+// Fills one OSVERSIONINFOW-shaped block and hands [major, minor, build, pack]
+// back; a failed read throws instead of guessing.
+func __readOsVersion() -> list {
+    let info: Buffer = new Buffer(__OSVERSION_SIZE);
+    info.setI32(0, __OSVERSION_SIZE);
+    let status: int32 = rtlGetVersion(info.address);
+    if (status != 0) {
+        info.release();
+        throw new Exception("platform: RtlGetVersion failed");
+    }
+    let major: int = info.i32(4);
+    let minor: int = info.i32(8);
+    let build: int = info.i32(12);
+    let pack: string = readWide(info.address + __OSVERSION_CSD_OFFSET, __OSVERSION_CSD_WCHAR);
+    info.release();
+    return [major, minor, build, pack];
+}
+
+func __machineName(architectureId: int) -> string {
+    return when (architectureId) {
+        9: "AMD64",
+        12: "ARM64",
+        6: "IA64",
+        5: "ARM",
+        0: "x86",
+        else: "unknown"
+    };
+}
+
+func __wordBits(architectureId: int) -> string {
+    return when (architectureId) {
+        9, 12, 6: "64bit",
+        else: "32bit"
+    };
+}
+
+// Release names per build: the Windows 11 line is recognized by its build
+// numbers, then the older NT table the same way Python's win32 table orders.
+func __releaseName(major: int, minor: int, build: int) -> string {
+    return when {
+        build >= 22000: "11",
+        major == 10: "10",
+        major == 6 and minor == 3: "8.1",
+        major == 6 and minor == 2: "8",
+        major == 6 and minor == 1: "7",
+        major == 6 and minor == 0: "Vista",
+        major == 5 and minor == 2: "XP Professional",
+        major == 5 and minor == 1: "XP",
+        major == 5: "2000",
+        else: ""
+    };
+}
+
+// The service pack part Python shows in platform(): a blank pack picks the
+// "SP0" default it displays, a named pack shortens to its SP form.
+func __packSuffix(pack: string) -> string {
+    if (pack == "") {
+        return "SP0";
+    }
+    if (pack.startswith("Service Pack ")) {
+        return "SP" + pack.slice(13, pack.length());
+    }
+    return pack;
+}
+
+// ---------------------------------------------------------------- interface
+
+func system() -> string {
+    return "Windows";
+}
+
+func node() -> string {
+    let sizeBlock: Buffer = new Buffer(4);
+    let nameBlock: Buffer = new Buffer(__COMPUTER_NAME_WCHAR * 2);
+    let name: string = "";
+    try {
+        sizeBlock.setI32(0, __COMPUTER_NAME_WCHAR);
+        let written: int32 = computerName(__COMPUTER_NAME_DNS_HOSTNAME, nameBlock.address, sizeBlock.address);
+        if (written != 0) {
+            name = readWide(nameBlock.address, __COMPUTER_NAME_WCHAR);
+        }
+    } catch (&failure) {
+        sizeBlock.release();
+        nameBlock.release();
+        throw failure;
+    }
+    sizeBlock.release();
+    nameBlock.release();
+    return name;
+}
+
+func release() -> string {
+    let numbers: list = __readOsVersion();
+    return __releaseName(numbers[0], numbers[1], numbers[2]);
+}
+
+func version() -> string {
+    let numbers: list = __readOsVersion();
+    return str(numbers[0]) + "." + str(numbers[1]) + "." + str(numbers[2]);
+}
+
+func machine() -> string {
+    let info: Buffer = new Buffer(__SYSTEM_INFO_SIZE);
+    let name: string = "";
+    try {
+        nativeSystemInfo(info.address);
+        name = __machineName(info.i16(__INFO_ARCH));
+    } catch (&failure) {
+        info.release();
+        throw failure;
+    }
+    info.release();
+    return name;
+}
+
+func architecture() -> list {
+    let info: Buffer = new Buffer(__SYSTEM_INFO_SIZE);
+    let bits: string = "";
+    try {
+        nativeSystemInfo(info.address);
+        bits = __wordBits(info.i16(__INFO_ARCH));
+    } catch (&failure) {
+        info.release();
+        throw failure;
+    }
+    info.release();
+    return [bits, "WindowsPE"];
+}
+
+func processor() -> string {
+    let key: Buffer = new Buffer(48);
+    let value: Buffer = new Buffer(__ENV_WCHAR * 2);
+    let text: string = "";
+    try {
+        key.utf16(0, __ENV_NAME);
+        let written: int32 = environmentValue(key.address, value.address, __ENV_WCHAR);
+        if (written > 0 and written < __ENV_WCHAR) {
+            text = readWide(value.address, __ENV_WCHAR);
+        }
+    } catch (&failure) {
+        key.release();
+        value.release();
+        throw failure;
+    }
+    key.release();
+    value.release();
+    return text;
+}
+
+// The composite Python reports, e.g. "Windows-11-10.0.26100-SP0".
+func platform() -> string {
+    let numbers: list = __readOsVersion();
+    let ver: string = str(numbers[0]) + "." + str(numbers[1]) + "." + str(numbers[2]);
+    return "Windows-" + __releaseName(numbers[0], numbers[1], numbers[2]) +
+        "-" + ver + "-" + __packSuffix(numbers[3]);
+}
+
+// Python's win32_ver order: release, version, service pack, processor type.
+func win32_ver() -> list {
+    let numbers: list = __readOsVersion();
+    let info: Buffer = new Buffer(__SYSTEM_INFO_SIZE);
+    let kind: string = "";
+    try {
+        nativeSystemInfo(info.address);
+        if (info.i32(__INFO_PROC_COUNT) > 1) {
+            kind = "Multiprocessor Free";
+        } else {
+            kind = "Uniprocessor Free";
+        }
+    } catch (&failure) {
+        info.release();
+        throw failure;
+    }
+    info.release();
+    let ver: string = str(numbers[0]) + "." + str(numbers[1]) + "." + str(numbers[2]);
+    return [
+        __releaseName(numbers[0], numbers[1], numbers[2]),
+        ver,
+        __packSuffix(numbers[3]),
+        kind
+    ];
+}
+
+// Python's NamedTuple fields, spoken as Dict entries.
+func uname() {
+    let numbers: list = __readOsVersion();
+    let answer: Dict = new Dict();
+    answer.set("system", system());
+    answer.set("node", node());
+    answer.set("release", __releaseName(numbers[0], numbers[1], numbers[2]));
+    answer.set("version", str(numbers[0]) + "." + str(numbers[1]) + "." + str(numbers[2]));
+    answer.set("machine", machine());
+    return answer;
+}
+
+}
+
+using posix {
+    @native("uname", from="c")
+    decl func posixUname(buf: ptr) -> int32;
+
+    @native("gethostname", from="c")
+    decl func posixGetHostName(buf: ptr, len: int) -> int32;
+
+    func __posixReadUname() -> list {
+        let buf = new Buffer(512);
+        let ret = posixUname(buf.address);
+        if (ret < 0) {
+            buf.release();
+            throw new Exception("platform: uname failed");
+        }
+        let sysname = buf.readCString(0, 65);
+        let nodename = buf.readCString(65, 65);
+        let release = buf.readCString(130, 65);
+        let version = buf.readCString(195, 65);
+        let machine = buf.readCString(260, 65);
+        buf.release();
+        return [sysname, nodename, release, version, machine];
+    }
+
+    func system() -> string {
+        let u = __posixReadUname();
+        return u[0];
+    }
+
+    func node() -> string {
+        let u = __posixReadUname();
+        return u[1];
+    }
+
+    func release() -> string {
+        let u = __posixReadUname();
+        return u[2];
+    }
+
+    func version() -> string {
+        let u = __posixReadUname();
+        return u[3];
+    }
+
+    func machine() -> string {
+        let u = __posixReadUname();
+        return u[4];
+    }
+
+    func architecture() -> list {
+        let m = machine();
+        let bits = "64bit";
+        if (m == "i386" or m == "i686" or m == "arm") {
+            bits = "32bit";
+        }
+        return [bits, "ELF"];
+    }
+
+    func processor() -> string {
+        return machine();
+    }
+
+    func platform() -> string {
+        let u = __posixReadUname();
+        return u[0] + "-" + u[2] + "-" + u[4];
+    }
+
+    func win32_ver() -> list {
+        return ["", "", "", ""];
+    }
+
+    func uname() {
+        let u = __posixReadUname();
+        let answer: Dict = new Dict();
+        answer.set("system", u[0]);
+        answer.set("node", u[1]);
+        answer.set("release", u[2]);
+        answer.set("version", u[3]);
+        answer.set("machine", u[4]);
+        return answer;
+    }
+}

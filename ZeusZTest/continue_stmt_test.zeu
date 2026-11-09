@@ -1,0 +1,75 @@
+import zeus.exception;
+
+// continue 必须跳到"下一轮"：计次循环是步进，列表/字典循环是 index++，
+// 条件循环是条件重判。任何一处回填错位都会多算或少算一轮。
+
+func countLoop() -> int {
+    var hits = 0;
+    for (0..10) [const &i] {
+        if (i % 3 != 0) continue;
+        hits = hits + 1;
+    }
+    return hits;
+}
+
+func listLoop() -> string {
+    let items = ["a", "b", "c", "d"];
+    var text = "";
+    for (items) [item] {
+        if (item == "c") continue;
+        text = text + item;
+    }
+    return text;
+}
+
+func condLoop() -> int {
+    var n = 0;
+    var hits = 0;
+    for (n < 6) {
+        n = n + 1;
+        if (n == 2 or n == 5) continue;
+        hits = hits + 1;
+    }
+    return hits;
+}
+
+func dictLoop() -> string {
+    let source = {"a": 1, "b": 2, "c": 3};
+    var text = "";
+    for (source) [key: value] {
+        if (key == "b") continue;
+        text = text + key;
+    }
+    return text;
+}
+
+func nestedLoop() -> int {
+    var hits = 0;
+    for (0..3) [const &i] {
+        for (0..3) [const &j] {
+            if (j == 1) continue;
+            hits = hits + 1;
+        }
+    }
+    return hits;
+}
+
+// continue 之后的语句不能执行；提前退出的那一轮也不能影响累计值。
+func guardedLoop() -> int {
+    let values = [5, 0, 7, 0, 9];
+    var total = 0;
+    for (values) [value] {
+        if (value == 0) continue;
+        total = total + value;
+    }
+    return total;
+}
+
+if (countLoop() != 4) throw new Exception("count loop continue");
+if (listLoop() != "abd") throw new Exception("list loop continue");
+if (condLoop() != 4) throw new Exception("cond loop continue");
+if (dictLoop() != "ac") throw new Exception("dict loop continue");
+if (nestedLoop() != 6) throw new Exception("nested continue stays in its own loop");
+if (guardedLoop() != 21) throw new Exception("continue skips the rest of the body");
+
+print("CONTINUE_STMT_PASS");

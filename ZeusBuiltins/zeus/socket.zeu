@@ -1,10 +1,947 @@
-// socket.zeu - Zeus Socket Module
-// 提供基于句柄的Socket操作，使用内置bytes类型进行数据传输
+// socket.zeu - TCP sockets on the platform socket library.
+//
+// The library is loaded at run time rather than linked into the executable, so
+// the language runtime carries no socket code. Everything below is a
+// declaration plus the bookkeeping that has to live somewhere: turning host
+// names into addresses, and keeping a handle table so a stale Socket cannot
+// address a socket the platform has since recycled.
 
-// 注意：不在文件级使用 using original，避免影响对象返回
-// 在需要原始bytes的函数内单独处理类型转换
+import zeus.ctypes;
+import zeus.thread;
+import zeus.string;
+import zeus.exception;
+import zeus.time;
 
-// ===== Socket 类 =====
+// ---------------------------------------------------------------- platform
+
+using windows {
+    // WSAStartup takes the version packed into a single word, low byte the major
+    // number, so 2.2 arrives as 0x0202.
+    @native("WSAStartup", from="ws2_32")
+    decl func wsaStartup(version: u16, data: ptr) -> int32;
+
+    @native("WSAGetLastError", from="ws2_32")
+    decl func wsaGetLastError() -> int32;
+
+    @native("socket", from="ws2_32")
+    decl func createSocket(domain: int32, kind: int32, protocol: int32) -> int;
+
+    @native("closesocket", from="ws2_32")
+    decl func closeSocket(handle: ptr) -> int32;
+
+    @native("shutdown", from="ws2_32")
+    decl func shutdownSocket(handle: ptr, how: int32) -> int32;
+
+    @native("connect", from="ws2_32")
+    decl func connectSocket(handle: ptr, address: ptr, addressLength: int32) -> int32;
+
+    @native("bind", from="ws2_32")
+    decl func bindSocket(handle: ptr, address: ptr, addressLength: int32) -> int32;
+
+    @native("listen", from="ws2_32")
+    decl func listenSocket(handle: ptr, backlog: int32) -> int32;
+
+    @native("accept", from="ws2_32")
+    decl func acceptSocket(handle: ptr, address: ptr, addressLength: ptr) -> int;
+
+    @native("send", from="ws2_32")
+    decl func sendOnSocket(handle: ptr, buffer: ptr, length: int32, flags: int32) -> int32;
+
+    @native("recv", from="ws2_32")
+    decl func recvFromSocket(handle: ptr, buffer: ptr, length: int32, flags: int32) -> int32;
+
+    @native("getsockopt", from="ws2_32")
+    decl func getSocketOption(handle: ptr, level: int32, option: int32, value: ptr, length: ptr) -> int32;
+
+    @native("setsockopt", from="ws2_32")
+    decl func setSocketOption(handle: ptr, level: int32, option: int32, value: ptr, length: int32) -> int32;
+
+    @native("ioctlsocket", from="ws2_32")
+    decl func setSocketMode(handle: ptr, command: u32, value: ptr) -> int32;
+
+    @native("select", from="ws2_32")
+    decl func selectSocket(nfds: int32, readSet: ptr, writeSet: ptr, exceptSet: ptr, timeout: ptr) -> int32;
+
+    @native("getsockname", from="ws2_32")
+    decl func getSocketName(handle: ptr, address: ptr, addressLength: ptr) -> int32;
+
+    @native("getpeername", from="ws2_32")
+    decl func getPeerName(handle: ptr, address: ptr, addressLength: ptr) -> int32;
+
+    @native("getaddrinfo", from="ws2_32")
+    decl func getAddrInfo(node: ptr, service: ptr, hints: ptr, result: ptr) -> int32;
+
+    @native("freeaddrinfo", from="ws2_32")
+    decl func freeAddrInfo(info: ptr);
+
+    let SOL_SOCKET = 65535;
+    let SO_ERROR = 4103;
+    let FIONBIO = 2147772030;   // 0x8004667E: u_long ioctl code, passed as u32
+    let WSAEWOULDBLOCK = 10035;
+    let WSAEINPROGRESS = 10036;
+    let WSAETIMEDOUT = 10060;
+
+    let addrInfoLayout = new Layout();
+    addrInfoLayout.field("ai_flags", 0, 4);
+    addrInfoLayout.field("ai_family", 4, 4);
+    addrInfoLayout.field("ai_socktype", 8, 4);
+    addrInfoLayout.field("ai_protocol", 12, 4);
+    addrInfoLayout.field("ai_addrlen", 16, 8);
+    addrInfoLayout.field("ai_canonname", 24, 8);
+    addrInfoLayout.field("ai_addr", 32, 8);
+    addrInfoLayout.field("ai_next", 40, 8);
+}
+
+using posix {
+    @native("socket", from="c")
+    decl func createSocket(domain: int32, kind: int32, protocol: int32) -> int;
+
+    @native("close", from="c")
+    decl func closeSocket(handle: ptr) -> int32;
+
+    @native("shutdown", from="c")
+    decl func shutdownSocket(handle: ptr, how: int32) -> int32;
+
+    @native("connect", from="c")
+    decl func connectSocket(handle: ptr, address: ptr, addressLength: int32) -> int32;
+
+    @native("bind", from="c")
+    decl func bindSocket(handle: ptr, address: ptr, addressLength: int32) -> int32;
+
+    @native("listen", from="c")
+    decl func listenSocket(handle: ptr, backlog: int32) -> int32;
+
+    @native("accept", from="c")
+    decl func acceptSocket(handle: ptr, address: ptr, addressLength: ptr) -> int;
+
+    @native("send", from="c")
+    decl func sendOnSocket(handle: ptr, buffer: ptr, length: int32, flags: int32) -> int32;
+
+    @native("recv", from="c")
+    decl func recvFromSocket(handle: ptr, buffer: ptr, length: int32, flags: int32) -> int32;
+
+    @native("getsockopt", from="c")
+    decl func getSocketOption(handle: ptr, level: int32, option: int32, value: ptr, length: ptr) -> int32;
+
+    @native("setsockopt", from="c")
+    decl func setSocketOption(handle: ptr, level: int32, option: int32, value: ptr, length: int32) -> int32;
+
+    @native("fcntl", from="c")
+    decl func posixFcntl(handle: ptr, cmd: int32, arg: int32) -> int32;
+
+    @native("poll", from="c")
+    decl func posixPoll(fds: ptr, nfds: int, timeout: int32) -> int32;
+
+    @native("__errno_location", from="c")
+    decl func posixErrnoLocation() -> ptr;
+
+    func wsaGetLastError() -> int32 {
+        let p = posixErrnoLocation();
+        if (p == 0) return 0;
+        return @faddr(p, 4) -> int;
+    }
+
+    @native("getsockname", from="c")
+    decl func getSocketName(handle: ptr, address: ptr, addressLength: ptr) -> int32;
+
+    @native("getpeername", from="c")
+    decl func getPeerName(handle: ptr, address: ptr, addressLength: ptr) -> int32;
+
+    @native("getaddrinfo", from="c")
+    decl func getAddrInfo(node: ptr, service: ptr, hints: ptr, result: ptr) -> int32;
+
+    @native("freeaddrinfo", from="c")
+    decl func freeAddrInfo(info: ptr);
+
+    let SOL_SOCKET = 1;
+    let SO_ERROR = 4;
+    let F_GETFL = 3;
+    let F_SETFL = 4;
+    let O_NONBLOCK = 2048;
+    let WSAEWOULDBLOCK = 11;
+    let WSAEINPROGRESS = 115;
+    let WSAETIMEDOUT = 110;
+
+    let addrInfoLayout = new Layout();
+    addrInfoLayout.field("ai_flags", 0, 4);
+    addrInfoLayout.field("ai_family", 4, 4);
+    addrInfoLayout.field("ai_socktype", 8, 4);
+    addrInfoLayout.field("ai_protocol", 12, 4);
+    addrInfoLayout.field("ai_addrlen", 16, 4);
+    addrInfoLayout.field("ai_addr", 24, 8);
+    addrInfoLayout.field("ai_canonname", 32, 8);
+    addrInfoLayout.field("ai_next", 40, 8);
+}
+
+let AF_INET = 2;
+let SOCK_STREAM = 1;
+let IPPROTO_TCP = 6;
+
+// A platform socket is an unsigned handle, and the invalid one is all ones.
+let INVALID_SOCKET = -1;
+
+let SD_BOTH = 2;
+
+let SOCKET_STATE_OPEN = 1;
+let SOCKET_STATE_CLOSING = 2;
+let SOCKET_WAIT_READ = 1;
+let SOCKET_WAIT_WRITE = 2;
+let SOCKET_WAIT_CONNECT = 3;
+let SOCKET_POLL_MILLIS = 25;
+let INVALID_HANDLE_ID = 0;
+
+let BYTE_DOT = 46;
+let BYTE_ZERO = 48;
+let BYTE_NINE = 57;
+
+let WSA_VERSION_MAJOR = 2;
+let WSA_VERSION_MINOR = 2;
+// WSADATA is a few hundred bytes; round up generously.
+let WSA_DATA_SIZE = 512;
+
+// ---------------------------------------------------------------- layouts
+
+// struct sockaddr_in, as Winsock defines it.
+let addressLayout = new Layout();
+addressLayout.field("sin_family", 0, 2);
+addressLayout.field("sin_port", 2, 2);
+addressLayout.field("sin_addr", 4, 4);
+addressLayout.field("sin_zero", 8, 8);
+
+// struct addrinfo layout defined per platform in using blocks above.
+
+// ---------------------------------------------------------------- state
+
+// The table contains only live or closing sockets. Closed entries are removed,
+// while public IDs keep increasing so stale IDs cannot name a later socket.
+class SocketHandleEntry {
+    using &this;
+
+
+    // 引用语义：本类持有原生资源或共享表项。值语义下「读字段」就会复制一份，
+    // 副本析构时 [~] 会把同一个句柄释放掉（或把状态写在快照上）。
+    func operator[@=]() -> &SocketHandleEntry {
+        return this;
+    }
+
+    let id;
+    let native;
+    let state;
+    let activeOperations;
+    let closeClaimed;
+    let sendTimeoutMillis;
+    let recvTimeoutMillis;
+
+    func init(id, native) {
+        this.id = id;
+        this.native = native;
+        this.state = SOCKET_STATE_OPEN;
+        this.activeOperations = 0;
+        this.closeClaimed = false;
+        this.sendTimeoutMillis = 0;
+        this.recvTimeoutMillis = 0;
+    }
+}
+
+class SocketOperationLease {
+    using &this;
+
+
+    // 引用语义：本类持有原生资源或共享表项。值语义下「读字段」就会复制一份，
+    // 副本析构时 [~] 会把同一个句柄释放掉（或把状态写在快照上）。
+    func operator[@=]() -> &SocketOperationLease {
+        return this;
+    }
+
+    let entry;
+    let native;
+    let sendTimeoutMillis;
+    let recvTimeoutMillis;
+    let released;
+
+    func init() {
+        this.entry = nil;
+        this.native = INVALID_SOCKET;
+        this.sendTimeoutMillis = 0;
+        this.recvTimeoutMillis = 0;
+        this.released = false;
+    }
+}
+
+let handleTable = [];
+let tableLock = new Lock();
+var winsockReady = false;
+var nextHandleId = 1;
+
+// ---------------------------------------------------------------- helpers
+
+func tableGuard() -> &Lock {
+    return tableLock;
+}
+
+using windows {
+    func startWinsock() {
+        let guard = tableGuard();
+        guard.acquire();
+        try {
+            if (!winsockReady) {
+                let version = WSA_VERSION_MINOR * 256 + WSA_VERSION_MAJOR;
+                let data = new Buffer(WSA_DATA_SIZE);
+                let result = wsaStartup(version, data.address);
+                data.release();
+                if (result != 0) {
+                    throw new Exception(
+                        "socket: Winsock could not start, error " + str(result));
+                }
+                winsockReady = true;
+            }
+        } catch (&error) {
+            guard.release();
+            throw error;
+        }
+        guard.release();
+    }
+}
+
+using posix {
+    func startWinsock() {
+        winsockReady = true;
+    }
+}
+
+// Ports travel in network byte order, which is the opposite of the order this
+// platform stores them in. There is no bitwise operator in the language, so the
+// swap goes through a small block.
+func htons(value: int) -> int {
+    let block = new Buffer(2);
+    block.setI16(0, value);
+    let high = block.u8(0);
+    let low = block.u8(1);
+    block.release();
+    return high * 256 + low;
+}
+
+func ntohs(value: int) -> int {
+    return htons(value);
+}
+
+func htonl(value: int) -> int {
+    let block = new Buffer(4);
+    block.setI32(0, value);
+    let first = block.u8(0);
+    let second = block.u8(1);
+    let third = block.u8(2);
+    let fourth = block.u8(3);
+    block.release();
+    return first * 16777216 + second * 65536 + third * 256 + fourth;
+}
+
+// A dotted quad can be written straight into sin_addr, so skip the resolver.
+func isIPv4Literal(node: Buffer, byteCount: int) -> bool {
+    if (byteCount == 0) return false;
+    let dots = 0;
+    let index = 0;
+    for (true) {
+        if (index >= byteCount) break;
+        let code = @faddr(node.address + index, 1) -> int;
+        if (code == BYTE_DOT) {
+            dots = dots + 1;
+        } else if (code < BYTE_ZERO or code > BYTE_NINE) {
+            return false;
+        }
+        index = index + 1;
+    }
+    return dots == 3;
+}
+
+// Folds a dotted quad into the 32-bit form sin_addr expects, with the first
+// octet in the most significant byte.
+func ipv4ToInt(node: Buffer, byteCount: int) -> int {
+    let result = 0;
+    let octet = 0;
+    let digits = 0;
+    let index = 0;
+    for (true) {
+        if (index >= byteCount) break;
+        let code = @faddr(node.address + index, 1) -> int;
+        if (code == BYTE_DOT) {
+            if (digits == 0) throw new Exception("socket: invalid IPv4 address");
+            result = result * 256 + octet;
+            octet = 0;
+            digits = 0;
+        } else {
+            octet = octet * 10 + (code - BYTE_ZERO);
+            digits = digits + 1;
+            if (octet > 255 or digits > 3) {
+                throw new Exception("socket: invalid IPv4 address");
+            }
+        }
+        index = index + 1;
+    }
+    if (digits == 0) throw new Exception("socket: invalid IPv4 address");
+    return result * 256 + octet;
+}
+
+// Resolves host and port into a filled sockaddr_in.
+func resolveAddress(host: string, port: int) -> Buffer {
+    if (port < 0 or port > 65535) {
+        throw new Exception("socket: port must be between 0 and 65535");
+    }
+
+    let node = new Buffer(host.length() + 2);
+    node.utf8(0, host);
+    let byteCount = host.length();
+
+    let addressLayoutRef: Layout = addressLayout;
+    let address = new Buffer(addressLayoutRef.size);
+    let familyOffset = addressLayoutRef.offsetOf("sin_family");
+    address.setI16(familyOffset, AF_INET);
+    let portOffset = addressLayoutRef.offsetOf("sin_port");
+    address.setI16(portOffset, htons(port));
+
+    if (isIPv4Literal(node, byteCount)) {
+        // sin_addr is four bytes in network order, so a dotted quad has to be
+        // stored swapped. Writing it with the eight byte pointer setter would
+        // also reach into the padding that follows.
+        try {
+            address.setI32(addressLayoutRef.offsetOf("sin_addr"),
+                htonl(ipv4ToInt(node, byteCount)));
+        } catch (&error) {
+            node.release();
+            address.release();
+            throw error;
+        }
+        node.release();
+        return address;
+    }
+
+    let service = new Buffer(16);
+    service.utf8(0, str(port));
+
+    let addrInfoLayoutRef: Layout = addrInfoLayout;
+    let hints = new Buffer(addrInfoLayoutRef.size);
+    hints.setI32(addrInfoLayoutRef.offsetOf("ai_family"), AF_INET);
+    hints.setI32(addrInfoLayoutRef.offsetOf("ai_socktype"), SOCK_STREAM);
+
+    let result = new Buffer(8);
+    result.setPointer(0, 0);
+
+    let status = getAddrInfo(
+        node.address, service.address, hints.address, result.address);
+    node.release();
+    service.release();
+    hints.release();
+
+    if (status != 0) {
+        result.release();
+        address.release();
+        throw new Exception(
+            "socket: cannot resolve '" + host + "', error " + str(status));
+    }
+
+    let head = result.pointer(0);
+    if (head == 0) {
+        result.release();
+        address.release();
+        throw new Exception("socket: no address for '" + host + "'");
+    }
+
+    // The chain points at storage the resolver owns, so @faddr cannot reach it and
+    // the address is copied out through the platform move before the chain is
+    // freed. Those octets are already in network order.
+    let source = readPointer(head, addrInfoLayoutRef.offsetOf("ai_addr"));
+    if (source == 0) {
+        freeAddrInfo(head);
+        result.release();
+        address.release();
+        throw new Exception("socket: resolver returned no IPv4 address for '" + host + "'");
+    }
+    copyBytes(address.address + addressLayoutRef.offsetOf("sin_addr"),
+        source + addressLayout.offsetOf("sin_addr"), 4);
+    freeAddrInfo(head);
+    result.release();
+    return address;
+}
+
+func __socket_find_entry_locked(id) -> int {
+    if (id == nil or id <= 0) return -1;
+    let index = 0;
+    for (index < handleTable.length()) {
+        if (handleTable[index].id == id) return index;
+        index = index + 1;
+    }
+    return -1;
+}
+
+func __socket_remove_entry_locked(id) {
+    let index = __socket_find_entry_locked(id);
+    if (index < 0) return;
+    let last = handleTable.length() - 1;
+    for (index < last) {
+        handleTable.set(index, handleTable[index + 1]);
+        index = index + 1;
+    }
+    handleTable.pop();
+}
+
+func __socket_allocate_handle_id() -> int {
+    let guard = tableGuard();
+    guard.acquire();
+    let id = nextHandleId;
+    nextHandleId = nextHandleId + 1;
+    guard.release();
+    if (id <= 0) throw new Exception("socket: handle ID space exhausted");
+    return id;
+}
+
+func registerHandle(native: int) -> int {
+    let id = __socket_allocate_handle_id();
+    let entry = new SocketHandleEntry(id, native);
+    let guard = tableGuard();
+    guard.acquire();
+    handleTable.append(entry);
+    guard.release();
+    return id;
+}
+
+// Accept publishes a client only while its listener remains open. The check
+// and insertion share the same lock as requestClose().
+func __socket_register_accepted(parentId, native: int) -> int {
+    let id = __socket_allocate_handle_id();
+    let entry = new SocketHandleEntry(id, native);
+    let guard = tableGuard();
+    guard.acquire();
+    let parentIndex = __socket_find_entry_locked(parentId);
+    if (parentIndex < 0) {
+        guard.release();
+        return INVALID_HANDLE_ID;
+    }
+    if (handleTable[parentIndex].state != SOCKET_STATE_OPEN) {
+        guard.release();
+        return INVALID_HANDLE_ID;
+    }
+    handleTable.append(entry);
+    guard.release();
+    return id;
+}
+
+func __socket_begin_operation(id) -> SocketOperationLease {
+    let lease = new SocketOperationLease();
+    if (id == nil or id <= 0) {
+        throw new Exception("socket: handle is closed");
+    }
+    let guard = tableGuard();
+    guard.acquire();
+    let index = __socket_find_entry_locked(id);
+    if (index < 0) {
+        guard.release();
+        throw new Exception("socket: handle is closed");
+    }
+    let entry = handleTable[index];
+    if (entry.state != SOCKET_STATE_OPEN) {
+        guard.release();
+        throw new Exception("socket: handle is closed");
+    }
+    entry.activeOperations = entry.activeOperations + 1;
+    lease.entry = entry;
+    lease.native = entry.native;
+    lease.sendTimeoutMillis = entry.sendTimeoutMillis;
+    lease.recvTimeoutMillis = entry.recvTimeoutMillis;
+    guard.release();
+    return lease;
+}
+
+func __socket_is_closing(lease: SocketOperationLease) -> bool {
+    let guard = tableGuard();
+    guard.acquire();
+    let closing = lease.entry.state != SOCKET_STATE_OPEN;
+    guard.release();
+    return closing;
+}
+
+func __socket_claim_close_locked(entry: SocketHandleEntry) -> int {
+    if (entry.state != SOCKET_STATE_CLOSING or
+        entry.activeOperations != 0 or entry.closeClaimed) {
+        return INVALID_SOCKET;
+    }
+    entry.closeClaimed = true;
+    let native = entry.native;
+    __socket_remove_entry_locked(entry.id);
+    return native;
+}
+
+func __socket_close_native(native: int) {
+    if (native == INVALID_SOCKET) return;
+    shutdownSocket(native, SD_BOTH);
+    closeSocket(native);
+}
+
+func __socket_end_operation(lease: SocketOperationLease) {
+    if (lease == nil) return;
+    let nativeToClose = INVALID_SOCKET;
+    let guard = tableGuard();
+    guard.acquire();
+    if (!lease.released) {
+        lease.released = true;
+        lease.entry.activeOperations = lease.entry.activeOperations - 1;
+        nativeToClose = __socket_claim_close_locked(lease.entry);
+    }
+    guard.release();
+    if (nativeToClose != INVALID_SOCKET) __socket_close_native(nativeToClose);
+}
+
+func __socket_request_close(id) {
+    if (id == nil or id <= 0) return;
+    let nativeToClose = INVALID_SOCKET;
+    let guard = tableGuard();
+    guard.acquire();
+    let index = __socket_find_entry_locked(id);
+    if (index >= 0) {
+        let entry = handleTable[index];
+        entry.state = SOCKET_STATE_CLOSING;
+        nativeToClose = __socket_claim_close_locked(entry);
+    }
+    guard.release();
+    if (nativeToClose != INVALID_SOCKET) __socket_close_native(nativeToClose);
+}
+
+func __socket_set_timeout(id, timeoutMillis: int) {
+    let guard = tableGuard();
+    guard.acquire();
+    let index = __socket_find_entry_locked(id);
+    if (index < 0) {
+        guard.release();
+        throw new Exception("socket: handle is closed");
+    }
+    if (handleTable[index].state != SOCKET_STATE_OPEN) {
+        guard.release();
+        throw new Exception("socket: handle is closed");
+    }
+    handleTable[index].sendTimeoutMillis = timeoutMillis;
+    handleTable[index].recvTimeoutMillis = timeoutMillis;
+    guard.release();
+}
+
+// The receive timeout is the one a caller reads back: send and receive share
+// it, and the receive side is what a wait normally needs to restore.
+func __socket_get_timeout(id) -> int {
+    let timeout = 0;
+    let guard = tableGuard();
+    guard.acquire();
+    let index = __socket_find_entry_locked(id);
+    if (index < 0) {
+        guard.release();
+        throw new Exception("socket: handle is closed");
+    }
+    if (handleTable[index].state != SOCKET_STATE_OPEN) {
+        guard.release();
+        throw new Exception("socket: handle is closed");
+    }
+    timeout = handleTable[index].recvTimeoutMillis;
+    guard.release();
+    return timeout;
+}
+
+using windows {
+    func __socket_set_nonblocking(native: int) {
+        let value = new Buffer(4);
+        value.setI32(0, 1);
+        let result = setSocketMode(native, FIONBIO, value.address);
+        let error = 0;
+        if (result < 0) error = wsaGetLastError();
+        value.release();
+        if (result < 0) {
+            throw new Exception("socket: cannot set nonblocking mode, error " + str(error));
+        }
+    }
+
+    func __socket_wait_ready(
+        lease: SocketOperationLease,
+        mode: int,
+        timeoutMillis: int
+    ) -> bool {
+        // Winsock fd_set has a count followed by up to 64 pointer-sized SOCKETs.
+        let readSetOffset = 0;
+        let writeSetOffset = 520;
+        let exceptSetOffset = 1040;
+        let timevalOffset = 1560;
+        let memory = new Buffer(1568);
+        let start = monotonic_ns();
+        let firstPoll = true;
+        let available = false;
+
+        try {
+            for (true) {
+                if (__socket_is_closing(lease)) {
+                    throw new Exception("socket: handle is closed");
+                }
+
+                let waitMillis = SOCKET_POLL_MILLIS;
+                if (timeoutMillis >= 0) {
+                    let elapsedNanos = monotonic_ns() - start;
+                    let remainingNanos = timeoutMillis * 1000000 - elapsedNanos;
+                    if (remainingNanos <= 0) {
+                        if (!firstPoll) break;
+                        waitMillis = 0;
+                    } else if (remainingNanos < waitMillis * 1000000) {
+                        waitMillis = remainingNanos / 1000000;
+                        if (waitMillis == 0) waitMillis = 1;
+                    }
+                }
+
+                memory.setI32(readSetOffset, 0);
+                memory.setI32(writeSetOffset, 0);
+                memory.setI32(exceptSetOffset, 0);
+                let readPointer = 0;
+                let writePointer = 0;
+                let exceptPointer = 0;
+                if (mode == SOCKET_WAIT_READ) {
+                    memory.setI32(readSetOffset, 1);
+                    memory.setPointer(readSetOffset + 8, lease.native);
+                    readPointer = memory.address + readSetOffset;
+                } else if (mode == SOCKET_WAIT_WRITE) {
+                    memory.setI32(writeSetOffset, 1);
+                    memory.setPointer(writeSetOffset + 8, lease.native);
+                    writePointer = memory.address + writeSetOffset;
+                } else if (mode == SOCKET_WAIT_CONNECT) {
+                    memory.setI32(writeSetOffset, 1);
+                    memory.setPointer(writeSetOffset + 8, lease.native);
+                    memory.setI32(exceptSetOffset, 1);
+                    memory.setPointer(exceptSetOffset + 8, lease.native);
+                    writePointer = memory.address + writeSetOffset;
+                    exceptPointer = memory.address + exceptSetOffset;
+                } else {
+                    throw new Exception("socket: invalid readiness mode");
+                }
+
+                memory.setI32(timevalOffset, int(waitMillis / 1000));
+                memory.setI32(timevalOffset + 4, (waitMillis % 1000) * 1000);
+                let ready = selectSocket(
+                    0, readPointer, writePointer, exceptPointer,
+                    memory.address + timevalOffset);
+                firstPoll = false;
+                if (ready < 0) {
+                    let error = wsaGetLastError();
+                    throw new Exception("socket: select failed with socket error " + str(error));
+                }
+                if (ready > 0) {
+                    if (__socket_is_closing(lease)) {
+                        throw new Exception("socket: handle is closed");
+                    }
+                    available = true;
+                    break;
+                }
+                if (timeoutMillis >= 0 and
+                    monotonic_ns() - start >= timeoutMillis * 1000000) {
+                    break;
+                }
+            }
+        } catch (&error) {
+            memory.release();
+            throw error;
+        }
+
+        memory.release();
+        return available;
+    }
+}
+
+using posix {
+    func __socket_set_nonblocking(native: int) {
+        let flags = posixFcntl(native, F_GETFL, 0);
+        if (flags < 0) {
+            let err = wsaGetLastError();
+            throw new Exception("socket: fcntl F_GETFL failed, error " + str(err));
+        }
+        let result = posixFcntl(native, F_SETFL, flags + O_NONBLOCK);
+        if (result < 0) {
+            let err = wsaGetLastError();
+            throw new Exception("socket: fcntl F_SETFL failed, error " + str(err));
+        }
+    }
+
+    func __socket_wait_ready(
+        lease: SocketOperationLease,
+        mode: int,
+        timeoutMillis: int
+    ) -> bool {
+        let memory = new Buffer(8);
+        memory.setI32(0, lease.native);
+        if (mode == SOCKET_WAIT_READ) {
+            memory.setI16(4, 1);
+        } else if (mode == SOCKET_WAIT_WRITE) {
+            memory.setI16(4, 4);
+        } else if (mode == SOCKET_WAIT_CONNECT) {
+            memory.setI16(4, 4 + 8);
+        } else {
+            memory.release();
+            throw new Exception("socket: invalid readiness mode");
+        }
+        memory.setI16(6, 0);
+
+        let start = monotonic_ns();
+        let available = false;
+        try {
+            for (true) {
+                if (__socket_is_closing(lease)) {
+                    throw new Exception("socket: handle is closed");
+                }
+                let waitMillis = SOCKET_POLL_MILLIS;
+                if (timeoutMillis >= 0) {
+                    let elapsedNanos = monotonic_ns() - start;
+                    let remainingNanos = timeoutMillis * 1000000 - elapsedNanos;
+                    if (remainingNanos <= 0) break;
+                    if (remainingNanos < waitMillis * 1000000) {
+                        waitMillis = int(remainingNanos / 1000000);
+                        if (waitMillis == 0) waitMillis = 1;
+                    }
+                }
+                let ready = posixPoll(memory.address, 1, waitMillis);
+                if (ready < 0) {
+                    let err = wsaGetLastError();
+                    if (err == 4) continue;
+                    throw new Exception("socket: poll failed with error " + str(err));
+                }
+                if (ready > 0) {
+                    if (__socket_is_closing(lease)) {
+                        throw new Exception("socket: handle is closed");
+                    }
+                    available = true;
+                    break;
+                }
+                if (timeoutMillis >= 0 and
+                    monotonic_ns() - start >= timeoutMillis * 1000000) {
+                    break;
+                }
+            }
+        } catch (&err) {
+            memory.release();
+            throw err;
+        }
+        memory.release();
+        return available;
+    }
+}
+
+func __socket_wait_timeout(timeoutMillis: int) -> int {
+    if (timeoutMillis == 0) return -1;
+    return timeoutMillis;
+}
+
+func __socket_connect_nonblocking(
+    lease: SocketOperationLease,
+    address,
+    addressLength: int,
+    timeoutMillis: int
+) {
+    if (timeoutMillis < -1) {
+        throw new Exception("socket: connect timeout must be non-negative");
+    }
+    if (__socket_is_closing(lease)) {
+        throw new Exception("socket: handle is closed");
+    }
+    let result = connectSocket(lease.native, address, addressLength);
+    if (result == 0) return;
+
+    let connectError = wsaGetLastError();
+    if (connectError != WSAEWOULDBLOCK and connectError != WSAEINPROGRESS) {
+        throw new Exception("socket: connect failed with error " + str(connectError));
+    }
+    if (!__socket_wait_ready(lease, SOCKET_WAIT_CONNECT, timeoutMillis)) {
+        throw new Exception("socket: connect timed out after " + str(timeoutMillis) + " ms");
+    }
+
+    let errorMemory = new Buffer(8);
+    errorMemory.setI32(4, 4);
+    let optionResult = 0;
+    let pendingError = 0;
+    try {
+        optionResult = getSocketOption(
+            lease.native, SOL_SOCKET, SO_ERROR,
+            errorMemory.address, errorMemory.address + 4);
+        if (optionResult < 0) pendingError = wsaGetLastError();
+        else pendingError = errorMemory.i32(0);
+    } catch (&error) {
+        errorMemory.release();
+        throw error;
+    }
+    errorMemory.release();
+    if (pendingError != 0) {
+        throw new Exception("socket: connect failed with error " + str(pendingError));
+    }
+    if (__socket_is_closing(lease)) {
+        throw new Exception("socket: handle is closed");
+    }
+}
+
+func __socket_send_all(lease: SocketOperationLease, data: bytes) -> int {
+    let length = data.length();
+    let sent = 0;
+    for (true) {
+        if (sent >= length) break;
+        if (__socket_is_closing(lease)) {
+            throw new Exception("socket: handle is closed");
+        }
+        let chunk = length - sent;
+        if (chunk > 2147483647) chunk = 2147483647;
+        let count = sendOnSocket(
+            lease.native, data.dataAddress() + sent, chunk, 0);
+        if (count > 0) {
+            sent = sent + count;
+            if (__socket_is_closing(lease)) {
+                throw new Exception("socket: handle is closed");
+            }
+        } else if (count == 0) {
+            throw new Exception("socket: send made no progress");
+        } else {
+            let sendError = wsaGetLastError();
+            if (sendError == WSAEWOULDBLOCK) {
+                let timeout = __socket_wait_timeout(lease.sendTimeoutMillis);
+                if (!__socket_wait_ready(lease, SOCKET_WAIT_WRITE, timeout)) {
+                    throw new Exception("socket: send failed with socket error " + str(WSAETIMEDOUT));
+                }
+            } else {
+                throw new Exception("socket: send failed with socket error " + str(sendError));
+            }
+        }
+    }
+    return sent;
+}
+
+func __socket_recv_once(
+    lease: SocketOperationLease,
+    bufferAddress: int,
+    size: int,
+    operation: string
+) -> int {
+    for (true) {
+        if (__socket_is_closing(lease)) {
+            throw new Exception("socket: handle is closed");
+        }
+        let received = recvFromSocket(lease.native, bufferAddress, size, 0);
+        if (received >= 0) {
+            if (__socket_is_closing(lease)) {
+                throw new Exception("socket: handle is closed");
+            }
+            return received;
+        } else {
+            let receiveError = wsaGetLastError();
+            if (receiveError == WSAEWOULDBLOCK) {
+                let timeout = __socket_wait_timeout(lease.recvTimeoutMillis);
+                if (!__socket_wait_ready(lease, SOCKET_WAIT_READ, timeout)) {
+                    throw new Exception(
+                        "socket: " + operation + " failed with socket error " + str(WSAETIMEDOUT));
+                }
+            } else {
+                throw new Exception(
+                    "socket: " + operation + " failed with socket error " + str(receiveError));
+            }
+        }
+    }
+    return 0;
+}
+
+// ===== Socket class =====
 
 class Socket {
     using &this;
@@ -13,46 +950,241 @@ class Socket {
     let isConnected;  // bool
     let isOpen;       // bool
 
-    func init(ip=nil, port=nil) {
-        this.handle = __socket_create();
-        this.isOpen = true;
+    // 绑定保持同一实例。包装器只持有句柄表里的一个 id，而 operator[~] 会关掉
+    // 那个 id；值语义下每个临时副本析构都会关同一个原生 socket，把还在用的
+    // 连接连根拔掉（读到一半的流就是这么崩的）。
+    func operator[@=]() -> &Socket {
+        return this;
+    }
+
+    func init(ip=nil, port=nil, createNative=true) {
+        this.handle = nil;
+        this.isOpen = false;
         this.isConnected = false;
 
+        // accept() needs a wrapper for an already-created SOCKET. Creating a
+        // normal Socket here would allocate and immediately discard a second
+        // native socket.
+        if (!createNative) return;
+
+        startWinsock();
+        let native = createSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (native == INVALID_SOCKET) {
+            let error = wsaGetLastError();
+            throw new Exception("socket: create failed with socket error " + str(error));
+        }
+        try {
+            __socket_set_nonblocking(native);
+            this.handle = registerHandle(native);
+        } catch (&error) {
+            __socket_close_native(native);
+            throw error;
+        }
+        this.isOpen = true;
+
         if (ip != nil and port != nil) {
-            this.connect(ip, port);
+            try {
+                this.connect(ip, port);
+            } catch (&error) {
+                this.close();
+                throw error;
+            }
         }
     }
 
-    func connect(host, port) {
-        let hostStr = host;
+    func connect(host, port, timeoutMillis=nil) {
+        if (timeoutMillis != nil and timeoutMillis < 0) {
+            throw new Exception("socket: connect timeout must be non-negative");
+        }
+        if (!this.isOpen) throw new Exception("socket is closed");
+        let address = resolveAddress(host, port);
+        let lease = nil;
+        try {
+            lease = __socket_begin_operation(this.handle);
+        } catch (&error) {
+            address.release();
+            throw error;
+        }
 
-        __socket_connect(this.handle, hostStr, port);
-        this.isConnected = true;
+        let timeout = -1;
+        if (timeoutMillis != nil) timeout = timeoutMillis;
+        try {
+            __socket_connect_nonblocking(
+                lease, address.address, addressLayout.size, timeout);
+            if (__socket_is_closing(lease)) {
+                throw new Exception("socket: handle is closed");
+            }
+            this.isConnected = true;
+        } catch (&error) {
+            address.release();
+            __socket_end_operation(lease);
+            if (timeoutMillis != nil) this.close();
+            throw error;
+        }
+        address.release();
+        __socket_end_operation(lease);
+    }
+
+    func setTimeout(timeoutMillis: int) {
+        if (!this.isOpen) throw new Exception("socket is closed");
+        if (timeoutMillis < -1) {
+            throw new Exception("socket timeout must be -1 or non-negative");
+        }
+        let milliseconds = timeoutMillis;
+        if (milliseconds < 0) milliseconds = 0;
+        __socket_set_timeout(this.handle, milliseconds);
+    }
+
+    // The receive timeout in milliseconds; 0 means "wait without a deadline".
+    func getTimeout() -> int {
+        if (!this.isOpen) throw new Exception("socket is closed");
+        return __socket_get_timeout(this.handle);
+    }
+
+    // Waits until a receive would not block, without consuming anything. A peer
+    // that closed the socket counts as readable: the next recv reports it.
+    // Returns false when the deadline passes first.
+    func waitReadable(timeoutMillis: int) -> bool {
+        if (!this.isOpen) throw new Exception("socket is closed");
+        if (timeoutMillis < 0) {
+            throw new Exception("socket wait timeout must be non-negative");
+        }
+        let lease = __socket_begin_operation(this.handle);
+        let readable = false;
+        try {
+            readable = __socket_wait_ready(lease, SOCKET_WAIT_READ, timeoutMillis);
+        } catch (&error) {
+            __socket_end_operation(lease);
+            throw error;
+        }
+        __socket_end_operation(lease);
+        return readable;
     }
 
     func bind(host, port) {
-        let hostStr = host;
-
-        __socket_bind(this.handle, hostStr, port);
+        if (!this.isOpen) throw new Exception("socket is closed");
+        let address = resolveAddress(host, port);
+        let lease = nil;
+        try {
+            lease = __socket_begin_operation(this.handle);
+        } catch (&error) {
+            address.release();
+            throw error;
+        }
+        try {
+            if (__socket_is_closing(lease)) {
+                throw new Exception("socket: handle is closed");
+            }
+            let result = bindSocket(lease.native, address.address, addressLayout.size);
+            if (result < 0) {
+                let error = wsaGetLastError();
+                throw new Exception("socket: bind failed with socket error " + str(error));
+            }
+            if (__socket_is_closing(lease)) {
+                throw new Exception("socket: handle is closed");
+            }
+        } catch (&error) {
+            address.release();
+            __socket_end_operation(lease);
+            throw error;
+        }
+        address.release();
+        __socket_end_operation(lease);
     }
 
     func listen(backlog=5) {
-        __socket_listen(this.handle, backlog);
+        if (!this.isOpen) throw new Exception("socket is closed");
+        let lease = __socket_begin_operation(this.handle);
+        try {
+            if (__socket_is_closing(lease)) {
+                throw new Exception("socket: handle is closed");
+            }
+            let result = listenSocket(lease.native, backlog);
+            if (result < 0) {
+                let error = wsaGetLastError();
+                throw new Exception("socket: listen failed with socket error " + str(error));
+            }
+            if (__socket_is_closing(lease)) {
+                throw new Exception("socket: handle is closed");
+            }
+        } catch (&error) {
+            __socket_end_operation(lease);
+            throw error;
+        }
+        __socket_end_operation(lease);
     }
 
     func accept() {
-        let clientHandle = __socket_accept(this.handle);
-        let result = new Socket();
+        if (!this.isOpen) throw new Exception("socket is closed");
+        let listenerId = this.handle;
+        let peerAddress = nil;
+        let peerLength = nil;
+        try {
+            peerAddress = new Buffer(addressLayout.size);
+            peerLength = new Buffer(4);
+            peerLength.setI32(0, addressLayout.size);
+        } catch (&error) {
+            if (peerAddress != nil) peerAddress.release();
+            if (peerLength != nil) peerLength.release();
+            throw error;
+        }
+        let lease = nil;
+        try {
+            lease = __socket_begin_operation(listenerId);
+        } catch (&error) {
+            peerAddress.release();
+            peerLength.release();
+            throw error;
+        }
+        let accepted = INVALID_SOCKET;
+        let peer = nil;
+        try {
+            for (true) {
+                if (__socket_is_closing(lease)) {
+                    throw new Exception("socket: handle is closed");
+                }
+                if (__socket_wait_ready(lease, SOCKET_WAIT_READ, -1)) {
+                    if (__socket_is_closing(lease)) {
+                        throw new Exception("socket: handle is closed");
+                    }
 
-        // 关闭 init 中创建的多余 socket，使用 accept 返回的 handle
-        result.close();
-        result.handle = clientHandle;
-        result.isOpen = true;
-        result.isConnected = true;
-        return result;
+                    peerLength.setI32(0, addressLayout.size);
+                    accepted = acceptSocket(
+                        lease.native, peerAddress.address, peerLength.address);
+                    if (accepted != INVALID_SOCKET) {
+                        // The accepted SOCKET is not published yet, so it can be made
+                        // nonblocking before any other thread can acquire a lease.
+                        __socket_set_nonblocking(accepted);
+                        peer = new Socket(nil, nil, false);
+                        let peerId = __socket_register_accepted(listenerId, accepted);
+                        if (peerId == INVALID_HANDLE_ID) {
+                            throw new Exception("socket: listener closed during accept");
+                        }
+                        accepted = INVALID_SOCKET;
+                        peer.adoptHandle(peerId);
+                        peer.isConnected = true;
+                        break;
+                    }
+
+                    let acceptError = wsaGetLastError();
+                    if (acceptError != WSAEWOULDBLOCK) {
+                        throw new Exception("socket: accept failed with error " + str(acceptError));
+                    }
+                }
+            }
+        } catch (&error) {
+            peerAddress.release();
+            peerLength.release();
+            if (accepted != INVALID_SOCKET) __socket_close_native(accepted);
+            __socket_end_operation(lease);
+            throw error;
+        }
+        peerAddress.release();
+        peerLength.release();
+        __socket_end_operation(lease);
+        return peer;
     }
 
-    // Transfer native socket ownership without carrying this wrapper across a worker VM.
     func detachHandle() {
         if (!this.isOpen) throw new Exception("socket is closed");
         let handle = this.handle;
@@ -72,59 +1204,194 @@ class Socket {
 
     func send(data) -> int {
         if (data == nil) {
-            return __socket_send(this.handle, bytes(""));
+            return this.sendAll(bytes(""));
         }
-        
         let dataType = type(data);
-        
-        // 使用早返回模式避免 else if 问题
+
         if (dataType == "Byte") {
-            return __socket_send(this.handle, data.data);
+            return this.sendAll(data.data);
         }
-        
+
         if (dataType == "bytes") {
-            return __socket_send(this.handle, data);
+            return this.sendAll(data);
         }
-        
-        return __socket_send(this.handle, bytes(data));
+
+        return this.sendAll(bytes(data));
     }
 
+    // Writes the whole buffer, however many calls it takes.
     func sendAll(data: bytes) -> int {
-        return __socket_send_all(this.handle, data);
+        if (!this.isOpen) throw new Exception("socket is closed");
+        let length = data.length();
+        if (length == 0) return 0;
+        let lease = __socket_begin_operation(this.handle);
+        let sent = 0;
+        try {
+            sent = __socket_send_all(lease, data);
+        } catch (&error) {
+            __socket_end_operation(lease);
+            throw error;
+        }
+        __socket_end_operation(lease);
+        return sent;
     }
 
+    // Receive scratch space is a bytes value rather than a ctypes Buffer: a
+    // bytes block is allocated in one step and its data address is already known
+    // to the VM, where a Buffer is cleared an octet at a time through the
+    // address validator. A read costs one native call and one slice, however
+    // large the buffer is.
     func recv(size=1024) {
-        return __socket_recv(this.handle, size);
+        if (!this.isOpen) throw new Exception("socket is closed");
+        if (size <= 0) return b"";
+        if (size > 2147483647) throw new Exception("socket receive size exceeds the native int32 limit");
+        let scratch = bytes(size);
+        let lease = __socket_begin_operation(this.handle);
+        let received = 0;
+        try {
+            received = __socket_recv_once(
+                lease, scratch.dataAddress(), size, "recv");
+        } catch (&error) {
+            __socket_end_operation(lease);
+            throw error;
+        }
+        __socket_end_operation(lease);
+        if (received == 0) {
+            this.isConnected = false;
+            return b"";
+        }
+        return scratch.slice(0, received);
     }
 
     func recvExact(size: int) -> bytes {
         if (size < 0) throw new Exception("socket receive size must be non-negative");
         if (size == 0) return b"";
-        return __socket_recv_exact(this.handle, size);
+        if (!this.isOpen) throw new Exception("socket is closed");
+
+        let scratch = bytes(size);
+        let lease = __socket_begin_operation(this.handle);
+        let filled = 0;
+        try {
+            for (true) {
+                if (__socket_is_closing(lease)) {
+                    throw new Exception("socket: handle is closed");
+                }
+                if (filled >= size) break;
+                let chunk = size - filled;
+                if (chunk > 2147483647) chunk = 2147483647;
+                let received = __socket_recv_once(
+                    lease, scratch.dataAddress() + filled, chunk, "recvExact");
+                if (received == 0) {
+                    this.isConnected = false;
+                    break;
+                }
+                filled = filled + received;
+            }
+        } catch (&error) {
+            __socket_end_operation(lease);
+            throw error;
+        }
+        __socket_end_operation(lease);
+        if (filled == 0) return b"";
+        return scratch.slice(0, filled);
     }
 
     func close() {
-        if (this.isOpen) {
-            __socket_close(this.handle);
-            this.handle = nil;
-            this.isOpen = false;
-            this.isConnected = false;
-        }
+        let id = this.handle;
+        this.isOpen = false;
+        this.isConnected = false;
+        __socket_request_close(id);
+        this.handle = nil;
     }
 
-    // Close the native socket to interrupt a blocking accept/recv without
-    // changing this wrapper. The owner calls close() after the operation exits.
+    // Mark the entry as closing without changing this wrapper. Active operations
+    // use bounded nonblocking waits; the final lease closes the SOCKET.
     func requestClose() {
-        if (this.isOpen) {
-            __socket_close(this.handle);
-        }
+        __socket_request_close(this.handle);
     }
 
     func getConnected() {
         if (!this.isOpen) {
             return false;
         }
-        return __socket_is_connected(this.handle);
+        if (!this.isConnected) {
+            return false;
+        }
+        let memory = new Buffer(addressLayout.size + 12);
+        let lease = nil;
+        try {
+            lease = __socket_begin_operation(this.handle);
+        } catch (&error) {
+            memory.release();
+            this.isConnected = false;
+            return false;
+        }
+        let connected = false;
+        try {
+            memory.setI32(4, 4);
+            let status = getSocketOption(
+                lease.native, SOL_SOCKET, SO_ERROR,
+                memory.address, memory.address + 4);
+            let pendingError = memory.i32(0);
+            if (status >= 0 and pendingError == 0) {
+                let peerAddressOffset = 8;
+                let peerLengthOffset = peerAddressOffset + addressLayout.size;
+                memory.setI32(peerLengthOffset, addressLayout.size);
+                let peerStatus = getPeerName(
+                    lease.native, memory.address + peerAddressOffset,
+                    memory.address + peerLengthOffset);
+                connected = peerStatus >= 0;
+            }
+            if (__socket_is_closing(lease)) connected = false;
+        } catch (&error) {
+            memory.release();
+            __socket_end_operation(lease);
+            throw error;
+        }
+        memory.release();
+        if (!connected) this.isConnected = false;
+        __socket_end_operation(lease);
+        return connected;
+    }
+
+    // The port this socket is bound to, which is how a caller that asked for
+    // port 0 finds out where the platform put it.
+    func localPort() -> int {
+        if (!this.isOpen) throw new Exception("socket is closed");
+        let memory = new Buffer(addressLayout.size + 4);
+        memory.setI32(addressLayout.size, addressLayout.size);
+        let lease = nil;
+        try {
+            lease = __socket_begin_operation(this.handle);
+        } catch (&error) {
+            memory.release();
+            throw error;
+        }
+        let status = 0;
+        let error = 0;
+        try {
+            status = getSocketName(
+                lease.native, memory.address, memory.address + addressLayout.size);
+            if (status < 0) error = wsaGetLastError();
+        } catch (&failure) {
+            memory.release();
+            __socket_end_operation(lease);
+            throw failure;
+        }
+        if (status < 0) {
+            memory.release();
+            __socket_end_operation(lease);
+            throw new Exception("socket: local port failed with socket error " + str(error));
+        }
+        if (__socket_is_closing(lease)) {
+            memory.release();
+            __socket_end_operation(lease);
+            throw new Exception("socket: handle is closed");
+        }
+        let packed = memory.i16(addressLayout.offsetOf("sin_port"));
+        memory.release();
+        __socket_end_operation(lease);
+        return ntohs(packed);
     }
 
     func operator[~] () {

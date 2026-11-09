@@ -5,6 +5,12 @@ import zeus.mem;
 class SharedPtr {
     using &this;
 
+    // 绑定保持同一实例。对象只有一个所有者，释放只在它真正死亡时发生一次；
+    // 别名读写的是同一份原生内存，所以「aliases 共享分配」仍然成立。
+    func operator[@=]() -> &SharedPtr {
+        return this;
+    }
+
     var addressValue: int = 0;
 
     func init(capacity: int) {

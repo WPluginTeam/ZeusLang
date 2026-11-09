@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -140,6 +141,12 @@ bool getDynamicTypeName(
         }
         if (std::holds_alternative<ZeusType::Bytes>(*variant)) {
             typeName = "bytes";
+            return true;
+        }
+        // Dictionary literals use ObjectData storage in both backends;
+        // report the source type so dynamic method lookup hits `impl dict`.
+        if (std::holds_alternative<ZeusType::Object>(*variant)) {
+            typeName = "dict";
             return true;
         }
     }
@@ -341,7 +348,21 @@ void zeus_value_dynamic_field_load(
             ("field is not available on dynamic receiver type '" + typeName + "'").c_str());
     }
 
-    getter(out, receiver, line);
+    try {
+        getter(out, receiver, line);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr,
+            "[ZeusRuntime] dynamic field load failed type=%s field=%s line=%d reason=%s\n",
+            typeName.c_str(), field_name, line, error.what());
+        std::fflush(stderr);
+        throw;
+    } catch (...) {
+        std::fprintf(stderr,
+            "[ZeusRuntime] dynamic field load failed type=%s field=%s line=%d reason=<non-standard exception>\n",
+            typeName.c_str(), field_name, line);
+        std::fflush(stderr);
+        throw;
+    }
 }
 
 void zeus_value_dynamic_attribute_load(
@@ -574,13 +595,33 @@ void zeus_value_dynamic_field_trace(
     if (!object || !callback) return;
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
 
+    std::vector<ZeusValue> sidecarSnapshot;
+    struct SnapshotGuard {
+        std::vector<ZeusValue>& values;
+        ~SnapshotGuard() {
+            for (auto& value : values) zeus_value_release(&value);
+        }
+    } snapshotGuard{sidecarSnapshot};
+
     {
         std::lock_guard<std::mutex> lock(dynamicFieldValuesMutex());
         const auto owner = dynamicFieldValues().find(object);
         if (owner != dynamicFieldValues().end()) {
-            for (const auto& field : owner->second) callback(context, &field.second);
+            sidecarSnapshot.reserve(owner->second.size());
+            for (const auto& field : owner->second) {
+                ZeusValue value{};
+                zeus_value_init_nil(&value);
+                struct SnapshotItemGuard {
+                    ZeusValue* value;
+                    ~SnapshotItemGuard() { zeus_value_release(value); }
+                } valueGuard{&value};
+                zeus_value_clone_internal(&value, &field.second);
+                sidecarSnapshot.push_back(value);
+                zeus_value_init_nil(&value);
+            }
         }
     }
+    for (const auto& value : sidecarSnapshot) callback(context, &value);
 
     // AOT class fields with native layouts live inside the class allocation,
     // not in the dynamic sidecar above. Visit their registered getters too so
@@ -661,7 +702,9 @@ void zeus_value_has_dynamic_member(
     }
 
     zeus_value_init_nil(out);
-    const ZeusNativeString name = zeus_value_intern_string(method_name);
+    const ZeusNativeString name = zeus_value_to_native_string(method_name);
+    std::unique_ptr<const char, decltype(&zeus_string_release)> ownedName(
+        name, &zeus_string_release);
     uint64_t nameLength = 0;
     if (name) std::memcpy(&nameLength, name - sizeof(uint64_t), sizeof(nameLength));
     if (!name || nameLength >
@@ -733,6 +776,34 @@ void zeus_value_dynamic_member_call(
             out, receiver, method_name, argc, arguments)) {
         dynamicMemberPanic(method_name, "method is not available for this dynamic receiver");
     }
+}
+
+void zeus_value_dynamic_safe_member_call(
+    ZeusValue* out,
+    const ZeusValue* receiver,
+    const char* method_name,
+    int32_t argc,
+    const ZeusValue* const* arguments
+) {
+    if (!receiver || receiver->tag == ZEUS_VALUE_TAG_NIL) {
+        zeus_value_init_nil(out);
+        return;
+    }
+    zeus_value_dynamic_member_call(out, receiver, method_name, argc, arguments);
+}
+
+void zeus_value_dynamic_safe_attribute_load(
+    ZeusValue* out,
+    const ZeusValue* receiver,
+    const char* member_name,
+    int32_t line,
+    ZeusClosureInvoke method_invoke
+) {
+    if (!receiver || receiver->tag == ZEUS_VALUE_TAG_NIL) {
+        zeus_value_init_nil(out);
+        return;
+    }
+    zeus_value_dynamic_attribute_load(out, receiver, member_name, line, method_invoke);
 }
 
 void zeus_value_subscript_load(

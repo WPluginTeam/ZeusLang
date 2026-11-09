@@ -82,4 +82,8 @@ void zeus_string_count(ZeusValue* out, const ZeusValue* value, const ZeusValue* 
     invokeStringBuiltin(out, "__str_count", {value, substring});
 }
 
+void zeus_string_compare(ZeusValue* out, const ZeusValue* left, const ZeusValue* right) {
+    invokeStringBuiltin(out, "__str_compare", {left, right});
+}
+
 } // extern "C"

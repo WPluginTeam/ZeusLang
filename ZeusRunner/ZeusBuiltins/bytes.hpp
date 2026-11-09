@@ -99,7 +99,7 @@ namespace ZeusBuiltins {
 
         // 从数组对象创建字节数组 (通过ObjectHandle - Zeus Array类)
         if (const ZeusType::ObjectHandle* ohp = std::get_if<ZeusType::ObjectHandle>(&arg)) {
-            if (g_vmObjects && ohp->id >= 0 && ohp->id < (int)g_vmObjects->size()) {
+            if (const auto* object = getValidObject(*ohp)) {
                 const auto hasObjectField = [](const ZeusType::ObjectInstance& object,
                                                const std::string& name) {
                     if (g_vmClasses && object.classId >= 0 &&
@@ -122,7 +122,7 @@ namespace ZeusBuiltins {
                     }
                     return field->second;
                 };
-                const auto& obj = (*g_vmObjects)[ohp->id];
+                const auto& obj = *object;
 
                 // 检查是否有data属性(Array类的内部数组)
                 if (hasObjectField(obj, "data")) {
@@ -130,8 +130,8 @@ namespace ZeusBuiltins {
 
                     // data是一个原生dict，使用ObjectHandle访问
                     if (const ZeusType::ObjectHandle* dataOhp = std::get_if<ZeusType::ObjectHandle>(&dataVar)) {
-                        if (dataOhp->id >= 0 && dataOhp->id < (int)g_vmObjects->size()) {
-                            const auto& dataObj = (*g_vmObjects)[dataOhp->id];
+                        if (const auto* dataObject = getValidObject(*dataOhp)) {
+                            const auto& dataObj = *dataObject;
                             ZeusType::Bytes bytes;
                             // 遍历所有属性，按数字索引顺序读取
                             for (int i = 0; ; ++i) {

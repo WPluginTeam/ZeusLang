@@ -1,0 +1,237 @@
+import zeus.ctypes;
+import zeus.exception;
+
+// Exercises the ctypes layer on its own: layout bookkeeping, bounds checking,
+// typed field access and the two string encodings a Win32 call needs.
+
+func assertTrue(condition, message: string) {
+    if (!condition) {
+        throw new Exception("ctypes test failed: " + message);
+    }
+}
+
+// 1. A fresh Layout starts empty.
+//
+// This also guards class field defaults for a class that lives in an imported
+// package. Layout is declared in zeus.ctypes, so its declared field values have
+// to survive package loading: a class whose defaults are dropped reports its
+// fields as whatever happens to be in memory, and the first symptom is a size
+// that is not zero before any field is declared.
+let empty = new Layout();
+assertTrue(empty.size == 0, "a fresh Layout must have size 0");
+assertTrue(empty.offsetOf("cb") == -1, "a fresh Layout must declare no fields");
+assertTrue(empty.fieldCount() == 0, "a fresh Layout must report no fields");
+
+// 2. Layout keeps field offsets named and grows to cover every field.
+// The offsets and the resulting size are what GetStartupInfoW reports on this
+// platform: cb = 104 and the three standard handles at 80, 88 and 96. Deriving
+// them by hand is not reliable, so the layout follows the operating system.
+let startup = new Layout();
+startup.field("cb", 0, 4);
+startup.field("lpReserved", 8, 8);
+startup.field("lpDesktop", 16, 8);
+startup.field("lpTitle", 24, 8);
+startup.field("dwFlags", 60, 4);
+startup.field("wShowWindow", 64, 2);
+startup.field("hStdInput", 80, 8);
+startup.field("hStdOutput", 88, 8);
+startup.field("hStdError", 96, 8);
+
+assertTrue(empty.fieldCount() == 0, "each Layout must have an independent field list");
+empty.field("probe", 0, 1);
+assertTrue(empty.fieldCount() == 1, "the second Layout can build its own field list");
+assertTrue(startup.fieldCount() == 9, "updating one Layout must not change another");
+assertTrue(startup.offsetOf("cb") == 0, "field offsets must stay paired with their own names");
+
+assertTrue(startup.offsetOf("cb") == 0, "first field offset");
+assertTrue(startup.offsetOf("lpTitle") == 24, "fourth field offset");
+assertTrue(startup.offsetOf("wShowWindow") == 64, "window visibility field");
+assertTrue(startup.offsetOf("hStdError") == 96, "last field offset");
+assertTrue(startup.offsetOf("nope") == -1, "unknown field reports -1");
+assertTrue(startup.size == 104, "size covers the widest field");
+assertTrue(startup.contains("lpDesktop"), "contains a declared field");
+assertTrue(!startup.contains("lpNope"), "rejects an undeclared field");
+
+let invalidLayout = new Layout();
+let invalidFieldRefused = false;
+try {
+    invalidLayout.field("bad", -1, 4);
+} catch (&e) {
+    invalidFieldRefused = true;
+}
+assertTrue(invalidFieldRefused, "negative field offsets are refused");
+let overflowFieldRefused = false;
+try {
+    invalidLayout.field("overflow", 9223372036854775807, 1);
+} catch (&e) {
+    overflowFieldRefused = true;
+}
+assertTrue(overflowFieldRefused, "field offset overflow is refused");
+let duplicateFieldRefused = false;
+try {
+    invalidLayout.field("cb", 0, 4);
+    invalidLayout.field("cb", 4, 4);
+} catch (&e) {
+    duplicateFieldRefused = true;
+}
+assertTrue(duplicateFieldRefused, "duplicate field names are refused");
+
+// 2. Typed access on an owned block.
+let block = new Buffer(16);
+block.setI32(0, 112);
+block.setI16(4, 1);
+block.setI8(6, 7);
+block.setI64(8, 1234567890123);
+
+assertTrue(block.i32(0) == 112, "i32 round trip");
+assertTrue(block.i16(4) == 1, "i16 round trip");
+assertTrue(block.i8(6) == 7, "i8 round trip");
+assertTrue(block.i64(8) == 1234567890123, "i64 round trip");
+
+// A pointer field is the same eight bytes as an i64.
+block.setPointer(8, 4096);
+assertTrue(block.pointer(8) == 4096, "pointer is stored as an address");
+
+// A fresh block is zeroed, which is what an unset structure field must be.
+let fresh = new Buffer(8);
+assertTrue(fresh.i32(0) == 0, "new blocks start zeroed");
+
+// Copying bytes writes into the Buffer and leaves the source intact.
+let payload = bytes([17, 34, 51]);
+let byteBlock = new Buffer(3);
+let copiedLength = byteBlock.writeBytes(0, payload);
+let copiedFirst = byteBlock.i8(0);
+let copiedLast = byteBlock.i8(2);
+assertTrue(copiedLength == 3, "writeBytes reports the copied length");
+assertTrue(copiedFirst == 17, "writeBytes copies the first source byte");
+assertTrue(copiedLast == 51, "writeBytes copies the last source byte");
+assertTrue(payload.get(0) == 17, "writeBytes leaves the source bytes unchanged");
+byteBlock.release();
+
+// 3. Writes past the end are refused rather than corrupting the heap.
+let refused = false;
+var boundsMessage = "";
+try {
+    block.setI32(14, 1);
+} catch (&e) {
+    refused = true;
+    boundsMessage = e.getMessage();
+}
+assertTrue(refused, "a write past the end must be refused");
+assertTrue(boundsMessage.index("outside the") >= 0,
+    "a bounds error must preserve its diagnostic message");
+let overflowOffsetRefused = false;
+try {
+    block.setI8(9223372036854775807, 1);
+} catch (&e) {
+    overflowOffsetRefused = true;
+}
+assertTrue(overflowOffsetRefused, "an overflowing buffer offset is refused");
+
+// 4. ASCII round trip through UTF-16.
+let wideBlock = new Buffer(32);
+let wideBytes = wideBlock.utf16(0, "Az");
+assertTrue(wideBytes == 6, "two characters plus a terminator is six bytes");
+assertTrue(@faddr(wideBlock.address + 0, 2) -> int == 65, "first UTF-16 unit");
+assertTrue(@faddr(wideBlock.address + 2, 2) -> int == 122, "second UTF-16 unit");
+assertTrue(@faddr(wideBlock.address + 4, 2) -> int == 0, "UTF-16 terminator");
+
+// An undersized destination must fail before it is partially modified.
+let shortWide = new Buffer(3);
+let wideRefused = false;
+try {
+    shortWide.utf16(0, "Az");
+} catch (&e) {
+    wideRefused = true;
+}
+assertTrue(wideRefused, "UTF-16 write past the end is refused");
+assertTrue(shortWide.i16(0) == 0, "failed UTF-16 write leaves the buffer unchanged");
+shortWide.release();
+
+// 5. A character outside ASCII still fits in one UTF-16 code unit.
+let bmp = new Buffer(16);
+let bmpBytes = bmp.utf16(0, "中");
+assertTrue(bmpBytes == 4, "one BMP character is two bytes plus terminator");
+assertTrue(@faddr(bmp.address + 0, 2) -> int == 20013, "U+4E2D as one unit");
+assertTrue(@faddr(bmp.address + 2, 2) -> int == 0, "terminator after BMP text");
+
+// 6. A character beyond the basic multilingual plane becomes a surrogate pair.
+let astral = new Buffer(16);
+let astralBytes = astral.utf16(0, "😀");
+assertTrue(astralBytes == 6, "an astral character is a pair plus terminator");
+let lead = @faddr(astral.address + 0, 2) -> int;
+let trail = @faddr(astral.address + 2, 2) -> int;
+assertTrue(lead >= 55296, "lead is a high surrogate");
+assertTrue(lead <= 57343, "lead is inside the high surrogate range");
+assertTrue(trail >= 56320, "trail is a low surrogate");
+assertTrue(trail <= 57343, "trail is inside the low surrogate range");
+assertTrue(@faddr(astral.address + 4, 2) -> int == 0, "terminator after the pair");
+assertTrue(readWide(astral.address, 2) == "😀", "readWide counts both surrogate units");
+
+let cappedHigh = new Buffer(2);
+cappedHigh.setI16(0, 55296);
+assertTrue(readWide(cappedHigh.address, 1) == "�",
+    "readWide does not inspect a low surrogate beyond the cap");
+
+let malformedWide = new Buffer(6);
+malformedWide.setI16(0, 55296);
+malformedWide.setI16(2, 65);
+malformedWide.setI16(4, 0);
+assertTrue(readWide(malformedWide.address, 3) == "�A",
+    "readWide preserves the unit after an unmatched high surrogate");
+malformedWide.release();
+cappedHigh.release();
+astral.release();
+
+// 7. UTF-8 keeps multi-byte text intact for the A-suffixed entry points.
+let utf8Block = new Buffer(32);
+let utf8Bytes = utf8Block.utf8(0, "Az中");
+assertTrue(utf8Bytes == 6, "five UTF-8 bytes plus terminator");
+assertTrue(@faddr(utf8Block.address + 0, 1) -> int == 65, "first UTF-8 byte");
+assertTrue(@faddr(utf8Block.address + 2, 1) -> int == 228, "lead byte of U+4E2D");
+assertTrue(@faddr(utf8Block.address + 5, 1) -> int == 0, "UTF-8 terminator");
+
+let shortUtf8 = new Buffer(2);
+let directUtf8Refused = false;
+try {
+    shortUtf8.writeCString(0, "Az");
+} catch (&e) {
+    directUtf8Refused = true;
+}
+assertTrue(directUtf8Refused, "writeCString refuses writes past the Buffer end");
+assertTrue(shortUtf8.i16(0) == 0, "failed direct UTF-8 write leaves the buffer unchanged");
+
+let utf8Refused = false;
+try {
+    shortUtf8.utf8(0, "Az");
+} catch (&e) {
+    utf8Refused = true;
+}
+assertTrue(utf8Refused, "UTF-8 write past the end is refused");
+assertTrue(shortUtf8.i16(0) == 0, "failed UTF-8 write leaves the buffer unchanged");
+shortUtf8.release();
+
+// 8. Releasing twice is harmless, and a released block refuses access.
+let done = new Buffer(8);
+done.setI32(0, 5);
+done.release();
+assertTrue(done.address == 0, "release clears the address");
+done.release();
+let releasedRefused = false;
+try {
+    done.i32(0);
+} catch (&e) {
+    releasedRefused = true;
+}
+assertTrue(releasedRefused, "a released block must refuse access");
+
+// 9. Every block is released explicitly. Relying on the destructor alone would
+//    free at program teardown, where imported functions are already gone.
+block.release();
+fresh.release();
+wideBlock.release();
+bmp.release();
+astral.release();
+utf8Block.release();
+
+print("CTYPES_TEST_PASS");

@@ -1,0 +1,1378 @@
+// ssl.zeu - TLS streams over platform sockets through schannel.
+//
+// Like zeus.socket, the module loads its entry points from the platform at
+// run time and carries no crypto of its own: the TLS engine the user already
+// has on the machine does the handshakes, the records and the certificates.
+// The surface follows the ssl.SSLContext shape: a context carries the trust
+// options, wrapSocket folds a connected socket into it and answers with an
+// SSLSocket that speaks the same send/recv protocol as zeus.Socket, so
+// protocol modules can take either transport without branching.
+//
+// The handshake consumes the wire bytes the socket receives, so all reads go
+// through a record pump: schannel is handed every raw octet it has not yet
+// consumed, and whatever it reports as extra stays queued for the next call.
+// Nothing is discarded between steps; that is what makes records split across
+// TCP segments, replies that arrive inside the final handshake flight, and
+// pipelined application data after the handshake all settle into one path.
+
+import zeus.ctypes;
+import zeus.byte;
+import zeus.string;
+import zeus.exception;
+import zeus.socket;
+import zeus.mem;
+
+
+using windows {
+// ---------------------------------------------------------------- system API
+
+// The A entry takes the package and the target name as ASCII, which is what
+// hostnames are on the wire anyway; a non-ASCII host needs IDNA first.
+@native("AcquireCredentialsHandleA", from="secur32")
+decl func __acquire_credentials_handle(
+    principal: ptr, package: ptr, credentialUse: int32, logonId: ptr,
+    authData: ptr, getKeyFn: ptr, keyContext: ptr,
+    credential: ptr, expiry: ptr) -> int32;
+
+// Credential handles are SecHandle blocks: two pointer-wide words. Passing the
+// buffer's address is the standard; the block stays valid until freed here.
+@native("FreeCredentialsHandle", from="secur32")
+decl func __free_credentials_handle(credential: ptr) -> int32;
+
+@native("InitializeSecurityContextA", from="secur32")
+decl func __initialize_security_context(
+    credentials: ptr, context: ptr, targetName: ptr,
+    contextRequirements: int32, reserved1: int32, targetDataRep: int32,
+    input: ptr, reserved2: int32, newContext: ptr, output: ptr,
+    contextAttributes: ptr, expiry: ptr) -> int32;
+
+@native("CompleteAuthToken", from="secur32")
+decl func __complete_auth_token(context: ptr, token: ptr) -> int32;
+
+// Attribute queries fill caller blocks; the stream sizes one decides the
+// layout of every outgoing record, so it is always read right after the
+// handshake completes.
+@native("QueryContextAttributesA", from="secur32")
+decl func __query_context_attributes(context: ptr, attribute: int32, buffer: ptr) -> int32;
+
+@native("DeleteSecurityContext", from="secur32")
+decl func __delete_security_context(context: ptr) -> int32;
+
+@native("EncryptMessage", from="secur32")
+decl func __encrypt_message(context: ptr, quality: int32, message: ptr, sequence: int32) -> int32;
+
+@native("DecryptMessage", from="secur32")
+decl func __decrypt_message(context: ptr, message: ptr, sequence: int32, quality: ptr) -> int32;
+
+// The graceful shutdown is a control token: after schannel has been told the
+// stream ends, one more context call emits the close_notify record.
+@native("ApplyControlToken", from="secur32")
+decl func __apply_control_token(context: ptr, input: ptr) -> int32;
+
+// Handshake tokens come back through memory the engine allocated
+// (ALLOCATE_MEMORY); this hands each one back once its bytes are on the wire.
+@native("FreeContextBuffer", from="secur32")
+decl func __free_context_buffer(buffer: ptr) -> int32;
+
+// ---------------------------------------------------------------- constants
+
+let SECPKG_CRED_OUTBOUND = 2;
+
+// Names and statuses are typed as the VM hands them back from int32 results:
+// well-known ones get names here, anything else goes out with its number.
+let SEC_E_OK = 0;
+let SEC_I_CONTINUE_NEEDED = 590610;             // 0x00090312
+let SEC_I_COMPLETE_NEEDED = 590611;             // 0x00090313
+let SEC_I_COMPLETE_AND_CONTINUE = 590612;       // 0x00090314
+let SEC_I_CONTEXT_EXPIRED = 590615;             // 0x00090317
+let SEC_I_INCOMPLETE_CREDENTIALS = 590624;      // 0x00090320
+let SEC_I_RENEGOTIATE = 590625;                 // 0x00090321
+let SEC_E_INCOMPLETE_MESSAGE = -2146893032;     // 0x80090318
+let SEC_E_UNTRUSTED_ROOT = -2146893019;         // 0x80090325
+let SEC_E_WRONG_PRINCIPAL = -2146893022;        // 0x80090322
+let SEC_E_CERT_EXPIRED = -2146893016;           // 0x80090328
+let SEC_E_ILLEGAL_MESSAGE = -2146893018;        // 0x80090326
+let SEC_E_ALGORITHM_MISMATCH = -2146893007;     // 0x80090331
+let SEC_E_NO_CREDENTIALS = -2146893042;         // 0x8009030e
+let SEC_E_INVALID_TOKEN = -2146893048;          // 0x80090308
+let SEC_E_MESSAGE_ALTERED = -2146893041;        // 0x8009030f
+
+// What the client demands of schannel: stream-based records with error
+// reporting, confidentiality over a sequenced channel, the credential this
+// module built (no store hunt for implicit client certificates), and
+// ALLOCATE_MEMORY -- on current Windows builds the handshake token comes back
+// through engine-owned memory; a caller-supplied output token buffer is
+// rejected outright at the very first context call.
+let ISC_REQUESTS = 33180;    // 0x0000819C: sequence|replay|confidentiality|
+                             // allocate memory|stream|use supplied creds
+
+let SECBUFFER_VERSION = 0;
+let SECBUFFER_EMPTY = 0;
+let SECBUFFER_DATA = 1;
+let SECBUFFER_TOKEN = 2;
+let SECBUFFER_EXTRA = 5;
+let SECBUFFER_STREAM_TRAILER = 6;
+let SECBUFFER_STREAM_HEADER = 7;
+let SECBUFFER_STREAM = 10;
+let SECBUFFER_ALERT = 17;
+
+let SECPKG_ATTR_STREAM_SIZES = 4;
+
+// The protocol mask pins TLS 1.2 as the wire protocol this module speaks.
+// Newer builds negotiate TLS 1.3 happily, but its session tickets surface as
+// renegotiation asks that need a handshake re-entry in the middle of a record
+// walk; the simplified client v1 bounces those, so 1.2 is the honest choice.
+let TLS_PROTOCOLS_DISABLED = -2049;               // 0xFFFFF7FF = ~0x0800
+
+// The TLS credential block on current builds is SCH_CREDENTIALS, version 5;
+// certificate checking follows the flags, and SCH_USE_STRONG_CRYPTO is part
+// of what the platform's own stacks (curl, .NET) send unconditionally.
+let SCH_CREDENTIALS_VERSION = 5;
+let SCH_USE_STRONG_CRYPTO = 4194304;              // 0x00400000
+let SCH_CRED_NO_SERVERNAME_CHECK = 4;
+let SCH_CRED_MANUAL_CRED_VALIDATION = 8;
+let SCH_CRED_NO_DEFAULT_CREDS = 16;
+let SCH_CRED_AUTO_CRED_VALIDATION = 32;
+let SCH_CRED_REVOCATION_CHECK_CHAIN = 512;       // 0x00000200
+let SCH_CRED_IGNORE_NO_REVOCATION_CHECK = 2048;
+let SCH_CRED_IGNORE_REVOCATION_OFFLINE = 4096;
+
+// The shutdown token is a single word behind a token buffer.
+let SCHANNEL_SHUTDOWN = 1;
+
+// The trace switch stays for diagnosis; the handshake keeps a round marker so
+// a failure message can say where the pump stopped. Record walks are hot
+// paths and carry no tracing.
+var sslTraceEnabled = false;
+
+func __trace(message: string) {
+    if (sslTraceEnabled) print("ssl-trace: " + message);
+}
+
+let SECBUFFER_SIZE = 16;
+let SECBUFFER_DESC_SIZE = 16;
+let SEC_HANDLE_SIZE = 16;
+let SCH_CREDENTIALS_SIZE = 72;
+let TLS_PARAMETERS_SIZE = 40;
+let STREAM_SIZES_COUNT = 5;
+let EXPIRY_SIZE = 8;
+let WIRE_CHUNK = 16384;
+let ISC_OUTPUT_SLOTS = 3;
+let RAW_MAX = 1048576;
+
+// ---------------------------------------------------------------- layouts
+
+// struct SecBufferDesc and struct SecBuffer, as sspi.h places them on x64:
+// the counts are four wide with four bytes of padding ahead of each pointer.
+let secBufferLayout = new Layout();
+secBufferLayout.field("cb_buffer", 0, 4);
+secBufferLayout.field("buffer_type", 4, 4);
+secBufferLayout.field("pv_buffer", 8, 8);
+
+let secBufferDescLayout = new Layout();
+secBufferDescLayout.field("ul_version", 0, 4);
+secBufferDescLayout.field("c_buffers", 4, 4);
+secBufferDescLayout.field("p_buffers", 8, 8);
+
+// struct SCH_CREDENTIALS (version 5), as the current schannel header places
+// it on x64: identity fields first, then one pointer pair for the trust
+// stores, then the protocol mask and the TLS parameter list. This replaced an
+// earlier SCHANNEL_CRED (version 4) sketch: current builds accept the acquire
+// with version 4 but reject the resulting credential at the first context
+// call, so the modern block is the only one the module ships.
+let schCredentialsLayout = new Layout();
+schCredentialsLayout.field("dw_version", 0, 4);
+schCredentialsLayout.field("dw_cred_format", 4, 4);
+schCredentialsLayout.field("c_creds", 8, 4);
+schCredentialsLayout.field("pa_creds", 16, 8);
+schCredentialsLayout.field("h_root_store", 24, 8);
+schCredentialsLayout.field("c_mappers", 32, 4);
+schCredentialsLayout.field("aph_mappers", 40, 8);
+schCredentialsLayout.field("dw_session_lifespan", 48, 4);
+schCredentialsLayout.field("dw_flags", 52, 4);
+schCredentialsLayout.field("c_tls_parameters", 56, 4);
+schCredentialsLayout.field("p_tls_parameters", 64, 8);
+
+// struct TLS_PARAMETERS: the protocol disable mask lives here, inverted as
+// what NOT to speak; the crypto list sits alongside but stays empty.
+let tlsParametersLayout = new Layout();
+tlsParametersLayout.field("c_alpn_ids", 0, 4);
+tlsParametersLayout.field("rgstr_alpn_ids", 8, 8);
+tlsParametersLayout.field("grbit_disabled_protocols", 16, 4);
+tlsParametersLayout.field("c_disabled_crypto", 20, 4);
+tlsParametersLayout.field("p_disabled_crypto", 24, 8);
+tlsParametersLayout.field("dw_flags", 32, 4);
+
+// struct SecPkgContext_StreamSizes.
+let streamSizesLayout = new Layout();
+streamSizesLayout.field("cb_header", 0, 4);
+streamSizesLayout.field("cb_trailer", 4, 4);
+streamSizesLayout.field("cb_maximum_message", 8, 4);
+streamSizesLayout.field("c_buffers", 12, 4);
+streamSizesLayout.field("cb_block_size", 16, 4);
+
+// ---------------------------------------------------------------- buffer stamps
+
+// SecBufferDesc blocks hand schannel the SecBuffer array of one call. Every
+// entry is stamped here, at one place, so no call site memorizes the offsets.
+func stampBuffer(block: Buffer, index: int, byteCount: int, kind: int, data: int) {
+    let base = index * SECBUFFER_SIZE;
+    block.setI32(base, byteCount);
+    block.setI32(base + 4, kind);
+    block.setPointer(base + 8, data);
+}
+
+func bufferCount(block: Buffer, index: int) -> int {
+    return block.i32(index * SECBUFFER_SIZE);
+}
+
+func bufferType(block: Buffer, index: int) -> int {
+    return block.i32(index * SECBUFFER_SIZE + 4);
+}
+
+func bufferData(block: Buffer, index: int) -> int {
+    return block.pointer(index * SECBUFFER_SIZE + 8);
+}
+
+func descFor(entries: Buffer, count: int) -> Buffer {
+    let desc = new Buffer(SECBUFFER_DESC_SIZE);
+    desc.setI32(secBufferDescLayout.offsetOf("ul_version"), SECBUFFER_VERSION);
+    desc.setI32(secBufferDescLayout.offsetOf("c_buffers"), count);
+    desc.setPointer(secBufferDescLayout.offsetOf("p_buffers"), entries.address);
+    return desc;
+}
+
+// Reads schannel's answer at one address: its answers point into buffers this
+// module handed over, so the bytes come back as a copy the VM owns.
+func regionToBytes(data: int, byteCount: int) -> bytes {
+    if (byteCount <= 0) return b"";
+    let result = bytes(byteCount);
+    copyBytes(result.dataAddress(), data, byteCount);
+    return result;
+}
+
+func describeStatus(status: int) -> string {
+    if (status == SEC_I_CONTINUE_NEEDED) return "continue needed";
+    if (status == SEC_I_CONTEXT_EXPIRED) return "context expired";
+    if (status == SEC_E_INCOMPLETE_MESSAGE) return "incomplete message";
+    if (status == SEC_E_UNTRUSTED_ROOT) {
+        return "the server's certificate chain reaches an untrusted root";
+    }
+    if (status == SEC_E_WRONG_PRINCIPAL) {
+        return "the certificate does not cover this host";
+    }
+    if (status == SEC_E_CERT_EXPIRED) {
+        return "the server's certificate has expired";
+    }
+    if (status == SEC_E_ILLEGAL_MESSAGE) {
+        return "the peer sent a record that is not a valid SSL/TLS message";
+    }
+    if (status == SEC_E_ALGORITHM_MISMATCH) {
+        return "no cipher suite could be agreed with the server";
+    }
+    if (status == SEC_I_INCOMPLETE_CREDENTIALS) {
+        return "the local credentials must be completed first";
+    }
+    if (status == SEC_E_NO_CREDENTIALS) {
+        return "no credentials are available for this security package";
+    }
+    if (status == SEC_E_INVALID_TOKEN) return "a token did not match its context";
+    if (status == SEC_E_MESSAGE_ALTERED) return "a message was altered in transit";
+    // The number rides along even for named statuses: schannel documents
+    // narrowly distinct codes (authority chains, offline revocation), and a
+    // caller debugging against a live server wants the raw code first.
+    return "schannel status " + str(status);
+}
+
+func fail(where: string, status: int) {
+    throw new Exception(
+        "ssl: " + where + " failed: " + describeStatus(status) +
+        " (raw " + str(status) + ")");
+}
+
+// ---------------------------------------------------------------- SSLSocket
+
+class SSLSocket {
+    using &this;
+
+    var socket = nil;          // the inner Socket the records travel over
+    var context = nil;
+    var verify = true;
+    var checkHostname = true;
+    var host = "";
+
+    var credentialAddress = 0; // owned allocation for the SecHandle
+    var contextAddress = 0;    // owned allocation for the TLS context
+    var handshakeDone = false;
+
+    // 同 Socket：拷贝一份 TLS 包装器再析构，会把底层连接关掉。
+    func operator[@=]() -> &SSLSocket {
+        return this;
+    }
+
+    var rawAddress = 0;        // owned allocation for unconsumed wire octets
+    var rawCapacity = 0;
+    var rawFill = 0;
+    var pending: bytes = b"";
+    var eof = false;
+    var wireClosed = false;    // the inner socket has been asked to close
+
+    var headerSize = 5;
+    var trailerSize = 16;
+    var maxMessage = 16384;
+
+    func init(socket: Socket, verify=true, checkHostname=true, host="", context=nil,
+            initialize=true) {
+        this.verify = verify;
+        this.checkHostname = checkHostname;
+        this.host = host;
+        this.context = context;
+        if (!initialize) {
+            this.wireClosed = true;
+            return;
+        }
+        this.socket = new Socket(nil, nil, false);
+        this.socket.adoptHandle(socket.detachHandle());
+        try {
+            let raw = new Buffer(WIRE_CHUNK);
+            this.rawAddress = raw.detach();
+            this.rawCapacity = WIRE_CHUNK;
+            this.__acquireCredentials();
+            this.__handshake();
+            this.__readStreamSizes();
+            this.handshakeDone = true;
+        } catch (&failure) {
+            try {
+                this.requestClose();
+            } catch (&cleanup) {}
+            throw failure;
+        }
+    }
+
+    // The credential block decides two independent things: which chain
+    // verdicts schannel performs (verify), and whether the host name inside
+    // the certificate must cover the server (checkHostname). The parameters
+    // block pins the protocol mask the way every platform stack does; without
+    // it current builds return a credential the first context call rejects.
+    func __acquireCredentials() {
+        let credential = new Buffer(SEC_HANDLE_SIZE);
+        this.credentialAddress = credential.detach();
+        let data = new Buffer(SCH_CREDENTIALS_SIZE);
+        let parameters = new Buffer(TLS_PARAMETERS_SIZE);
+        let expiry = new Buffer(EXPIRY_SIZE);
+        let package = new Buffer(64);
+        package.utf8(0, "Microsoft Unified Security Protocol Provider");
+
+        let flags = SCH_CRED_MANUAL_CRED_VALIDATION +
+            SCH_CRED_IGNORE_NO_REVOCATION_CHECK + SCH_CRED_IGNORE_REVOCATION_OFFLINE;
+        if (this.verify) {
+            flags = SCH_CRED_AUTO_CRED_VALIDATION + SCH_CRED_REVOCATION_CHECK_CHAIN;
+        }
+        // NO_DEFAULT_CREDS keeps schannel from proposing client certificates
+        // on its own: the credential built here is exactly what the engine
+        // gets to use.
+        flags = flags + SCH_CRED_NO_DEFAULT_CREDS + SCH_USE_STRONG_CRYPTO;
+        if (!this.checkHostname) {
+            flags = flags + SCH_CRED_NO_SERVERNAME_CHECK;
+        }
+
+        let flagsOffset = schCredentialsLayout.offsetOf("dw_flags");
+        data.setI32(flagsOffset, flags);
+        data.setI32(schCredentialsLayout.offsetOf("dw_version"),
+            SCH_CREDENTIALS_VERSION);
+        // The engine wants the protocol mask inverted: TLS 1.2 stays the one
+        // enabled version and everything else is off, typed the way a signed
+        // int32 carries a bit mask on this VM.
+        parameters.setI32(tlsParametersLayout.offsetOf("grbit_disabled_protocols"),
+            TLS_PROTOCOLS_DISABLED);
+        parameters.setI32(tlsParametersLayout.offsetOf("c_disabled_crypto"), 0);
+        parameters.setPointer(tlsParametersLayout.offsetOf("p_disabled_crypto"),
+            0);
+        data.setPointer(schCredentialsLayout.offsetOf("p_tls_parameters"),
+            parameters.address);
+        data.setI32(schCredentialsLayout.offsetOf("c_tls_parameters"), 1);
+
+        let status = __acquire_credentials_handle(
+            0, package.address, SECPKG_CRED_OUTBOUND, 0, data.address,
+            0, 0, this.credentialAddress, expiry.address);
+        // The engine copies the credential at acquire time; the parameter
+        // blocks only need to live long enough for this call.
+        package.release();
+        data.release();
+        parameters.release();
+        expiry.release();
+        if (status != SEC_E_OK) {
+            free(this.credentialAddress);
+            this.credentialAddress = 0;
+            fail("AcquireCredentialsHandle", status);
+        }
+    }
+
+    // A hostname for schannel arrives as ASCII; anything wider is an identity
+    // the caller must punycode first, and pretending otherwise would send a
+    // torn-down name to a validator.
+    func __targetName() {
+        if (this.host.length() == 0) return nil;
+        let probe = new Buffer(this.host.length() + 1);
+        probe.utf8(0, this.host);
+        for (0..this.host.length()) [const &index] {
+            if (probe.u8(index) > 127) {
+                probe.release();
+                throw new Exception(
+                    "ssl: hostname must be ASCII (encode international names as punycode)");
+            }
+        }
+        probe.release();
+        let name = new Buffer(this.host.length() + 1);
+        name.utf8(0, this.host);
+        return name;
+    }
+
+    // ---------------------------------------------------------------- pump
+
+    // The handshake is a conversation: schannel asks for more octets, we take
+    // them from the socket, and every answer comes back as one more token for
+    // the wire. Leftover octets schannel did not consume are reported as an
+    // extra input buffer and move to the front of the pump.
+    func __handshake() {
+        let contextBlock = new Buffer(SEC_HANDLE_SIZE);
+        this.contextAddress = contextBlock.detach();
+        let attributes = new Buffer(8);
+        let expiry = new Buffer(EXPIRY_SIZE);
+        let target = this.__targetName();
+        let targetAddress = 0;
+        if (target != nil) targetAddress = target.address;
+
+        let firstCall = true;
+        let status = 0;
+        let round = 0;
+
+        for (true) {
+            round = round + 1;
+            __trace("round " + str(round) + " enters with rawFill=" + str(this.rawFill));
+            // Input: everything received so far, and one slot left empty for
+            // schannel to report unconsumed octets through.
+            let entries = new Buffer(2 * SECBUFFER_SIZE);
+            stampBuffer(entries, 0, this.rawFill, SECBUFFER_TOKEN,
+                this.rawAddress);
+            stampBuffer(entries, 1, 0, SECBUFFER_EMPTY, 0);
+            let inDesc = descFor(entries, 2);
+
+            // Output: token, alert and spare slots, all starting empty. The
+            // engine allocates whatever it produces and hands the pointers
+            // back; caller memory here is rejected on current builds.
+            let outEntries = new Buffer(ISC_OUTPUT_SLOTS * SECBUFFER_SIZE);
+            stampBuffer(outEntries, 0, 0, SECBUFFER_TOKEN, 0);
+            stampBuffer(outEntries, 1, 0, SECBUFFER_ALERT, 0);
+            stampBuffer(outEntries, 2, 0, SECBUFFER_EMPTY, 0);
+            let outDesc = descFor(outEntries, ISC_OUTPUT_SLOTS);
+
+            let contextPointer = 0;
+            if (!firstCall) contextPointer = this.contextAddress;
+            let inputAddress = 0;
+            if (!firstCall) inputAddress = inDesc.address;
+            let tokenSlots = new Buffer(ISC_OUTPUT_SLOTS * 16);
+
+            status = __initialize_security_context(
+                this.credentialAddress, contextPointer, targetAddress,
+                ISC_REQUESTS, 0, 0, inputAddress, 0,
+                this.contextAddress, outDesc.address,
+                attributes.address, expiry.address);
+            firstCall = false;
+            __trace("round " + str(round) + " status=" + str(status));
+
+            let completeFailed = false;
+            if (status == SEC_I_COMPLETE_NEEDED or
+                    status == SEC_I_COMPLETE_AND_CONTINUE) {
+                let completeStatus = __complete_auth_token(
+                    this.contextAddress, outDesc.address);
+                if (completeStatus != SEC_E_OK) {
+                    status = completeStatus;
+                    completeFailed = true;
+                } else {
+                    if (status == SEC_I_COMPLETE_NEEDED) {
+                        status = SEC_E_OK;
+                    } else {
+                        status = SEC_I_CONTINUE_NEEDED;
+                    }
+                }
+            }
+
+            // Every token slot the engine filled travels to the peer before
+            // anything else happens; the listener's next step depends on it.
+            for (0..ISC_OUTPUT_SLOTS) [const &tokenIndex] {
+                let gave = bufferCount(outEntries, tokenIndex);
+                let gaveData = bufferData(outEntries, tokenIndex);
+                tokenSlots.setPointer(tokenIndex * 16, gaveData);
+                tokenSlots.setI32(tokenIndex * 16 + 8, gave);
+                tokenSlots.setI32(tokenIndex * 16 + 12,
+                    bufferType(outEntries, tokenIndex));
+            }
+
+            // Schannel reports what it did not consume from our input as an
+            // extra buffer. The remainder is pinned to the front so the next
+            // round hands over exactly what is still unresolved.
+            if (status != SEC_E_INCOMPLETE_MESSAGE) {
+                let leftover = bufferCount(entries, 1);
+                if (bufferType(entries, 1) == SECBUFFER_EXTRA and leftover > 0) {
+                    let source = bufferData(entries, 1);
+                    let start = this.rawFill - leftover;
+                    if (source != 0) {
+                        start = source - this.rawAddress;
+                    }
+                    if (start >= 0 and leftover <= this.rawFill) {
+                        copyBytes(this.rawAddress, this.rawAddress + start, leftover);
+                    }
+                    this.rawFill = leftover;
+                } else {
+                    this.rawFill = 0;
+                }
+            }
+
+            inDesc.release();
+            entries.release();
+            outDesc.release();
+            outEntries.release();
+
+            // Engine memory must be freed even if the socket rejects a token.
+            // ALERT buffers carry handshake failures and travel like tokens.
+            try {
+                if (!completeFailed) {
+                    for (0..ISC_OUTPUT_SLOTS) [const &sendIndex] {
+                        let sendAddress = tokenSlots.pointer(sendIndex * 16);
+                        let sendCount = tokenSlots.i32(sendIndex * 16 + 8);
+                        let sendType = tokenSlots.i32(sendIndex * 16 + 12);
+                        if ((sendType == SECBUFFER_TOKEN or
+                                sendType == SECBUFFER_ALERT) and
+                                sendCount > 0 and sendAddress != 0) {
+                            this.socket.sendAll(regionToBytes(sendAddress, sendCount));
+                        }
+                    }
+                }
+            } catch (&sendFailure) {
+                for (0..ISC_OUTPUT_SLOTS) [const &freeIndex] {
+                    let address = tokenSlots.pointer(freeIndex * 16);
+                    if (address != 0) __free_context_buffer(address);
+                }
+                tokenSlots.release();
+                throw sendFailure;
+            }
+
+            // Every pointer the engine handed out this round is engine-owned
+            // memory, even when its slot carried an alert or spare buffer.
+            for (0..ISC_OUTPUT_SLOTS) [const &freeIndex] {
+                let address = tokenSlots.pointer(freeIndex * 16);
+                if (address != 0) {
+                    __free_context_buffer(address);
+                }
+            }
+            tokenSlots.release();
+
+            if (status == SEC_E_OK) break;
+            if (status == SEC_E_INCOMPLETE_MESSAGE or
+                    status == SEC_I_CONTINUE_NEEDED) {
+                // The engine wants more octets before it can make the next
+                // step; partial input stays queued while refill appends bytes.
+                this.__refill();
+            } else {
+                fail("handshake round " + str(round), status);
+            }
+        }
+
+        attributes.release();
+        expiry.release();
+        if (target != nil) target.release();
+    }
+
+    // Pulls a chunk off the wire into the pump buffer, growing the buffer when
+    // schannel needs more room than one record's worth.
+    func __refill() {
+        let chunk = this.socket.recv(WIRE_CHUNK);
+        let got = chunk.length();
+        __trace("refill got=" + str(got));
+        if (got == 0) {
+            throw new Exception(
+                "ssl: the connection closed during the handshake with '" +
+                this.host + "'");
+        }
+        for (true) {
+            if (this.rawFill + got <= this.rawCapacity) break;
+            this.__growRaw();
+        }
+        copyBytes(this.rawAddress + this.rawFill, chunk.dataAddress(), got);
+        this.rawFill = this.rawFill + got;
+    }
+
+    func __growRaw() {
+        let newCapacity = this.rawCapacity * 2;
+        let grown = new Buffer(newCapacity);
+        if (this.rawFill > 0) {
+            copyBytes(grown.address, this.rawAddress, this.rawFill);
+        }
+        free(this.rawAddress);
+        this.rawAddress = grown.detach();
+        this.rawCapacity = newCapacity;
+    }
+
+    // Stream sizes turn into the geometry every record follows for its whole
+    // lifetime: header span, trailer span, and the ceiling on one message.
+    func __readStreamSizes() {
+        let sizes = new Buffer(STREAM_SIZES_COUNT * 4);
+        let status = __query_context_attributes(
+            this.contextAddress, SECPKG_ATTR_STREAM_SIZES, sizes.address);
+        if (status != SEC_E_OK) {
+            sizes.release();
+            fail("QueryContextAttributes", status);
+        }
+        let header = sizes.i32(streamSizesLayout.offsetOf("cb_header"));
+        let trailer = sizes.i32(streamSizesLayout.offsetOf("cb_trailer"));
+        let maximum = sizes.i32(streamSizesLayout.offsetOf("cb_maximum_message"));
+        sizes.release();
+        if (header <= 0) fail("stream sizes report", SEC_E_ILLEGAL_MESSAGE);
+        if (trailer <= 0) fail("stream sizes report", SEC_E_ILLEGAL_MESSAGE);
+        if (maximum <= 0) fail("stream sizes report", SEC_E_ILLEGAL_MESSAGE);
+        this.headerSize = header;
+        this.trailerSize = trailer;
+        this.maxMessage = maximum;
+    }
+
+    // One decrypt pass over whatever raw octets are queued. The input slot is
+    // SECBUFFER_DATA (the record walk's own convention) and the three output
+    // slots start empty: presets confuse the engine, which reads every typed
+    // slot above the first as more input and rejects the whole walk. Outputs
+    // land with retyped slots: plaintext in pending, leftover raw octets go
+    // back to the front of the queue, and an expired context turns into
+    // end-of-file once no plaintext is left behind.
+    func __decryptRound() -> bool {
+        let entries = new Buffer(4 * SECBUFFER_SIZE);
+        stampBuffer(entries, 0, this.rawFill, SECBUFFER_DATA, this.rawAddress);
+        stampBuffer(entries, 1, 0, SECBUFFER_EMPTY, 0);
+        stampBuffer(entries, 2, 0, SECBUFFER_EMPTY, 0);
+        stampBuffer(entries, 3, 0, SECBUFFER_EMPTY, 0);
+        let desc = descFor(entries, 4);
+        let quality = new Buffer(4);
+
+        let status = __decrypt_message(
+            this.contextAddress, desc.address, 0, quality.address);
+        desc.release();
+        quality.release();
+
+        if (status == SEC_E_INCOMPLETE_MESSAGE) {
+            entries.release();
+            return false;
+        }
+
+        let extraCount = 0;
+        let extraData = 0;
+        let index = 1;
+        for (true) {
+            if (index >= 4) break;
+            let kind = bufferType(entries, index);
+            if (kind == SECBUFFER_DATA and bufferCount(entries, index) > 0) {
+                let piece = regionToBytes(bufferData(entries, index),
+                    bufferCount(entries, index));
+                this.pending = this.pending + piece;
+            } else {
+                if (kind == SECBUFFER_EXTRA and bufferCount(entries, index) > 0) {
+                    extraCount = bufferCount(entries, index);
+                    extraData = bufferData(entries, index);
+                }
+            }
+            index = index + 1;
+        }
+        entries.release();
+
+        if (extraCount > 0) {
+            let start = this.rawFill - extraCount;
+            if (extraData != 0) {
+                start = extraData - this.rawAddress;
+            }
+            if (start >= 0 and extraCount <= this.rawFill) {
+                // The engine reports leftover octets by address inside our
+                // block; copying them to the front keeps one convention for
+                // both the handshake and the record walks.
+                copyBytes(this.rawAddress, this.rawAddress + start, extraCount);
+                this.rawFill = extraCount;
+            } else {
+                this.rawFill = 0;
+            }
+        } else {
+            this.rawFill = 0;
+        }
+        if (status == SEC_I_CONTEXT_EXPIRED) {
+            this.rawFill = 0;
+            this.eof = true;
+            return true;
+        }
+        if (status == SEC_I_RENEGOTIATE) {
+            throw new Exception(
+                "ssl: the peer asked for a renegotiation, which the stream does not support");
+        }
+        if (status != SEC_E_OK) {
+            fail("DecryptMessage", status);
+        }
+        return true;
+    }
+
+    func __wireChunk() -> bool {
+        let chunk = this.socket.recv(WIRE_CHUNK);
+        let got = chunk.length();
+        if (got == 0) {
+            if (this.rawFill > 0) {
+                throw new Exception("ssl: the connection closed inside an unfinished record");
+            }
+            // 对端没发 close_notify 就断开：按 Python 的 suppress_ragged_eofs=True
+            // 处理，当作正常关闭返回 b""，让上层按“连接结束”收尾，而不是抛协议错误。
+            this.eof = true;
+            return false;
+        }
+        for (true) {
+            if (this.rawFill + got <= this.rawCapacity) break;
+            this.__growRaw();
+        }
+        copyBytes(this.rawAddress + this.rawFill, chunk.dataAddress(), got);
+        this.rawFill = this.rawFill + got;
+        return true;
+    }
+
+    // ---------------------------------------------------------------- surface
+
+    func isOpen() -> bool {
+        return !this.wireClosed and !this.closedTraffic();
+    }
+
+    func closedTraffic() -> bool {
+        // Plaintext received before close_notify remains readable first.
+        return this.eof and this.pending.length() == 0;
+    }
+
+    func getConnected() -> bool {
+        return !this.wireClosed and !this.closedTraffic() and
+            this.socket.getConnected();
+    }
+
+    func setTimeout(timeoutMillis: int) {
+        this.socket.setTimeout(timeoutMillis);
+    }
+
+    func getTimeout() -> int {
+        return this.socket.getTimeout();
+    }
+
+    // Plaintext already decrypted in this stream is readable without the wire,
+    // so a pending record has to answer before the inner socket is asked.
+    // Ciphertext that was already drained from the socket but not decrypted yet
+    // counts too: one TLS record can carry several WebSocket frames, and the
+    // decrypted part is consumed one frame at a time.
+    func waitReadable(timeoutMillis: int) -> bool {
+        if (this.pending.length() > 0) return true;
+        if (this.rawFill > 0) return true;
+        if (this.eof) return true;
+        return this.socket.waitReadable(timeoutMillis);
+    }
+
+    func recv(size=16384) -> bytes {
+        if (this.wireClosed) throw new Exception("ssl: stream is closed");
+        if (size <= 0) return b"";
+        if (this.pending.length() > 0) {
+            let take = size;
+            if (take > this.pending.length()) take = this.pending.length();
+            let answer = this.pending.slice(0, take);
+            if (take < this.pending.length()) {
+                this.pending = this.pending.slice(take, this.pending.length());
+            } else {
+                this.pending = b"";
+            }
+            return answer;
+        }
+        if (this.eof) return b"";
+
+        for (true) {
+            if (this.rawFill > 0) {
+                this.__decryptRound();
+                if (this.pending.length() > 0) {
+                    let take = size;
+                    if (take > this.pending.length()) take = this.pending.length();
+                    let answer = this.pending.slice(0, take);
+                    if (take < this.pending.length()) {
+                        this.pending = this.pending.slice(take, this.pending.length());
+                    } else {
+                        this.pending = b"";
+                    }
+                    return answer;
+                }
+                if (this.eof) return b"";
+            }
+            let alive = this.__wireChunk();
+            if (!alive) return b"";
+        }
+        return b"";
+    }
+
+    func recvExact(size: int) -> bytes {
+        if (size < 0) throw new Exception("ssl receive size must be non-negative");
+        if (size == 0) return b"";
+        let output = b"";
+        for (true) {
+            if (output.length() >= size) break;
+            let chunk = this.recv(size - output.length());
+            if (chunk.length() == 0) break;
+            output = output + chunk;
+        }
+        return output;
+    }
+
+    func send(data) -> int {
+        if (this.wireClosed) throw new Exception("ssl: stream is closed");
+        let payload = this.__bytesArgument(data);
+        if (payload.length() == 0) return 0;
+        return this.sendAll(payload);
+    }
+
+    // Writes whole records until the payload is out, which keeps every call
+    // inside schannel's maximum and the socket's own chunking free of rules.
+    func sendAll(data) -> int {
+        if (this.wireClosed) throw new Exception("ssl: stream is closed");
+        let payload = this.__bytesArgument(data);
+        if (payload.length() == 0) return 0;
+        let length = payload.length();
+        let sent = 0;
+        for (true) {
+            if (sent >= length) break;
+            let piece = length - sent;
+            if (piece > this.maxMessage) piece = this.maxMessage;
+
+            let record = bytes(this.headerSize + piece + this.trailerSize);
+            copyBytes(record.dataAddress() + this.headerSize,
+                payload.dataAddress() + sent, piece);
+
+            let entries = new Buffer(4 * SECBUFFER_SIZE);
+            stampBuffer(entries, 0, this.headerSize, SECBUFFER_STREAM_HEADER,
+                record.dataAddress());
+            stampBuffer(entries, 1, piece, SECBUFFER_DATA,
+                record.dataAddress() + this.headerSize);
+            stampBuffer(entries, 2, this.trailerSize, SECBUFFER_STREAM_TRAILER,
+                record.dataAddress() + this.headerSize + piece);
+            stampBuffer(entries, 3, 0, SECBUFFER_EMPTY, 0);
+            let desc = descFor(entries, 4);
+
+            let status = __encrypt_message(
+                this.contextAddress, 0, desc.address, 0);
+            let recordLength = 0;
+            if (status == SEC_E_OK) {
+                recordLength = bufferCount(entries, 0) +
+                    bufferCount(entries, 1) + bufferCount(entries, 2);
+            }
+            desc.release();
+            entries.release();
+            if (status != SEC_E_OK) fail("EncryptMessage", status);
+            if (recordLength <= 0 or recordLength > record.length()) {
+                fail("EncryptMessage output length", SEC_E_ILLEGAL_MESSAGE);
+            }
+
+            this.socket.sendAll(record.slice(0, recordLength));
+            sent = sent + piece;
+        }
+        return length;
+    }
+
+    // The argument protocol mirrors zeus.Socket: bytes go through as they are,
+    // Byte wrappers unwrap, and anything else gets the bytes() coercion.
+    func __bytesArgument(data) -> bytes {
+        let dataType = type(data);
+        if (dataType == "bytes") return data;
+        if (dataType == "Byte") return data.data;
+        return bytes(data);
+    }
+
+    // ---------------------------------------------------------------- closing
+
+    // close_notify is sent when schannel still has a live context; errors never
+    // keep requestClose from releasing the engine handles and transport.
+    func shutdownNotify() {
+        if (this.contextAddress == 0) return;
+        if (!this.handshakeDone) return;
+
+        // The shutdown marker tells schannel that the next context call
+        // speaks an end-of-stream record instead of an application one.
+        let marker = new Buffer(8);
+        marker.setI32(0, SCHANNEL_SHUTDOWN);
+        let inEntries = new Buffer(SECBUFFER_SIZE);
+        stampBuffer(inEntries, 0, 4, SECBUFFER_TOKEN, marker.address);
+        let inDesc = descFor(inEntries, 1);
+        let advice = __apply_control_token(this.contextAddress, inDesc.address);
+        inDesc.release();
+        inEntries.release();
+        marker.release();
+        if (advice != SEC_E_OK) return;
+
+        let attributes = new Buffer(8);
+        let target = this.__targetName();
+        let targetAddress = 0;
+        if (target != nil) targetAddress = target.address;
+        let outEntries = new Buffer(ISC_OUTPUT_SLOTS * SECBUFFER_SIZE);
+        stampBuffer(outEntries, 0, 0, SECBUFFER_TOKEN, 0);
+        stampBuffer(outEntries, 1, 0, SECBUFFER_ALERT, 0);
+        stampBuffer(outEntries, 2, 0, SECBUFFER_EMPTY, 0);
+        let outDesc = descFor(outEntries, ISC_OUTPUT_SLOTS);
+        let tokenSlots = new Buffer(ISC_OUTPUT_SLOTS * 16);
+        let status = __initialize_security_context(
+            this.credentialAddress, this.contextAddress, targetAddress,
+            ISC_REQUESTS, 0, 0, 0, 0, this.contextAddress,
+            outDesc.address, attributes.address, 0);
+        if (status == SEC_I_COMPLETE_NEEDED or
+                status == SEC_I_COMPLETE_AND_CONTINUE) {
+            let completeStatus = __complete_auth_token(
+                this.contextAddress, outDesc.address);
+            if (completeStatus != SEC_E_OK) {
+                status = completeStatus;
+            } else {
+                if (status == SEC_I_COMPLETE_NEEDED) {
+                    status = SEC_E_OK;
+                } else {
+                    status = SEC_I_CONTINUE_NEEDED;
+                }
+            }
+        }
+        attributes.release();
+        if (target != nil) target.release();
+
+        for (0..ISC_OUTPUT_SLOTS) [const &outIndex] {
+            tokenSlots.setPointer(outIndex * 16,
+                bufferData(outEntries, outIndex));
+            tokenSlots.setI32(outIndex * 16 + 8,
+                bufferCount(outEntries, outIndex));
+            tokenSlots.setI32(outIndex * 16 + 12,
+                bufferType(outEntries, outIndex));
+        }
+        outDesc.release();
+        outEntries.release();
+        try {
+            if (status == SEC_E_OK or status == SEC_I_CONTINUE_NEEDED) {
+                for (0..ISC_OUTPUT_SLOTS) [const &sendIndex] {
+                    let sendAddress = tokenSlots.pointer(sendIndex * 16);
+                    let sendCount = tokenSlots.i32(sendIndex * 16 + 8);
+                    let sendType = tokenSlots.i32(sendIndex * 16 + 12);
+                    if ((sendType == SECBUFFER_TOKEN or
+                            sendType == SECBUFFER_ALERT) and
+                            sendCount > 0 and sendAddress != 0) {
+                        this.socket.sendAll(regionToBytes(sendAddress, sendCount));
+                    }
+                }
+            }
+        } catch (&sendFailure) {
+            for (0..ISC_OUTPUT_SLOTS) [const &freeIndex] {
+                let address = tokenSlots.pointer(freeIndex * 16);
+                if (address != 0) __free_context_buffer(address);
+            }
+            tokenSlots.release();
+            throw sendFailure;
+        }
+        for (0..ISC_OUTPUT_SLOTS) [const &freeIndex] {
+            let address = tokenSlots.pointer(freeIndex * 16);
+            if (address != 0) __free_context_buffer(address);
+        }
+        tokenSlots.release();
+    }
+
+    func close() {
+        this.requestClose();
+    }
+
+    func requestClose() {
+        if (this.wireClosed) return;
+
+        // The engine releases happen before the wire closes so nothing in the
+        // shutdown path can look at a socket that is already gone. A clean
+        // close_notify is a courtesy to the peer; errors in it never hold a
+        // close back.
+        let engineLive = this.contextAddress != 0 and this.credentialAddress != 0;
+        if (engineLive) {
+            try {
+                this.shutdownNotify();
+            } catch (&refused) {}
+        }
+        if (this.contextAddress != 0) {
+            try {
+                __delete_security_context(this.contextAddress);
+            } catch (&gone) {}
+            free(this.contextAddress);
+            this.contextAddress = 0;
+        }
+        if (this.credentialAddress != 0) {
+            try {
+                __free_credentials_handle(this.credentialAddress);
+            } catch (&gone) {}
+            free(this.credentialAddress);
+            this.credentialAddress = 0;
+        }
+        if (this.rawAddress != 0) {
+            free(this.rawAddress);
+            this.rawAddress = 0;
+            this.rawCapacity = 0;
+        }
+        this.rawFill = 0;
+        this.pending = b"";
+
+        this.wireClosed = true;
+        this.socket.requestClose();
+    }
+
+    // Store the new wrapper on the destination stream itself. A local
+    // Socket wrapper would close the shared handle when this method returns.
+    func __adoptSocketHandle(handle) {
+        this.socket = new Socket(nil, nil, false);
+        this.socket.adoptHandle(handle);
+    }
+
+    func take() -> SSLSocket {
+        if (this.wireClosed) throw new Exception("ssl: stream is closed");
+        let emptySocket = new Socket(nil, nil, false);
+        let moved = new SSLSocket(emptySocket, this.verify,
+            this.checkHostname, this.host, this.context, false);
+        moved.__adoptSocketHandle(this.socket.detachHandle());
+        moved.credentialAddress = this.credentialAddress;
+        moved.contextAddress = this.contextAddress;
+        moved.handshakeDone = this.handshakeDone;
+        moved.rawAddress = this.rawAddress;
+        moved.rawCapacity = this.rawCapacity;
+        moved.rawFill = this.rawFill;
+        moved.pending = this.pending;
+        moved.eof = this.eof;
+        moved.headerSize = this.headerSize;
+        moved.trailerSize = this.trailerSize;
+        moved.maxMessage = this.maxMessage;
+        moved.wireClosed = false;
+
+        this.socket = nil;
+        this.context = nil;
+        this.credentialAddress = 0;
+        this.contextAddress = 0;
+        this.handshakeDone = false;
+        this.rawAddress = 0;
+        this.rawCapacity = 0;
+        this.rawFill = 0;
+        this.pending = b"";
+        this.eof = true;
+        this.wireClosed = true;
+        return moved;
+    }
+
+    func localPort() -> int {
+        if (this.wireClosed) throw new Exception("ssl: stream is closed");
+        return this.socket.localPort();
+    }
+
+    func toString() {
+        let status = "disconnected";
+        if (!this.wireClosed and this.socket.getConnected()) {
+            status = "connected";
+        }
+        let server = this.host;
+        if (server.length() == 0) server = "no-server-name";
+        return "<SSLSocket " + server + " " + status + ">";
+    }
+
+    func operator[with] () {
+        return this;
+    }
+
+    func operator[~with] () {
+        this.close();
+    }
+
+    func operator[~] () {
+        // Teardown can reach this stream after the imports that power the
+        // handshake have let go, so the destructor reports nothing and does
+        // the only thing that has to happen: hand the socket its own close.
+        try {
+            this.close();
+        } catch (&teardown) {}
+    }
+}
+
+// ---------------------------------------------------------------- context
+
+// The context object only carries the trust decisions; every wrap call builds
+// its own schannel credential, so a context never outlives anything that
+// would break if it did.
+class SSLContext {
+    using &this;
+
+    var verify = true;
+    var checkHostname = true;
+
+    func init(verify=true, checkHostname=true) {
+        this.verify = verify;
+        this.checkHostname = checkHostname;
+    }
+
+    // Folds a connected socket into the context. The handshake runs here, so
+    // the caller receives a stream that is ready to carry records.
+    func wrapSocket(&socket: Socket, host="") -> SSLSocket {
+        if (type(socket) != "Socket") {
+            throw new Exception("ssl: wrapSocket needs a zeus.socket Socket");
+        }
+        if (this.verify and host.length() == 0) {
+            throw new Exception("ssl: verified wrapping needs the server host name");
+        }
+        return new SSLSocket(
+            socket, this.verify, this.checkHostname, host, this);
+    }
+}
+
+// ---------------------------------------------------------------- interface
+
+// The default context matches what a careful caller wants: the certificate
+// chain is checked against the system's roots, and the host name in it has to
+// cover the server that presented it.
+func createDefaultContext() -> SSLContext {
+    return new SSLContext(true, true);
+}
+
+// The escape hatch for self-signed test servers and private roots: everything
+// about validation is the caller's own choice now.
+func createInsecureContext() -> SSLContext {
+    return new SSLContext(false, false);
+}
+
+}
+
+using posix {
+    @native("OPENSSL_init_ssl", from="ssl")
+    decl func opensslInit(opts: int, settings: ptr) -> int32;
+
+    @native("TLS_client_method", from="ssl")
+    decl func tlsClientMethod() -> ptr;
+
+    @native("SSL_CTX_new", from="ssl")
+    decl func sslCtxNew(method: ptr) -> ptr;
+
+    @native("SSL_CTX_free", from="ssl")
+    decl func sslCtxFree(ctx: ptr);
+
+    @native("SSL_CTX_set_default_verify_paths", from="ssl")
+    decl func sslCtxSetDefaultVerifyPaths(ctx: ptr) -> int32;
+
+    @native("SSL_CTX_set_verify", from="ssl")
+    decl func sslCtxSetVerify(ctx: ptr, mode: int32, callback: ptr);
+
+    @native("SSL_new", from="ssl")
+    decl func sslNew(ctx: ptr) -> ptr;
+
+    @native("SSL_free", from="ssl")
+    decl func sslFree(ssl: ptr);
+
+    @native("SSL_set_fd", from="ssl")
+    decl func sslSetFd(ssl: ptr, fd: int32) -> int32;
+
+    @native("SSL_ctrl", from="ssl")
+    decl func sslCtrl(ssl: ptr, cmd: int32, larg: int, parg: ptr) -> int;
+
+    @native("SSL_connect", from="ssl")
+    decl func sslConnect(ssl: ptr) -> int32;
+
+    @native("SSL_read", from="ssl")
+    decl func sslRead(ssl: ptr, buf: ptr, num: int32) -> int32;
+
+    @native("SSL_write", from="ssl")
+    decl func sslWrite(ssl: ptr, buf: ptr, num: int32) -> int32;
+
+    @native("SSL_shutdown", from="ssl")
+    decl func sslShutdown(ssl: ptr) -> int32;
+
+    @native("SSL_get_error", from="ssl")
+    decl func sslGetError(ssl: ptr, ret: int32) -> int32;
+
+    var opensslInitialized = false;
+
+    func ensureOpenssl() {
+        if (!opensslInitialized) {
+            opensslInit(0, 0);
+            opensslInitialized = true;
+        }
+    }
+
+    class SSLSocket {
+        using &this;
+
+        func operator[@=]() -> &SSLSocket {
+            return this;
+        }
+
+        var socket;
+        var sslHandle = 0;
+        var verify = true;
+        var checkHostname = true;
+        var host = "";
+        var closed = false;
+
+        func init(&socket: Socket, verify: bool, checkHostname: bool, host: string, &context) {
+            this.socket = socket;
+            this.verify = verify;
+            this.checkHostname = checkHostname;
+            this.host = host;
+
+            ensureOpenssl();
+            let handle = sslNew(context.ctxHandle);
+            if (handle == 0) {
+                throw new Exception("ssl: SSL_new failed");
+            }
+            this.sslHandle = handle;
+
+            if (host.length() > 0) {
+                let hostBuf = new Buffer(host.length() + 1);
+                hostBuf.writeCString(0, host);
+                // SSL_CTRL_SET_TLSEXT_HOSTNAME = 55, TLSEXT_NAMETYPE_host_name = 0
+                sslCtrl(this.sslHandle, 55, 0, hostBuf.address);
+                hostBuf.release();
+            }
+
+            // Bind to native socket fd
+            let nativeFd = socket.handle;
+            sslSetFd(this.sslHandle, nativeFd);
+
+            let res = sslConnect(this.sslHandle);
+            if (res <= 0) {
+                let err = sslGetError(this.sslHandle, res);
+                sslFree(this.sslHandle);
+                this.sslHandle = 0;
+                throw new Exception("ssl: handshake failed, OpenSSL error " + str(err));
+            }
+        }
+
+        func send(data) -> int {
+            if (this.closed || this.sslHandle == 0) {
+                throw new Exception("ssl: stream is closed");
+            }
+            let raw = b"";
+            if (type(data) == "bytes") {
+                raw = data;
+            } else if (type(data) == "string") {
+                raw = bytes(data);
+            } else {
+                throw new Exception("ssl: send expects bytes or string");
+            }
+            if (raw.length() == 0) return 0;
+            let written = sslWrite(this.sslHandle, raw.dataAddress(), raw.length());
+            if (written <= 0) {
+                let err = sslGetError(this.sslHandle, written);
+                throw new Exception("ssl: write failed, error " + str(err));
+            }
+            return written;
+        }
+
+        func recv(maxBytes: int = 4096) -> bytes {
+            if (this.closed || this.sslHandle == 0) {
+                throw new Exception("ssl: stream is closed");
+            }
+            if (maxBytes <= 0) return b"";
+            let buf = new Buffer(maxBytes);
+            let got = sslRead(this.sslHandle, buf.address, maxBytes);
+            if (got <= 0) {
+                buf.release();
+                return b"";
+            }
+            let values = [];
+            for (0..got) [const &i] {
+                values.append(buf.u8(i));
+            }
+            buf.release();
+            return bytes(values);
+        }
+
+        func close() {
+            if (this.closed) return;
+            this.closed = true;
+            if (this.sslHandle != 0) {
+                sslShutdown(this.sslHandle);
+                sslFree(this.sslHandle);
+                this.sslHandle = 0;
+            }
+            try {
+                this.socket.close();
+            } catch (&e) {}
+        }
+
+        func localPort() -> int {
+            return this.socket.localPort();
+        }
+
+        func toString() {
+            let status = "disconnected";
+            if (!this.closed and this.socket.getConnected()) {
+                status = "connected";
+            }
+            let server = this.host;
+            if (server.length() == 0) server = "no-server-name";
+            return "<SSLSocket " + server + " " + status + ">";
+        }
+
+        func operator[with] () {
+            return this;
+        }
+
+        func operator[~with] () {
+            this.close();
+        }
+
+        func operator[~] () {
+            try {
+                this.close();
+            } catch (&teardown) {}
+        }
+    }
+
+    class SSLContext {
+        using &this;
+
+        var verify = true;
+        var checkHostname = true;
+        var ctxHandle = 0;
+
+        func init(verify=true, checkHostname=true) {
+            this.verify = verify;
+            this.checkHostname = checkHostname;
+
+            ensureOpenssl();
+            let method = tlsClientMethod();
+            let ctx = sslCtxNew(method);
+            if (ctx == 0) {
+                throw new Exception("ssl: SSL_CTX_new failed");
+            }
+            this.ctxHandle = ctx;
+
+            if (verify) {
+                sslCtxSetDefaultVerifyPaths(this.ctxHandle);
+                sslCtxSetVerify(this.ctxHandle, 1, 0); // SSL_VERIFY_PEER = 1
+            } else {
+                sslCtxSetVerify(this.ctxHandle, 0, 0); // SSL_VERIFY_NONE = 0
+            }
+        }
+
+        func wrapSocket(&socket: Socket, host="") -> SSLSocket {
+            if (type(socket) != "Socket") {
+                throw new Exception("ssl: wrapSocket needs a zeus.socket Socket");
+            }
+            if (this.verify and host.length() == 0) {
+                throw new Exception("ssl: verified wrapping needs the server host name");
+            }
+            return new SSLSocket(socket, this.verify, this.checkHostname, host, this);
+        }
+
+        func operator[~]() {
+            if (this.ctxHandle != 0) {
+                sslCtxFree(this.ctxHandle);
+                this.ctxHandle = 0;
+            }
+        }
+    }
+
+    func createDefaultContext() -> SSLContext {
+        return new SSLContext(true, true);
+    }
+
+    func createInsecureContext() -> SSLContext {
+        return new SSLContext(false, false);
+    }
+}

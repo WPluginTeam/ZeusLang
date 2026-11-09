@@ -1,0 +1,315 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.json;
+import zeus.time [&zeusTime];
+
+import samples.NexoraCodeCore.conversation_store;
+import samples.NexoraCodeCore.storage;
+import samples.NexoraCodeCore.turn_injection;
+
+// 会话存储（S7）的契约测试：增删改查、标题占位规则、幽灵条目清理、
+// 文件名清洗。和基线一样，标题来源只记在索引里。
+var const USER_TEXT = "帮我看看这个函数为什么在第二次调用时返回 nil，顺便解释一下上下文压缩";
+
+func testConversationStore(root: string) {
+    let storeRoot = root + "/conversations";
+    let store = new NexoraCoreConversationStore(storeRoot);
+
+    // 1. 新建
+    let first = store.create();
+    let firstId = dict_get(first, "conversation_id", "");
+    if (!firstId.startswith("conv_")) throw new Exception("会话号格式不对: " + firstId);
+    if (dict_get(first, "title", "") != "新会话") throw new Exception("默认标题不对");
+    if (dict_get(first, "messages", nil).length() != 0) throw new Exception("新会话不该有消息");
+    if (!file.exists(storeRoot + "/" + firstId + ".json")) throw new Exception("会话文件没有落盘");
+
+    // 2. 读取
+    let loaded = store.get(firstId);
+    if (loaded == nil) throw new Exception("读不回来刚建的会话");
+    if (dict_get(loaded, "conversation_id", "") != firstId) throw new Exception("读回的会话号不一致");
+    if (store.get("conv_missing") != nil) throw new Exception("不存在的会话应返回 nil");
+
+    // 3. 追加消息：首条用户消息生成自动标题
+    if (!store.appendMessage(firstId, {"role": "user", "content": USER_TEXT})) {
+        throw new Exception("追加消息失败");
+    }
+    let updated = store.get(firstId);
+    if (dict_get(updated, "messages", nil).length() != 1) throw new Exception("消息没有落盘");
+
+    let titleState = store.getTitleState(firstId);
+    if (dict_get(titleState, "title_source", "") != "auto") throw new Exception("标题来源应为 auto");
+    let guessed = dict_get(titleState, "title", "");
+    if (guessed.length() != 24) throw new Exception("自动标题应截断到 24 字，实际 " + str(guessed.length()));
+    if (dict_get(updated, "title", "") != guessed) throw new Exception("会话文件里的标题没同步");
+
+    // 4. 追加到不存在的会话
+    if (store.appendMessage("conv_missing", {"role": "user", "content": "x"})) {
+        throw new Exception("不存在的会话不该追加成功");
+    }
+
+    // 5. 列表：新的在前
+    zeusTime.sleep(0.02);
+    let second = store.create("手动命名的会话");
+    let secondId = dict_get(second, "conversation_id", "");
+    let listed = store.list();
+    if (listed.length() != 2) throw new Exception("列表数量不对，实际 " + str(listed.length()));
+    if (dict_get(listed[0], "conversation_id", "") != secondId) throw new Exception("列表没有按时间倒序");
+
+    // 6. 用户改名覆盖自动标题；自动标题不能再覆盖用户标题
+    if (!store.setTitle(firstId, "用户改的名字")) throw new Exception("改名失败");
+    let afterRename = store.getTitleState(firstId);
+    if (dict_get(afterRename, "title", "") != "用户改的名字") throw new Exception("改名没生效");
+    if (dict_get(afterRename, "title_source", "") != "user") throw new Exception("来源应为 user");
+
+    zeusTime.sleep(0.02);
+    store.appendMessage(firstId, {"role": "user", "content": "第二轮消息不该改标题"});
+    let afterSecond = store.getTitleState(firstId);
+    if (dict_get(afterSecond, "title", "") != "用户改的名字") {
+        throw new Exception("自动标题覆盖了用户标题");
+    }
+
+    // 7. 占位标题规则
+    if (!nexora_core_is_placeholder_title("新对话")) throw new Exception("占位标题未识别");
+    if (!nexora_core_is_placeholder_title("   ")) throw new Exception("空标题应视为占位");
+    if (nexora_core_is_placeholder_title("真实标题")) throw new Exception("真实标题被误判为占位");
+    if (!nexora_core_can_overwrite_title("新对话", "user")) throw new Exception("占位标题应可覆盖");
+    if (!nexora_core_can_overwrite_title("真标题", "auto")) throw new Exception("自动标题应可覆盖");
+    if (nexora_core_can_overwrite_title("真标题", "user")) throw new Exception("不该覆盖用户标题");
+
+    // 8. 会话号清洗：路径分隔符与空白不能逃出目录
+    let tricky = "a/b c:d";
+    let trickyPath = storeRoot + "/" + nexora_core_sanitize_file_name(tricky) + ".json";
+    if (trickyPath.index("..") >= 0) throw new Exception("清洗后出现了上级目录");
+    if (trickyPath.index("/a/") >= 0) throw new Exception("清洗后还带路径分隔符");
+
+    let longName = "";
+    for (0..80) [const &index] {
+        longName = longName + "长";
+    }
+    if (nexora_core_sanitize_file_name(longName).length() != 60) {
+        throw new Exception("清洗没有截断到 60 字");
+    }
+
+    // 9. 幽灵条目：索引里有、文件不在，列表时顺手清掉
+    let index = store.loadIndex();
+    index["conv_ghost0000"] = {"title": "幽灵会话", "updated_at": 1};
+    nexora_core_write_json_atomic(store.indexPath(), index);
+    let cleaned = store.list();
+    if (cleaned.length() != 2) throw new Exception("幽灵条目没有被清掉");
+    if (dict_get(store.loadIndex(), "conv_ghost0000", nil) != nil) {
+        throw new Exception("索引文件里的幽灵条目还在");
+    }
+
+    // 10. 删除
+    if (!store.remove(secondId)) throw new Exception("删除失败的返回值不对");
+    if (store.get(secondId) != nil) throw new Exception("删除后还能读到");
+    if (file.exists(storeRoot + "/" + secondId + ".json")) throw new Exception("会话文件没删掉");
+    if (store.remove(secondId)) throw new Exception("重复删除应返回 false");
+
+    // 11. 收尾
+    store.remove(firstId);
+    if (file.exists(storeRoot + "/index.json")) file.removeFile(storeRoot + "/index.json");
+    if (file.exists(storeRoot)) file.removeDir(storeRoot);
+}
+
+// 业务方法（S8）：工具协议修复、摘要提交、注入基线、会话设置、用量锚点。
+func testConversationBusiness(root: string) {
+    let storeRoot = root + "/conversations_business";
+    let store = new NexoraCoreConversationStore(storeRoot);
+
+    // --- 工具结果替换
+    let created = store.create("工具会话");
+    let id = dict_get(created, "conversation_id", "");
+
+    let callMessage = {"role": "assistant",
+        "tool_calls": [{"id": "call_1", "name": "read_file"}]};
+    store.appendMessage(id, callMessage);
+
+    let placeholder = {"role": "tool", "tool_call_id": "call_1", "content": "等待批准"};
+    store.appendMessage(id, placeholder);
+
+    if (!store.replaceToolResult(id, "call_1", "已批准，内容 42")) {
+        throw new Exception("工具结果替换失败");
+    }
+    let replaced = dict_get(store.get(id), "messages", []);
+    if (dict_get(replaced[1], "content", "") != "已批准，内容 42") {
+        throw new Exception("替换后的内容不对");
+    }
+    if (store.replaceToolResult(id, "call_missing", "x")) {
+        throw new Exception("不存在的调用不该替换成功");
+    }
+    if (store.replaceToolResult(id, "", "x")) throw new Exception("空调用号不该替换成功");
+
+    // --- 悬空调用修补
+    let danglingCreated = store.create("悬空会话");
+    let danglingId = dict_get(danglingCreated, "conversation_id", "");
+
+    let danglingCall = {"role": "assistant", "tool_calls": [{"id": "call_9", "name": "run"}]};
+    store.appendMessage(danglingId, danglingCall);
+    let followUp = {"role": "user", "content": "继续"};
+    store.appendMessage(danglingId, followUp);
+
+    let repairedCount = store.repairDanglingToolCalls(danglingId);
+    if (repairedCount != 1) {
+        throw new Exception("应补 1 条占位结果，实际 " + str(repairedCount));
+    }
+
+    let repairedMessages = dict_get(store.get(danglingId), "messages", []);
+    if (repairedMessages.length() != 3) throw new Exception("修补后的条数不对");
+    if (dict_get(repairedMessages[1], "role", "") != "tool") throw new Exception("占位结果位置不对");
+    if (dict_get(repairedMessages[1], "tool_call_id", "") != "call_9") {
+        throw new Exception("占位结果绑错了调用");
+    }
+    if (dict_get(repairedMessages[1], "content", "") == "") throw new Exception("占位结果没有文案");
+
+    if (store.repairDanglingToolCalls(danglingId) != 0) throw new Exception("修过一次之后不该再补");
+
+    let orphan = {"role": "tool", "tool_call_id": "call_none", "content": "孤儿结果"};
+    store.appendMessage(danglingId, orphan);
+    let dropped = store.repairDanglingToolCalls(danglingId);
+    if (dropped != -1) throw new Exception("孤儿结果应被丢掉（返回 -1），实际 " + str(dropped));
+
+    // --- 摘要提交
+    let contextCreated = store.create("摘要会话");
+    let contextId = dict_get(contextCreated, "conversation_id", "");
+
+    let m1 = {"role": "user", "content": "第一问"};
+    let m2 = {"role": "assistant", "content": "第一答"};
+    store.appendMessage(contextId, m1);
+    store.appendMessage(contextId, m2);
+
+    let prefix = [m1, m2];
+    let record = {"summary": "前两轮摘要", "history_cut_index": 2};
+    store.saveContext(contextId, record, prefix);
+
+    let withSummary = store.get(contextId);
+    if (dict_get(dict_get(withSummary, "context_state", nil), "summary", "") != "前两轮摘要") {
+        throw new Exception("摘要没落盘");
+    }
+    if (dict_get(withSummary, "messages", []).length() != 2) throw new Exception("提交摘要不该删消息");
+
+    let rebuiltInjection = {"role": "system", "content": "## Project conventions\n最新约定",
+        "metadata": {"injection": {"name": "project_conventions", "mode": "full"}}};
+    let rebuiltRecord = {"summary": "重建后的摘要", "history_cut_index": 1};
+    store.saveContext(contextId, rebuiltRecord, prefix, [rebuiltInjection]);
+    let withRebuiltInjection = store.get(contextId);
+    let rebuiltMessages = dict_get(withRebuiltInjection, "messages", []);
+    if (rebuiltMessages.length() != 3) throw new Exception("摘要重建应同时写入注入消息");
+    if (dict_get(rebuiltMessages[1], "content", "") != rebuiltInjection["content"]) {
+        throw new Exception("全量注入没有插在摘要边界");
+    }
+    if (dict_get(dict_get(withRebuiltInjection, "context_state", nil),
+            "history_cut_index", -1) != 1) {
+        throw new Exception("注入写入时摘要边界不一致");
+    }
+    if (dict_get(withRebuiltInjection, "context_compressions", []).length() != 2) {
+        throw new Exception("压缩记录没落下");
+    }
+
+    let otherPrefix = [{"role": "user", "content": "别的历史"}];
+    let rejected = false;
+    try {
+        store.saveContext(contextId, record, otherPrefix);
+    } catch (&error) {
+        rejected = true;
+    }
+    if (!rejected) throw new Exception("历史不一致时不该接受旧摘要");
+
+    // --- 注入消息、基线与审批模式作为一次存储操作
+    let injectionCreated = store.create("注入会话");
+    let injectionId = dict_get(injectionCreated, "conversation_id", "");
+    store.appendMessage(injectionId, {"role": "user", "content": "前一轮"});
+    store.appendMessage(injectionId, {"role": "user", "content": "当前轮"});
+    let injectionBaseline = {"project_conventions": {"hash": "fingerprint", "lines": ["约定"]}};
+    let diffInjection = {"role": "system", "content": "约定已更新",
+        "metadata": {"injection": {"name": "project_conventions", "mode": "diff"}}};
+    if (!store.insertInjections(injectionId, 1, [diffInjection], injectionBaseline, "auto")) {
+        throw new Exception("注入事务没有提交");
+    }
+    let injectedConversation = store.get(injectionId);
+    let injectedHistory = dict_get(injectedConversation, "messages", []);
+    if (injectedHistory.length() != 3) {
+        throw new Exception("注入历史条数不对");
+    }
+    if (injectedHistory[1]["role"] != "system" or injectedHistory[2]["content"] != "当前轮") {
+        throw new Exception("注入消息应插在当前 user 消息前");
+    }
+    if (dict_get(injectedConversation, "injection_version", 0) != NEXORA_INJECTION_VERSION) {
+        throw new Exception("注入版本没有更新");
+    }
+    if (dict_get(injectedConversation, "injection_permission_mode", "") != "auto") {
+        throw new Exception("审批模式没有更新");
+    }
+    if (dict_get(injectedConversation, "injection_baseline", nil) == nil) {
+        throw new Exception("注入、版本与审批模式必须同次落盘");
+    }
+
+    if (!store.insertInjections(injectionId, 3, [], nil, "confirm")) {
+        throw new Exception("无注入消息时审批模式更新失败");
+    }
+    if (dict_get(store.get(injectionId), "injection_permission_mode", "") != "confirm") {
+        throw new Exception("审批模式状态未更新");
+    }
+
+    // --- 注入基线
+    let baseline = {"tools_hash": "abc", "count": 2};
+    store.saveInjectionBaseline(contextId, baseline);
+    if (dict_get(store.get(contextId), "injection_baseline", nil) == nil) {
+        throw new Exception("注入基线没落盘");
+    }
+
+    let missing = false;
+    try {
+        store.saveInjectionBaseline("conv_missing", baseline);
+    } catch (&error) {
+        missing = true;
+    }
+    if (!missing) throw new Exception("不存在的会话应报错");
+
+    // --- 会话设置
+    if (!nexora_core_dict_is_empty(store.getSettings(contextId))) {
+        throw new Exception("新会话的设置应为空");
+    }
+
+    let patch = {"model_name": "gpt-x", "permission_mode": "ask", "junk": "忽略"};
+    let saved = store.saveSettings(contextId, patch);
+    if (dict_get(saved, "model_name", "") != "gpt-x") throw new Exception("设置没写入");
+    if (dict_get(saved, "junk", nil) != nil) throw new Exception("白名单外的字段被写入了");
+
+    let ensured = store.ensureSettings(contextId,
+        {"model_name": "默认模型", "permission_mode": "deny"});
+    if (dict_get(ensured, "model_name", "") != "gpt-x") {
+        throw new Exception("ensureSettings 覆盖了已有设置");
+    }
+
+    let oldCreated = store.create("老会话");
+    let oldId = dict_get(oldCreated, "conversation_id", "");
+    let filled = store.ensureSettings(oldId,
+        {"model_name": "默认模型", "permission_mode": "ask"});
+    if (dict_get(filled, "model_name", "") != "默认模型") throw new Exception("老会话没有补默认设置");
+    if (dict_get(store.getSettings(oldId), "permission_mode", "") != "ask") {
+        throw new Exception("默认设置没落盘");
+    }
+
+    // --- 用量锚点
+    store.recordContextUsage(oldId, 1000, 4, 1100);
+    store.recordContextUsage(oldId, 1500, 6, 1600);
+    let usage = dict_get(store.get(oldId), "context_state", nil);
+    if (dict_get(usage, "last_input_tokens", 0) != 1500) throw new Exception("实测输入没更新");
+    if (dict_get(usage, "prev_input_tokens", 0) != 1000) throw new Exception("上一轮锚点没保留");
+    if (dict_get(usage, "last_measured_message_count", 0) != 6) throw new Exception("消息条数没记");
+
+    // --- 压缩调用记账
+    let callRecord = {"model": "small", "input_tokens": 200};
+    store.recordCompressionCall(oldId, callRecord);
+    let calls = dict_get(store.get(oldId), "context_compression_calls", []);
+    if (calls.length() != 1) throw new Exception("压缩调用的记录条数不对");
+
+    // 收尾
+    for ([id, danglingId, contextId, injectionId, oldId]) [each] {
+        store.remove(each);
+    }
+    if (file.exists(storeRoot + "/index.json")) file.removeFile(storeRoot + "/index.json");
+    if (file.exists(storeRoot)) file.removeDir(storeRoot);
+}

@@ -44,7 +44,7 @@ ZeusAOT\build_aot.bat
 `../ZeusLLVM/ZeusEmitter.hpp`：主程序单编 IR → `.ll` 文本。
 
 ```
-Zeus.exe --emit-llvm prog.zeu [out.ll]   # 默认输出 prog.zeu.ll
+ZeusCompiler.exe --emit-llvm prog.zeu [out.ll]   # 默认输出 prog.zeu.ll
 ```
 
 * 输入是 **freestanding 主程序单编**（无包合并）：`print` 按名走本征函数；class

@@ -1,0 +1,76 @@
+import samples.NexoraCodeCore.agent_events_test;
+import samples.NexoraCodeCore.backend_api_test;
+import samples.NexoraCodeCore.agent_loop_test;
+import samples.NexoraCodeCore.compression_test;
+import samples.NexoraCodeCore.connection_test;
+import samples.NexoraCodeCore.context_test;
+import samples.NexoraCodeCore.provider_config_test;
+import samples.NexoraCodeCore.provider_stream_test;
+import samples.NexoraCodeCore.provider_models_test;
+import samples.NexoraCodeCore.permission_settings_test;
+import samples.NexoraCodeCore.conversation_store_test;
+import samples.NexoraCodeCore.journal_test;
+import samples.NexoraCodeCore.rpc_test;
+import samples.NexoraCodeCore.task_stream_test;
+import samples.NexoraCodeCore.stream_runtime_test;
+import samples.NexoraCodeCore.tool_registry_test;
+import samples.NexoraCodeCore.tool_approval_test;
+import samples.NexoraCodeCore.tool_approval_model_test;
+import samples.NexoraCodeCore.turn_injection_test;
+import samples.NexoraCodeCore.verification;
+
+// 事件日志需要一个可写的临时目录；运行器把 __GROUND__ 换成一次性目录。
+var const GROUND = "__GROUND__";
+
+testRemotePolicy();
+testJsonUnicode();
+print("NEXORA_POLICY_JSON_TESTS_PASS");
+testTaskLifecycleBuffer();
+print("NEXORA_TASK_EVENT_TESTS_PASS");
+testConnectionStateMachine();
+print("NEXORA_CONNECTION_STATE_TESTS_PASS");
+testRpcDispatch();
+print("NEXORA_RPC_DISPATCH_TESTS_PASS");
+testAgentEvents();
+print("NEXORA_AGENT_EVENTS_TESTS_PASS");
+testProviderConfig();
+print("NEXORA_PROVIDER_CONFIG_TESTS_PASS");
+testProviderStream();
+print("NEXORA_PROVIDER_STREAM_TESTS_PASS");
+testNexoraProviderModels(GROUND);
+print("NEXORA_PROVIDER_MODELS_TESTS_PASS");
+testNexoraPermissionSettings(GROUND);
+print("NEXORA_PERMISSION_SETTINGS_TESTS_PASS");
+testAgentLoop();
+print("NEXORA_AGENT_LOOP_TESTS_PASS");
+testTurnInjection();
+print("NEXORA_TURN_INJECTION_TESTS_PASS");
+testCompression();
+print("NEXORA_COMPRESSION_TESTS_PASS");
+testContext();
+print("NEXORA_CONTEXT_TESTS_PASS");
+testTaskStreamRelay();
+print("NEXORA_TASK_STREAM_TESTS_PASS");
+testTaskJournal(GROUND);
+print("NEXORA_TASK_JOURNAL_TESTS_PASS");
+testStreamRuntime(GROUND);
+print("NEXORA_STREAM_RUNTIME_TESTS_PASS");
+try {
+    testBackendApi(GROUND);
+} catch (&backendApiError) {
+    print("BACKEND_API_TEST_ERROR: " + backendApiError.getMessage());
+    throw backendApiError;
+}
+print("NEXORA_BACKEND_API_TESTS_PASS");
+testConversationStore(GROUND);
+print("NEXORA_CONVERSATION_STORE_TESTS_PASS");
+testConversationBusiness(GROUND);
+print("NEXORA_CONVERSATION_BUSINESS_TESTS_PASS");
+testNexoraToolRegistry(GROUND);
+print("NEXORA_TOOL_REGISTRY_TESTS_PASS");
+testNexoraToolApproval();
+print("NEXORA_TOOL_APPROVAL_TESTS_PASS");
+testNexoraToolApprovalModel(GROUND);
+print("NEXORA_TOOL_APPROVAL_MODEL_TESTS_PASS");
+runJsonBenchmarks();
+print("NEXORA_CODE_CORE_OFFLINE_TEST_PASS");

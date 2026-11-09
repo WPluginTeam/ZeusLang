@@ -1,47 +1,550 @@
+// file.zeu - file IO on the platform's own entry points.
 
-// File module for Zeus built-in functions
-// Created: 2025/12/5 by Himpq
+import zeus.ctypes;
+import zeus.byte;
 
-class File {
-    using &this;
+let FILE_BEGIN = 0;
+let FILE_CURRENT = 1;
+let FILE_END = 2;
 
-    func init (path, mode="r") {
-        using original {
-            let pathStr = path;
-            let modeStr = mode;
-            
-            this.path = path;
-            this.mode = mode;
-            this.handle = __file_open(pathStr, modeStr);
-        }
+using windows {
+// ---------------------------------------------------------------- system API
+
+// The W entry takes the buffer length in UTF-16 code units: the name has to be
+// 16 bit encodable and NUL terminated exactly like zeus.socket builds addresses.
+@native("CreateFileW", from="kernel32")
+decl func createFileW(
+    name: ptr, desiredAccess: u32, shareMode: u32,
+    securityAttributes: ptr, creationDisposition: u32,
+    flagsAndAttributes: u32, templateFile: ptr) -> ptr;
+
+@native("ReadFile", from="kernel32")
+decl func readFile(file: ptr, buffer: ptr, byteCount: u32, bytesRead: ptr, overlapped: ptr) -> int32;
+
+@native("WriteFile", from="kernel32")
+decl func writeFile(file: ptr, buffer: ptr, byteCount: u32, bytesWritten: ptr, overlapped: ptr) -> int32;
+
+// The Ex-pointer call counts in 64 bit distances: int is already pointer wide,
+// so an offset fits whole, and the result pointer may stay zero when the new
+// position is taken from tell() instead.
+@native("SetFilePointerEx", from="kernel32")
+decl func setFilePointerEx(file: ptr, distance: int, result: ptr, method: u32) -> int32;
+
+@native("GetFileSizeEx", from="kernel32")
+decl func getFileSizeEx(file: ptr, size: ptr) -> int32;
+
+@native("FlushFileBuffers", from="kernel32")
+decl func flushFileBuffers(file: ptr) -> int32;
+
+@native("CloseHandle", from="kernel32")
+decl func closeHandle(handle: ptr) -> int32;
+
+@native("GetLastError", from="kernel32")
+decl func getLastError() -> u32;
+
+// Path queries and directory changes use the same entry points Python's os
+// module does, so asking about a missing path is a boolean, not an exception.
+@native("CreateDirectoryW", from="kernel32")
+decl func createDirectoryW(name: ptr, securityAttributes: ptr) -> int32;
+
+@native("RemoveDirectoryW", from="kernel32")
+decl func removeDirectoryW(name: ptr) -> int32;
+
+@native("DeleteFileW", from="kernel32")
+decl func deleteFileW(name: ptr) -> int32;
+
+@native("GetFileAttributesW", from="kernel32")
+decl func getFileAttributesW(name: ptr) -> int32;
+
+@native("GetFinalPathNameByHandleW", from="kernel32")
+decl func getFinalPathNameByHandleW(
+    file: ptr, path: ptr, bufferLength: u32, flags: u32) -> u32;
+
+@native("MoveFileExW", from="kernel32")
+decl func moveFileExW(existingName: ptr, newName: ptr, flags: u32) -> int32;
+
+@native("FindFirstFileW", from="kernel32")
+decl func findFirstFileW(pattern: ptr, findData: ptr) -> ptr;
+
+@native("FindNextFileW", from="kernel32")
+decl func findNextFileW(handle: ptr, findData: ptr) -> int32;
+
+@native("FindClose", from="kernel32")
+decl func findClose(handle: ptr) -> int32;
+
+// A directory listing arrives as UTF-16, so entry names are converted through
+// the same code page the rest of the module decodes with.
+@native("WideCharToMultiByte", from="kernel32")
+decl func wideCharToMultiByte(
+    codePage: u32, flags: u32, source: ptr, sourceLength: int32,
+    target: ptr, targetLength: int32, defaultChar: ptr, usedDefault: ptr) -> int32;
+
+// ---------------------------------------------------------------- constants
+
+let GENERIC_READ = 2147483648;      // 0x80000000: a DWORD, passed as u32
+let GENERIC_WRITE = 1073741824;     // 0x40000000
+let FILE_SHARE_READ = 1;
+let FILE_SHARE_WRITE = 2;
+let FILE_SHARE_DELETE = 4;
+
+let CREATE_NEW = 1;                 // 'x': fail when the file exists
+let CREATE_ALWAYS = 2;              // 'w'
+let OPEN_EXISTING = 3;              // 'r', 'r+'
+let OPEN_ALWAYS = 4;                // 'a', 'a+'
+
+let FILE_ATTRIBUTE_NORMAL = 128;
+let INVALID_HANDLE_VALUE = -1;
+let FILE_FLAG_BACKUP_SEMANTICS = 33554432;
+
+let FILE_BEGIN = 0;
+let FILE_CURRENT = 1;
+let FILE_END = 2;
+
+// The count fields of ReadFile and WriteFile are 32 bit: one call never
+// moves more than a plain positive int32, so bigger payloads loop.
+let __MAX_CHUNK = 1073741824;       // 0x40000000
+let __PATH_WCHAR = 1024;
+let __POSITION_BUFFER = 8;
+
+// GetFileAttributesW reports a missing path as -1 in its DWORD result, so the
+// declaration is signed and the check is a plain equality.
+let __INVALID_FILE_ATTRIBUTES = -1;
+let FILE_ATTRIBUTE_DIRECTORY = 16;
+let __ERROR_ALREADY_EXISTS = 183;
+let __ERROR_FILE_NOT_FOUND = 2;
+let __ERROR_PATH_NOT_FOUND = 3;
+
+let __MOVEFILE_REPLACE_EXISTING = 1;
+let __MOVEFILE_WRITE_THROUGH = 8;
+
+// WIN32_FIND_DATAW is 592 bytes with the entry name at offset 44: four DWORDs,
+// three FILETIMEs, two reserved DWORDs, then cFileName[MAX_PATH] and the short
+// name. The listing only needs the first field and the name.
+let __FIND_DATA_BYTES = 592;
+let __FIND_NAME_OFFSET = 44;
+let __FIND_NAME_WCHAR = 260;
+let __CP_UTF8 = 65001;
+
+// ---------------------------------------------------------------- mode table
+
+// Reads the mode letters and turns them into CreateFileW decisions. Returns
+// [desiredAccess, creationDisposition, isBinary, isAppend] where append is the
+// write side of 'a' and reads move freely in the updating modes.
+// Unknown letters fail loudly here: silently tolerating a misspelled mode
+// would create the file under the wrong CreateFileW semantics.
+func __fileModePlan(mode: string) -> list {
+    if (mode.length() == 0 || mode.length() > 6) {
+        throw new Exception("file: empty or oversized mode string");
     }
 
-    func write (data) {
-        using original {
-            if (type(data) == "Byte") {
-                // For now, just write the data
-                // Binary mode validation can be enhanced later
-                __file_write(this.handle, data.data);
+    let readFlag = false;
+    let writeFlag = false;
+    let appendFlag = false;
+    let binary = false;
+    let seenB = false;
+    let seenT = false;
+    let seenPlus = false;
+    let baseMode = "";
+
+    let index = 0;
+    for (true) {
+        if (index >= mode.length()) break;
+        let letter = mode.slice(index, index + 1);
+        index = index + 1;
+        if (letter == "r") {
+            if (baseMode.length() > 0) {
+                throw new Exception("file: mode has more than one base operation");
+            }
+            baseMode = letter;
+            readFlag = true;
+        } else {
+            if (letter == "w") {
+                if (baseMode.length() > 0) {
+                    throw new Exception("file: mode has more than one base operation");
+                }
+                baseMode = letter;
+                writeFlag = true;
             } else {
-                __file_write(this.handle, data);
+                if (letter == "a") {
+                    if (baseMode.length() > 0) {
+                        throw new Exception("file: mode has more than one base operation");
+                    }
+                    baseMode = letter;
+                    writeFlag = true;
+                    appendFlag = true;
+                } else {
+                    if (letter == "x") {
+                        if (baseMode.length() > 0) {
+                            throw new Exception("file: mode has more than one base operation");
+                        }
+                        baseMode = letter;
+                        writeFlag = true;
+                    } else {
+                        if (letter == "b") {
+                            if (seenB) {
+                                throw new Exception("file: mode has a duplicate 'b'");
+                            }
+                            seenB = true;
+                            binary = true;
+                        } else {
+                            if (letter == "t") {
+                                if (seenT) {
+                                    throw new Exception("file: mode has a duplicate 't'");
+                                }
+                                seenT = true;
+                            } else {
+                                if (letter == "+") {
+                                    if (seenPlus) {
+                                        throw new Exception("file: mode has a duplicate '+'");
+                                    }
+                                    seenPlus = true;
+                                    readFlag = true;
+                                    writeFlag = true;
+                                } else {
+                                    throw new Exception("file: unknown mode letter '" + letter + "'");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (seenB and seenT) {
+        throw new Exception("file: mode cannot be both 'b' and 't'");
+    }
+    if (baseMode.length() == 0) {
+        throw new Exception("file: mode must contain exactly one of 'r', 'w', 'a' or 'x'");
+    }
+
+    let desiredAccess = 0;
+    if (readFlag) {
+        desiredAccess = desiredAccess + GENERIC_READ;
+    }
+    if (writeFlag) {
+        desiredAccess = desiredAccess + GENERIC_WRITE;
+    }
+
+    // 'x' never overwrites: the platform answers with a failure instead,
+    // which Python matches through its CREATE_NEW disposition. 'w' replaces,
+    // 'r' and 'r+' demand the file to exist, 'a' and 'a+' create at need.
+    let disposition = OPEN_EXISTING;
+    if (baseMode == "a") {
+        disposition = OPEN_ALWAYS;
+    } else {
+        if (baseMode == "x") {
+            disposition = CREATE_NEW;
+        } else {
+            if (baseMode == "w") {
+                disposition = CREATE_ALWAYS;
             }
         }
     }
 
-    func read (size=-1) {
-        return __file_read(this.handle, size);
+    if (desiredAccess == 0) {
+        throw new Exception("file: mode grants no access rights");
     }
 
-    func close () {
-        __file_close(this.handle);
+    return [desiredAccess, disposition, binary, appendFlag];
+}
+
+// ---------------------------------------------------------------- path helpers
+
+// Encodes a path for the W entry points: UTF-16 with a NUL terminator in a
+// buffer the caller releases once the native call returns.
+func __fileWideBuffer(path: string) -> Buffer {
+    if (path.length() >= __PATH_WCHAR) {
+        throw new Exception("file: path exceeds " + str(__PATH_WCHAR - 1) + " characters");
     }
 
-    func seek (offset, whence=0) {
-        __file_seek(this.handle, offset, whence);
+    let name = new Buffer(__PATH_WCHAR * 2);
+    try {
+        name.utf16(0, path);
+    } catch (&bad) {
+        name.release();
+        throw new Exception("file: cannot encode path for the platform: " + str(bad));
     }
+    return name;
+}
+
+// Turns a NUL terminated UTF-16 string into text. Windows names are already
+// UTF-16, so converting through the system code page keeps surrogate pairs and
+// non-ASCII names intact without a decoder of our own.
+func __fileWideToText(address: int) -> string {
+    let capacity = __PATH_WCHAR * 4;
+    let target = new Buffer(capacity);
+    let written = 0;
+    try {
+        written = wideCharToMultiByte(__CP_UTF8, 0, address, -1, target.address, capacity, 0, 0);
+    } catch (&e) {
+        target.release();
+        throw e;
+    }
+    if (written <= 1) {
+        target.release();
+        return "";
+    }
+    // bytes(length) allocates a zeroed block; copy the converted octets into it
+    // and let the normal UTF-8 decoder build the string.
+    let data = bytes(written - 1);
+    copyBytes(data.dataAddress(), target.address, written - 1);
+    target.release();
+    return decodeBytes(data);
+}
+
+// FILE_ATTRIBUTE_DIRECTORY is 0x10, the fifth bit of the attribute mask.
+func __fileDirectoryBit(attributes: int) -> bool {
+    return (attributes / FILE_ATTRIBUTE_DIRECTORY) % 2 == 1;
+}
+
+// The index of the last separator, or -1 when the path has none.
+func __fileLastSeparator(path: string) -> int {
+    let best = -1;
+    for (0..path.length()) [const &index] {
+        let letter = path.get(index);
+        if (letter == "\\" or letter == "/") best = index;
+    }
+    return best;
+}
+
+// A drive root ("F:" or "F:\") already exists: it is not a directory to create.
+func __fileIsDriveRoot(path: string) -> bool {
+    if (path.length() == 2 and path.get(1) == ":") return true;
+    if (path.length() == 3 and path.get(1) == ":" and
+        (path.get(2) == "\\" or path.get(2) == "/")) {
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------- class
+
+class File {
+    using &this;
+
+
+    // 引用语义：本类持有原生资源或共享表项。值语义下「读字段」就会复制一份，
+    // 副本析构时 [~] 会把同一个句柄释放掉（或把状态写在快照上）。
+    func operator[@=]() -> &File {
+        return this;
+    }
+
+    var path = "";
+    var mode = "";
+    var binary = false;
+    var append = false;
+    var handle = 0;
+    var closed = true;
+
+    func init(path, mode="r") {
+        let plan = __fileModePlan(mode);
+        this.path = path;
+        this.mode = mode;
+        this.binary = plan[2];
+        this.append = plan[3];
+
+        let name = __fileWideBuffer(path);
+        this.handle = createFileW(
+            name.address, plan[0], FILE_SHARE_READ + FILE_SHARE_WRITE,
+            0, plan[1], FILE_ATTRIBUTE_NORMAL, 0);
+        name.release();
+        if (this.handle == INVALID_HANDLE_VALUE or this.handle == 0) {
+            let failure = getLastError();
+            this.handle = 0;
+            throw new Exception("file: cannot open '" + path + "' in mode '" + mode + "' (error " + str(failure) + ")");
+        }
+        this.closed = false;
+
+        // 'a' and 'a+' start writing at the end of the file, which is what
+        // makes an OPEN_ALWAYS handle behave like an append descriptor.
+        if (this.append) {
+            this.seek(0, FILE_END);
+        }
+    }
+
+    func isOpen() -> bool {
+        return !this.closed;
+    }
+
+    func close() {
+        if (this.closed) return;
+        this.closed = true;
+        closeHandle(this.handle);
+        this.handle = 0;
+    }
+
+    func flush() {
+        if (this.closed) {
+            throw new Exception("file: '" + this.path + "' is already closed");
+        }
+        if (flushFileBuffers(this.handle) == 0) {
+            let failure = getLastError();
+            throw new Exception("file: FlushFileBuffers failed (error " + str(failure) + ")");
+        }
+    }
+
+    // Position helpers use LARGE_INTEGER blocks: SetFilePointerEx hands the
+    // new position back through an 8 byte result pointer when told to.
+    func seek(offset: int, whence=0) {
+        if (this.closed) {
+            throw new Exception("file: '" + this.path + "' is already closed");
+        }
+        if (whence != FILE_BEGIN and whence != FILE_CURRENT and whence != FILE_END) {
+            throw new Exception("file: seek whence must be 0, 1 or 2");
+        }
+        if (setFilePointerEx(this.handle, offset, 0, whence) == 0) {
+            let failure = getLastError();
+            throw new Exception("file: seek failed (error " + str(failure) + ")");
+        }
+    }
+
+    func tell() -> int {
+        if (this.closed) {
+            throw new Exception("file: '" + this.path + "' is already closed");
+        }
+        let position = new Buffer(__POSITION_BUFFER);
+        let ok = setFilePointerEx(this.handle, 0, position.address, FILE_CURRENT);
+        let answer = position.i64(0);
+        position.release();
+        if (ok == 0) {
+            let failure = getLastError();
+            throw new Exception("file: tell failed (error " + str(failure) + ")");
+        }
+        return answer;
+    }
+
+    // Bytes remaining from the cursor, per GetFileSizeEx. Regular files only:
+    // a device or pipe does not answer a size query.
+    func __remaining() -> int {
+        let size = new Buffer(__POSITION_BUFFER);
+        if (getFileSizeEx(this.handle, size.address) == 0) {
+            size.release();
+            let failure = getLastError();
+            throw new Exception("file: GetFileSizeEx failed (error " + str(failure) + ")");
+        }
+        let answer = size.i64(0) - this.tell();
+        size.release();
+        return answer;
+    }
+
+    // Pulls octets through the handle until the caller's demand is met or the
+    // file ends. maxBytes below zero reads the whole rest of the file.
+    func readRaw(maxBytes: int) -> bytes {
+        if (this.closed) {
+            throw new Exception("file: '" + this.path + "' is already closed");
+        }
+        let want = maxBytes;
+        if (want < 0) {
+            want = this.__remaining();
+        }
+        if (want <= 0) {
+            return b"";
+        }
+
+        let parts = [];
+        let done = 0;
+        for (true) {
+            if (done >= want) break;
+            let take = want - done;
+            if (take > __MAX_CHUNK) {
+                take = __MAX_CHUNK;
+            }
+            let chunk = new Buffer(take + 8);
+            let count = new Buffer(__POSITION_BUFFER);
+            let ok = readFile(this.handle, chunk.address, take, count.address, 0);
+            let got = count.i32(0);
+            count.release();
+            if (ok == 0) {
+                let failure = getLastError();
+                chunk.release();
+                throw new Exception("file: ReadFile failed (error " + str(failure) + ")");
+            }
+            if (got <= 0) {
+                chunk.release();
+                break;
+            }
+            let values = [];
+            let octet = 0;
+            for (true) {
+                if (octet >= got) break;
+                values.append(@faddr(chunk.address + octet, 1) -> int);
+                octet = octet + 1;
+            }
+            parts.append(bytes(values));
+            done = done + got;
+            chunk.release();
+        }
+
+        let data = b"";
+        let index = 0;
+        for (true) {
+            if (index >= parts.length()) break;
+            data = data + parts[index];
+            index = index + 1;
+        }
+        return data;
+    }
+
+    // Pushes octets from a raw address; the '-' signs of int32 counts stay
+    // away because the chunk cap keeps every call inside one call's range.
+    func writeRaw(address: int, total: int) {
+        if (this.closed) {
+            throw new Exception("file: '" + this.path + "' is already closed");
+        }
+        if (total <= 0) return;
+        let pushed = 0;
+        for (true) {
+            if (pushed >= total) break;
+            let take = total - pushed;
+            if (take > __MAX_CHUNK) {
+                take = __MAX_CHUNK;
+            }
+            let count = new Buffer(__POSITION_BUFFER);
+            let ok = writeFile(this.handle, address + pushed, take, count.address, 0);
+            let wrote = count.i32(0);
+            count.release();
+            if (ok == 0 or wrote <= 0) {
+                let failure = getLastError();
+                throw new Exception("file: WriteFile failed (error " + str(failure) + ")");
+            }
+            pushed = pushed + wrote;
+        }
+    }
+
+    func read(size=-1) {
+        let data = this.readRaw(size);
+        if (this.binary) {
+            return data;
+        }
+        try {
+            return data.decode("utf-8");
+        } catch (&bad) {
+            throw new Exception("file: read bytes are not valid UTF-8 in text mode");
+        }
+    }
+
+    func write(data) {
+        // Append descriptors write at the end on every call, which is how
+        // Python presents 'a' on the platform CRT.
+        if (this.append) {
+            this.seek(0, FILE_END);
+        }
+        if (type(data) == "bytes") {
+            this.writeRaw(data.dataAddress(), data.length());
+            return;
+        }
+        if (type(data) == "string") {
+            let raw = bytes(data);
+            this.writeRaw(raw.dataAddress(), raw.length());
+            return;
+        }
+        throw new Exception("file: write expects bytes or string");
+    }
+
+    // ---------------------------------------------------------------- with & teardown
 
     func operator[with] () {
-
+        return this;
     }
 
     func operator[~with] () {
@@ -49,7 +552,685 @@ class File {
     }
 
     func operator[~] () {
-        print("[Warning] Close file automatically in destructor.", this.path);
-        this.close();
+        if (this.closed) return;
+        // Destruction can run while the program is already tearing down, so
+        // the close here is best effort: imports may be gone before a frame
+        // release reaches this object.
+        try {
+            print("[Warning] Close file automatically in destructor.", this.path);
+            this.close();
+        } catch (&shutdown) {}
+    }
+}
+
+// ---------------------------------------------------------------- interface
+
+// The one call Python spells open(); it stays a bare function so scripts can
+// write `let f = open("log.txt")` without importing a name further.
+func open(path, mode="r") {
+    return new File(path, mode);
+}
+
+// ---------------------------------------------------------------- paths
+
+// Whether the path names anything at all. A missing path is false, never an
+// error: callers ask this before deciding what to create.
+func exists(path: string) -> bool {
+    let wide = __fileWideBuffer(path);
+    let attributes = 0;
+    try {
+        attributes = getFileAttributesW(wide.address);
+    } catch (&e) {
+        wide.release();
+        throw e;
+    }
+    wide.release();
+    return attributes != __INVALID_FILE_ATTRIBUTES;
+}
+
+func isDirectory(path: string) -> bool {
+    let wide = __fileWideBuffer(path);
+    let attributes = 0;
+    try {
+        attributes = getFileAttributesW(wide.address);
+    } catch (&e) {
+        wide.release();
+        throw e;
+    }
+    wide.release();
+    if (attributes == __INVALID_FILE_ATTRIBUTES) return false;
+    return __fileDirectoryBit(attributes);
+}
+
+// Resolves an existing file or directory through Windows' handle API. This
+// follows reparse points, so callers can compare the returned path with a
+// trusted root instead of trusting lexical normalization alone.
+func realPath(path: string) -> string {
+    let name = __fileWideBuffer(path);
+    let handle = 0;
+    try {
+        handle = createFileW(name.address, 0,
+            FILE_SHARE_READ + FILE_SHARE_WRITE + FILE_SHARE_DELETE,
+            0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
+    } catch (&e) {
+        name.release();
+        throw e;
+    }
+    name.release();
+
+    if (handle == INVALID_HANDLE_VALUE or handle == 0) {
+        let failure = getLastError();
+        throw new Exception(
+            "file: cannot resolve '" + path + "' (error " + str(failure) + ")");
+    }
+
+    let output = new Buffer(__PATH_WCHAR * 2);
+    let written = 0;
+    try {
+        written = getFinalPathNameByHandleW(
+            handle, output.address, __PATH_WCHAR, 0);
+    } catch (&e) {
+        output.release();
+        closeHandle(handle);
+        throw e;
+    }
+    if (written == 0 or written >= __PATH_WCHAR) {
+        let failure = getLastError();
+        output.release();
+        closeHandle(handle);
+        throw new Exception(
+            "file: cannot resolve '" + path + "' (error " + str(failure) + ")");
+    }
+
+    let resolved = "";
+    try {
+        resolved = __fileWideToText(output.address).replace("\\", "/");
+    } catch (&e) {
+        output.release();
+        closeHandle(handle);
+        throw e;
+    }
+    output.release();
+    closeHandle(handle);
+
+    if (resolved.startswith("//?/UNC/")) {
+        return "//" + resolved.slice(8, resolved.length());
+    }
+    if (resolved.startswith("//?/")) {
+        return resolved.slice(4, resolved.length());
+    }
+    return resolved;
+}
+
+// Creates one directory level. An existing directory is not an error, which
+// keeps a create-if-missing call site free of a race check.
+func mkdir(path: string) {
+    if (exists(path)) {
+        if (isDirectory(path)) return;
+        throw new Exception("file: '" + path + "' exists and is not a directory");
+    }
+
+    let wide = __fileWideBuffer(path);
+    let created = 0;
+    try {
+        created = createDirectoryW(wide.address, 0);
+    } catch (&e) {
+        wide.release();
+        throw e;
+    }
+    let failure = getLastError();
+    wide.release();
+    if (created != 0) return;
+    if (failure == __ERROR_ALREADY_EXISTS) return;
+    throw new Exception(
+        "file: cannot create directory '" + path + "' (error " + str(failure) + ")");
+}
+
+// Creates every missing level, like os.makedirs(exist_ok=True).
+func mkdirs(path: string) {
+    if (path.length() == 0) return;
+    if (exists(path)) {
+        if (isDirectory(path)) return;
+        throw new Exception("file: '" + path + "' exists and is not a directory");
+    }
+    if (__fileIsDriveRoot(path)) return;
+
+    let separator = __fileLastSeparator(path);
+    if (separator > 0) {
+        mkdirs(path.slice(0, separator));
+    }
+    mkdir(path);
+}
+
+// Moves a file or directory onto a new name, replacing an existing target.
+func rename(from: string, to: string) {
+    let source = __fileWideBuffer(from);
+    let target = __fileWideBuffer(to);
+    let moved = 0;
+    try {
+        moved = moveFileExW(
+            source.address, target.address,
+            __MOVEFILE_REPLACE_EXISTING + __MOVEFILE_WRITE_THROUGH);
+    } catch (&e) {
+        source.release();
+        target.release();
+        throw e;
+    }
+    let failure = getLastError();
+    source.release();
+    target.release();
+    if (moved == 0) {
+        throw new Exception(
+            "file: cannot rename '" + from + "' to '" + to +
+            "' (error " + str(failure) + ")");
+    }
+}
+
+func removeFile(path: string) {
+    let wide = __fileWideBuffer(path);
+    let removed = 0;
+    try {
+        removed = deleteFileW(wide.address);
+    } catch (&e) {
+        wide.release();
+        throw e;
+    }
+    let failure = getLastError();
+    wide.release();
+    if (removed == 0) {
+        throw new Exception("file: cannot remove '" + path + "' (error " + str(failure) + ")");
+    }
+}
+
+// Removes an empty directory. A directory that still holds entries is refused
+// by the platform, so a recursive delete can never happen by accident.
+func removeDir(path: string) {
+    let wide = __fileWideBuffer(path);
+    let removed = 0;
+    try {
+        removed = removeDirectoryW(wide.address);
+    } catch (&e) {
+        wide.release();
+        throw e;
+    }
+    let failure = getLastError();
+    wide.release();
+    if (removed == 0) {
+        throw new Exception(
+            "file: cannot remove directory '" + path + "' (error " + str(failure) + ")");
+    }
+}
+
+// Entry names directly inside path, "." and ".." excluded. The order is the
+// platform's, so callers sort when they need one.
+func listDir(path: string) -> list {
+    if (!exists(path)) {
+        throw new Exception("file: cannot list '" + path + "': no such directory");
+    }
+    if (!isDirectory(path)) {
+        throw new Exception("file: cannot list '" + path + "': not a directory");
+    }
+
+    let pattern = path;
+    if (__fileLastSeparator(pattern) != pattern.length() - 1) {
+        pattern = pattern + "\\";
+    }
+    pattern = pattern + "*";
+
+    let wide = __fileWideBuffer(pattern);
+    let findData = new Buffer(__FIND_DATA_BYTES);
+    let names = [];
+    let handle = 0;
+    try {
+        handle = findFirstFileW(wide.address, findData.address);
+    } catch (&e) {
+        wide.release();
+        findData.release();
+        throw e;
+    }
+    if (handle == INVALID_HANDLE_VALUE or handle == 0) {
+        let failure = getLastError();
+        wide.release();
+        findData.release();
+        throw new Exception("file: cannot list '" + path + "' (error " + str(failure) + ")");
+    }
+
+    for (true) {
+        let name = __fileWideToText(findData.address + __FIND_NAME_OFFSET);
+        if (name != "" and name != "." and name != "..") {
+            names.append(name);
+        }
+        if (findNextFileW(handle, findData.address) == 0) break;
+    }
+
+    findClose(handle);
+    wide.release();
+    findData.release();
+    return names;
+}
+
+}
+
+using posix {
+    @native("open", from="c")
+    decl func posixOpen(path: ptr, flags: int32, mode: int32) -> int32;
+
+    @native("read", from="c")
+    decl func posixRead(fd: int32, buf: ptr, count: int) -> int;
+
+    @native("write", from="c")
+    decl func posixWrite(fd: int32, buf: ptr, count: int) -> int;
+
+    @native("lseek", from="c")
+    decl func posixLseek(fd: int32, offset: int, whence: int32) -> int;
+
+    @native("fsync", from="c")
+    decl func posixFsync(fd: int32) -> int32;
+
+    @native("close", from="c")
+    decl func posixClose(fd: int32) -> int32;
+
+    @native("stat", from="c")
+    decl func posixStat(path: ptr, buf: ptr) -> int32;
+
+    @native("mkdir", from="c")
+    decl func posixMkdir(path: ptr, mode: int32) -> int32;
+
+    @native("rmdir", from="c")
+    decl func posixRmdir(path: ptr) -> int32;
+
+    @native("unlink", from="c")
+    decl func posixUnlink(path: ptr) -> int32;
+
+    @native("rename", from="c")
+    decl func posixRename(oldPath: ptr, newPath: ptr) -> int32;
+
+    @native("opendir", from="c")
+    decl func posixOpendir(path: ptr) -> ptr;
+
+    @native("readdir", from="c")
+    decl func posixReaddir(dir: ptr) -> ptr;
+
+    @native("closedir", from="c")
+    decl func posixClosedir(dir: ptr) -> int32;
+
+    @native("realpath", from="c")
+    decl func posixRealpath(path: ptr, resolvedPath: ptr) -> ptr;
+
+    @native("__errno_location", from="c")
+    decl func posixErrnoLocation() -> ptr;
+
+    func posixErrno() -> int {
+        let p = posixErrnoLocation();
+        if (p == 0) return 0;
+        return @faddr(p, 4) -> int;
+    }
+
+    func __fileModePlan(mode: string) -> list {
+        if (mode.length() == 0 || mode.length() > 6) {
+            throw new Exception("file: empty or oversized mode string");
+        }
+
+        let readFlag = false;
+        let writeFlag = false;
+        let appendFlag = false;
+        let binary = false;
+        let seenPlus = false;
+        let baseMode = "";
+
+        for (0..mode.length()) [const &index] {
+            let letter = mode.slice(index, index + 1);
+            when (letter) {
+                "r": { baseMode = letter; readFlag = true; }
+                "w": { baseMode = letter; writeFlag = true; }
+                "a": { baseMode = letter; writeFlag = true; appendFlag = true; }
+                "x": { baseMode = letter; writeFlag = true; }
+                "b": { binary = true; }
+                "t": {}
+                "+": { seenPlus = true; readFlag = true; writeFlag = true; }
+                else: throw new Exception("file: unknown mode letter '" + letter + "'");
+            }
+        }
+        if (baseMode.length() == 0) {
+            throw new Exception("file: mode must contain exactly one of 'r', 'w', 'a' or 'x'");
+        }
+
+        let flags = 0;
+        if (readFlag and writeFlag) {
+            flags = 2;
+        } else if (writeFlag) {
+            flags = 1;
+        } else {
+            flags = 0;
+        }
+
+        when (baseMode) {
+            "w": flags = flags + 64 + 512;
+            "a": flags = flags + 64 + 1024;
+            "x": flags = flags + 64 + 128;
+        }
+
+        return [flags, binary, appendFlag];
+    }
+
+    class File {
+        using &this;
+
+        func operator[@=]() -> &File {
+            return this;
+        }
+
+        var path = "";
+        var mode = "";
+        var binary = false;
+        var append = false;
+        var handle = -1;
+        var closed = true;
+
+        func init(path, mode="r") {
+            let plan = __fileModePlan(mode);
+            this.path = path;
+            this.mode = mode;
+            this.binary = plan[1];
+            this.append = plan[2];
+
+            let name = new Buffer(path.length() + 1);
+            name.writeCString(0, path);
+            this.handle = posixOpen(name.address, plan[0], 438);
+            name.release();
+
+            if (this.handle < 0) {
+                let err = posixErrno();
+                throw new Exception("file: cannot open '" + path + "' in mode '" + mode + "' (error " + str(err) + ")");
+            }
+            this.closed = false;
+
+            if (this.append) {
+                this.seek(0, FILE_END);
+            }
+        }
+
+        func isOpen() -> bool {
+            return !this.closed;
+        }
+
+        func close() {
+            if (this.closed) return;
+            this.closed = true;
+            posixClose(this.handle);
+            this.handle = -1;
+        }
+
+        func flush() {
+            if (this.closed) {
+                throw new Exception("file: '" + this.path + "' is already closed");
+            }
+            if (posixFsync(this.handle) < 0) {
+                let err = posixErrno();
+                throw new Exception("file: fsync failed (error " + str(err) + ")");
+            }
+        }
+
+        func seek(offset: int, whence=0) {
+            if (this.closed) {
+                throw new Exception("file: '" + this.path + "' is already closed");
+            }
+            if (whence != FILE_BEGIN and whence != FILE_CURRENT and whence != FILE_END) {
+                throw new Exception("file: seek whence must be 0, 1 or 2");
+            }
+            if (posixLseek(this.handle, offset, whence) < 0) {
+                let err = posixErrno();
+                throw new Exception("file: seek failed (error " + str(err) + ")");
+            }
+        }
+
+        func tell() -> int {
+            if (this.closed) {
+                throw new Exception("file: '" + this.path + "' is already closed");
+            }
+            let pos = posixLseek(this.handle, 0, 1);
+            if (pos < 0) {
+                let err = posixErrno();
+                throw new Exception("file: tell failed (error " + str(err) + ")");
+            }
+            return pos;
+        }
+
+        func __remaining() -> int {
+            let cur = this.tell();
+            let end = posixLseek(this.handle, 0, 2);
+            posixLseek(this.handle, cur, 0);
+            if (end < cur) return 0;
+            return end - cur;
+        }
+
+        func readRaw(maxBytes: int) -> bytes {
+            if (this.closed) {
+                throw new Exception("file: '" + this.path + "' is already closed");
+            }
+            let want = maxBytes;
+            if (want < 0) {
+                want = this.__remaining();
+            }
+            if (want <= 0) {
+                return b"";
+            }
+
+            let parts = [];
+            let done = 0;
+            for (true) {
+                if (done >= want) break;
+                let take = want - done;
+                if (take > 1048576) take = 1048576;
+                let chunk = new Buffer(take);
+                let got = posixRead(this.handle, chunk.address, take);
+                if (got < 0) {
+                    let err = posixErrno();
+                    chunk.release();
+                    throw new Exception("file: read failed (error " + str(err) + ")");
+                }
+                if (got == 0) {
+                    chunk.release();
+                    break;
+                }
+                let values = [];
+                for (0..got) [const &i] {
+                    values.append(chunk.u8(i));
+                }
+                parts.append(bytes(values));
+                done = done + got;
+                chunk.release();
+            }
+
+            let data = b"";
+            for (0..parts.length()) [const &i] {
+                data = data + parts[i];
+            }
+            return data;
+        }
+
+        func writeRaw(address: int, total: int) {
+            if (this.closed) {
+                throw new Exception("file: '" + this.path + "' is already closed");
+            }
+            if (total <= 0) return;
+            let pushed = 0;
+            for (true) {
+                if (pushed >= total) break;
+                let take = total - pushed;
+                if (take > 1048576) take = 1048576;
+                let wrote = posixWrite(this.handle, address + pushed, take);
+                if (wrote <= 0) {
+                    let err = posixErrno();
+                    throw new Exception("file: write failed (error " + str(err) + ")");
+                }
+                pushed = pushed + wrote;
+            }
+        }
+
+        func read(size=-1) {
+            let data = this.readRaw(size);
+            if (this.binary) {
+                return data;
+            }
+            try {
+                return data.decode("utf-8");
+            } catch (&bad) {
+                throw new Exception("file: read bytes are not valid UTF-8 in text mode");
+            }
+        }
+
+        func write(data) {
+            if (this.append) {
+                this.seek(0, FILE_END);
+            }
+            if (type(data) == "bytes") {
+                this.writeRaw(data.dataAddress(), data.length());
+                return;
+            }
+            if (type(data) == "string") {
+                let raw = bytes(data);
+                this.writeRaw(raw.dataAddress(), raw.length());
+                return;
+            }
+            throw new Exception("file: write expects bytes or string");
+        }
+
+        func operator[with] () {
+            return this;
+        }
+
+        func operator[~with] () {
+            this.close();
+        }
+
+        func operator[~] () {
+            if (this.closed) return;
+            try {
+                print("[Warning] Close file automatically in destructor.", this.path);
+                this.close();
+            } catch (&shutdown) {}
+        }
+    }
+
+    func exists(path: string) -> bool {
+        let name = new Buffer(path.length() + 1);
+        name.writeCString(0, path);
+        let buf = new Buffer(144);
+        let ret = posixStat(name.address, buf.address);
+        name.release();
+        buf.release();
+        return ret == 0;
+    }
+
+    func isDirectory(path: string) -> bool {
+        let name = new Buffer(path.length() + 1);
+        name.writeCString(0, path);
+        let buf = new Buffer(144);
+        let ret = posixStat(name.address, buf.address);
+        name.release();
+        if (ret != 0) {
+            buf.release();
+            return false;
+        }
+        let mode = buf.i32(24);
+        buf.release();
+        return int(mode / 4096) % 16 == 4;
+    }
+
+    func realPath(path: string) -> string {
+        let name = new Buffer(path.length() + 1);
+        name.writeCString(0, path);
+        let resolved = new Buffer(4096);
+        let ret = posixRealpath(name.address, resolved.address);
+        name.release();
+        if (ret == 0) {
+            resolved.release();
+            let err = posixErrno();
+            throw new Exception("file: cannot resolve '" + path + "' (error " + str(err) + ")");
+        }
+        let ans = resolved.readCString(0, 4096);
+        resolved.release();
+        return ans;
+    }
+
+    func mkdir(path: string) {
+        if (exists(path)) {
+            if (isDirectory(path)) return;
+            throw new Exception("file: '" + path + "' exists and is not a directory");
+        }
+        let name = new Buffer(path.length() + 1);
+        name.writeCString(0, path);
+        let ret = posixMkdir(name.address, 511);
+        name.release();
+        if (ret != 0) {
+            let err = posixErrno();
+            if (err == 17) return;
+            throw new Exception("file: cannot create directory '" + path + "' (error " + str(err) + ")");
+        }
+    }
+
+    func rename(from: string, to: string) {
+        let src = new Buffer(from.length() + 1);
+        src.writeCString(0, from);
+        let dst = new Buffer(to.length() + 1);
+        dst.writeCString(0, to);
+        let ret = posixRename(src.address, dst.address);
+        src.release();
+        dst.release();
+        if (ret != 0) {
+            let err = posixErrno();
+            throw new Exception("file: cannot rename '" + from + "' to '" + to + "' (error " + str(err) + ")");
+        }
+    }
+
+    func removeFile(path: string) {
+        let name = new Buffer(path.length() + 1);
+        name.writeCString(0, path);
+        let ret = posixUnlink(name.address);
+        name.release();
+        if (ret != 0) {
+            let err = posixErrno();
+            throw new Exception("file: cannot remove '" + path + "' (error " + str(err) + ")");
+        }
+    }
+
+    func removeDir(path: string) {
+        let name = new Buffer(path.length() + 1);
+        name.writeCString(0, path);
+        let ret = posixRmdir(name.address);
+        name.release();
+        if (ret != 0) {
+            let err = posixErrno();
+            throw new Exception("file: cannot remove directory '" + path + "' (error " + str(err) + ")");
+        }
+    }
+
+    func listDir(path: string) -> list {
+        if (!exists(path)) {
+            throw new Exception("file: cannot list '" + path + "': no such directory");
+        }
+        if (!isDirectory(path)) {
+            throw new Exception("file: cannot list '" + path + "': not a directory");
+        }
+        let name = new Buffer(path.length() + 1);
+        name.writeCString(0, path);
+        let dir = posixOpendir(name.address);
+        name.release();
+        if (dir == 0) {
+            let err = posixErrno();
+            throw new Exception("file: cannot list '" + path + "' (error " + str(err) + ")");
+        }
+        let names = [];
+        for (true) {
+            let entry = posixReaddir(dir);
+            if (entry == 0) break;
+            let entryName = readCString(entry + 19, 256);
+            if (entryName != "" and entryName != "." and entryName != "..") {
+                names.append(entryName);
+            }
+        }
+        posixClosedir(dir);
+        return names;
     }
 }

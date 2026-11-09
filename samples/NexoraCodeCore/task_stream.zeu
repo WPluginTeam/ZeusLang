@@ -1,0 +1,240 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import zeus.string;
+
+// 任务流中继（S5）。基线 _relay_task_events 的帧序列：
+//   meta 缺失      -> task_stream_error("任务不存在或已清理")
+//   status 运行中   -> task_state(session)
+//   seq 为 nil      -> task_state(最新的 session)
+//   seq 有值        -> task_event(event)
+//   event 是 gap    -> task_stream_gap(head_seq)，并结束这一轮
+//   正常走完        -> task_state(最新的 session)
+// 宿主只需要两个方法：getMeta(stream_id) 和 iterChunks(stream_id, fromSeq)。
+
+func __nexora_stream_type(source) {
+    let found = nil;
+    try {
+        found = dict_get(source, "type", "");
+    } catch (&error) {
+        return "";
+    }
+    if (found == nil) return "";
+    return str(found);
+}
+
+func __nexora_stream_send(connection, frame) {
+    connection.sendText(JSON.stringify(frame));
+    return true;
+}
+
+func nexora_core_task_stream_error(connection, subscriptionId: string, streamId: string, message: string) {
+    let frame = {
+        "type": "task_stream_error",
+        "subscription_id": subscriptionId,
+        "stream_id": streamId,
+        "message": message
+    };
+    return __nexora_stream_send(connection, frame);
+}
+
+func nexora_core_task_stream_state(connection, subscriptionId: string, streamId: string, session) {
+    let frame = {
+        "type": "task_state",
+        "subscription_id": subscriptionId,
+        "stream_id": streamId,
+        "session": session
+    };
+    return __nexora_stream_send(connection, frame);
+}
+
+func nexora_core_task_stream_event(connection, subscriptionId: string, streamId: string, event) {
+    let frame = {
+        "type": "task_event",
+        "subscription_id": subscriptionId,
+        "stream_id": streamId,
+        "event": event
+    };
+    return __nexora_stream_send(connection, frame);
+}
+
+func nexora_core_task_stream_gap(connection, subscriptionId: string, streamId: string, headSeq) {
+    let frame = {
+        "type": "task_stream_gap",
+        "subscription_id": subscriptionId,
+        "stream_id": streamId,
+        "head_seq": headSeq
+    };
+    return __nexora_stream_send(connection, frame);
+}
+
+// 32 位小写十六进制：基线的订阅号/流号格式，格式不对的帧直接丢弃。
+func nexora_core_is_stream_id(value) -> bool {
+    if (type(value) != "string") return false;
+    if (value.length() != 32) return false;
+    for (0..32) [const &i] {
+        let character = value.get(i);
+        if (character >= "0" and character <= "9") continue;
+        if (character >= "a" and character <= "f") continue;
+        return false;
+    }
+    return true;
+}
+
+// 一轮中继：从 afterSeq 开始把宿主给的快照推完。state 是订阅记录里共享的那个
+// 字典（dict 按引用共享），断线/退订后置 stopped，下一轮什么都不发。
+func nexora_core_relay_task_stream(connection, subscriptionId: string, streamId: string,
+                                   afterSeq: int, taskStream, state) -> int {
+    let meta = taskStream.getMeta(streamId);
+    if (meta == nil) {
+        nexora_core_task_stream_error(connection, subscriptionId, streamId, "任务不存在或已清理");
+        return 1;
+    }
+
+    let sent = 0;
+    let status = dict_get(meta, "status", "");
+    if (status == "running" or status == "cancelling") {
+        nexora_core_task_stream_state(connection, subscriptionId, streamId, meta);
+        sent = sent + 1;
+    }
+
+    let chunks = nil;
+    try {
+        chunks = taskStream.iterChunks(streamId, afterSeq);
+    } catch (&error) {
+        nexora_core_task_stream_error(connection, subscriptionId, streamId,
+            "电脑任务事件转发失败：" + type(error));
+        return sent + 1;
+    }
+    if (chunks == nil) chunks = [];
+
+    let lastSeq = afterSeq;
+    for (chunks) [entry] {
+        if (dict_get(state, "stopped", false)) return sent;
+
+        let event = dict_get(entry, "event", nil);
+        if (event == nil) continue;
+
+        if (__nexora_stream_type(event) == "task_stream_gap") {
+            nexora_core_task_stream_gap(connection, subscriptionId, streamId,
+                dict_get(event, "head_seq", nil));
+            return sent + 1;
+        }
+
+        let sequence = dict_get(entry, "seq", nil);
+        if (sequence == nil) {
+            nexora_core_task_stream_state(connection, subscriptionId, streamId,
+                taskStream.getMeta(streamId));
+        } else {
+            nexora_core_task_stream_event(connection, subscriptionId, streamId, event);
+            if (type(sequence) == "int" and sequence > lastSeq) {
+                lastSeq = sequence;
+            }
+        }
+        sent = sent + 1;
+    }
+
+    // 游标前进到已推完的位置，pump 下一轮只取新块。
+    state["after_seq"] = lastSeq;
+
+    if (!dict_get(state, "stopped", false)) {
+        nexora_core_task_stream_state(connection, subscriptionId, streamId,
+            taskStream.getMeta(streamId));
+        sent = sent + 1;
+    }
+    return sent;
+}
+
+// 订阅表：`task_subscribe` 注册并先推一轮，`task_unsubscribe` 移除，
+// 断线时整体停止（基线的 finally 分支）。
+class NexoraCoreTaskStreamHandler {
+    using &this;
+
+    let taskStream = nil;
+    let relays = [];
+
+    func init(taskStreamValue) {
+        this.taskStream = taskStreamValue;
+    }
+
+    func operator[@=]() -> &NexoraCoreTaskStreamHandler {
+        return this;
+    }
+
+    func count() -> int {
+        return this.relays.length();
+    }
+
+    func subscriptionAt(subscriptionId: string) {
+        // 复制绑定：字典是共享容器，取出来返回的仍是同一条记录。
+        for (this.relays) [relay] {
+            if (relay["subscription_id"] == subscriptionId) return relay;
+        }
+        return nil;
+    }
+
+    func handleSubscribe(frame, connection) {
+        let subscriptionId = dict_get(frame, "subscription_id", "");
+        let streamId = dict_get(frame, "stream_id", "");
+        if (!nexora_core_is_stream_id(subscriptionId)) return false;
+        if (!nexora_core_is_stream_id(streamId)) return false;
+        if (this.subscriptionAt(subscriptionId) != nil) return false;
+
+        let afterSeq = dict_get(frame, "after_seq", 0);
+        if (type(afterSeq) != "int") return false;
+        if (afterSeq < 0) afterSeq = 0;
+
+        let relay = {
+            "subscription_id": subscriptionId,
+            "stream_id": streamId,
+            "state": {"stopped": false, "after_seq": afterSeq}
+        };
+        this.relays.append(relay);
+
+        nexora_core_relay_task_stream(connection, subscriptionId, streamId, afterSeq,
+            this.taskStream, relay["state"]);
+        return true;
+    }
+
+    func handleUnsubscribe(frame, connection) {
+        let subscriptionId = dict_get(frame, "subscription_id", "");
+        if (type(subscriptionId) != "string") return false;
+
+        let index = -1;
+        for (0..this.relays.length()) [const &i] {
+            if (this.relays[i]["subscription_id"] == subscriptionId) {
+                index = i;
+                break;
+            }
+        }
+        if (index < 0) return false;
+
+        // 嵌套下标不能直接赋值，先取出共享的 state 字典再写。
+        let state = this.relays[index]["state"];
+        state["stopped"] = true;
+        this.relays.remove(index);
+        return true;
+    }
+
+    // 活流：宿主有新块时再推一轮，只推仍然订阅着的。游标在 state 里，
+    // 上一轮推完就前进过，所以这里不会重发旧块。
+    func pump(connection) -> int {
+        let sent = 0;
+        for (this.relays) [relay] {
+            if (dict_get(relay["state"], "stopped", false)) continue;
+            sent = sent + nexora_core_relay_task_stream(connection,
+                relay["subscription_id"], relay["stream_id"],
+                dict_get(relay["state"], "after_seq", 0),
+                this.taskStream, relay["state"]);
+        }
+        return sent;
+    }
+
+    func stopAll() {
+        for (this.relays) [relay] {
+            let state = relay["state"];
+            state["stopped"] = true;
+        }
+        this.relays = [];
+    }
+}

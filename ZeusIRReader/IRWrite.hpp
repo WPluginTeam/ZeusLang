@@ -20,7 +20,7 @@ namespace IRBinary {
 
     // Magic + version
     static const unsigned char MAGIC[4] = { 'Z', 'I', 'R', '1' };
-    static const uint16_t VERSION = 9;
+    static const uint16_t VERSION = 10;
 
     // Arg type tags（尾部追加：老 .zir 里不可能出现新 tag，前向兼容）
     enum ArgTag : uint8_t {
@@ -40,6 +40,7 @@ namespace IRBinary {
         SECTION_SYMBOLS = 1,
         SECTION_GLOBAL_NAMES = 2,
         SECTION_INSTRUCTION_METADATA = 3,
+        SECTION_GLOBAL_TEARDOWN_LAYOUT = 4,
     };
 
     struct SectionEntry {
@@ -53,6 +54,10 @@ namespace IRBinary {
         std::string compilerName;
         std::string buildTime;
         std::string buildVersion;
+        bool hasGlobalTeardownLayout = false;
+        uint32_t packageGlobalCount = 0;
+        uint32_t mainGlobalStart = 0;
+        uint32_t mainGlobalEnd = 0;
     };
 
     inline void writeRaw(std::ofstream &ofs, const void* data, size_t sz) {
@@ -128,10 +133,17 @@ namespace IRBinary {
                                const std::vector<std::string>* globalNames = nullptr,
                                const IRMeta* meta = nullptr,
                                std::string* errorMsg = nullptr) {
+        IRMeta useMeta = meta ? *meta : getDefaultMeta();
+        if (useMeta.hasGlobalTeardownLayout &&
+            (!globalNames || useMeta.packageGlobalCount > useMeta.mainGlobalStart ||
+             useMeta.mainGlobalStart > useMeta.mainGlobalEnd ||
+             useMeta.mainGlobalEnd > globalNames->size())) {
+            if (errorMsg) *errorMsg = "Invalid global teardown layout";
+            return false;
+        }
+
         std::ofstream ofs(path, std::ios::binary);
         if (!ofs) { if (errorMsg) *errorMsg = "Cannot open file for write: " + path; return false; }
-
-        IRMeta useMeta = meta ? *meta : getDefaultMeta();
 
         std::vector<std::string> symbols;
         std::unordered_map<std::string, uint32_t> symbolIndex;
@@ -222,6 +234,16 @@ namespace IRBinary {
                 if (errorMsg) *errorMsg = "Failed to write IR instruction metadata";
                 return false;
             }
+            sections.push_back(ent);
+        }
+        if (useMeta.hasGlobalTeardownLayout) {
+            SectionEntry ent;
+            ent.type = SECTION_GLOBAL_TEARDOWN_LAYOUT;
+            ent.offset = static_cast<uint32_t>(ofs.tellp());
+            writeUint32(ofs, useMeta.packageGlobalCount);
+            writeUint32(ofs, useMeta.mainGlobalStart);
+            writeUint32(ofs, useMeta.mainGlobalEnd);
+            ent.size = 3 * sizeof(uint32_t);
             sections.push_back(ent);
         }
 

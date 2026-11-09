@@ -1,0 +1,48 @@
+import samples.NexoraCodeCore.core;
+import samples.NexoraCodeCore.policy;
+import zeus.exception;
+import zeus.json;
+import zeus.ssl;
+
+func assertNexoraCore(condition, message: string) {
+    if (!condition) throw new Exception("NexoraCodeCore test failed: " + message);
+}
+
+print("NEXORA_STEP_CONNECTING");
+let testSslContext = createInsecureContext();
+let connection = nexora_core_connect(
+    "https://127.0.0.1:__PORT__",
+    "sample-device",
+    "sample-token",
+    testSslContext
+);
+print("NEXORA_STEP_AUTHENTICATED");
+
+nexora_core_send_ping(connection);
+print("NEXORA_STEP_PING_SENT");
+let rpc = nexora_core_receive_frame(connection);
+assertNexoraCore(rpc["type"] == "rpc", "RPC frame type is decoded");
+assertNexoraCore(rpc["request_id"] == "req-42", "RPC request ID is preserved");
+assertNexoraCore(
+    rpc["payload"]["path"] == "/api/config" and
+    rpc["payload"]["method"] == "GET",
+    "RPC payload fields are decoded"
+);
+assertNexoraCore(
+    nexora_core_allowed_request(rpc["payload"]["method"], rpc["payload"]["path"]),
+    "received RPC request passes the Nexora remote allowlist"
+);
+print("NEXORA_STEP_RPC_RECEIVED");
+
+let result = JSON.parse(
+    "{\"status\":200,\"body\":{\"ok\":true,\"message\":\"Zeus 通过\"}}"
+);
+nexora_core_send_rpc_result(connection, rpc["request_id"], result);
+print("NEXORA_STEP_RPC_RESULT_SENT");
+nexora_core_close(connection);
+assertNexoraCore(nexora_core_receive_frame(connection) == nil,
+    "WebSocket close handshake returns end-of-stream");
+delete connection;
+print("NEXORA_STEP_CLOSED");
+
+print("NEXORA_CODE_CORE_TEST_PASS");

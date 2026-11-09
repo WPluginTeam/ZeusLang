@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -111,7 +112,9 @@ std::string keyString(const ZeusType::UniversalVariant& value) {
             zeus_value_from_box(ownedString.get(), &boxedString);
 
             const ZeusNativeString view =
-                zeus_value_intern_string(ownedString.get());
+                zeus_value_to_native_string(ownedString.get());
+            std::unique_ptr<const char, decltype(&zeus_string_release)> ownedView(
+                view, &zeus_string_release);
             uint64_t length = 0;
             if (view) std::memcpy(&length, view - sizeof(uint64_t), sizeof(length));
             if (!view || length >

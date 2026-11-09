@@ -1,0 +1,175 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import samples.NexoraCodeCore.rpc;
+
+func assertRpc(condition, message: string) {
+    if (!condition) throw new Exception("Nexora rpc test failed: " + message);
+}
+
+func __rpc_frame_type(text: string) {
+    let frame = JSON.parse(text);
+    for (frame) [&key: &value] {
+        if (key == "type") return value;
+    }
+    return "";
+}
+
+class RecordingLocalApi {
+    using &this;
+
+    let calls = [];
+    let answer = nil;
+    let failure = nil;
+
+    func operator[@=]() -> &RecordingLocalApi {
+        return this;
+    }
+
+    func dispatch(method, path, query, body) {
+        this.calls.append(method + " " + path);
+        if (this.failure != nil) throw this.failure;
+        return this.answer;
+    }
+}
+
+class RecordingRpcConnection {
+    using &this;
+
+    let sent = [];
+
+    func operator[@=]() -> &RecordingRpcConnection {
+        return this;
+    }
+
+    func sendText(text: string) {
+        this.sent.append(text);
+    }
+}
+
+func rpcFrame(requestId: string, method: string, path: string) {
+    let payload = {"method": method, "path": path, "query": nil, "body": nil};
+    let frame = {"type": "rpc", "request_id": requestId, "payload": payload};
+    return frame;
+}
+
+func lastResult(connection) {
+    let text = connection.sent[connection.sent.length() - 1];
+    let frame = JSON.parse(text);
+    return frame;
+}
+
+// 白名单内的请求交给宿主，回帧带同一个 request_id 和宿主给的状态。
+func testRpcDispatchAllowed() {
+    let api = new RecordingLocalApi();
+    api.answer = {"status": 200, "body": {"items": []}};
+    let handler = new NexoraCoreRpcHandler(api);
+    let connection = new RecordingRpcConnection();
+
+    let handled = handler.handle(rpcFrame("rpc-1", "GET", "/api/chat/queue"), connection);
+
+    assertRpc(handled, "an allowed request is handled");
+    assertRpc(api.calls.length() == 1, "the host is called once");
+    assertRpc(api.calls[0] == "GET /api/chat/queue", "the host sees method and path");
+    assertRpc(connection.sent.length() == 1, "one result frame goes out");
+
+    let result = lastResult(connection);
+    assertRpc(result["type"] == "rpc_result", "the reply is an rpc_result");
+    assertRpc(result["request_id"] == "rpc-1", "the reply echoes the request id");
+    assertRpc(result["result"]["status"] == 200, "the reply carries the host status");
+}
+
+// 方法大小写不敏感：基线把 method 统一成大写再判定。
+func testRpcDispatchUppercasesMethod() {
+    let api = new RecordingLocalApi();
+    api.answer = {"status": 204, "body": nil};
+    let handler = new NexoraCoreRpcHandler(api);
+    let connection = new RecordingRpcConnection();
+
+    handler.handle(rpcFrame("rpc-2", "patch", "/api/chat/queue/abc123"), connection);
+
+    assertRpc(api.calls.length() == 1, "the lowercase method reaches the host");
+    assertRpc(api.calls[0] == "PATCH /api/chat/queue/abc123", "the method is uppercased");
+}
+
+// 白名单外：403，宿主一次都不能被调用。
+func testRpcDispatchForbidden() {
+    let api = new RecordingLocalApi();
+    api.answer = {"status": 200, "body": nil};
+    let handler = new NexoraCoreRpcHandler(api);
+    let connection = new RecordingRpcConnection();
+
+    handler.handle(rpcFrame("rpc-3", "GET", "/api/admin"), connection);
+
+    assertRpc(api.calls.length() == 0, "a forbidden path never reaches the host");
+    let result = lastResult(connection);
+    assertRpc(result["result"]["status"] == 403, "the reply is a 403");
+    assertRpc(result["request_id"] == "rpc-3", "the 403 still echoes the request id");
+}
+
+// 宿主抛错：500，连接不受影响。
+func testRpcDispatchHostFailure() {
+    let api = new RecordingLocalApi();
+    api.failure = new Exception("host exploded");
+    let handler = new NexoraCoreRpcHandler(api);
+    let connection = new RecordingRpcConnection();
+
+    handler.handle(rpcFrame("rpc-4", "GET", "/api/chat/queue"), connection);
+
+    let result = lastResult(connection);
+    assertRpc(result["result"]["status"] == 500, "a host exception becomes a 500");
+}
+
+// 宿主没给出能当 JSON 的结果：502。
+func testRpcDispatchBadAnswer() {
+    let api = new RecordingLocalApi();
+    api.answer = "not a dict";
+    let handler = new NexoraCoreRpcHandler(api);
+    let connection = new RecordingRpcConnection();
+
+    handler.handle(rpcFrame("rpc-5", "GET", "/api/chat/queue"), connection);
+
+    let result = lastResult(connection);
+    assertRpc(result["result"]["status"] == 502, "a non-dict answer becomes a 502");
+}
+
+// 没有 request_id 的帧不回：回了也没人认领。
+func testRpcDispatchMissingRequestId() {
+    let api = new RecordingLocalApi();
+    api.answer = {"status": 200, "body": nil};
+    let handler = new NexoraCoreRpcHandler(api);
+    let connection = new RecordingRpcConnection();
+
+    let frame = {"type": "rpc", "payload": {"method": "GET", "path": "/api/chat/queue"}};
+    let handled = handler.handle(frame, connection);
+
+    assertRpc(!handled, "a frame without request_id is ignored");
+    assertRpc(connection.sent.length() == 0, "no reply goes out without a request id");
+    assertRpc(api.calls.length() == 0, "the host is not called either");
+}
+
+// 没有 payload：400，仍然回帧。
+func testRpcDispatchMissingPayload() {
+    let api = new RecordingLocalApi();
+    api.answer = {"status": 200, "body": nil};
+    let handler = new NexoraCoreRpcHandler(api);
+    let connection = new RecordingRpcConnection();
+
+    let frame = {"type": "rpc", "request_id": "rpc-6"};
+    handler.handle(frame, connection);
+
+    assertRpc(connection.sent.length() == 1, "a payload-less request still gets a reply");
+    let result = lastResult(connection);
+    assertRpc(result["result"]["status"] == 400, "the reply is a 400");
+    assertRpc(api.calls.length() == 0, "the host is not called");
+}
+
+func testRpcDispatch() {
+    testRpcDispatchAllowed();
+    testRpcDispatchUppercasesMethod();
+    testRpcDispatchForbidden();
+    testRpcDispatchHostFailure();
+    testRpcDispatchBadAnswer();
+    testRpcDispatchMissingRequestId();
+    testRpcDispatchMissingPayload();
+}

@@ -1,0 +1,310 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.json;
+import zeus.time [&zeusTime];
+
+import samples.NexoraCodeCore.storage;
+import samples.NexoraCodeCore.task_stream;
+
+// 任务事件日志（S6）。契约和基线 SessionJournal 一致：
+//   <stream>.json    元数据，原子替换（临时文件 + rename）
+//   <stream>.jsonl   事件，一行一条，带 _stream_seq 单调递增
+//
+// 任务号和订阅号同一套格式（32 位小写十六进制），非法 id 直接拒绝，避免
+// 拼出跑到目录外的路径。
+let NEXORA_JOURNAL_RETENTION_DAYS = 7;
+let NEXORA_JOURNAL_MAX_FILES = 500;
+let NEXORA_JOURNAL_CHUNK_LIMIT = 500;
+
+// 本进程里写过的事件日志。重启后这些 id 不在集合里，读到的 running 才会
+// 被当成中断；同进程内的任务列表不能因为读一次就改状态。
+let __nexora_journal_live = [];
+
+func __nexora_journal_live_add(streamId: string) {
+    for (__nexora_journal_live) [entry] {
+        if (entry == streamId) return;
+    }
+    __nexora_journal_live.append(streamId);
+}
+
+func __nexora_journal_live_has(streamId: string) -> bool {
+    for (__nexora_journal_live) [entry] {
+        if (entry == streamId) return true;
+    }
+    return false;
+}
+
+func __nexora_journal_live_remove(streamId: string) {
+    let retained = [];
+    for (__nexora_journal_live) [entry] {
+        if (entry == streamId) continue;
+        retained.append(entry);
+    }
+    __nexora_journal_live = retained;
+}
+
+// 元数据里的时间戳可能是整数、浮点，也可能缺字段（旧文件）。
+func __nexora_journal_timestamp(meta) {
+    let timestampValue = dict_get(meta, "updated_at", 0);
+    if (type(timestampValue) == "int" or type(timestampValue) == "float") return timestampValue;
+    return 0;
+}
+
+class NexoraCoreTaskJournal {
+    using &this;
+
+    let root = "";
+
+    func init(rootPath) {
+        this.root = rootPath;
+    }
+
+    func operator[@=]() -> &NexoraCoreTaskJournal {
+        return this;
+    }
+
+    func pathOf(streamId, suffix: string) -> string {
+        if (!nexora_core_is_stream_id(streamId)) {
+            throw new Exception("任务 ID 非法");
+        }
+        return this.root + "/" + streamId + suffix;
+    }
+
+
+    // 存元数据。运行时的 chunks / cond 之类字段不落盘：重启后它们没有意义。
+    func saveMeta(session) {
+        let streamId = dict_get(session, "stream_id", nil);
+        if (!nexora_core_is_stream_id(streamId)) {
+            throw new Exception("任务 ID 非法");
+        }
+
+        let meta = {};
+        for (session) [&key: &value] {
+            if (key == "chunks" or key == "cond" or key == "_request_message") {
+                continue;
+            }
+            meta[key] = value;
+        }
+        if (dict_get(meta, "last_seq", nil) == nil) meta["last_seq"] = 0;
+        meta["updated_at"] = zeusTime.time();
+
+        __nexora_journal_live_add(streamId);
+        file.mkdirs(this.root);
+        nexora_core_write_text_atomic(this.pathOf(streamId, ".json"), JSON.stringify(meta));
+        return meta;
+    }
+
+    // A terminal task is no longer protected from interrupted-session repair
+    // or retention cleanup by this process's live-session registry.
+    func markFinished(streamId: string) {
+        if (!nexora_core_is_stream_id(streamId)) {
+            throw new Exception("任务 ID 非法");
+        }
+        __nexora_journal_live_remove(streamId);
+        return true;
+    }
+
+    // 批量追加事件：调用方负责攒批，这里只开一次文件。
+    func append(streamId, chunks) -> int {
+        if (chunks == nil) return 0;
+        let count = chunks.length();
+        if (count == 0) return 0;
+
+        file.mkdirs(this.root);
+        let handle = file.open(this.pathOf(streamId, ".jsonl"), "a");
+        try {
+            for (chunks) [chunk] {
+                handle.write(JSON.stringify(chunk) + "\n");
+            }
+            handle.flush();
+        } catch (&error) {
+            handle.close();
+            throw error;
+        }
+        handle.close();
+
+        __nexora_journal_live_add(streamId);
+        return count;
+    }
+
+    // 从 after 之后读最多 limit 条，顺带把 last_seq 推到最新。
+    // limit 为 0 时只取元数据，不扫事件文件。
+    func read(streamId, after=0, limit=NEXORA_JOURNAL_CHUNK_LIMIT) {
+        let metaPath = this.pathOf(streamId, ".json");
+        if (!file.exists(metaPath)) {
+            return {"chunks": [], "meta": nil};
+        }
+
+        let meta = JSON.parse(nexora_core_read_text(metaPath));
+        if (type(meta) != "dict") meta = {};
+
+        // 电脑重启后 running/cancelling 的任务不会自己恢复，读的时候标记中断。
+        let status = dict_get(meta, "status", "");
+        if (!__nexora_journal_live_has(streamId) and
+            (status == "running" or status == "cancelling")) {
+            meta["status"] = "interrupted";
+            meta["stage"] = "interrupted";
+            meta["error"] = "电脑进程已重启，任务未自动重跑";
+        }
+
+        let chunks = [];
+        let eventsPath = this.pathOf(streamId, ".jsonl");
+        if (limit > 0 and file.exists(eventsPath)) {
+            let lastSeq = dict_get(meta, "last_seq", 0);
+            if (type(lastSeq) != "int") lastSeq = 0;
+
+            let text = nexora_core_read_text(eventsPath);
+            if (text.length() > 0) {
+                for (text.split("\n")) [line] {
+                    if (line.length() == 0) continue;
+
+                    let chunk = nil;
+                    try {
+                        chunk = JSON.parse(line);
+                    } catch (&skipped) {
+                        continue; // 半截行（断电）不该让整个续读失败
+                    }
+                    if (type(chunk) != "dict") continue;
+
+                    let sequence = dict_get(chunk, "_stream_seq", nil);
+                    if (type(sequence) != "int") sequence = 0;
+                    if (sequence > lastSeq) lastSeq = sequence;
+
+                    if (sequence > after and chunks.length() < limit) {
+                        chunks.append(chunk);
+                    }
+                }
+            }
+            meta["last_seq"] = lastSeq;
+        }
+
+        return {"chunks": chunks, "meta": meta};
+    }
+
+    // 单条元数据；坏文件返回 nil，不打断任务列表。
+    func tryMeta(streamId) {
+        let path = this.pathOf(streamId, ".json");
+        if (!file.exists(path)) return nil;
+        try {
+            let meta = JSON.parse(nexora_core_read_text(path));
+            if (type(meta) != "dict") return nil;
+            return meta;
+        } catch (&error) {
+            return nil;
+        }
+    }
+
+    // 最近写过的任务，新的在前。条数受 limit 约束，避免长期运行后扫全目录。
+    func recent(limit=NEXORA_JOURNAL_MAX_FILES) {
+        let metas = [];
+        if (!file.exists(this.root)) return metas;
+
+        for (file.listDir(this.root)) [name] {
+            if (!name.endswith(".json")) continue;
+            let streamId = name.slice(0, name.length() - 5);
+            if (!nexora_core_is_stream_id(streamId)) continue;
+            let meta = this.tryMeta(streamId);
+            if (meta == nil) continue;
+            metas.append(meta);
+        }
+
+        // 插入排序：列表没有 insert，先按数量铺开再往后挪。
+        let ordered = [];
+        for (0..metas.length()) [const &index] {
+            ordered.append(nil);
+        }
+        let count = 0;
+        for (metas) [meta] {
+            let timestampValue = __nexora_journal_timestamp(meta);
+            let position = count;
+            for (true) {
+                if (position <= 0) break;
+                if (__nexora_journal_timestamp(ordered[position - 1]) >= timestampValue) break;
+                ordered[position] = ordered[position - 1];
+                position = position - 1;
+            }
+            ordered[position] = meta;
+            count = count + 1;
+        }
+
+        let result = [];
+        for (0..count) [const &index] {
+            if (index >= limit) break;
+            result.append(ordered[index]);
+        }
+        return result;
+    }
+
+    func removeTask(streamId) {
+        for ([".json", ".jsonl"]) [suffix] {
+            let path = this.pathOf(streamId, suffix);
+            if (file.exists(path)) file.removeFile(path);
+        }
+    }
+
+    // 过期或超出上限的日志删掉，返回被删的任务号。运行中的永不删：
+    // 删了续读会直接 404。
+    func purgeExpired(
+        retentionDays=NEXORA_JOURNAL_RETENTION_DAYS,
+        maxFiles=NEXORA_JOURNAL_MAX_FILES
+    ) {
+        let removed = [];
+        if (!file.exists(this.root)) return removed;
+
+        let deadline = zeusTime.time() - retentionDays * 86400;
+        let kept = 0;
+        for (this.recent(1000000)) [meta] {
+            let streamId = dict_get(meta, "stream_id", nil);
+            if (!nexora_core_is_stream_id(streamId)) continue;
+            if (__nexora_journal_live_has(streamId)) continue;
+
+            let expired = __nexora_journal_timestamp(meta) < deadline;
+            let overflow = kept >= maxFiles;
+            if (!expired and !overflow) {
+                kept = kept + 1;
+                continue;
+            }
+
+            this.removeTask(streamId);
+            removed.append(streamId);
+        }
+        return removed;
+    }
+}
+
+// 把事件日志接到 S5 的宿主接口上：只要求 getMeta(stream_id) 和
+// iterChunks(stream_id, fromSeq) 两个方法。
+class NexoraCoreJournalTaskStream {
+    using &this;
+
+    let journal = nil;
+
+    func init(journalValue) {
+        this.journal = journalValue;
+    }
+
+    func operator[@=]() -> &NexoraCoreJournalTaskStream {
+        return this;
+    }
+
+    func getMeta(streamId) {
+        let answer = this.journal.read(streamId, 0, 0);
+        return dict_get(answer, "meta", nil);
+    }
+
+    func iterChunks(streamId, fromSeq) {
+        let answer = this.journal.read(streamId, fromSeq, NEXORA_JOURNAL_CHUNK_LIMIT);
+        let entries = [];
+        for (dict_get(answer, "chunks", [])) [chunk] {
+            // _stream_seq 属于存储格式，转发给宿主的事件里不该带它。
+            let event = {};
+            for (chunk) [&key: &value] {
+                if (key == "_stream_seq") continue;
+                event[key] = value;
+            }
+            entries.append({"seq": dict_get(chunk, "_stream_seq", 0), "event": event});
+        }
+        return entries;
+    }
+}

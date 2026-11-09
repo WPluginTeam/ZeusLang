@@ -1,0 +1,329 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.json;
+
+import samples.NexoraCodeCore.backend_api;
+import samples.NexoraCodeCore.conversation_store;
+import samples.NexoraCodeCore.journal;
+import samples.NexoraCodeCore.stream_runtime;
+
+var const BACKEND_CHAT_TEST_PORT = "__PORT__";
+var const BACKEND_CHAT_TEST_ROOT = "__DATA_ROOT__";
+var const BACKEND_CHAT_TEST_KEY = "backend-test-key";
+
+func __nexora_backend_chat_assert(value: bool, message: string) {
+    if (!value) {
+        print("BACKEND_CHAT_ASSERTION_FAILED", message);
+        throw new Exception("backend chat test: " + message);
+    }
+}
+
+func __nexora_backend_chat_has_event(chunks, eventType: string) -> bool {
+    for (chunks) [chunk] {
+        if (dict_get(chunk, "type", "") == eventType) return true;
+    }
+    return false;
+}
+
+func __nexora_backend_chat_repeat(piece: string, times: int) -> string {
+    let text = "";
+    for (0..times) [const &index] {
+        text = text + piece;
+    }
+    return text;
+}
+
+func exerciseBackendChat() {
+    file.mkdirs(BACKEND_CHAT_TEST_ROOT);
+    let agents = file.open(BACKEND_CHAT_TEST_ROOT + "/AGENTS.md", "w");
+    agents.write("Project rule fixture: use the existing project conventions.");
+    agents.close();
+    let fixture = file.open(BACKEND_CHAT_TEST_ROOT + "/sample.txt", "w");
+    fixture.write("backend tool fixture");
+    fixture.close();
+
+    let baseUrl = "http://127.0.0.1:" + BACKEND_CHAT_TEST_PORT + "/v1";
+    let provider = {"name": "mock", "model": "test-model", "base_url": baseUrl,
+        "api_key": BACKEND_CHAT_TEST_KEY, "temperature": 0.0,
+        "max_tokens": 64, "context_window": 4096, "timeout_seconds": 5};
+    let compressionProvider = {"name": "mock-compress", "model": "test-model",
+        "base_url": baseUrl, "api_key": BACKEND_CHAT_TEST_KEY,
+        "temperature": 0.0, "max_tokens": 64,
+        "context_window": 1536, "timeout_seconds": 5};
+    let providers = {"providers": [provider, compressionProvider]};
+    let store = new NexoraCoreConversationStore(BACKEND_CHAT_TEST_ROOT + "/conversations");
+    let runtime = new NexoraCoreStreamRuntime(
+        new NexoraCoreTaskJournal(BACKEND_CHAT_TEST_ROOT + "/tasks"), 64, 4);
+    let api = new NexoraCoreBackendApi(store, runtime, providers, BACKEND_CHAT_TEST_ROOT);
+    let settingsApi = new NexoraCoreBackendApi(store, runtime, providers,
+        BACKEND_CHAT_TEST_ROOT, {
+            "local_custom_system_prompt": "  Custom settings fixture  ",
+            "local_read_agents_md": false
+        });
+
+    let started = api.dispatch("POST", "/api/chat", "",
+        {"message": "hello from frontend", "provider": "mock"});
+    __nexora_backend_chat_assert(dict_get(started, "status", 0) == 202,
+        "chat request must start an asynchronous task");
+    let result = dict_get(started, "body", {});
+    let streamId = str(dict_get(result, "stream_id", ""));
+    let conversationId = str(dict_get(result, "conversation_id", ""));
+    __nexora_backend_chat_assert(streamId.length() == 32,
+        "chat response must include a stream id");
+    __nexora_backend_chat_assert(conversationId != "",
+        "chat response must include a conversation id");
+    __nexora_backend_chat_assert(JSON.stringify(result).index(BACKEND_CHAT_TEST_KEY) < 0,
+        "chat response must not expose provider credentials");
+    __nexora_backend_chat_assert(runtime.joinSession(streamId, 10000),
+        "provider-backed chat worker must complete");
+
+    let meta = runtime.getSessionMeta(streamId);
+    __nexora_backend_chat_assert(dict_get(meta, "status", "") == "awaiting_approval",
+        "write tool call must pause at the approval boundary");
+    let taskRead = runtime.readSessionChunks(streamId, 0, 64);
+    __nexora_backend_chat_assert(__nexora_backend_chat_has_event(
+        dict_get(taskRead, "chunks", []), "task_finished"),
+        "approval wait must be a completed, replayable task state");
+
+    let approvalId = "";
+    let approvalJson = "";
+    for (dict_get(taskRead, "chunks", [])) [chunk] {
+        let event = chunk;
+        if (dict_get(event, "type", "") != "permission_required") continue;
+        approvalId = str(dict_get(event, "approval_id", ""));
+        approvalJson = JSON.stringify(event);
+    }
+    __nexora_backend_chat_assert(approvalId.length() == 32,
+        "permission event must carry an opaque approval id");
+    __nexora_backend_chat_assert(approvalJson.index("approved file body") < 0 and
+        approvalJson.index("arguments") < 0,
+        "permission event must not expose the frozen tool arguments");
+    __nexora_backend_chat_assert(!file.exists(BACKEND_CHAT_TEST_ROOT + "/approved.txt"),
+        "write handler must not run before user approval");
+
+    let wrongStream = api.dispatch("POST", "/api/tasks/approval", "", {
+        "stream_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "approval_id": approvalId, "decision": "approve"});
+    __nexora_backend_chat_assert(dict_get(wrongStream, "status", 0) == 404,
+        "approval id must not resolve against a different task");
+
+    let approvalBody = {"stream_id": streamId, "approval_id": approvalId,
+        "decision": "approve"};
+    let resolved = api.dispatch("POST", "/api/tasks/approval", "", approvalBody);
+    __nexora_backend_chat_assert(dict_get(resolved, "status", 0) == 202,
+        "approved tool must produce a continuation task");
+    let continuationId = str(dict_get(dict_get(resolved, "body", {}),
+        "continuation_stream_id", ""));
+    __nexora_backend_chat_assert(continuationId.length() == 32,
+        "approval response must identify the continuation task");
+    let duplicate = api.dispatch("POST", "/api/tasks/approval", "", approvalBody);
+    __nexora_backend_chat_assert(dict_get(duplicate, "status", 0) == 202 and
+        str(dict_get(dict_get(duplicate, "body", {}), "continuation_stream_id", "")) == continuationId,
+        "approval retries must return the original continuation task");
+    let changedDecision = api.dispatch("POST", "/api/tasks/approval", "", {
+        "stream_id": streamId, "approval_id": approvalId, "decision": "deny"});
+    __nexora_backend_chat_assert(dict_get(changedDecision, "status", 0) == 409,
+        "a completed approval cannot be changed to a denial");
+    __nexora_backend_chat_assert(runtime.joinSession(continuationId, 10000),
+        "provider-backed continuation must complete");
+
+    let continuationMeta = runtime.getSessionMeta(continuationId);
+    __nexora_backend_chat_assert(dict_get(continuationMeta, "status", "") == "done",
+        "resumed provider-backed chat must finish successfully");
+    __nexora_backend_chat_assert(runtime.getAccumulatedContent(continuationId) == "Backend reply",
+        "continuation text must reach the task event stream");
+    let createdFile = file.open(BACKEND_CHAT_TEST_ROOT + "/approved.txt", "r");
+    let createdContent = createdFile.read();
+    createdFile.close();
+    __nexora_backend_chat_assert(createdContent == "approved file body",
+        "approved write must execute with the server-stored arguments");
+
+    let conversation = store.get(conversationId);
+    let messages = dict_get(conversation, "messages", []);
+    __nexora_backend_chat_assert(messages.length() == 7,
+        "project instructions, user, tool requests/results, and assistant replies must persist");
+    __nexora_backend_chat_assert(
+        dict_get(messages[0], "metadata", {})["injection"]["name"] == "project_conventions" and
+        dict_get(messages[0], "content", "").index("Project rule fixture") >= 0,
+        "the full project instruction must be persisted before the first user message");
+    __nexora_backend_chat_assert(dict_get(messages[1], "content", "") == "hello from frontend",
+        "user message must be persisted before the task starts");
+    __nexora_backend_chat_assert(dict_get(messages[2], "role", "") == "assistant" and
+        dict_get(messages[2], "tool_calls", nil) != nil,
+        "tool request must be persisted as an assistant message");
+    __nexora_backend_chat_assert(dict_get(messages[3], "role", "") == "tool" and
+        dict_get(messages[3], "content", "").index("backend tool fixture") >= 0,
+        "tool output must be persisted and sent back to the provider");
+    __nexora_backend_chat_assert(dict_get(messages[4], "role", "") == "assistant" and
+        dict_get(messages[4], "tool_calls", nil) != nil,
+        "write request must be persisted before approval");
+    __nexora_backend_chat_assert(dict_get(messages[5], "role", "") == "tool" and
+        dict_get(messages[5], "content", "").index("Wrote") >= 0,
+        "approval must replace the placeholder tool result before resuming");
+    __nexora_backend_chat_assert(dict_get(messages[6], "content", "") == "Backend reply",
+        "assistant continuation must persist its final message");
+
+    let deniedStart = api.dispatch("POST", "/api/chat", "",
+        {"message": "deny the requested write", "provider": "mock"});
+    __nexora_backend_chat_assert(dict_get(deniedStart, "status", 0) == 202,
+        "second chat must start for denial coverage");
+    let deniedStartBody = dict_get(deniedStart, "body", {});
+    let deniedStreamId = str(dict_get(deniedStartBody, "stream_id", ""));
+    let deniedConversationId = str(dict_get(deniedStartBody, "conversation_id", ""));
+    __nexora_backend_chat_assert(runtime.joinSession(deniedStreamId, 10000),
+        "denied tool request must reach its approval boundary");
+    let deniedMeta = runtime.getSessionMeta(deniedStreamId);
+    __nexora_backend_chat_assert(dict_get(deniedMeta, "status", "") == "awaiting_approval",
+        "second write request must also pause before execution");
+    let deniedTaskRead = runtime.readSessionChunks(deniedStreamId, 0, 64);
+    let deniedApprovalId = "";
+    for (dict_get(deniedTaskRead, "chunks", [])) [chunk] {
+        if (dict_get(chunk, "type", "") == "permission_required") {
+            deniedApprovalId = str(dict_get(chunk, "approval_id", ""));
+        }
+    }
+    __nexora_backend_chat_assert(deniedApprovalId.length() == 32,
+        "denial test must receive a valid approval id");
+    __nexora_backend_chat_assert(!file.exists(BACKEND_CHAT_TEST_ROOT + "/denied.txt"),
+        "denial test file must not exist before the decision");
+    let deniedResolution = api.dispatch("POST", "/api/tasks/approval", "", {
+        "stream_id": deniedStreamId, "approval_id": deniedApprovalId, "decision": "deny"});
+    __nexora_backend_chat_assert(dict_get(deniedResolution, "status", 0) == 202,
+        "denial must resume the agent with a denial tool result");
+    let deniedContinuationId = str(dict_get(dict_get(deniedResolution, "body", {}),
+        "continuation_stream_id", ""));
+    __nexora_backend_chat_assert(runtime.joinSession(deniedContinuationId, 10000),
+        "denied continuation must finish");
+    __nexora_backend_chat_assert(!file.exists(BACKEND_CHAT_TEST_ROOT + "/denied.txt"),
+        "denied write must never modify the workspace");
+    let deniedConversation = store.get(deniedConversationId);
+    let deniedMessages = dict_get(deniedConversation, "messages", []);
+    __nexora_backend_chat_assert(deniedMessages.length() == 5 and
+        dict_get(deniedMessages[0], "metadata", {})["injection"]["name"] == "project_conventions" and
+        dict_get(deniedMessages[3], "content", "").index("denied by user") >= 0 and
+        dict_get(deniedMessages[4], "content", "") == "Denied reply",
+        "denial result must replace the placeholder before the model resumes");
+
+    let commandStart = api.dispatch("POST", "/api/chat", "",
+        {"message": "run a short approved command", "provider": "mock"});
+    __nexora_backend_chat_assert(dict_get(commandStart, "status", 0) == 202,
+        "command chat must start");
+    let commandStartBody = dict_get(commandStart, "body", {});
+    let commandStreamId = str(dict_get(commandStartBody, "stream_id", ""));
+    let commandConversationId = str(dict_get(commandStartBody, "conversation_id", ""));
+    __nexora_backend_chat_assert(runtime.joinSession(commandStreamId, 10000),
+        "command call must reach the approval boundary");
+    __nexora_backend_chat_assert(dict_get(
+        runtime.getSessionMeta(commandStreamId), "status", "") == "awaiting_approval",
+        "command operation must require approval in confirm mode");
+    let commandTaskRead = runtime.readSessionChunks(commandStreamId, 0, 64);
+    let commandApprovalId = "";
+    let commandApprovalSummary = "";
+    for (dict_get(commandTaskRead, "chunks", [])) [chunk] {
+        if (dict_get(chunk, "type", "") != "permission_required") continue;
+        commandApprovalId = str(dict_get(chunk, "approval_id", ""));
+        commandApprovalSummary = str(dict_get(chunk, "summary", ""));
+    }
+    __nexora_backend_chat_assert(commandApprovalId.length() == 32 and
+        commandApprovalSummary.index("echo approved-command") >= 0,
+        "approval summary must show the command that the user will authorize");
+    __nexora_backend_chat_assert(!file.exists(
+        BACKEND_CHAT_TEST_ROOT + "/command-approved.txt"),
+        "shell command must not execute before approval");
+    let commandResolved = api.dispatch("POST", "/api/tasks/approval", "", {
+        "stream_id": commandStreamId,
+        "approval_id": commandApprovalId,
+        "decision": "approve"});
+    __nexora_backend_chat_assert(dict_get(commandResolved, "status", 0) == 202,
+        "approved command must start its continuation task");
+    let commandContinuationId = str(dict_get(dict_get(commandResolved, "body", {}),
+        "continuation_stream_id", ""));
+    __nexora_backend_chat_assert(runtime.joinSession(commandContinuationId, 10000),
+        "command continuation must finish");
+    __nexora_backend_chat_assert(file.exists(
+        BACKEND_CHAT_TEST_ROOT + "/command-approved.txt"),
+        "approved shell command must run in its requested working directory");
+    let commandOutput = file.open(
+        BACKEND_CHAT_TEST_ROOT + "/command-approved.txt", "r");
+    let commandOutputText = commandOutput.read();
+    commandOutput.close();
+    __nexora_backend_chat_assert(commandOutputText.index("approved-command") >= 0,
+        "approved command must write its expected output");
+    let commandConversation = store.get(commandConversationId);
+    let commandMessages = dict_get(commandConversation, "messages", []);
+    __nexora_backend_chat_assert(commandMessages.length() == 5 and
+        dict_get(commandMessages[0], "metadata", {})["injection"]["name"] == "project_conventions" and
+        dict_get(commandMessages[3], "content", "").index("Exit code: 0") >= 0 and
+        dict_get(commandMessages[4], "content", "") == "Command reply",
+        "command output must replace the placeholder before model continuation");
+
+    let compressionConversation = store.create("compression persistence");
+    let compressionConversationId = str(dict_get(
+        compressionConversation, "conversation_id", ""));
+    __nexora_backend_chat_assert(store.insertInjections(
+        compressionConversationId, 0, [], nil, "confirm"),
+        "prior confirmation mode must be recorded before switching modes");
+    let fullSettings = api.dispatch("POST", "/api/conversations/settings", "", {
+        "conversation_id": compressionConversationId,
+        "permission_mode": "full"});
+    __nexora_backend_chat_assert(dict_get(fullSettings, "status", 0) == 200,
+        "permission mode must be configurable before the chat starts");
+    let oldUserText = __nexora_backend_chat_repeat("old user history ", 3000);
+    let oldAssistantText = __nexora_backend_chat_repeat("old assistant history ", 3000);
+    __nexora_backend_chat_assert(store.appendMessage(compressionConversationId,
+        {"role": "user", "content": oldUserText}),
+        "compression fixture must persist its old user turn");
+    __nexora_backend_chat_assert(store.appendMessage(compressionConversationId,
+        {"role": "assistant", "content": oldAssistantText}),
+        "compression fixture must persist its old assistant turn");
+    let compressionStart = settingsApi.dispatch("POST", "/api/chat", "", {
+        "message": "compress this history", "provider": "mock-compress",
+        "conversation_id": compressionConversationId});
+    __nexora_backend_chat_assert(dict_get(compressionStart, "status", 0) == 202,
+        "compression chat must start");
+    let compressionStreamId = str(dict_get(
+        dict_get(compressionStart, "body", {}), "stream_id", ""));
+    __nexora_backend_chat_assert(runtime.joinSession(compressionStreamId, 10000),
+        "compression chat must complete through the Agent Loop");
+    __nexora_backend_chat_assert(
+        dict_get(runtime.getSessionMeta(compressionStreamId), "status", "") == "done",
+        "compressed request must complete successfully");
+    let compressedConversation = store.get(compressionConversationId);
+    let contextState = dict_get(compressedConversation, "context_state", {});
+    __nexora_backend_chat_assert(str(dict_get(contextState, "summary", "")) != "",
+        "folded context summary must persist in the conversation");
+    __nexora_backend_chat_assert(
+        dict_get(compressedConversation, "context_compressions", []).length() == 1,
+        "folded context metadata must persist exactly once");
+    let compressedMessages = dict_get(compressedConversation, "messages", []);
+    let savedPermissionMessages = 0;
+    let savedCustomInstructionMessages = 0;
+    for (compressedMessages) [message] {
+        let metadata = dict_get(message, "metadata", {});
+        if (dict_get(dict_get(metadata, "injection", {}), "name", "") == "permission_mode") {
+            savedPermissionMessages = savedPermissionMessages + 1;
+        }
+        if (dict_get(dict_get(metadata, "injection", {}), "name", "") ==
+                "custom_instructions") {
+            savedCustomInstructionMessages = savedCustomInstructionMessages + 1;
+        }
+    }
+    __nexora_backend_chat_assert(savedPermissionMessages >= 2,
+        "compression persistence must retain the full current permission injection");
+    __nexora_backend_chat_assert(savedCustomInstructionMessages >= 1,
+        "custom prompt injection must persist with the conversation");
+
+    print("NEXORA_BACKEND_CHAT_TEST_PASS");
+}
+
+func main() {
+    let baselineNodes = __gc_collect();
+    exerciseBackendChat();
+    let remainingNodes = __gc_collect();
+    __nexora_backend_chat_assert(remainingNodes <= baselineNodes + 64,
+        "completed chat tasks must release their runtime callback graph");
+    print("NEXORA_BACKEND_LIFETIME_TEST_PASS", baselineNodes, remainingNodes);
+}
+
+main();

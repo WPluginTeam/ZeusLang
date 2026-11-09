@@ -135,11 +135,23 @@ namespace IRGenericStatic {
         const std::string& type,
         const std::map<std::string, std::string>& substitutions
     ) {
-        const bool isReference = !type.empty() && type.front() == '&';
-        const std::string baseType = isReference ? type.substr(1) : type;
+        if (type.empty()) return type;
+        const bool isReference = type.front() == '&';
+        const std::string stripped = isReference ? type.substr(1) : type;
+        const bool isNullable = !stripped.empty() && stripped.back() == '?';
+        const std::string baseType = isNullable ? stripped.substr(0, stripped.size() - 1) : stripped;
+
+        auto formatResult = [&](const std::string& substitutedBase) {
+            std::string res;
+            if (isReference) res += '&';
+            res += substitutedBase;
+            if (isNullable) res += '?';
+            return res;
+        };
+
         auto found = substitutions.find(baseType);
         if (found != substitutions.end()) {
-            return (isReference ? "&" : "") + found->second;
+            return formatResult(found->second);
         }
 
         constexpr const char* runtimePrefix = "__zeus_typevar:";
@@ -148,7 +160,7 @@ namespace IRGenericStatic {
                 std::char_traits<char>::length(runtimePrefix));
             found = substitutions.find(parameter);
             if (found != substitutions.end()) {
-                return (isReference ? "&" : "") + found->second;
+                return formatResult(found->second);
             }
         }
 
@@ -167,7 +179,7 @@ namespace IRGenericStatic {
         if (!changed) return type;
         const std::string specialized = ZeusTypeInfer::genericSpecializationName(
             genericBase, genericArguments);
-        return (isReference ? "&" : "") + specialized;
+        return formatResult(specialized);
     }
 
     inline bool containsTypeParameter(

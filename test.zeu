@@ -1,23 +1,24 @@
+import zeus.static;
 
-
-var globalVar = 123;
-
-class MyTest {
+@type(T1,T2) class Pair {
     using &this;
 
-    func test() {
-        print("this is test func", this.a);
-    }
+    let first: T1? = nil;
+    let second: T2? = nil;
 
-    func init() {
-        this.a = 123;
-        print(this.a);
+    func init(a: T1, b: T2) {
+        this.first = a;
+        this.second = b;
     }
 }
 
-var b = [];
-for (10) [&i] {
-    b.append(new MyTest());
-}
+func main() {
+    let sa = new StaticArray<Pair<int, string>>(100);
+    sa.append(new Pair<int, string>(1, "one"));
 
-print(b);
+    for (0..sa.length()) [i] {
+        let item = sa.get(i);
+        print("first: ", item.first, ", second: ", item.second);
+    }
+}
+main();

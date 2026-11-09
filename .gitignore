@@ -1,3 +1,14 @@
+# Samples: keep the sample sources trackable, ignore the build scratch.
+# This block comes first on purpose, so the build-output rules further down
+# still apply to the files inside the sample tree.
+samples/*
+!samples/NexoraCodeCore/
+!samples/NexoraCodeCore/**
+**/zeusc-*/
+**/__pycache__/
+samples/NexoraCodeCore/.*/
+samples/NexoraCodeCore/wss_debug/
+
 # Build outputs (MSVC / linker temporaries)
 *.exe
 *.obj
@@ -10,6 +21,12 @@
 *.txt
 *.json
 
+# Native Zeus NexoraCodeCore CLI output
+/dist/
+/ZeusNativeRuntime.dll
+/ZeusNativeRuntime/build/
+ZeusAOT/demo/ZeusNativeRuntime.dll
+
 # VS Code workspace cache (keep shared tasks/launch/settings tracked)
 /.vs/ipch/
 *.code-workspace
@@ -17,3 +34,26 @@
 
 # Codex workspace scratch build cache
 /.codex-ws-build/
+/.codex-build/
+
+# Zeus compiler and CLI build intermediates
+/ZeusCLI/.build/
+
+# Local scratch: sandbox ACL repair reports, ad-hoc verification build trees,
+# and the compiler binary a long-running session keeps aside.
+/.dsh-acl-recovery/
+/verify-*/
+/Zeus.exe.bak
+
+# Generated test IR and Python caches
+/ZeusZTest/*.zeu.ll
+__pycache__/
+*.py[cod]
+
+# Root-level ad-hoc compiler scratch artifacts
+/temp*.ll
+/test_decl.ll
+/test_mcu.ll
+/test_mcu.o
+/test_decl.zeu
+/test_mcu.zeu

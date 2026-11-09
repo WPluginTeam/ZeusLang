@@ -1,0 +1,114 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.path;
+import zeus.process;
+import zeus.string;
+import zeus.time [&commandTime];
+
+class NexoraCoreCommandTools {
+    using &this;
+
+    let root = ".";
+    let cancelCheck = nil;
+
+    func init(rootValue: string) {
+        this.root = Path.normalize(file.realPath(rootValue));
+    }
+
+    func operator[@=]() -> &NexoraCoreCommandTools {
+        return this;
+    }
+
+    func setCancelCheck(check) {
+        this.cancelCheck = check;
+    }
+
+    func resolveWorkingDirectory(value: string) -> string {
+        let requested = value.strip();
+        if (requested == "") return this.root;
+        let candidate = requested;
+        if (!Path.isAbsolute(candidate)) candidate = Path.join(this.root, candidate);
+        let canonical = "";
+        try {
+            canonical = Path.normalize(file.realPath(candidate));
+        } catch (&error) {
+            return "";
+        }
+        if (!file.isDirectory(canonical)) return "";
+        return canonical;
+    }
+
+    func runCommand(args: dict) {
+        let command = str(dict_get(args, "command", "")).strip();
+        if (command == "") return {"error": "command is required"};
+
+        let workingDirectory = this.resolveWorkingDirectory(
+            str(dict_get(args, "cwd", "")));
+        if (workingDirectory == "") {
+            return {"error": "cwd must be an existing directory"};
+        }
+
+        let timeout = int(dict_get(args, "timeout", 30));
+        if (timeout < 1 or timeout > 300) {
+            return {"error": "timeout must be between 1 and 300 seconds"};
+        }
+
+        let process = nil;
+        let result = {};
+        let failure = "";
+        try {
+            process = Process.run("cmd.exe /D /C " + command, true,
+                workingDirectory);
+            let startedAt = commandTime.monotonic();
+            let timedOut = false;
+            let cancelled = false;
+            let exitCode = -1;
+            let cancelCheck = this.cancelCheck;
+            for (true) {
+                if (cancelCheck != nil) {
+                    if (cancelCheck()) {
+                        cancelled = true;
+                        break;
+                    }
+                }
+                if (process.wait(100)) {
+                    exitCode = process.exitCodeOf();
+                    break;
+                }
+                if (commandTime.monotonic() - startedAt >= float(timeout)) {
+                    timedOut = true;
+                    break;
+                }
+            }
+
+            if (timedOut or cancelled) {
+                process.terminate();
+                process.wait(5000);
+            }
+            let output = process.output();
+            if (timedOut) {
+                result = {"error": "Command timed out after " + str(timeout) +
+                    " seconds.", "output": output};
+            } else if (cancelled) {
+                result = {"error": "Command cancelled.", "output": output};
+            } else {
+                result = {"content": "Exit code: " + str(exitCode) +
+                    "\n" + output, "exit_code": exitCode,
+                    "output": output, "working_directory": workingDirectory};
+            }
+        } catch (&error) {
+            failure = str(error);
+        }
+
+        if (process != nil) {
+            if (process.running()) {
+                process.terminate();
+                process.wait(5000);
+            }
+            process.close();
+        }
+        if (failure != "") return {"error": "Command failed: " + failure};
+        return result;
+    }
+}

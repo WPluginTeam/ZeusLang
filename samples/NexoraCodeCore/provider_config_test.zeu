@@ -1,0 +1,53 @@
+import zeus.dict;
+import zeus.exception;
+import samples.NexoraCodeCore.provider_config;
+
+func assertProviderConfig(condition, message: string) {
+    if (!condition) throw new Exception("Nexora provider config test failed: " + message);
+}
+
+func testCompletionsUrl() {
+    assertProviderConfig(
+        nexora_completions_url("https://aiapi.usst.edu.cn/v1") ==
+            "https://aiapi.usst.edu.cn/v1/chat/completions",
+        "a versioned base gets chat/completions appended");
+    assertProviderConfig(
+        nexora_completions_url("https://example.com/openai/v1/") ==
+            "https://example.com/openai/v1/chat/completions",
+        "trailing slashes are stripped first");
+    assertProviderConfig(
+        nexora_completions_url("https://example.com/api/chat/completions") ==
+            "https://example.com/api/chat/completions",
+        "a full endpoint passes through");
+    assertProviderConfig(
+        nexora_completions_url("http://127.0.0.1:8000") ==
+            "http://127.0.0.1:8000/v1/chat/completions",
+        "a bare host gets the v1 prefix");
+
+    assertProviderConfig(
+        nexora_completions_url("http://example.com/v1") ==
+            "http://example.com/v1/chat/completions",
+        "plain http is allowed here; the loopback rule lives on the server-url side");
+
+    let rejected = false;
+    try {
+        nexora_completions_url("https://user@example.com/v1");
+    } catch (&error) {
+        rejected = true;
+    }
+    assertProviderConfig(rejected, "userinfo in the base url is rejected");
+}
+
+func testProviderHeaders() {
+    let authed = nexora_provider_headers("sk-abc");
+    assertProviderConfig(authed["Authorization"] == "Bearer sk-abc",
+        "api key becomes a bearer token");
+    let anon = nexora_provider_headers("  ");
+    assertProviderConfig(anon.get("Authorization", nil) == nil,
+        "an empty key sends no auth header");
+}
+
+func testProviderConfig() {
+    testCompletionsUrl();
+    testProviderHeaders();
+}

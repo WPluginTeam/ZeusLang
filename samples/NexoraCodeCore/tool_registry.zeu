@@ -1,0 +1,291 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.string;
+
+import samples.NexoraCodeCore.file_tools;
+import samples.NexoraCodeCore.command_tools;
+import samples.NexoraCodeCore.terminal_tools;
+
+func __nexora_tool_matches_type(value, expected: string) -> bool {
+    if (expected == "string") return type(value) == "string";
+    if (expected == "integer") return type(value) == "int";
+    if (expected == "number") return type(value) == "int" or type(value) == "float";
+    if (expected == "boolean") return type(value) == "bool";
+    if (expected == "object") return type(value) == "dict";
+    if (expected == "array") return type(value) == "Array";
+    return true;
+}
+
+func __nexora_tool_value_error(value, key: string, rule: dict) -> string {
+    let expected = str(dict_get(rule, "type", ""));
+    if (!__nexora_tool_matches_type(value, expected)) {
+        return "Argument " + key + " must be " + expected + ".";
+    }
+    let minimum = dict_get(rule, "minimum", nil);
+    if (minimum != nil and (type(value) == "int" or type(value) == "float") and
+            value < minimum) {
+        return "Argument " + key + " is below its minimum.";
+    }
+    let maximum = dict_get(rule, "maximum", nil);
+    if (maximum != nil and (type(value) == "int" or type(value) == "float") and
+            value > maximum) {
+        return "Argument " + key + " exceeds its maximum.";
+    }
+    let enumValues = dict_get(rule, "enum", nil);
+    if (type(enumValues) == "Array") {
+        let matched = false;
+        for (enumValues) [allowed] {
+            if (value == allowed) matched = true;
+        }
+        if (!matched) return "Argument " + key + " is not allowed.";
+    }
+    return "";
+}
+
+func __nexora_tool_validate_arguments(arguments, schema: dict) -> dict {
+    if (type(arguments) != "dict") {
+        return {"ok": false, "error": "Tool arguments must be an object."};
+    }
+
+    let required = dict_get(schema, "required", []);
+    for (required) [requiredKey] {
+        if (dict_get(arguments, str(requiredKey), nil) == nil) {
+            return {"ok": false, "error": "Missing required argument: " + str(requiredKey)};
+        }
+    }
+
+    let normalized: dict = {};
+    let properties = dict_get(schema, "properties", {});
+    for (properties) [&propertyKey: &rule] {
+        let supplied = dict_get(arguments, propertyKey, nil);
+        if (supplied != nil) {
+            let validationError = __nexora_tool_value_error(supplied, propertyKey, rule);
+            if (validationError != "") {
+                return {"ok": false, "error": validationError};
+            }
+            dict_set(normalized, propertyKey, supplied);
+        } else {
+            let defaultValue = dict_get(rule, "default", nil);
+            if (defaultValue == nil) continue;
+            let validationError = __nexora_tool_value_error(defaultValue, propertyKey, rule);
+            if (validationError != "") {
+                return {"ok": false, "error": validationError};
+            }
+            dict_set(normalized, propertyKey, defaultValue);
+        }
+    }
+    return {"ok": true, "arguments": normalized};
+}
+
+class NexoraCoreToolRegistry {
+    using &this;
+
+    let handlers: dict = {};
+    let schemas: dict = {};
+    let operations: dict = {};
+    let aliases: dict = {};
+    let definitions: Array = [];
+    let fileTools = nil;
+    let commandTools = nil;
+    let terminalTools = nil;
+
+    func operator[@=]() -> &NexoraCoreToolRegistry {
+        return this;
+    }
+
+    func init(workspaceRoot: string) {
+        this.fileTools = new NexoraCoreFileTools(workspaceRoot);
+        this.commandTools = new NexoraCoreCommandTools(workspaceRoot);
+        this.terminalTools = new NexoraCoreTerminalTools(workspaceRoot);
+        this.register({
+            "type": "function",
+            "function": {
+                "name": "local_file_read",
+                "description": "Read a UTF-8 text file under the configured workspace. Use a workspace-relative path.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative file path"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        }, this.fileTools.readFile, "read");
+        this.register({
+            "type": "function",
+            "function": {
+                "name": "local_file_list",
+                "description": "List files and directories directly under a workspace-relative path.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative directory path"},
+                        "max_entries": {"type": "integer", "default": 200, "minimum": 1, "maximum": 500}
+                    },
+                    "required": ["path"]
+                }
+            }
+        }, this.fileTools.listDirectory, "read");
+        this.register({
+            "type": "function",
+            "function": {
+                "name": "local_file_search_tree",
+                "description": "Search a bounded directory tree. Pattern supports * and ?; hidden and sensitive paths are skipped by default.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative directory path"},
+                        "max_depth": {"type": "integer", "default": 3, "minimum": 0, "maximum": 8},
+                        "pattern": {"type": "string", "default": "*", "description": "Filename glob or relative-path glob"},
+                        "include_files": {"type": "boolean", "default": true},
+                        "include_dirs": {"type": "boolean", "default": true},
+                        "include_hidden": {"type": "boolean", "default": false},
+                        "max_entries": {"type": "integer", "default": 200, "minimum": 1, "maximum": 500}
+                    },
+                    "required": ["path"]
+                }
+            }
+        }, this.fileTools.searchTree, "read");
+        this.register({
+            "type": "function",
+            "function": {
+                "name": "local_file_write",
+                "description": "Write UTF-8 text to a file under the configured workspace. The backend asks for approval before running this tool.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative file path"},
+                        "content": {"type": "string", "description": "Complete UTF-8 file contents"}
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        }, this.fileTools.writeFile, "write");
+        this.register({
+            "type": "function",
+            "function": {
+                "name": "local_shell_exec",
+                "description": "Run one short command in a local command shell. This runs only after user approval; long-running servers and listeners are not supported.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Command to execute. Its preview is shown in the approval prompt."},
+                        "cwd": {"type": "string", "description": "Working directory; defaults to the configured workspace"},
+                        "timeout": {"type": "integer", "default": 30, "minimum": 1, "maximum": 300}
+                    },
+                    "required": ["command"]
+                }
+            }
+        }, this.commandTools.runCommand, "command");
+        this.register({
+            "type": "function",
+            "function": {
+                "name": "local_terminal",
+                "description": "Run a local command as a terminal session. Run waits up to wait_seconds (10 by default), then returns output and a terminal_id. Use read to fetch later output or terminate to stop the process tree. Standard input is not supported.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["run", "read", "terminate"]},
+                        "command": {"type": "string", "description": "Command to execute; required for run."},
+                        "terminal_id": {"type": "string", "description": "Session id; required for read and terminate."},
+                        "cwd": {"type": "string", "description": "Working directory; defaults to the configured workspace."},
+                        "wait_seconds": {"type": "integer", "default": 10, "minimum": 0, "maximum": 86400}
+                    },
+                    "required": ["action"]
+                }
+            }
+        }, this.terminalTools.run, "command");
+        this.registerAlias("read_file", "local_file_read");
+    }
+
+    func register(definition: dict, handler, operation: string="write") {
+        let functionDefinition = dict_get(definition, "function", nil);
+        if (type(functionDefinition) != "dict") {
+            throw new Exception("Tool definition must contain a function object.");
+        }
+        let name = str(dict_get(functionDefinition, "name", "")).strip();
+        if (name == "") throw new Exception("Tool definition is missing a name.");
+        if (dict_get(this.handlers, name, nil) != nil) {
+            throw new Exception("Duplicate tool name: " + name);
+        }
+        let parameters = dict_get(functionDefinition, "parameters", nil);
+        if (type(parameters) != "dict") {
+            throw new Exception("Tool definition is missing parameters: " + name);
+        }
+        dict_set(this.handlers, name, handler);
+        dict_set(this.schemas, name, parameters);
+        dict_set(this.operations, name, operation);
+        this.definitions.append(definition);
+    }
+
+    func registerAlias(aliasName: string, targetName: string) {
+        if (dict_get(this.handlers, targetName, nil) == nil) {
+            throw new Exception("Tool alias target is not registered: " + targetName);
+        }
+        if (dict_get(this.handlers, aliasName, nil) != nil or
+                dict_get(this.aliases, aliasName, nil) != nil) {
+            throw new Exception("Duplicate tool alias: " + aliasName);
+        }
+        dict_set(this.aliases, aliasName, targetName);
+    }
+
+    func toolDefinitions() -> Array {
+        return this.definitions;
+    }
+
+    func operationOf(nameValue: string, arguments=nil) -> string {
+        let name = nameValue.strip();
+        let aliasTarget = dict_get(this.aliases, name, nil);
+        if (aliasTarget != nil) name = str(aliasTarget);
+        if (name == "local_terminal" and type(arguments) == "dict" and
+                str(dict_get(arguments, "action", "")).strip().lower() == "read") {
+            return "read";
+        }
+        return str(dict_get(this.operations, name, ""));
+    }
+
+    func setCancelCheck(check) {
+        this.commandTools.setCancelCheck(check);
+    }
+
+    func prepareCall(call) -> dict {
+        if (type(call) != "dict") return {"ok": false, "error": "Tool call must be an object."};
+        let name = str(dict_get(call, "name", "")).strip();
+        let aliasTarget = dict_get(this.aliases, name, nil);
+        if (aliasTarget != nil) name = str(aliasTarget);
+        if (dict_get(this.handlers, name, nil) == nil) {
+            return {"ok": false, "error": "Unknown tool: " + name};
+        }
+
+        let arguments = dict_get(call, "arguments", nil);
+        let validation = __nexora_tool_validate_arguments(
+            arguments, dict_get(this.schemas, name, {}));
+        if (!dict_get(validation, "ok", false)) {
+            return {"ok": false, "error": "Invalid arguments for " + name + ": " +
+                str(dict_get(validation, "error", "invalid arguments"))};
+        }
+        let normalized = dict_get(validation, "arguments", {});
+        return {"ok": true, "name": name, "arguments": normalized,
+            "call": {"id": dict_get(call, "id", ""), "name": name,
+                "arguments": normalized}};
+    }
+
+    func executePrepared(prepared: dict) {
+        let name = str(dict_get(prepared, "name", ""));
+        let handler = dict_get(this.handlers, name, nil);
+        if (handler == nil) return {"error": "Unknown tool: " + name};
+        try {
+            return handler(dict_get(prepared, "arguments", {}));
+        } catch (&error) {
+            return {"error": "Tool " + name + " failed: " + str(error)};
+        }
+    }
+
+    func execute(call) {
+        let prepared = this.prepareCall(call);
+        if (!dict_get(prepared, "ok", false)) {
+            return {"error": str(dict_get(prepared, "error", "Invalid tool call."))};
+        }
+        return this.executePrepared(prepared);
+    }
+}

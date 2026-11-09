@@ -1,0 +1,52 @@
+import zeus.dict;
+
+// return 后面直接跟字典字面量曾经被当成代码块起始（只有 var/赋值/表达式语句
+// 才被识别为字典上下文），于是 `return {"a": 1};` 报 P0015。嵌套的 `{` 也不在
+// 计数里，`{"a": {"b": 1}}` 会在内层再开一个块。这里把四种形状都钉住。
+
+func single() {
+    return {"type": "task_started", "stream_id": "s1"};
+}
+
+func multi() {
+    return {
+        "type": "task_finished",
+        "stream_id": "s2",
+        "status": "done"
+    };
+}
+
+func empty() {
+    return {};
+}
+
+func nested() {
+    return {"outer": {"inner": [1, 2, 3]}};
+}
+
+func fromCall() {
+    return build();
+}
+
+func build() {
+    return {"from": "call"};
+}
+
+let one = single();
+if (one["type"] != "task_started" or one["stream_id"] != "s1") {
+    throw new Exception("single-line dict return");
+}
+
+let two = multi();
+if (two["status"] != "done") throw new Exception("multi-line dict return");
+
+if (dict_get(empty(), "missing", "absent") != "absent") {
+    throw new Exception("empty dict return");
+}
+
+let deep = nested();
+if (deep["outer"]["inner"][2] != 3) throw new Exception("nested dict return");
+
+if (fromCall()["from"] != "call") throw new Exception("return through a call");
+
+print("RETURN_DICT_PASS");

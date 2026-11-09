@@ -21,5 +21,6 @@ void zeus_string_endswith(ZeusValue* out, const ZeusValue* value, const ZeusValu
 void zeus_string_lower(ZeusValue* out, const ZeusValue* value);
 void zeus_string_upper(ZeusValue* out, const ZeusValue* value);
 void zeus_string_count(ZeusValue* out, const ZeusValue* value, const ZeusValue* substring);
+void zeus_string_compare(ZeusValue* out, const ZeusValue* left, const ZeusValue* right);
 
 }

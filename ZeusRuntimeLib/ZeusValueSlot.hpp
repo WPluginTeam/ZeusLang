@@ -2,6 +2,7 @@
 
 #include "ZeusABIInternal.hpp"
 
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <cstring>
@@ -154,6 +155,11 @@ public:
         case ZEUS_VALUE_TAG_BIGINT:
         case ZEUS_VALUE_TAG_BIGDECIMAL:
             return zeus_value_native_address(&value_, 1);
+        case ZEUS_VALUE_TAG_OBJECT:
+            // A handle names an object-table slot, not addressable storage, so
+            // there is no scalar address to hand to a raw @addr/@faddr call.
+            throw std::logic_error(
+                "class instance handle has no addressable native representation");
         case ZEUS_VALUE_TAG_BOXED:
             validateBox(value_);
             return nullptr;
@@ -282,6 +288,14 @@ private:
         case ZEUS_VALUE_TAG_BOXED:
             validateBox(value);
             return boxFrom(value)->v;
+        case ZEUS_VALUE_TAG_OBJECT: {
+            // Restores the name only: the object table and the generation check
+            // stay on the VM side, so decoding stays free of VM state.
+            ZeusObjectHandle handle{};
+            std::memcpy(&handle, &value.payload, sizeof(handle));
+            return UniversalVariant(ZeusType::ObjectHandle{
+                static_cast<int>(handle.id), static_cast<int>(handle.generation)});
+        }
         case ZEUS_VALUE_TAG_DELETED:
             throw std::runtime_error("read from deleted variable");
         default:
@@ -306,6 +320,11 @@ private:
         try {
             zeus_value_release(&value);
         } catch (...) {
+            std::fprintf(stderr,
+                "[ZeusRuntime] fatal value release: slot tag=%u flags=%u\n",
+                static_cast<unsigned int>(value.tag),
+                static_cast<unsigned int>(value.flags));
+            std::fflush(stderr);
             std::terminate();
         }
     }
@@ -314,6 +333,11 @@ private:
         try {
             zeus_value_release_internal(&value);
         } catch (...) {
+            std::fprintf(stderr,
+                "[ZeusRuntime] fatal internal value release: slot tag=%u flags=%u\n",
+                static_cast<unsigned int>(value.tag),
+                static_cast<unsigned int>(value.flags));
+            std::fflush(stderr);
             std::terminate();
         }
     }
@@ -325,3 +349,7 @@ static_assert(sizeof(ZeusValueSlot) == sizeof(ZeusValue),
     "ZeusValueSlot must preserve the 16-byte ZeusValue layout");
 static_assert(sizeof(ZeusValueSlot) == 16,
     "ZeusValueSlot ABI size must remain 16 bytes");
+// A class instance handle has to survive the round trip through the payload
+// without dropping or widening the slot generation.
+static_assert(sizeof(ZeusObjectHandle) == 8,
+    "ZeusObjectHandle must fit the ZeusValue payload exactly");

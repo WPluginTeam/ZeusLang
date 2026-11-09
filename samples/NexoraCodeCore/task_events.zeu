@@ -1,0 +1,101 @@
+import zeus.json;
+import zeus.string;
+
+// Lifecycle payloads arrive from the host as decoded JSON, and the Python
+// baseline read every field through dict.get(), which tolerates a missing key.
+// A plain index raises KeyError here, so the fields are read through a lookup
+// that returns an empty string for an absent or nil value.
+func __nexora_lifecycle_text(payload, name: string) -> string {
+    for (payload) [&key: &value] {
+        if (key == name) {
+            if (value == nil) return "";
+            return str(value);
+        }
+    }
+    return "";
+}
+
+func nexora_core_task_lifecycle_frame(payload) {
+    let eventType = __nexora_lifecycle_text(payload, "type");
+    if (eventType != "task_started" and eventType != "task_finished") {
+        return nil;
+    }
+
+    let frame = {
+        "type": "task_lifecycle",
+        "event": eventType,
+        "stream_id": __nexora_lifecycle_text(payload, "stream_id"),
+        "conversation_id": __nexora_lifecycle_text(payload, "conversation_id"),
+        "status": __nexora_lifecycle_text(payload, "status")
+    };
+    return frame;
+}
+
+func nexora_core_task_event_buffer(lock) {
+    let buffer = {"lock": lock, "frames": []};
+    return buffer;
+}
+
+func nexora_core_task_event_enqueue(buffer, payload) -> bool {
+    let frame = nexora_core_task_lifecycle_frame(payload);
+    if (frame == nil) return false;
+
+    let lock = buffer["lock"];
+    lock.acquire();
+    try {
+        let frames = buffer["frames"];
+        frames.append(frame);
+        if (frames.length() > 64) {
+            frames.remove(0);
+        }
+    } catch (&error) {
+        lock.release();
+        throw error;
+    }
+    lock.release();
+    return true;
+}
+
+func nexora_core_task_event_take_pending(buffer) -> Array {
+    let pending: Array = [];
+    let lock = buffer["lock"];
+    lock.acquire();
+    try {
+        pending = buffer["frames"].copy();
+        buffer["frames"].clear();
+    } catch (&error) {
+        lock.release();
+        throw error;
+    }
+    lock.release();
+    return pending;
+}
+
+func nexora_core_task_event_length(buffer) -> int {
+    let count: int = 0;
+    let lock = buffer["lock"];
+    lock.acquire();
+    try {
+        count = buffer["frames"].length();
+    } catch (&error) {
+        lock.release();
+        throw error;
+    }
+    lock.release();
+    return count;
+}
+
+// Drains the queue under the host lock and writes the frames outside it, so a
+// task-event producer never waits on the wire and a slow socket never holds the
+// queue. A failed write propagates to the socket loop: the remaining frames go
+// away with the connection, which is what the Python baseline does with its
+// per-run list.
+func nexora_core_flush_task_events(connection, buffer) -> int {
+    let pending = nexora_core_task_event_take_pending(buffer);
+    let sent: int = 0;
+    for (pending) [&frame] {
+        connection.sendText(JSON.stringify(frame));
+        sent = sent + 1;
+    }
+    return sent;
+}

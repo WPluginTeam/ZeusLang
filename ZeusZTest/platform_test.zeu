@@ -1,0 +1,37 @@
+import zeus.platform [&platform];
+
+// The runner compares every labeled line against Python's platform module.
+print("SYSTEM: " + platform.system());
+print("NODE: " + platform.node());
+print("RELEASE: " + platform.release());
+print("VERSION: " + platform.version());
+print("MACHINE: " + platform.machine());
+print("PROCESSOR: " + platform.processor());
+print("PLATFORM: " + platform.platform());
+
+// Composition paths Python covers too: the composite string opens with the
+// same system-release-version prefix, and the uname dict carries every field
+// with the value the single getters report.
+let composite = platform.platform();
+let prefix = "Windows-" + platform.release() + "-" + platform.version() + "-";
+if (!composite.startswith(prefix)) {
+    throw new Exception("platform composite format mismatch: " + composite);
+}
+
+let fields = platform.uname();
+if (fields.get("system") != "Windows") {
+    throw new Exception("uname system field mismatch");
+}
+if (fields.get("node") != platform.node()) {
+    throw new Exception("uname node field mismatch");
+}
+if (fields.get("release") != platform.release()) {
+    throw new Exception("uname release field mismatch");
+}
+if (fields.get("version") != platform.version()) {
+    throw new Exception("uname version field mismatch");
+}
+if (fields.get("machine") != platform.machine()) {
+    throw new Exception("uname machine field mismatch");
+}
+print("PLATFORM_TEST_PASS");

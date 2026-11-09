@@ -1,0 +1,18 @@
+@native decl Double = 1;
+
+class InvalidNumber {}
+
+func rejectAssignment(value) {
+    let target: Double = 1.25;
+    let caught = false;
+    try {
+        target = value;
+    } catch (&error) {
+        caught = true;
+    }
+    if (!caught or target != 1.25) throw "invalid DOUBLE assignment changed its target";
+}
+
+rejectAssignment("not a number");
+rejectAssignment(new InvalidNumber());
+print("NATIVE_DECL_DYNAMIC_ERROR_PASS");

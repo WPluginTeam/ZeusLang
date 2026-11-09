@@ -5,6 +5,9 @@
 #include <string>
 #include <deque>
 #include <climits>
+#include <cstddef>
+#include <mutex>
+#include <unordered_map>
 #include "../ZeusParser/LexerType.hpp"      // LexerType::Value
 #include "ZeusVariant.hpp"                // ZeusType::UniversalVariant
 #include "ZeusGC.hpp"
@@ -14,6 +17,45 @@ inline std::vector<ZeusType::ClassInfo>* g_vmClassesPtr = nullptr;
 inline std::deque<ZeusType::ObjectInstance>* g_vmObjectsPtr = nullptr;
 
 namespace ZeusVMUtils {
+inline std::unordered_map<int, std::string>& classHandleNames() {
+    static std::unordered_map<int, std::string> names;
+    return names;
+}
+
+inline std::mutex& classHandleNamesMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline void registerClassHandleName(int id, const std::string& name) {
+    if (id < 0 || name.empty()) return;
+    std::lock_guard<std::mutex> lock(classHandleNamesMutex());
+    classHandleNames().try_emplace(id, name);
+}
+
+inline std::string classHandleName(int id) {
+    std::lock_guard<std::mutex> lock(classHandleNamesMutex());
+    const auto found = classHandleNames().find(id);
+    return found == classHandleNames().end() ? std::string() : found->second;
+}
+
+inline bool isValidObjectHandle(const ZeusType::ObjectInstance& object,
+                                const ZeusType::ObjectHandle& handle) noexcept {
+    return object.generation == handle.generation &&
+           !object.markedForDeletion && object.classId >= 0;
+}
+
+template <typename ObjectTable>
+inline auto getValidObject(ObjectTable& objects,
+                          const ZeusType::ObjectHandle& handle)
+    -> decltype(&objects[0]) {
+    if (handle.id < 0 || static_cast<std::size_t>(handle.id) >= objects.size()) {
+        return nullptr;
+    }
+    auto* object = &objects[static_cast<std::size_t>(handle.id)];
+    return isValidObjectHandle(*object, handle) ? object : nullptr;
+}
+
 
 inline int bigIntegerToInt(const ZeusType::BigInteger& big) {
     return ZeusType::bigIntegerToInt(big);
@@ -220,6 +262,27 @@ inline ZeusType::UniversalVariant makeArray(int n, std::vector<ZeusType::Univers
 inline std::string arrayToDebugString(const ZeusType::UniversalVariant& u);
 inline std::string valueToDebugString(const ZeusType::UniversalVariant& u);
 
+// "b\"...\"" debug rendering, shared by debug dumps and the __builtin_str
+// leaf conversion. Debug dumps keep a short tail (default limit); the
+// user-facing str()/toString path passes a limit of SIZE_MAX for the full
+// escaped dump, like arrays and maps which also render without truncation.
+inline std::string bytesToDebugString(const ZeusType::Bytes& bytes, size_t limit = 32) {
+    std::string result = "b\"";
+    for (size_t i = 0; i < bytes.data.size() && i < limit; ++i) {
+        uint8_t byte = bytes.data[i];
+        if (byte >= 32 && byte < 127 && byte != '\\' && byte != '"') {
+            result += static_cast<char>(byte);
+        } else {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "\\x%02x", byte);
+            result += buf;
+        }
+    }
+    if (bytes.data.size() > limit) result += "...";
+    result += "\"";
+    return result;
+}
+
 inline std::string arrayToDebugString(const ZeusType::UniversalVariant& u) {
     const ZeusType::Array* arr = getArrayConst(u);
     if (!arr || !arr->impl) {
@@ -271,7 +334,10 @@ inline std::string valueToDebugString(const ZeusType::UniversalVariant& u) {
         return std::string("<native:#") + std::to_string(std::get<ZeusType::NativeFuncHandle>(u).id) + ">";
     }
     if (std::holds_alternative<ZeusType::ClassHandle>(u)) {
-        return std::string("<class:#") + std::to_string(std::get<ZeusType::ClassHandle>(u).id) + ">";
+        const int id = std::get<ZeusType::ClassHandle>(u).id;
+        const std::string name = classHandleName(id);
+        if (!name.empty()) return "<class '" + name + "'>";
+        return std::string("<class:#") + std::to_string(id) + ">";
     }
     if (std::holds_alternative<ZeusType::LLVMClassHandle>(u)) {
         const auto& handle = std::get<ZeusType::LLVMClassHandle>(u);
@@ -291,7 +357,7 @@ inline std::string valueToDebugString(const ZeusType::UniversalVariant& u) {
         // 尝试获取具体类名
         if (g_vmObjectsPtr && g_vmClassesPtr && objHandle.id >= 0 && objHandle.id < (int)g_vmObjectsPtr->size()) {
             const auto& obj = (*g_vmObjectsPtr)[objHandle.id];
-            if (obj.classId >= 0 && obj.classId < (int)g_vmClassesPtr->size()) {
+            if (isValidObjectHandle(obj, objHandle) && obj.classId >= 0 && obj.classId < (int)g_vmClassesPtr->size()) {
                 className = (*g_vmClassesPtr)[obj.classId].name;
             }
         }
@@ -307,21 +373,7 @@ inline std::string valueToDebugString(const ZeusType::UniversalVariant& u) {
             return arrayToDebugString(u);
         }
         if (std::holds_alternative<ZeusType::Bytes>(var)) {
-            const auto& bytes = std::get<ZeusType::Bytes>(var);
-            std::string result = "b\"";
-            for (size_t i = 0; i < bytes.data.size() && i < 32; ++i) {
-                uint8_t byte = bytes.data[i];
-                if (byte >= 32 && byte < 127 && byte != '\\' && byte != '"') {
-                    result += static_cast<char>(byte);
-                } else {
-                    char buf[8];
-                    snprintf(buf, sizeof(buf), "\\x%02x", byte);
-                    result += buf;
-                }
-            }
-            if (bytes.data.size() > 32) result += "...";
-            result += "\"";
-            return result;
+            return bytesToDebugString(std::get<ZeusType::Bytes>(var));
         }
         // Null 情况已在外层统一成 "nil"
         if (std::holds_alternative<ZeusType::String>(var)) {

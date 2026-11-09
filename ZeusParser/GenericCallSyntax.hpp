@@ -109,6 +109,14 @@ namespace ZeusParser {
             position = afterArguments;
         }
         typeName = (isReference ? "&" : "") + baseName;
+        // Nullable suffix: `Node?`, `int?`, `StaticArray<int>?`. The lexer
+        // yields `?` as a plain operator; consuming it here keeps every type
+        // spelling path (annotations, generics, sizeof) consistent.
+        if (position < tokens.size() &&
+            isGenericCallOperator(tokens[position], "?")) {
+            typeName += "?";
+            ++position;
+        }
         return true;
     }
 

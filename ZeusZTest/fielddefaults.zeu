@@ -1,0 +1,34 @@
+// Test-support package.
+//
+// Declares classes whose field defaults cover every literal the class layout
+// metadata classifies. Defaults on a class that arrives from a package used to
+// be dropped, so the regression has to be exercised on this side of the import
+// boundary; see class_field_defaults_test.zeu, which imports this package and
+// reads every field back. Nothing here runs on its own.
+
+class PackageDefaults {
+    using &this;
+
+    var zero = 0;
+    var negative = -7;
+    var yes = true;
+    var no = false;
+    var text = "hello";
+    var nothing = nil;
+    var items = [];
+
+    func init() {
+    }
+}
+
+class PackageDefaultsWithInit {
+    using &this;
+
+    var zero = 0;
+    var text = "hello";
+
+    func init() {
+        this.zero = 0;
+        this.text = "hello";
+    }
+}

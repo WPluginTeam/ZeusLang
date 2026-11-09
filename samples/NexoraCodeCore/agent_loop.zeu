@@ -1,0 +1,546 @@
+import zeus.byte;
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import zeus.string;
+import samples.NexoraCodeCore.agent_events;
+import samples.NexoraCodeCore.agent_retry;
+import samples.NexoraCodeCore.compression;
+import samples.NexoraCodeCore.context;
+import samples.NexoraCodeCore.provider_stream;
+import samples.NexoraCodeCore.tool_approval_context;
+import samples.NexoraCodeCore.turn_injection;
+
+// agent 循环的骨架。对照 Python 侧 AgentLoop.stream_send 的主循环，这里只保留
+// 与传输、工具、存储无关的那部分：
+//
+//   发一轮 -> 折叠流式增量 -> 有工具调用就执行并回填 -> 否则收尾
+//
+// 三件宿主才知道的事从 options 注入，Zeus 侧不碰它们的具体实现：
+//   openRound(messages, maxTokens) -> 会话对象（next(sliceMillis) / close() / 可选 cancel()）
+//   executeTool(call)     -> 工具输出（字符串，或 {"content": ...} / {"error": ...}）
+//   saveMessage(message)  -> 可选，把消息落到会话存储
+// 可选钩子：onEvent(event) 观察增量与轮次事件，shouldCancel() 提供额外取消源。
+//
+// 事件（顺序）：
+//   {"type": "round_start", "round": n}
+//   {"type": "thinking" | "text", "text": ...}      服务端增量
+//   {"type": "usage", "usage": {...}}               服务端用量
+//   {"type": "function_call", "call_id": ..., "name": ...} 工具即将执行
+//   {"type": "round_end", "round": n, "status": ..., "finishReason": ...,
+//    "toolCalls": k, "truncated": bool, "textLength": len}
+//   {"type": "function_result", "call_id": ..., "name": ..., "content": ...,
+//    "truncated": bool, "originalLength": n}
+//
+// 返回：
+//   {"status": "done" | "cancelled" | "max_rounds" | "error" | "context_overflow" |
+//    "awaiting_approval",
+//    "message": 最后一条 assistant 消息（done / max_rounds 时非 nil）,
+//    "rounds": 已完成的轮数, "toolCalls": 已执行的工具数,
+//    "truncated": 是否有某轮被 max_tokens 截断, "finishReasons": [...],
+//    "usage": 累计用量, "error": 说明, "messages": 最终消息表}
+
+func nexora_agent_run(options: dict) {
+    let openRound = options.get("openRound", nil);
+    if (openRound == nil) throw new Exception("agent loop: 需要 openRound 回调");
+    let executeTool = options.get("executeTool", nil);
+    let setApprovalContext = options.get("setApprovalContext", nil);
+    let getApprovalAction = options.get("getApprovalAction", nil);
+    let saveMessage = options.get("saveMessage", nil);
+    let onEvent = options.get("onEvent", nil);
+    let shouldCancel = options.get("shouldCancel", nil);
+
+    let messages = options.get("messages", nil);
+    if (type(messages) != "Array") throw new Exception("agent loop: 需要 messages 数组");
+
+    let injectionContext = __nexora_agent_prepare_injections(options, messages, onEvent);
+    messages = injectionContext["messages"];
+
+    let maxRounds = __nexora_agent_int(options.get("maxRounds", nil), 8);
+    let sliceMillis = __nexora_agent_int(options.get("sliceMillis", nil), 1000);
+    let maxFrames = __nexora_agent_int(options.get("maxFrames", nil), 200000);
+    let contextWindow = __nexora_agent_int(options.get("contextWindow", nil), 0);
+    let maxOutputTokens = __nexora_agent_int(options.get("maxOutputTokens", nil), 0);
+    let maxToolOutput = __nexora_agent_int(options.get("maxToolOutput", nil), 20000);
+    let autoRetryLimit = __nexora_agent_int(options.get("autoRetryCount", nil), 5);
+    let emptyRetryLimit = __nexora_agent_int(
+        options.get("emptyResponseRetryCount", nil), 2);
+    if (autoRetryLimit < 0) autoRetryLimit = 0;
+    if (autoRetryLimit > 10) autoRetryLimit = 10;
+    if (emptyRetryLimit < 0) emptyRetryLimit = 0;
+    if (emptyRetryLimit > 10) emptyRetryLimit = 10;
+    // 只用于预算估算的 tools 块（真正的 tools 由宿主拼进请求体）。
+    let toolsForBudget = options.get("tools", nil);
+    let summarize = options.get("summarize", nil);
+
+    let totals = {};
+    let stats = {"rounds": 0, "toolCalls": 0, "truncated": false, "finishReasons": [],
+        "compressed": "", "autoRetries": []};
+    let lastMessage = nil;
+    let emptyRetryCount = 0;
+    let retryAfterEmptyResponse = false;
+    let toolResultsExecuted = 0;
+
+    let rounds = 0;
+    for (rounds < maxRounds) {
+        if (__nexora_agent_cancelled(shouldCancel)) {
+            return __nexora_agent_result("cancelled", lastMessage, stats, totals, "", messages);
+        }
+
+        // 上下文预算：越线就先压缩（裁工具结果 -> 折历史 -> 判溢出），
+        // 压缩只作用于本次请求，之后所有轮次都沿着压缩后的消息表继续。
+        if (contextWindow > 0 and maxOutputTokens > 0) {
+            let basis = nexora_estimate_tokens({"messages": messages});
+            let decision = nexora_prepare_decision(contextWindow, maxOutputTokens, basis);
+            if (decision != "direct") {
+                let expectedMessages = messages;
+                let compressed = nexora_compress(messages, contextWindow,
+                    maxOutputTokens, toolsForBudget, summarize);
+                let compressedStatus = str(compressed["status"]);
+                stats["compressed"] = compressedStatus;
+                if (compressedStatus == "overflow") {
+                    return __nexora_agent_result("context_overflow", lastMessage, stats,
+                        totals, "agent loop: 上下文超出窗口且无法压缩：estimate=" +
+                        str(basis) + "，窗口=" + str(contextWindow), messages);
+                }
+                messages = compressed["messages"];
+                if (compressedStatus == "folded") {
+                    let fullInjections = injectionContext["fullMessages"];
+                    let injectionIndex = int(compressed.get("injectionIndex", messages.length()));
+                    messages = nexora_injection_messages_insert(
+                        messages, injectionIndex, fullInjections);
+
+                    let record = {
+                        "summary": compressed.get("summary", ""),
+                        "history_cut_index": compressed.get("historyCutIndex", 0),
+                        "dropped_messages": compressed.get("droppedMessages", 0)
+                    };
+                    let saveContext = options.get("saveContext", nil);
+                    if (saveContext != nil) {
+                        saveContext(record, fullInjections, expectedMessages);
+                    }
+                }
+                __nexora_agent_emit(onEvent, {"type": "context_compression",
+                    "status": compressedStatus,
+                    "before": compressed["before"],
+                    "estimate": compressed["estimate"],
+                    "budget": compressed["budget"],
+                    "droppedMessages": compressed["droppedMessages"]});
+            }
+        }
+
+        rounds = rounds + 1;
+        stats["rounds"] = rounds;
+
+        let requestMessages = messages;
+        if (retryAfterEmptyResponse) {
+            requestMessages = nexora_agent_retry_empty_messages(
+                messages, toolResultsExecuted > 0);
+            retryAfterEmptyResponse = false;
+        }
+        let requestMaxTokens = maxOutputTokens;
+
+        let roundBaseMessages = requestMessages;
+        let roundBaseMaxTokens = requestMaxTokens;
+        __nexora_agent_emit(onEvent, {"type": "round_start", "round": rounds});
+
+        let retryAttempt = 0;
+        let carriedContent = "";
+        let state = nil;
+        let status = "";
+        let streamError = "";
+        for (retryAttempt <= autoRetryLimit) {
+            state = nexora_chat_stream_state();
+            status = "";
+            streamError = "";
+            let session = nil;
+            try {
+                session = openRound(requestMessages, requestMaxTokens);
+                if (session == nil) {
+                    throw new Exception("agent loop: openRound returned no session");
+                }
+                status = __nexora_agent_round(session, state, sliceMillis,
+                    maxFrames, onEvent, shouldCancel);
+            } catch (&error) {
+                status = "stream_error";
+                streamError = str(error);
+            } fin {
+                if (session != nil) {
+                    try {
+                        session.close();
+                    } catch (&closeError) {}
+                }
+            }
+
+            if (status == "stream_error" and
+                    str(state.get("finishReason", "")) != "") {
+                status = "done";
+            }
+            if (status != "stream_error") break;
+            if (__nexora_agent_cancelled(shouldCancel)) {
+                status = "cancelled";
+                break;
+            }
+            if (retryAttempt >= autoRetryLimit) break;
+
+            let attemptContent = string_join(state.get("textParts", []));
+            if (attemptContent != "") carriedContent = carriedContent + attemptContent;
+            requestMessages = nexora_agent_retry_continuation_messages(
+                roundBaseMessages, carriedContent);
+            requestMaxTokens = roundBaseMaxTokens;
+            if (roundBaseMaxTokens > 0 and carriedContent != "") {
+                let baseEstimate = nexora_estimate_tokens({
+                    "messages": roundBaseMessages, "tools": toolsForBudget});
+                let retryEstimate = nexora_estimate_tokens({
+                    "messages": requestMessages, "tools": toolsForBudget});
+                let addedInputTokens = retryEstimate - baseEstimate;
+                if (addedInputTokens < 0) addedInputTokens = 0;
+                requestMaxTokens = roundBaseMaxTokens - addedInputTokens;
+                if (requestMaxTokens <= 0) {
+                    status = "retry_budget";
+                    streamError = "provider continuation leaves no output token budget";
+                    break;
+                }
+            }
+
+            retryAttempt = retryAttempt + 1;
+            let delayMillis = nexora_agent_retry_delay_millis(retryAttempt);
+            let retryEvent = {"type": "auto_retry", "reason": streamError,
+                "attempt": retryAttempt, "limit": autoRetryLimit,
+                "delay_ms": delayMillis, "round": rounds};
+            stats["autoRetries"].append(retryEvent);
+            __nexora_agent_emit(onEvent, retryEvent);
+            if (!nexora_agent_retry_wait(delayMillis, shouldCancel)) {
+                status = "cancelled";
+                break;
+            }
+        }
+
+        if (status == "cancelled") {
+            __nexora_agent_emit(onEvent, {"type": "round_end", "round": rounds,
+                "status": "cancelled", "finishReason": "", "toolCalls": 0,
+                "truncated": false, "textLength": 0});
+            return __nexora_agent_result("cancelled", lastMessage, stats, totals, "", messages);
+        }
+        if (status != "done") {
+            let failedMessage = nexora_chat_stream_message(state);
+            let failedContent = carriedContent + str(failedMessage.get("content", ""));
+            if (failedContent != "") failedMessage["content"] = failedContent;
+            lastMessage = failedMessage;
+            let errorMessage = "provider stream failed after " +
+                str(retryAttempt) + " retries: " + streamError;
+            if (status != "stream_error" and status != "retry_budget") {
+                errorMessage = "agent loop: stream ended with status " + status;
+            }
+            __nexora_agent_emit(onEvent, {"type": "round_end", "round": rounds,
+                "status": "error", "finishReason": str(state.get("finishReason", "")),
+                "toolCalls": 0, "truncated": false,
+                "textLength": str(failedContent).length()});
+            __nexora_agent_emit(onEvent, {"type": "error", "message": errorMessage});
+            return __nexora_agent_result("error", failedMessage, stats,
+                totals, errorMessage, messages);
+        }
+
+        let usage = state.get("usage", nil);
+        if (type(usage) == "dict") nexora_accumulate_usage(usage, totals);
+
+        let message = nexora_chat_stream_message(state);
+        let completeContent = carriedContent + str(message.get("content", ""));
+        if (completeContent != "") message["content"] = completeContent;
+        lastMessage = message;
+
+        let finishReason = str(state.get("finishReason", ""));
+        if (finishReason != "") {
+            let reasons = stats.get("finishReasons", []);
+            reasons.append(finishReason);
+            stats["finishReasons"] = reasons;
+        }
+        let truncatedNow = finishReason == "length";
+        if (truncatedNow) stats["truncated"] = true;
+
+        let toolRequests = nexora_chat_stream_tool_requests(message);
+        __nexora_agent_emit(onEvent, {"type": "round_end", "round": rounds,
+            "status": "done", "finishReason": finishReason,
+            "toolCalls": toolRequests.length(), "truncated": truncatedNow,
+            "textLength": str(message.get("content", "")).length()});
+
+        // 没有工具调用：这一轮就是最终回答。
+        if (toolRequests.length() == 0) {
+            if (str(message.get("content", "")).strip() == "") {
+                if (finishReason == "tool_calls") {
+                    let emptyError = "model requested tool calls but returned no executable calls";
+                    __nexora_agent_emit(onEvent, {"type": "error", "message": emptyError});
+                    return __nexora_agent_result("error", message, stats,
+                        totals, emptyError, messages);
+                }
+                if (emptyRetryCount >= emptyRetryLimit) {
+                    let emptyError = "model returned no visible content after " +
+                        str(emptyRetryCount) + " empty-response retries (finish_reason=" +
+                        finishReason + ")";
+                    if (toolResultsExecuted > 0) {
+                        emptyError = "tool results were returned, but the model produced no visible content after " +
+                            str(emptyRetryCount) + " empty-response retries (finish_reason=" +
+                            finishReason + ")";
+                    }
+                    __nexora_agent_emit(onEvent, {"type": "error", "message": emptyError});
+                    return __nexora_agent_result("error", message, stats,
+                        totals, emptyError, messages);
+                }
+
+                emptyRetryCount = emptyRetryCount + 1;
+                retryAfterEmptyResponse = true;
+                let retryReason = "The model returned no visible content (finish_reason=" +
+                    finishReason + "). Ask it to answer the user's request directly.";
+                if (toolResultsExecuted > 0) {
+                    retryReason = "Tool results were returned but the model produced no visible content (finish_reason=" +
+                        finishReason + "). Ask it to use the tool results to answer the user's request.";
+                }
+                let retryEvent = {"type": "auto_retry", "reason": retryReason,
+                    "attempt": emptyRetryCount, "limit": emptyRetryLimit,
+                    "delay_ms": 0, "round": rounds};
+                stats["autoRetries"].append(retryEvent);
+                __nexora_agent_emit(onEvent, retryEvent);
+                continue;
+            }
+            messages.append(message);
+            if (saveMessage != nil) saveMessage(message);
+            return __nexora_agent_result("done", message, stats, totals, "", messages);
+        }
+        if (executeTool == nil) {
+            return __nexora_agent_result("error", message, stats, totals,
+                "agent loop: 模型请求工具但没有 executeTool 回调", messages);
+        }
+
+        // 有工具调用：assistant 消息和每个工具结果都进历史，再跑下一轮。
+        if (saveMessage != nil) saveMessage(message);
+        messages.append(message);
+        let pendingApproval = nil;
+        let approvalActions: Array = [];
+        for (toolRequests) [call] {
+            let callId = str(call["id"]);
+            if (pendingApproval != nil) {
+                let skipped = nexora_tool_result_message(callId,
+                    "Not executed because another tool call is awaiting approval.");
+                messages.append(skipped);
+                if (saveMessage != nil) saveMessage(skipped);
+                continue;
+            }
+            __nexora_agent_emit(onEvent, {"type": "function_call",
+                "call_id": callId, "name": str(call["name"])});
+            if (setApprovalContext != nil) {
+                setApprovalContext(nexora_tool_approval_context(messages,
+                    message, approvalActions));
+            }
+            let execution = executeTool(call);
+            if (getApprovalAction != nil) {
+                let action = getApprovalAction();
+                if (type(action) == "dict") approvalActions.append(action);
+            }
+            if (type(execution) == "dict" and
+                    dict_get(execution, "permission_required", false) == true) {
+                pendingApproval = execution;
+                let placeholder = nexora_tool_result_message(callId,
+                    "Awaiting user approval.");
+                messages.append(placeholder);
+                if (saveMessage != nil) saveMessage(placeholder);
+                continue;
+            }
+            let raw = __nexora_agent_tool_content(execution);
+            let output = __nexora_agent_limit_tool_output(raw, maxToolOutput);
+            stats["toolCalls"] = __nexora_agent_int(stats.get("toolCalls", 0), 0) + 1;
+            toolResultsExecuted = toolResultsExecuted + 1;
+            let resultMessage = nexora_tool_result_message(callId, output);
+            messages.append(resultMessage);
+            if (saveMessage != nil) saveMessage(resultMessage);
+            __nexora_agent_emit(onEvent, {"type": "function_result", "call_id": callId,
+                "name": str(call["name"]), "content": output,
+                "truncated": output.length() < raw.length(),
+                "originalLength": raw.length()});
+        }
+        if (pendingApproval != nil) {
+            __nexora_agent_emit(onEvent, {"type": "permission_required",
+                "approval_id": dict_get(pendingApproval, "approval_id", ""),
+                "operation": dict_get(pendingApproval, "operation", "write"),
+                "name": dict_get(pendingApproval, "name", "tool"),
+                "summary": dict_get(pendingApproval, "summary", "Tool call requires approval."),
+                "call_id": dict_get(pendingApproval, "call_id", "")});
+            return __nexora_agent_result("awaiting_approval", message, stats,
+                totals, "", messages);
+        }
+    }
+
+    return __nexora_agent_result("max_rounds", lastMessage, stats, totals, "", messages);
+}
+
+// 读完一轮：把每个 SSE 帧解析成 chunk 再折叠进 state。
+// 返回 "done" / "cancelled" / "limit"（帧数上限）。
+func __nexora_agent_round(session, state: dict, sliceMillis: int, maxFrames: int,
+        onEvent, shouldCancel) -> string {
+    let index = 0;
+    for (index < maxFrames) {
+        index = index + 1;
+        if (__nexora_agent_cancelled(shouldCancel)) {
+            // 取消要传到传输层：光退出读循环不会让对端停止推流，
+            // socket 会一直留到会话析构。
+            __nexora_agent_try_cancel(session);
+            return "cancelled";
+        }
+
+        let frame = session.next(sliceMillis);
+        if (frame == nil) continue;
+
+        let frameType = str(frame["type"]);
+        if (frameType == "cancelled") return "cancelled";
+        if (frameType == "done") return "done";
+        if (frameType != "event") continue;
+
+        let data = str(frame["data"]);
+        if (data == "[DONE]") return "done";
+
+        let chunk = __nexora_agent_parse(data);
+        if (type(chunk) != "dict") continue;
+
+        let events = nexora_chat_stream_apply(state, chunk);
+        for (events) [event] {
+            __nexora_agent_emit(onEvent, event);
+        }
+    }
+    return "limit";
+}
+
+func __nexora_agent_prepare_injections(options: dict, messages: Array, onEvent) -> dict {
+    let sources = options.get("injectionSources", nil);
+    if (type(sources) != "dict") {
+        return {"messages": messages, "fullMessages": []};
+    }
+
+    let loadState = options.get("loadInjectionState", nil);
+    let state = options.get("injectionState", {});
+    if (loadState != nil) state = loadState();
+    if (type(state) != "dict") state = {};
+
+    let baseline = nexora_injection_state_baseline(state);
+    let plan = nexora_plan_injection(sources, baseline);
+    let fullPlan = nexora_plan_injection(sources, baseline, true);
+    let newMessages = nexora_injection_build_messages(
+        plan["blocks"], plan["diagnostics"]);
+    let fullMessages = nexora_injection_build_messages(
+        fullPlan["blocks"], fullPlan["diagnostics"]);
+
+    let permissionModeValue: string = options.get("permissionMode", "");
+    let permissionMode = permissionModeValue.strip().lower();
+    let previousPermissionModeValue: string = state.get("injection_permission_mode", "");
+    let previousPermissionMode = previousPermissionModeValue.strip().lower();
+    let shouldAddPermissionMessage = permissionMode != previousPermissionMode and
+        (previousPermissionMode != "" or permissionMode == "auto");
+    if (shouldAddPermissionMessage) {
+        newMessages.append(nexora_injection_permission_message(permissionMode));
+    }
+    if (permissionMode != "") {
+        fullMessages.append(nexora_injection_permission_message(permissionMode));
+    }
+
+    let skipUserMessage = options.get("skipUserMessage", false);
+    let insertIndex = messages.length();
+    if (!skipUserMessage and insertIndex > 0) insertIndex = insertIndex - 1;
+    messages = nexora_injection_messages_insert(messages, insertIndex, newMessages);
+
+    let saveInjections = options.get("saveInjections", nil);
+    if (newMessages.length() > 0 and saveInjections != nil) {
+        saveInjections(newMessages, plan["baseline"], permissionMode, skipUserMessage);
+    }
+
+    if (plan["diagnostics"].length() > 0) {
+        let headChars = __nexora_agent_int(options.get("headChars", nil), 0);
+        __nexora_agent_emit(onEvent, {"type": "context_injection",
+            "blocks": plan["diagnostics"], "head_chars": headChars});
+    }
+
+    return {"messages": messages, "fullMessages": fullMessages};
+}
+
+// 会话可能只实现 next/close；取消是可选能力，缺了就当它不支持。
+func __nexora_agent_try_cancel(session) {
+    try {
+        session.cancel();
+    } catch (&error) {}
+}
+
+func __nexora_agent_emit(onEvent, event) {
+    if (onEvent == nil) return;
+    onEvent(event);
+}
+
+func __nexora_agent_parse(data: string) {
+    try {
+        return JSON.parse(data);
+    } catch (&error) {
+        throw new Exception("agent loop: 流块不是合法 JSON: " + str(error));
+    }
+}
+
+func __nexora_agent_int(value, fallback: int) -> int {
+    if (type(value) == "int") return value;
+    return fallback;
+}
+
+func __nexora_agent_cancelled(shouldCancel) -> bool {
+    if (shouldCancel == nil) return false;
+    let flag = shouldCancel();
+    if (flag == nil) return false;
+    if (flag == false) return false;
+    return true;
+}
+
+// 工具输出的三种常见形态：字符串、{"content": ...}、{"error": ...}。
+func __nexora_agent_tool_content(output) -> string {
+    if (output == nil) return "";
+    if (type(output) == "string") return output;
+    if (type(output) == "dict") {
+        let content = output.get("content", nil);
+        if (content == nil) content = output.get("error", nil);
+        return nexora_stringify_content(content);
+    }
+    return nexora_stringify_content(output);
+}
+
+// 工具输出会原样回填进下一轮请求，几十 KB 的文件内容能直接把窗口顶爆，
+// 所以超过上限就截断并留下说明（长度按字节算，与 context 的估算口径一致）。
+func __nexora_agent_limit_tool_output(output: string, limit: int) -> string {
+    if (limit <= 0) return output;
+    if (output.length() <= limit) return output;
+    let kept = __nexora_agent_truncate_utf8(output, limit);
+    return kept + "\n…[tool output truncated: " +
+        str(output.length() - kept.length()) + " bytes omitted]";
+}
+
+// 按字节截断时不能把一个 UTF-8 字符劈成两半，否则回填的 JSON 会带坏字节。
+// 从截断点往回退到首字节（<0x80 或 >=0xC0）为止。
+func __nexora_agent_truncate_utf8(text: string, limit: int) -> string {
+    let raw = bytes(text);
+    if (raw.length() <= limit) return text;
+    let cut = limit;
+    for (cut > 0) {
+        let code = __bytes_get(raw, cut);
+        if (code < 128 or code >= 192) break;
+        cut = cut - 1;
+    }
+    return raw.slice(0, cut).decode("utf-8");
+}
+
+func __nexora_agent_result(status: string, message, stats: dict, totals: dict,
+        error: string, messages: Array) {
+    return {
+        "status": status,
+        "message": message,
+        "rounds": __nexora_agent_int(stats.get("rounds", 0), 0),
+        "toolCalls": __nexora_agent_int(stats.get("toolCalls", 0), 0),
+        "truncated": stats.get("truncated", false) == true,
+        "compressed": str(stats.get("compressed", "")),
+        "finishReasons": stats.get("finishReasons", []),
+        "autoRetries": stats.get("autoRetries", []),
+        "usage": totals,
+        "error": error,
+        "messages": messages
+    };
+}

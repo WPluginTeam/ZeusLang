@@ -21,7 +21,7 @@ public:
             fail("expected an expression");
             return diagnostics_;
         }
-        if (!parseOr()) return diagnostics_;
+        if (!parseConditional()) return diagnostics_;
         if (position_ != tokens_.size()) {
             fail("unexpected token '" + tokenText(tokens_[position_]) + "'");
         }
@@ -97,8 +97,33 @@ private:
                                      std::holds_alternative<LexerType::Operator>(tokens_[position_ + 1]) &&
                                      std::get<LexerType::Operator>(tokens_[position_ + 1]).symbol == "|")) {
             if (atOperator("or")) ++position_;
-            else position_ += 2; // Lexer currently emits `||` as two tokens.
+            else position_ += 2; // 兼容遗留的分开写法 `| |`（`||` 已由词法规范化为 or）。
             if (!parseAnd()) return fail("expected an expression after 'or'");
+        }
+        return true;
+    }
+
+    bool parseConditional() {
+        if (!parseOr()) return false;
+        if (!consumeOperator("?")) return true;
+
+        // Elvis: value ?: fallback. Keep it distinct from truthy branching;
+        // the IR lowering checks specifically for nil and evaluates value once.
+        if (consumeOperator(":")) {
+            if (!parseConditional()) {
+                return fail("expected an expression after the Elvis operator");
+            }
+            return true;
+        }
+
+        if (!parseConditional()) {
+            return fail("expected an expression after '?' in conditional expression");
+        }
+        if (!consumeOperator(":")) {
+            return fail("expected ':' after the true branch of conditional expression");
+        }
+        if (!parseConditional()) {
+            return fail("expected an expression after ':' in conditional expression");
         }
         return true;
     }
@@ -158,6 +183,24 @@ private:
                 position_ = genericCallPosition;
                 continue;
             }
+            if (atOperator("?")) {
+                const bool startsSafeNavigation = position_ + 1 < tokens_.size() &&
+                    std::holds_alternative<LexerType::Operator>(tokens_[position_ + 1]) &&
+                    std::get<LexerType::Operator>(tokens_[position_ + 1]).symbol == ".";
+                if (!startsSafeNavigation) break;
+                ++position_;
+                // Safe navigation: `?.member` behaves exactly like `.member`
+                // at the syntax level; nullability is enforced by the type
+                // checker and the nil short-circuit by the IR generator.
+                if (!consumeOperator(".")) {
+                    return fail("expected '.' after '?' in safe navigation");
+                }
+                if (position_ >= tokens_.size() || !isMemberName(tokens_[position_])) {
+                    return fail("expected a member name after '?.'");
+                }
+                ++position_;
+                continue;
+            }
             if (consumeOperator(".")) {
                 if (position_ >= tokens_.size() || !isMemberName(tokens_[position_])) {
                     return fail("expected a member name after '.'");
@@ -171,7 +214,7 @@ private:
             }
             if (consumeOperator("[")) {
                 if (atOperator("]")) return fail("expected an index expression");
-                if (!parseOr()) return false;
+                if (!parseConditional()) return false;
                 if (!consumeOperator("]")) return fail("expected ']' after index expression");
                 continue;
             }
@@ -203,13 +246,13 @@ private:
             if (atOperator(")")) {
                 return fail("@" + intrinsicName + " requires one value argument");
             }
-            if (!parseOr()) return false;
+            if (!parseConditional()) return false;
             if (isFetchAddress && consumeOperator(",")) {
                 if (position_ < tokens_.size() && isIdentifier(tokens_[position_]) &&
                     (std::get<LexerType::Keyword>(tokens_[position_]).name == "slot" ||
                      std::get<LexerType::Keyword>(tokens_[position_]).name == "slot_clear")) {
                     ++position_;
-                } else if (!parseOr()) {
+                } else if (!parseConditional()) {
                     return false;
                 }
             }
@@ -272,7 +315,7 @@ private:
 
         if (consumeOperator("(")) {
             if (atOperator(")")) return fail("empty parentheses are not an expression");
-            if (!parseOr()) return false;
+            if (!parseConditional()) return false;
             if (!consumeOperator(")")) return fail("expected ')' after grouped expression");
             return true;
         }
@@ -294,7 +337,7 @@ private:
                     return fail("expected a value for named argument");
                 }
             }
-            if (!parseOr()) return false;
+            if (!parseConditional()) return false;
             if (consumeOperator(close)) return true;
             if (!consumeOperator(",")) return fail("expected ',' or '" + close + "' after argument");
             if (consumeOperator(close)) return true; // trailing comma is accepted by the current parser
@@ -307,7 +350,7 @@ private:
             if (position_ >= tokens_.size() || atOperator(",") || atOperator("]")) {
                 return fail("expected a list element");
             }
-            if (!parseOr()) return false;
+            if (!parseConditional()) return false;
             if (consumeOperator("]")) return true;
             if (!consumeOperator(",")) return fail("expected ',' or ']' after list element");
             if (consumeOperator("]")) return true; // trailing comma is accepted by the current parser
@@ -320,12 +363,13 @@ private:
             if (position_ >= tokens_.size() || atOperator(",") || atOperator("}")) {
                 return fail("expected a dictionary key");
             }
-            if (!parseOr()) return false;
-            if (!consumeOperator(":")) return fail("expected ':' after dictionary key");
-            if (position_ >= tokens_.size() || atOperator(",") || atOperator("}")) {
-                return fail("expected a dictionary value");
+            if (!parseConditional()) return false;
+            if (consumeOperator(":")) {
+                if (position_ >= tokens_.size() || atOperator(",") || atOperator("}")) {
+                    return fail("expected a dictionary value");
+                }
+                if (!parseConditional()) return false;
             }
-            if (!parseOr()) return false;
             if (consumeOperator("}")) return true;
             if (!consumeOperator(",")) return fail("expected ',' or '}' after dictionary entry");
             if (consumeOperator("}")) return true; // trailing comma is accepted by the current parser

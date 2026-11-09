@@ -1,0 +1,117 @@
+import zeus.byte;
+
+func readView(view: &bytes, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + view[index];
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func readFaddr(dataAddress: int, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        checksum = checksum + @faddr(dataAddress + index, 1) -> int;
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func writeView(view: &bytes, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var value = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        view[index] = value;
+        checksum = checksum + value;
+        value = value + 1;
+        if (value > 255) value = 0;
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func writeFaddr(dataAddress: int, index: int, iterations: int) -> int {
+    var cursor = 0;
+    var value = 0;
+    var checksum = 0;
+    for (true) {
+        if (cursor >= iterations) break;
+        @faddr(dataAddress + index, 1) -> int = value;
+        checksum = checksum + value;
+        value = value + 1;
+        if (value > 255) value = 0;
+        cursor = cursor + 1;
+    }
+    return checksum;
+}
+
+func measure(data: bytes, sample: int) {
+    let index = 173;
+    let iterations = 100000;
+    let dataAddress = data.dataAddress();
+    let view = @faddr(dataAddress, data.length()) -> &bytes;
+    var viewReadElapsed = 0;
+    var faddrReadElapsed = 0;
+    var viewReadChecksum = 0;
+    var faddrReadChecksum = 0;
+    var viewWriteElapsed = 0;
+    var faddrWriteElapsed = 0;
+    var viewWriteChecksum = 0;
+    var faddrWriteChecksum = 0;
+    var started = 0;
+
+    if (sample % 2 == 0) {
+        started = __time_perf_counter_ns();
+        viewReadChecksum = readView(view, index, iterations);
+        viewReadElapsed = __time_perf_counter_ns() - started;
+        started = __time_perf_counter_ns();
+        faddrReadChecksum = readFaddr(dataAddress, index, iterations);
+        faddrReadElapsed = __time_perf_counter_ns() - started;
+    } else {
+        started = __time_perf_counter_ns();
+        faddrReadChecksum = readFaddr(dataAddress, index, iterations);
+        faddrReadElapsed = __time_perf_counter_ns() - started;
+        started = __time_perf_counter_ns();
+        viewReadChecksum = readView(view, index, iterations);
+        viewReadElapsed = __time_perf_counter_ns() - started;
+    }
+    print("FADDR_RANGE_READ_NS", sample, viewReadElapsed, faddrReadElapsed,
+          viewReadChecksum, faddrReadChecksum);
+
+    if (sample % 2 == 0) {
+        started = __time_perf_counter_ns();
+        viewWriteChecksum = writeView(view, index, iterations);
+        viewWriteElapsed = __time_perf_counter_ns() - started;
+        started = __time_perf_counter_ns();
+        faddrWriteChecksum = writeFaddr(dataAddress, index, iterations);
+        faddrWriteElapsed = __time_perf_counter_ns() - started;
+    } else {
+        started = __time_perf_counter_ns();
+        faddrWriteChecksum = writeFaddr(dataAddress, index, iterations);
+        faddrWriteElapsed = __time_perf_counter_ns() - started;
+        started = __time_perf_counter_ns();
+        viewWriteChecksum = writeView(view, index, iterations);
+        viewWriteElapsed = __time_perf_counter_ns() - started;
+    }
+    print("FADDR_RANGE_WRITE_NS", sample, viewWriteElapsed, faddrWriteElapsed,
+          viewWriteChecksum, faddrWriteChecksum);
+}
+
+let data = bytes(4096);
+let address = data.dataAddress();
+let view = @faddr(address, data.length()) -> &bytes;
+readView(view, 173, 1000);
+readFaddr(address, 173, 1000);
+writeView(view, 173, 1000);
+writeFaddr(address, 173, 1000);
+for (0 .. 5) [const &sample] {
+    measure(data, sample);
+}
+print("FADDR_RANGE_BENCH_PASS");

@@ -1,0 +1,5 @@
+{
+  "backend_url": "http://127.0.0.1:8765",
+  "backend_executable": "F:/Code/CPPProject/Zeus2/dist/NexoraCodeCoreBackend.exe",
+  "backend_working_directory": "F:/Code/AI/ChatDB/NexoraCode"
+}

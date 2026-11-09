@@ -1,0 +1,93 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.thread;
+import samples.NexoraCodeCore.sse;
+
+// 一次可取消的流式会话：把「响应流 + SSE 分帧状态 + 取消标志」收在一个对象里，
+// 调用方只看见 next() / cancel() / close()，不用关心分帧状态存在哪。
+//
+// 取消用 Event 通知，而不是直接关 socket：取消通常来自别的线程，而在 recv 中途
+// 关句柄会把解析停在半帧上。next() 只在片与片之间检查取消，代价是最多再等一个
+// slice，换来的是不需要跨线程同步 socket。
+//
+// 绑定保持同一实例（operator[@=]）：取消标志和分帧游标都要能被另一个线程看见，
+// 默认的值语义会复制标量，取消就永远传不到读循环里。
+class NexoraStreamSession {
+    using &this;
+
+    let response = nil;
+    let state = nil;
+    let stop = new Event();
+    let closed = false;
+    let statusCode = 0;
+
+    func operator[@=]() -> &NexoraStreamSession {
+        return this;
+    }
+
+    // 读一帧，最多阻塞 sliceMillis：
+    //   {"type": "event", "data": ...}  一帧
+    //   {"type": "done"}                [DONE] 或对端干净关闭
+    //   {"type": "cancelled"}           已被 cancel()
+    //   nil                             这一片没凑出整帧（超时或只收到半行），继续读
+    // 分帧错误（块没收完连接就断）仍然抛异常，不吞半截数据。
+    func next(sliceMillis: int = 1000) {
+        if (this.closed) throw new Exception("Nexora stream session is closed");
+        if (this.stop.isSet()) return {"type": "cancelled"};
+        let frame = nexora_sse_next(this.response, this.state, sliceMillis);
+        if (frame != nil) return frame;
+        if (this.stop.isSet()) return {"type": "cancelled"};
+        return nil;
+    }
+
+    func isCancelled() -> bool {
+        return this.stop.isSet();
+    }
+
+    func cancel() {
+        this.stop.set();
+    }
+
+    func close() {
+        if (this.closed) return;
+        this.closed = true;
+        if (this.response != nil) {
+            try {
+                this.response.close();
+            } catch (&error) {}
+        }
+    }
+}
+
+func nexora_stream_session(response) {
+    let session = new NexoraStreamSession();
+    session.response = response;
+    session.state = {"pending": []};
+    session.statusCode = response.status_code;
+    return session;
+}
+
+// GET 打开（SSE 端点，测试里的 mock 也走这条）。
+func nexora_open_session(url: string, headers = nil, timeout = nil) {
+    return nexora_stream_session(nexora_sse_get(url, headers, timeout));
+}
+
+// POST 打开（聊天补全：JSON body + text/event-stream 响应）。
+func nexora_open_chat_session(url: string, body = nil, headers = nil, timeout = nil) {
+    return nexora_stream_session(nexora_sse_post(url, body, headers, timeout));
+}
+
+// 把会话读干，返回所有事件帧。'done' / 'cancelled' 都会结束循环，
+// cancelled 会作为最后一个元素返回，调用方据此区分「读完」和「被打断」。
+func nexora_stream_collect(session, sliceMillis: int = 1000, maxFrames: int = 100000) -> Array {
+    let frames: Array = [];
+    for (0..maxFrames) [const &i] {
+        let frame = session.next(sliceMillis);
+        if (frame == nil) continue;
+        let frameType = str(frame["type"]);
+        frames.append(frame);
+        if (frameType == "done") break;
+        if (frameType == "cancelled") break;
+    }
+    return frames;
+}

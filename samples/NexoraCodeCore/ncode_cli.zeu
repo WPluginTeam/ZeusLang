@@ -1,0 +1,651 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.io [&];
+import zeus.native_runtime [&];
+import zeus.json;
+import zeus.process;
+import zeus.requests [&];
+import zeus.string;
+import zeus.time [&ncodeTime];
+import samples.NexoraCodeCore.storage;
+import samples.NexoraCodeCore.project_instructions;
+import samples.NexoraCodeCore.system_prompt;
+import samples.NexoraCodeCore.turn_injection;
+
+let NEXORA_NCODE_BACKEND_URL = "http://127.0.0.1:8765";
+let NEXORA_NCODE_CONFIG_PATH = "ncode.config.json";
+
+func __ncode_config_path() -> string {
+    let executable = Process.executablePath();
+    let separator = executable.rindex("\\");
+    if (separator < 0) {
+        throw new Exception("cannot locate the ncode executable directory");
+    }
+    return executable.slice(0, separator + 1) + NEXORA_NCODE_CONFIG_PATH;
+}
+
+func __ncode_load_config(path: string) {
+    let config = nil;
+    try {
+        config = JSON.parse(nexora_core_read_text(path));
+    } catch (&error) {
+        throw new Exception("cannot read " + path + ": " + str(error));
+    }
+    if (type(config) != "dict") {
+        throw new Exception(path + " must contain a JSON object");
+    }
+
+    let backendUrl = dict_get(config, "backend_url", NEXORA_NCODE_BACKEND_URL);
+    let backendExecutable = dict_get(config, "backend_executable", "");
+    let backendWorkingDirectory = dict_get(config, "backend_working_directory", "");
+    if (type(backendUrl) != "string" or backendUrl == "") {
+        throw new Exception("ncode.config.json backend_url must be a non-empty string");
+    }
+    if (type(backendExecutable) != "string" or backendExecutable == "") {
+        throw new Exception("ncode.config.json backend_executable must be a non-empty path");
+    }
+    if (type(backendWorkingDirectory) != "string" or backendWorkingDirectory == "") {
+        throw new Exception("ncode.config.json backend_working_directory must be a non-empty path");
+    }
+    return config;
+}
+
+func __ncode_int(value) -> int {
+    if (type(value) != "int") return 0;
+    if (value < 0) return 0;
+    return value;
+}
+
+func __ncode_compact_tokens(value: int) -> string {
+    if (value >= 1000000) {
+        let tenths = int(value * 10 / 1000000);
+        let whole = int(tenths / 10);
+        let decimal = tenths - whole * 10;
+        if (decimal == 0) return str(whole) + "M";
+        return str(whole) + "." + str(decimal) + "M";
+    }
+    if (value >= 1000) {
+        let tenths = int(value * 10 / 1000);
+        let whole = int(tenths / 10);
+        let decimal = tenths - whole * 10;
+        if (decimal == 0) return str(whole) + "K";
+        return str(whole) + "." + str(decimal) + "K";
+    }
+    return str(value);
+}
+
+func __ncode_estimate_context(messages) -> int {
+    let encoded = JSON.stringify({"messages": messages});
+    let estimate = int(encoded.length() / 3);
+    if (estimate < 1) return 1;
+    return estimate;
+}
+
+class NexoraCoreCliClient {
+    using &this;
+
+    let baseUrl = NEXORA_NCODE_BACKEND_URL;
+
+    func init(baseUrlValue: string = NEXORA_NCODE_BACKEND_URL) {
+        this.baseUrl = baseUrlValue;
+    }
+
+    func request(method: string, path: string, body=nil, timeout=15) {
+        let response = nil;
+        try {
+            if (method == "POST") {
+                response = requests.post(this.baseUrl + path, nil, nil, body, timeout);
+            } else {
+                response = requests.get(this.baseUrl + path, nil, nil, nil, timeout);
+            }
+        } catch (&error) {
+            throw new Exception("backend request failed: " + str(error));
+        }
+        let responseText = response.text("utf-8");
+        let payload = nil;
+        try {
+            payload = JSON.parse(responseText);
+        } catch (&error) {
+            throw new Exception("backend returned invalid JSON (HTTP " +
+                str(response.status_code) + ")");
+        }
+        if (type(payload) != "dict") {
+            throw new Exception("backend response must be a JSON object");
+        }
+        if (response.status_code < 200 or response.status_code >= 300) {
+            throw new Exception(str(dict_get(payload, "message",
+                "HTTP " + str(response.status_code))));
+        }
+        return payload;
+    }
+
+    func get(path: string, timeout=15) {
+        return this.request("GET", path, nil, timeout);
+    }
+
+    func post(path: string, body, timeout=15) {
+        return this.request("POST", path, body, timeout);
+    }
+}
+
+class NexoraCoreCli {
+    using &this;
+
+    let client = nil;
+    let config = nil;
+    let backendProcess = nil;
+    let models = [];
+    let providerName = "";
+    let conversationId = "";
+    let permissionMode = "confirm";
+    let nextTitle = "";
+
+    func init() {
+        this.config = __ncode_load_config(__ncode_config_path());
+        this.client = new NexoraCoreCliClient(str(dict_get(
+            this.config, "backend_url", NEXORA_NCODE_BACKEND_URL)));
+    }
+
+    func write(text: string) {
+        print(text);
+        flushOutput();
+    }
+
+    func findModel(name: string) {
+        let wanted = name.lower();
+        for (this.models) [item] {
+            let current = str(dict_get(item, "name", ""));
+            if (current.lower() == wanted) return item;
+        }
+        return nil;
+    }
+
+    func selectedModel() {
+        return this.findModel(this.providerName);
+    }
+
+    func refreshModels() {
+        let payload = this.client.get("/api/models");
+        this.models = dict_get(payload, "items", []);
+    }
+
+    func backendReady() -> bool {
+        let health = nil;
+        try {
+            health = this.client.get("/health", 0.5);
+        } catch (&error) {
+            return false;
+        }
+        if (str(dict_get(health, "service", "")) != "NexoraCodeCore") {
+            throw new Exception("backend_url is serving a different service");
+        }
+        return dict_get(health, "ok", false) == true;
+    }
+
+    func ensureBackend() {
+        if (this.backendReady()) return;
+
+        let executable = str(dict_get(this.config, "backend_executable", ""));
+        let workingDirectory = str(dict_get(
+            this.config, "backend_working_directory", ""));
+        this.write("| -> Starting NexoraCodeCore backend...");
+        try {
+            this.backendProcess = Process.run(
+                "\"" + executable + "\"", false, workingDirectory);
+        } catch (&error) {
+            throw new Exception("cannot start backend " + executable + ": " + str(error));
+        }
+
+        let startedAt = ncodeTime.monotonic();
+        for (true) {
+            if (!this.backendProcess.running()) {
+                throw new Exception("backend exited before becoming ready (exit " +
+                    str(this.backendProcess.exitCodeOf()) +
+                    "); run the configured executable from backend_working_directory " +
+                    "to see its startup error");
+            }
+            if (this.backendReady()) {
+                this.write("| -> NexoraCodeCore backend ready.");
+                return;
+            }
+            if (ncodeTime.monotonic() - startedAt >= 20) break;
+            ncodeTime.sleep(0.25);
+        }
+        throw new Exception("backend did not become ready within 20 seconds; check " +
+            "backend_executable and backend_working_directory in ncode.config.json");
+    }
+
+    func connect() {
+        this.ensureBackend();
+        this.refreshModels();
+        if (this.models.length() == 0) {
+            throw new Exception("backend has no configured providers");
+        }
+        let first = this.models[0];
+        this.providerName = str(dict_get(first, "name", ""));
+        if (this.providerName == "") {
+            throw new Exception("backend returned a provider without a name");
+        }
+    }
+    func showModels() {
+        this.refreshModels();
+        this.write("Available models:");
+        for (this.models) [item] {
+            let name = str(dict_get(item, "name", "(unnamed)"));
+            let model = str(dict_get(item, "model", ""));
+            let marker = " ";
+            if (name.lower() == this.providerName.lower()) marker = "*";
+            let context = __ncode_int(dict_get(item, "context_window", 0));
+            let suffix = "";
+            if (context > 0) {
+                suffix = " | context " + __ncode_compact_tokens(context);
+            }
+            this.write(marker + " " + name + " - " + model + suffix);
+        }
+        this.write("Use /model NAME to switch providers.");
+    }
+
+    func showBackend() {
+        if (this.backendReady()) {
+            this.write("NexoraCodeCore backend is ready at " +
+                str(dict_get(this.config, "backend_url", NEXORA_NCODE_BACKEND_URL)));
+        } else {
+            this.write("NexoraCodeCore backend is not responding.");
+        }
+    }
+
+    func showHistory() {
+        let payload = this.client.get("/api/conversations");
+        let items = dict_get(payload, "items", []);
+        if (items.length() == 0) {
+            this.write("No saved conversations.");
+            return;
+        }
+        this.write("Recent conversations:");
+        let count = 0;
+        for (items) [item] {
+            if (count >= 20) break;
+            let conversationId = str(dict_get(item, "conversation_id", ""));
+            let title = str(dict_get(item, "title", "Untitled"));
+            let marker = " ";
+            if (conversationId == this.conversationId) marker = "*";
+            this.write(marker + " " + conversationId + "  " + title);
+            count = count + 1;
+        }
+    }
+
+    func conversationUsage() {
+        let totals = {"raw_input": 0, "cached_input": 0, "output": 0, "total": 0};
+        if (this.conversationId == "") return totals;
+
+        let payload = this.client.get("/api/tasks?limit=500");
+        let sessions = dict_get(payload, "items", []);
+        for (sessions) [session] {
+            if (str(dict_get(session, "conversation_id", "")) != this.conversationId) continue;
+            let result = dict_get(session, "result", {});
+            let usage = dict_get(result, "usage", {});
+            if (type(usage) != "dict") continue;
+            for (["raw_input", "cached_input", "output", "total"]) [key] {
+                let previous = __ncode_int(dict_get(totals, key, 0));
+                let amount = __ncode_int(dict_get(usage, key, 0));
+                dict_set(totals, key, previous + amount);
+            }
+            if (__ncode_int(dict_get(usage, "total", 0)) == 0) {
+                let total = __ncode_int(dict_get(totals, "total", 0));
+                let rawInput = __ncode_int(dict_get(usage, "raw_input", 0));
+                let output = __ncode_int(dict_get(usage, "output", 0));
+                dict_set(totals, "total", total + rawInput + output);
+            }
+        }
+        return totals;
+    }
+
+    func showContext() {
+        let selected = this.selectedModel();
+        let contextWindow = __ncode_int(dict_get(selected, "context_window", 0));
+        let estimated = 0;
+        if (this.conversationId != "") {
+            let payload = this.client.get(
+                "/api/conversations/get?conversation_id=" + this.conversationId);
+            let conversation = dict_get(payload, "conversation", {});
+            let history = dict_get(conversation, "messages", []);
+            let workRoot = str(dict_get(this.config,
+                "backend_working_directory", "."));
+            let messages = [{"role": "system",
+                "content": nexora_build_default_system_prompt(workRoot)}];
+            for (history) [message] {
+                messages.append(message);
+            }
+            let currentInstructions = nexora_read_project_instructions(workRoot);
+            let injectionState = nexora_injection_state_baseline(conversation);
+            let injectionPlan = nexora_plan_injection(
+                {"project_conventions": currentInstructions}, injectionState);
+            let pendingInjections = nexora_injection_build_messages(
+                injectionPlan["blocks"], injectionPlan["diagnostics"]);
+            for (pendingInjections) [message] {
+                messages.append(message);
+            }
+            estimated = __ncode_estimate_context(messages);
+        }
+
+        if (contextWindow > 0) {
+            this.write("| -> Context: " + __ncode_compact_tokens(estimated) +
+                " / " + __ncode_compact_tokens(contextWindow) + " Tokens (estimated)");
+        } else {
+            this.write("| -> Context: " + __ncode_compact_tokens(estimated) +
+                " / unknown Tokens");
+        }
+        this.write("| -> Conversation Usage:");
+        let usage = this.conversationUsage();
+        let total = __ncode_int(dict_get(usage, "total", 0));
+        let cached = __ncode_int(dict_get(usage, "cached_input", 0));
+        let rawInput = __ncode_int(dict_get(usage, "raw_input", 0));
+        let ratio = 0;
+        if (rawInput > 0) ratio = int(cached * 100 / rawInput);
+        this.write("|        Total: " + __ncode_compact_tokens(total) + " Tokens");
+        this.write("|        Cached Hits: " + __ncode_compact_tokens(cached) +
+            " (" + str(ratio) + "%)");
+        if (this.conversationId == "") {
+            this.write("|        Start a chat to create a conversation.");
+        }
+    }
+
+    func setModel(name: string) {
+        let selected = this.findModel(name);
+        if (selected == nil) {
+            this.write("Provider not found: " + name + ". Use /models to list providers.");
+            return;
+        }
+        this.providerName = str(dict_get(selected, "name", ""));
+        this.write("Provider set to " + this.providerName + " (" +
+            str(dict_get(selected, "model", "")) + ").");
+    }
+
+    func openConversation(conversationId: string) {
+        let payload = this.client.get(
+            "/api/conversations/get?conversation_id=" + conversationId);
+        let conversation = dict_get(payload, "conversation", {});
+        this.conversationId = str(dict_get(conversation, "conversation_id", conversationId));
+        let settings = dict_get(conversation, "settings", {});
+        let savedMode = str(dict_get(settings, "permission_mode", "confirm")).strip().lower();
+        if (savedMode != "") this.permissionMode = savedMode;
+        this.nextTitle = "";
+        this.write("Opened " + this.conversationId + ": " +
+            str(dict_get(conversation, "title", "Untitled")));
+    }
+
+    func chat(prompt: string) {
+        let body = {"message": prompt, "provider": this.providerName};
+        if (this.conversationId != "") dict_set(body, "conversation_id", this.conversationId);
+        if (this.nextTitle != "") dict_set(body, "title", this.nextTitle);
+        let started = this.client.post("/api/chat", body);
+        let streamId = str(dict_get(started, "stream_id", ""));
+        let conversationId = str(dict_get(started, "conversation_id", ""));
+        if (streamId == "" or conversationId == "") {
+            throw new Exception("backend did not return task and conversation IDs");
+        }
+        this.conversationId = conversationId;
+        this.permissionMode = str(dict_get(started, "permission_mode", this.permissionMode));
+        this.nextTitle = "";
+        let selected = this.selectedModel();
+        this.write("| -> " + this.providerName + ": " +
+            str(dict_get(selected, "model", "")));
+        this.waitForTask(streamId);
+    }
+
+    func resolveToolApproval(streamId: string, approval) -> string {
+        this.write("| -> Approval required: " +
+            str(dict_get(approval, "summary", "Tool operation")));
+        print("Approve this tool? [y/N] ", end="");
+        flushOutput();
+        let answer = input().strip().lower();
+        let decision = "deny";
+        if (answer == "y" or answer == "yes") decision = "approve";
+        let resolved = this.client.post("/api/tasks/approval", {
+            "stream_id": streamId,
+            "approval_id": str(dict_get(approval, "approval_id", "")),
+            "decision": decision
+        });
+        let continuationId = str(dict_get(resolved, "continuation_stream_id", ""));
+        if (continuationId == "") {
+            throw new Exception("backend did not return the continuation task");
+        }
+        this.write("| -> Tool " + decision + "; continuing.");
+        return continuationId;
+    }
+
+    func waitForTask(streamId: string) {
+        let activeStreamId = streamId;
+        let afterSequence = 0;
+        let textOpen = false;
+        let displayedTextLength = 0;
+        let startedAt = ncodeTime.monotonic();
+
+        for (true) {
+            let path = "/api/tasks?stream_id=" + activeStreamId +
+                "&after_seq=" + str(afterSequence);
+            let payload = this.client.get(path);
+            let session = dict_get(payload, "session", {});
+            let events = dict_get(payload, "events", []);
+            let nextStreamId = "";
+
+            if (dict_get(payload, "gap", false) == true) {
+                this.write("| -> Some older task events have expired from the live window.");
+                let head = __ncode_int(dict_get(payload, "head_seq", 0));
+                if (head > 0 and head - 1 > afterSequence) afterSequence = head - 1;
+                let accumulated = dict_get(payload, "content", "");
+                if (type(accumulated) == "string") {
+                    let missing = "";
+                    let accumulatedLength = accumulated.length();
+                    if (accumulatedLength >= displayedTextLength) {
+                        missing = accumulated.slice(displayedTextLength, accumulatedLength);
+                    } else {
+                        if (textOpen) {
+                            this.write("");
+                            textOpen = false;
+                        }
+                        this.write("| -> Latest accumulated response:");
+                        missing = accumulated;
+                    }
+                    if (missing != "") {
+                        print(missing, end="");
+                        flushOutput();
+                        displayedTextLength = accumulatedLength;
+                        textOpen = true;
+                    }
+                }
+            }
+
+            for (events) [item] {
+                let sequence = __ncode_int(dict_get(item, "seq", 0));
+                if (sequence > afterSequence) afterSequence = sequence;
+                let event = dict_get(item, "event", {});
+                if (type(event) != "dict") continue;
+                let eventType = str(dict_get(event, "type", ""));
+                if (eventType == "text") {
+                    let text = str(dict_get(event, "text", ""));
+                    if (text != "") {
+                        print(text, end="");
+                        flushOutput();
+                        displayedTextLength = displayedTextLength + text.length();
+                        textOpen = true;
+                    }
+                } else if (eventType == "function_call") {
+                    if (textOpen) {
+                        this.write("");
+                        textOpen = false;
+                    }
+                    this.write("| -> Tool: " + str(dict_get(event, "name", "unknown")));
+                } else if (eventType == "function_result") {
+                    if (textOpen) {
+                        this.write("");
+                        textOpen = false;
+                    }
+                    let content = str(dict_get(event, "content", ""));
+                    let preview = content;
+                    if (preview.length() > 500) {
+                        preview = preview.slice(0, 500) + "…";
+                    }
+                    this.write("|         " + str(dict_get(event, "name", "tool")) +
+                        ": " + preview);
+                } else if (eventType == "permission_required") {
+                    if (textOpen) {
+                        this.write("");
+                        textOpen = false;
+                    }
+                    nextStreamId = this.resolveToolApproval(activeStreamId, event);
+                    break;
+                } else if (eventType == "context_compression") {
+                    this.write("| -> Context compressed: " +
+                        str(dict_get(event, "status", "")));
+                } else if (eventType == "error") {
+                    this.write("| -> Error: " + str(dict_get(event, "message", "")));
+                }
+            }
+
+            let status = str(dict_get(session, "status", ""));
+            if (nextStreamId == "" and status == "awaiting_approval") {
+                let approval = dict_get(payload, "approval", nil);
+                if (approval == nil) {
+                    this.write("| -> Task awaits approval, but its request is no longer available.");
+                    return;
+                }
+                nextStreamId = this.resolveToolApproval(activeStreamId, approval);
+            }
+
+            if (nextStreamId != "") {
+                activeStreamId = nextStreamId;
+                afterSequence = 0;
+                displayedTextLength = 0;
+                startedAt = ncodeTime.monotonic();
+                textOpen = false;
+                continue;
+            }
+
+            if (status == "done" or status == "cancelled" or status == "error" or
+                status == "awaiting_approval" or status == "max_rounds" or status == "context_overflow" or
+                status == "interrupted") {
+                if (textOpen) this.write("");
+                if (status != "done") {
+                    let error = str(dict_get(session, "error", ""));
+                    if (error == "") {
+                        let result = dict_get(session, "result", {});
+                        error = str(dict_get(result, "error", ""));
+                    }
+                    if (error == "") this.write("| -> Task " + status);
+                    else this.write("| -> Task " + status + ": " + error);
+                }
+                return;
+            }
+
+            if (ncodeTime.monotonic() - startedAt > 900) {
+                this.write("| -> Timed out while waiting; task remains available in backend history.");
+                return;
+            }
+            ncodeTime.sleep(0.25);
+        }
+    }
+
+    func handleCommand(line: string) -> bool {
+        let splitAt = line.index(" ");
+        let command = line;
+        let argument = "";
+        if (splitAt >= 0) {
+            command = line.slice(0, splitAt);
+            argument = line.slice(splitAt + 1, line.length()).strip();
+        }
+        command = command.lower();
+
+        if (command == "/quit" or command == "/exit") return false;
+        if (command == "/help" or command == "/?") {
+            this.write("Commands: /help /backend /models /model NAME /permissions [read_only|confirm|full] /ctx /history /open ID /new [title] /quit");
+            this.write("Type any other line to chat.");
+        } else if (command == "/backend") {
+            this.showBackend();
+        } else if (command == "/models") {
+            this.showModels();
+        } else if (command == "/model") {
+            if (argument != "") {
+                this.setModel(argument);
+            } else {
+                let selected = this.selectedModel();
+                this.write("Current provider: " + this.providerName + " (" +
+                    str(dict_get(selected, "model", "")) + ")");
+            }
+        } else if (command == "/permissions") {
+            if (argument == "") {
+                this.write("Permission mode: " + this.permissionMode);
+            } else if (this.conversationId == "") {
+                this.write("Start or open a conversation before changing its permission mode.");
+            } else {
+                let mode = argument.lower();
+                if (mode != "read_only" and mode != "confirm" and mode != "full") {
+                    this.write("Usage: /permissions read_only|confirm|full");
+                } else {
+                    let saved = this.client.post("/api/conversations/settings", {
+                        "conversation_id": this.conversationId,
+                        "permission_mode": mode
+                    });
+                    this.permissionMode = mode;
+                    this.write("Permission mode set to " + mode + ".");
+                }
+            }
+        } else if (command == "/ctx") {
+            this.showContext();
+        } else if (command == "/history" or command == "/conversations") {
+            this.showHistory();
+        } else if (command == "/open") {
+            if (argument == "") this.write("Usage: /open CONVERSATION_ID");
+            else this.openConversation(argument);
+        } else if (command == "/new") {
+            this.conversationId = "";
+            this.permissionMode = "confirm";
+            this.nextTitle = argument;
+            if (argument == "") this.write("Started a new conversation.");
+            else this.write("Started a new conversation: " + argument);
+        } else {
+            this.write("Unknown command: " + command + ". Use /help.");
+        }
+        return true;
+    }
+
+    func run() {
+        this.connect();
+        let selected = this.selectedModel();
+        this.write("NexoraCodeCore CLI - " + this.providerName + " (" +
+            str(dict_get(selected, "model", "")) + ")");
+        this.write("Type /help for commands.");
+
+        for (true) {
+            print("> ", end="");
+            flushOutput();
+            let line = input();
+            if (line == "") return;
+            let trimmed = line.strip();
+            if (trimmed == "") continue;
+            if (trimmed.startswith("/")) {
+                if (!this.handleCommand(trimmed)) return;
+            } else {
+                try {
+                    this.chat(line);
+                } catch (&error) {
+                    this.write("| -> Error: " + str(error));
+                }
+            }
+        }
+    }
+}
+
+func main() -> int {
+    try {
+        let cli = new NexoraCoreCli();
+        cli.run();
+    } catch (&error) {
+        print("ncode: " + str(error));
+        flushOutput();
+        return 1;
+    }
+    return 0;
+}
+
+main();

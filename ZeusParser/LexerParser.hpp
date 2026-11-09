@@ -124,6 +124,174 @@ namespace LexerParser {
                     continue;
                 }
 
+                // 识别 $"..." 或 f"..." / F"..." 字符串插值字面量（必须在 isalpha 之前检查）
+                if ((c == '$' || c == 'f' || c == 'F') && cNext == '"') {
+                    tokenStartOffset = static_cast<size_t>(n - 1);
+                    n++; // 消费开头的 '"'
+
+                    struct InterpolatedPart {
+                        bool isExpr = false;
+                        std::string text;
+                        std::vector<LexerType::Token> exprTokens;
+                        size_t offset = 0;
+                    };
+
+                    std::vector<InterpolatedPart> parts;
+                    std::string currentText;
+                    size_t partStartOffset = static_cast<size_t>(n);
+                    bool unterminated = true;
+
+                    while (n < input.size()) {
+                        char ch = input[n++];
+                        if (ch == '"') {
+                            unterminated = false;
+                            if (!currentText.empty()) {
+                                parts.push_back({false, currentText, {}, partStartOffset});
+                                currentText.clear();
+                            }
+                            break;
+                        }
+                        if (ch == '\n') {
+                            currentText += ch;
+                            currentLine++;
+                            continue;
+                        }
+                        if (ch == '\\' && n < input.size()) {
+                            char nextChar = input[n++];
+                            switch (nextChar) {
+                                case '{':  currentText += '{';  break;
+                                case '}':  currentText += '}';  break;
+                                case 'n':  currentText += '\n'; break;
+                                case 't':  currentText += '\t'; break;
+                                case 'r':  currentText += '\r'; break;
+                                case '\\': currentText += '\\'; break;
+                                case '"':  currentText += '"';  break;
+                                case '\'': currentText += '\''; break;
+                                case '0':  currentText += '\0'; break;
+                                case 'b':  currentText += '\b'; break;
+                                case 'f':  currentText += '\f'; break;
+                                case 'v':  currentText += '\v'; break;
+                                default:
+                                    currentText += '\\';
+                                    currentText += nextChar;
+                                    break;
+                            }
+                            continue;
+                        }
+                        if (ch == '{') {
+                            if (!currentText.empty()) {
+                                parts.push_back({false, currentText, {}, partStartOffset});
+                                currentText.clear();
+                            }
+                            size_t exprStartOffset = static_cast<size_t>(n);
+                            int braceDepth = 1;
+                            std::string exprStr;
+                            bool inSubStr = false;
+                            char subStrQuote = '\0';
+
+                            while (n < input.size() && braceDepth > 0) {
+                                char ec = input[n++];
+                                if (inSubStr) {
+                                    exprStr += ec;
+                                    if (ec == '\\' && n < input.size()) {
+                                        exprStr += input[n++];
+                                    } else if (ec == subStrQuote) {
+                                        inSubStr = false;
+                                    }
+                                    continue;
+                                }
+                                if (ec == '"' || ec == '\'') {
+                                    inSubStr = true;
+                                    subStrQuote = ec;
+                                    exprStr += ec;
+                                    continue;
+                                }
+                                if (ec == '{') {
+                                    braceDepth++;
+                                    exprStr += ec;
+                                } else if (ec == '}') {
+                                    braceDepth--;
+                                    if (braceDepth > 0) {
+                                        exprStr += ec;
+                                    }
+                                } else if (ec == '\n') {
+                                    exprStr += ec;
+                                    currentLine++;
+                                } else {
+                                    exprStr += ec;
+                                }
+                            }
+
+                            if (braceDepth > 0) {
+                                reportLexError("L0004", "unterminated expression in interpolated string", exprStartOffset);
+                                break;
+                            }
+
+                            auto subTokens = parse(exprStr, diagnostics);
+                            parts.push_back({true, "", std::move(subTokens), exprStartOffset});
+                            partStartOffset = static_cast<size_t>(n);
+                            continue;
+                        }
+
+                        currentText += ch;
+                    }
+
+                    if (unterminated) {
+                        reportLexError("L0002", "unterminated string literal", tokenStartOffset);
+                        continue;
+                    }
+
+                    if (parts.empty()) {
+                        auto val = LexerType::Value(std::string(""));
+                        setTokenPosition(val, tokenStartOffset);
+                        tokens.push_back(val);
+                    } else if (parts.size() == 1 && !parts[0].isExpr) {
+                        auto val = LexerType::Value(parts[0].text);
+                        setTokenPosition(val, tokenStartOffset);
+                        tokens.push_back(val);
+                    } else {
+                        auto openParen = LexerType::Operator("(");
+                        setTokenPosition(openParen, tokenStartOffset);
+                        tokens.push_back(openParen);
+
+                        bool needPlus = false;
+                        for (size_t p = 0; p < parts.size(); ++p) {
+                            if (needPlus) {
+                                auto plusOp = LexerType::Operator("+");
+                                setTokenPosition(plusOp, parts[p].offset);
+                                tokens.push_back(plusOp);
+                            }
+                            if (!parts[p].isExpr) {
+                                auto val = LexerType::Value(parts[p].text);
+                                setTokenPosition(val, parts[p].offset);
+                                tokens.push_back(val);
+                            } else {
+                                auto strKw = LexerType::Keyword("str");
+                                setTokenPosition(strKw, parts[p].offset);
+                                tokens.push_back(strKw);
+
+                                auto callOpen = LexerType::Operator("(");
+                                setTokenPosition(callOpen, parts[p].offset);
+                                tokens.push_back(callOpen);
+
+                                for (const auto& exprTk : parts[p].exprTokens) {
+                                    tokens.push_back(exprTk);
+                                }
+
+                                auto callClose = LexerType::Operator(")");
+                                setTokenPosition(callClose, parts[p].offset);
+                                tokens.push_back(callClose);
+                            }
+                            needPlus = true;
+                        }
+
+                        auto closeParen = LexerType::Operator(")");
+                        setTokenPosition(closeParen, tokenStartOffset);
+                        tokens.push_back(closeParen);
+                    }
+                    continue;
+                }
+
                 if (c == '"') {
                     tokenStartOffset = static_cast<size_t>(n - 1);
                     stat = TokenStatus::STRING_READING;
@@ -176,6 +344,16 @@ namespace LexerParser {
                     }
                     if (c == '>' && cNext == '=') {
                         auto op = LexerType::Operator(">=");
+                        setTokenPosition(op, static_cast<size_t>(n - 1));
+                        tokens.push_back(op);
+                        n++;
+                        continue;
+                    }
+                    if (c == '|' && cNext == '|') {
+                        // `||` 与关键字 `or` 是同义词：词法阶段统一规范化为 or
+                        // 运算符记号，使折叠 / IR 生成 / 类型推断等下游只需
+                        // 处理单一运算符记号（与 and/or 关键字的处理一致）。
+                        auto op = LexerType::Operator("or");
                         setTokenPosition(op, static_cast<size_t>(n - 1));
                         tokens.push_back(op);
                         n++;

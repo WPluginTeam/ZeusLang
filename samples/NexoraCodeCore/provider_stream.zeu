@@ -1,0 +1,194 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import zeus.string;
+import samples.NexoraCodeCore.agent_events;
+
+// OpenAI 兼容流式补全的增量聚合。
+//
+// 服务端把一条 assistant 消息拆成很多 chunk：正文按 token 片段来；工具调用按
+// index 分组，arguments 甚至会被切成几段字符串（同一 index 的片段必须拼接）。
+// 这里把 chunk 折进一个可变状态，结束时再收敛成一条标准 assistant 消息，
+// 下一轮把它原样回填进 messages 即可。
+
+func nexora_chat_stream_state() {
+    return {
+        "textParts": [],
+        "reasoningParts": [],
+        "toolCalls": [],
+        "finishReason": "",
+        "usage": nil,
+        "chunks": 0
+    };
+}
+
+// 请求体。tools 为空时不下发（有的服务端不接受空数组）。
+func nexora_chat_stream_payload(model: string, messages: Array, tools = nil,
+        temperature = nil, maxTokens = nil, includeUsage: bool = true) {
+    let payload = {"model": model, "messages": messages, "stream": true};
+    if (type(tools) == "Array") {
+        if (tools.length() > 0) payload["tools"] = tools;
+    }
+    if (temperature != nil) payload["temperature"] = temperature;
+    if (maxTokens != nil) payload["max_tokens"] = maxTokens;
+    // 流式下 usage 只在最后一个 chunk 出现，且要显式索取。
+    if (includeUsage) payload["stream_options"] = {"include_usage": true};
+    return payload;
+}
+
+func __nexora_stream_count(value) -> int {
+    if (type(value) == "int") return value;
+    return 0;
+}
+
+// 折叠一个 chunk，返回它带来的事件（可能为空）：
+//   {"type": "text", "text": ...}
+//   {"type": "usage", "usage": {...}}
+//   {"type": "finish", "reason": ...}
+func nexora_chat_stream_apply(state: dict, chunk: dict) -> Array {
+    let events: Array = [];
+    state["chunks"] = __nexora_stream_count(state.get("chunks", 0)) + 1;
+
+    let usage = chunk.get("usage", nil);
+    if (type(usage) == "dict") {
+        state["usage"] = usage;
+        events.append({"type": "usage", "usage": usage});
+    }
+
+    let choices = chunk.get("choices", nil);
+    if (type(choices) != "Array") return events;
+    if (choices.length() == 0) return events;
+
+    let choice = choices[0];
+    if (type(choice) != "dict") return events;
+
+    let delta = choice.get("delta", nil);
+    if (type(delta) == "dict") {
+        // 推理模型的思考流（DeepSeek / vLLM 的 reasoning_content）单独累计，
+        // 不进 assistant 消息：回填到下一轮请求里部分服务端会直接报 400。
+        let thought = nexora_stringify_content(delta.get("reasoning_content", nil));
+        if (thought != "") {
+            state["reasoningParts"].append(thought);
+            events.append({"type": "thinking", "text": thought});
+        }
+
+        let piece = nexora_stringify_content(delta.get("content", nil));
+        if (piece != "") {
+            state["textParts"].append(piece);
+            events.append({"type": "text", "text": piece});
+        }
+        __nexora_stream_merge_tool_calls(state, delta.get("tool_calls", nil));
+    }
+
+    let finish = choice.get("finish_reason", nil);
+    if (type(finish) == "string" and finish != "") {
+        state["finishReason"] = finish;
+        events.append({"type": "finish", "reason": finish});
+    }
+    return events;
+}
+
+// 按 index 合并工具调用片段。片段可能只带 arguments，也可能只带 id/name，
+// 所以每次都取出旧条目、叠加、再写回（不依赖数组元素是引用）。
+func __nexora_stream_merge_tool_calls(state: dict, calls) {
+    if (type(calls) != "Array") return;
+    let merged = state.get("toolCalls", []);
+    if (type(merged) != "Array") merged = [];
+
+    for (calls) [call] {
+        if (type(call) != "dict") continue;
+        let slot = call.get("index", nil);
+        if (type(slot) != "int") slot = merged.length();
+        if (slot < 0) continue;
+        for (merged.length() <= slot) {
+            merged.append({"id": "", "name": "", "argumentParts": []});
+        }
+
+        let entry = {"id": "", "name": "", "argumentParts": []};
+        let previous = merged[slot];
+        if (type(previous) == "dict") {
+            entry["id"] = str(previous.get("id", ""));
+            entry["name"] = str(previous.get("name", ""));
+            let previousParts = previous.get("argumentParts", []);
+            if (type(previousParts) == "Array") entry["argumentParts"] = previousParts;
+        }
+
+        let callId = call.get("id", nil);
+        if (type(callId) == "string" and callId != "") entry["id"] = callId;
+
+        let callFunction = call.get("function", nil);
+        if (type(callFunction) == "dict") {
+            let callName = callFunction.get("name", nil);
+            if (type(callName) == "string" and callName != "") {
+                // 名字正常只来一次；个别服务端会切片，切片就拼起来。
+                if (entry["name"] == "") entry["name"] = callName;
+                else if (entry["name"] != callName) entry["name"] = entry["name"] + callName;
+            }
+            let fragment = callFunction.get("arguments", nil);
+            if (type(fragment) == "string") {
+                entry["argumentParts"].append(fragment);
+            }
+        }
+        merged.set(slot, entry);
+    }
+    state["toolCalls"] = merged;
+}
+
+// 收敛成一条标准 assistant 消息；没有工具调用时不带 tool_calls 字段。
+func nexora_chat_stream_message(state: dict) {
+    let message = {"role": "assistant",
+        "content": string_join(state.get("textParts", []))};
+    let merged = state.get("toolCalls", []);
+    if (type(merged) != "Array") return message;
+    if (merged.length() == 0) return message;
+
+    let calls: Array = [];
+    for (merged) [entry] {
+        if (type(entry) != "dict") continue;
+        let name = str(entry.get("name", ""));
+        if (name == "") continue;
+        let callId = str(entry.get("id", ""));
+        if (callId == "") callId = "call_" + str(calls.length());
+        let arguments = string_join(entry.get("argumentParts", []));
+        if (arguments == "") arguments = "{}";
+        calls.append({"id": callId, "type": "function",
+            "function": {"name": name, "arguments": arguments}});
+    }
+    if (calls.length() == 0) return message;
+    message["tool_calls"] = calls;
+    return message;
+}
+
+// 把消息里的工具调用拆成执行请求。参数解析失败不中断循环：把原文交给工具，
+// 让它自己报错，比在循环里吞掉一次调用更容易排查。
+func nexora_chat_stream_tool_requests(message) -> Array {
+    let requests: Array = [];
+    if (type(message) != "dict") return requests;
+    let calls = message.get("tool_calls", nil);
+    if (type(calls) != "Array") return requests;
+
+    for (calls) [call] {
+        if (type(call) != "dict") continue;
+        let callFunction = call.get("function", nil);
+        if (type(callFunction) != "dict") continue;
+        let raw = str(callFunction.get("arguments", "{}"));
+        let parsed = nil;
+        try {
+            parsed = JSON.parse(raw);
+        } catch (&error) {
+            parsed = {"parse_error": str(error), "raw": raw};
+        }
+        requests.append({
+            "id": str(call.get("id", "")),
+            "name": str(callFunction.get("name", "")),
+            "arguments": parsed,
+            "rawArguments": raw
+        });
+    }
+    return requests;
+}
+
+// 工具结果回填成 OpenAI 的 tool 消息。
+func nexora_tool_result_message(callId: string, content: string) {
+    return {"role": "tool", "tool_call_id": callId, "content": content};
+}

@@ -20,7 +20,6 @@
                 "${file}",
                 "${workspaceFolder}\\ZeusRuntimeLib\\ZeusGCABI.cpp",
                 "${workspaceFolder}\\ZeusRuntimeLib\\ZeusThreadABI.cpp",
-                "${workspaceFolder}\\ZeusRuntimeLib\\ZeusSocketABI.cpp",
                 "${workspaceFolder}\\ZeusRuntimeLib\\ZeusRuntimeDebug.cpp",
                 "/link",
                 "/LTCG"
@@ -55,7 +54,6 @@
                 "${file}",
                 "${workspaceFolder}\\ZeusRuntimeLib\\ZeusGCABI.cpp",
                 "${workspaceFolder}\\ZeusRuntimeLib\\ZeusThreadABI.cpp",
-                "${workspaceFolder}\\ZeusRuntimeLib\\ZeusSocketABI.cpp",
                 "${workspaceFolder}\\ZeusRuntimeLib\\ZeusRuntimeDebug.cpp"
             ],
             "options": {

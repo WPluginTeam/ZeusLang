@@ -1,0 +1,93 @@
+import zeus.ctypes [&ctypes];
+@native decl NativeByte = ctypes.INT8;
+
+var tooLarge: int = 128;
+var tooSmall: int = -129;
+var caughtGlobals = 0;
+
+try {
+    var rejectedGlobal: NativeByte = tooSmall;
+} catch (&error) {
+    caughtGlobals = caughtGlobals + 1;
+}
+
+var stableGlobal: NativeByte = 127;
+try {
+    stableGlobal = tooLarge;
+} catch (&error) {
+    caughtGlobals = caughtGlobals + 1;
+}
+if (caughtGlobals != 2 or stableGlobal != 127) {
+    throw "native global validation did not preserve its stored value";
+}
+
+func takeNativeByte(value: NativeByte) -> int {
+    return value;
+}
+
+func returnNativeByte() -> NativeByte {
+    return tooLarge;
+}
+
+func defaultNativeByte(value: NativeByte = tooLarge) -> int {
+    return value;
+}
+
+func checkCallerEnvironment() -> int {
+    let sentinel: int = 913;
+    let caught: int = 0;
+    let stable: NativeByte = 127;
+
+    if (takeNativeByte(127) != 127) {
+        throw "valid native parameter was rejected";
+    }
+
+    try {
+        let rejected: NativeByte = tooSmall;
+    } catch (&error) {
+        caught = caught + 1;
+    }
+
+    try {
+        stable = tooLarge;
+    } catch (&error) {
+        caught = caught + 1;
+    }
+
+    try {
+        takeNativeByte(tooLarge);
+    } catch (&error) {
+        caught = caught + 1;
+    }
+
+    try {
+        takeNativeByte(value = tooSmall);
+    } catch (&error) {
+        caught = caught + 1;
+    }
+
+    try {
+        returnNativeByte();
+    } catch (&error) {
+        caught = caught + 1;
+    }
+
+    try {
+        defaultNativeByte();
+    } catch (&error) {
+        caught = caught + 1;
+    }
+
+    if (caught != 6 or sentinel != 913 or stable != 127) {
+        throw "native validation damaged the caller environment";
+    }
+    if (takeNativeByte(19) != 19) {
+        throw "native call failed after handling a validation error";
+    }
+    return caught;
+}
+
+if (checkCallerEnvironment() != 6) {
+    throw "native exception checks did not complete";
+}
+print("NATIVE_VM_EXCEPTION_PASS");

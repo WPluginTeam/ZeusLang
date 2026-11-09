@@ -1,0 +1,34 @@
+// A raw bytes range has to survive a dynamic method boundary: the adapter
+// that converts boxed arguments into the native ABI of the callee has to know
+// that a &bytes is a {pointer, length} pair and not a pointer.
+using original;
+import zeus.byte;
+
+class Reader {
+    using &this;
+    let byteLength: int = 0;
+
+    func init(length: int) {
+        this.byteLength = length;
+    }
+
+    func first(range: &bytes) -> int {
+        return range[0];
+    }
+
+    func sum(range: &bytes) -> int {
+        let total = 0;
+        for (0..this.byteLength) [const &i] {
+            total = total + range[i];
+        }
+        return total;
+    }
+}
+
+let reader = new Reader(5);
+let data = bytes("hello");
+let address = data.dataAddress();
+let range = @faddr(address, 5) -> &bytes;
+if (reader.first(range) != 104) throw "raw bytes range across a dynamic call";
+if (reader.sum(range) != 532) throw "raw bytes range scan across a dynamic call";
+print("RAW_BYTES_RANGE_PARAM_PASS");

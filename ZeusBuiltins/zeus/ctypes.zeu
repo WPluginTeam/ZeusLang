@@ -1,0 +1,495 @@
+// zeus.ctypes - raw native memory, struct layout and Win32 string encoding.
+//
+// Everything here is built on zeus.mem and @faddr: a struct is a block of
+// native memory whose fields are placed at documented offsets, and an argument
+// is the address of that block. No language or ABI feature is required, so
+// this stays usable from both the interpreter and a compiled binary.
+//
+// Field offsets are the caller's knowledge, not this module's: Win32 documents
+// each structure's layout, and Layout only keeps those numbers named and
+// checked against the size that gets allocated.
+
+// Stable compiler native type IDs. @native decl resolves these at compile time.
+var const DOUBLE = 1;
+var const LONGLONG = 2;
+var const INT32 = 3;
+var const INT8 = 4;
+var const INTEGER = 5;
+var const BOOL = 6;
+var const PTR = 7;
+var const STRING = 8;
+var const BYTES = 9;
+var const RAW_BYTES_RANGE = 10;
+var const FLOAT = 11;
+var const INT16 = 12;
+var const UINT8 = 13;
+var const UINT16 = 14;
+var const UINT32 = 15;
+var const UINT64 = 16;
+
+import zeus.mem;
+import zeus.byte;
+import zeus.string;
+
+// The platform's own block move. @faddr deliberately refuses addresses the VM
+// did not hand out, which is what makes it safe, and that is also why it cannot
+// reach memory a native call owns -- a resolver's answer, a library's output
+// block, a mapped file. RtlMoveMemory is the move the platform already
+// performs, so no runtime code has to be added to make foreign memory
+// readable.
+using windows {
+    @native("RtlMoveMemory", from="ntdll")
+    decl func platformMove(destination: ptr, source: ptr, count: int);
+
+    @native("memset", from="ucrtbase")
+    decl func platformZero(destination: ptr, value: int32, count: int);
+}
+
+using posix {
+    @native("memmove", from="c")
+    decl func platformMove(destination: ptr, source: ptr, count: int);
+
+    @native("memset", from="c")
+    decl func platformZero(destination: ptr, value: int32, count: int);
+}
+
+// Reads a NUL-terminated C string from raw memory.
+func readCString(address: int, capBytes: int = 1024) -> string {
+    if (address == 0 || capBytes <= 0) return "";
+    let scratch = new Buffer(capBytes);
+    copyBytes(scratch.address, address, capBytes);
+    let s = scratch.readCString(0, capBytes);
+    scratch.release();
+    return s;
+}
+
+// Copies count octets from one address to another, whatever allocated them.
+func copyBytes(destination: int, source: int, count: int) {
+    if (count <= 0) return;
+    if (destination == 0 || source == 0) {
+        throw new Exception("ctypes copy needs both addresses");
+    }
+    platformMove(destination, source, count);
+}
+
+// Reads a pointer sized value out of a block the VM does not own.
+func readPointer(block: int, offset: int) -> int {
+    let scratch = new Buffer(8);
+    copyBytes(scratch.address, block + offset, 8);
+    let value = scratch.pointer(0);
+    scratch.release();
+    return value;
+}
+
+// Layout keeps the offset of each named field so a caller declares a structure
+// once instead of scattering bare numbers across call sites.
+class Layout {
+    using &this;
+
+    var _names = [];
+    var _offsets = [];
+    var _widths = [];
+    var size = 0;
+
+    // Declares a field at a fixed offset. The size grows to cover any field
+    // that reaches past the end, so declaring fields in any order still yields
+    // a block large enough for all of them.
+    func field(name: string, offset: int, width: int) -> &Layout {
+        if (name.length() == 0) {
+            throw new Exception("ctypes field name cannot be empty");
+        }
+        if (offset < 0 || width <= 0 ||
+            offset > 9223372036854775807 - width) {
+            throw new Exception("ctypes field offset and width must be valid");
+        }
+        if (this.contains(name)) {
+            throw new Exception("ctypes field is already declared: " + name);
+        }
+        this._names.append(name);
+        this._offsets.append(offset);
+        this._widths.append(width);
+        let end = offset + width;
+        if (end > this.size) this.size = end;
+        return this;
+    }
+
+    func offsetOf(name: string) -> int {
+        let count = this._names.length();
+        for (0..count) [const &index] {
+            if (this._names[index] == name) return this._offsets[index];
+        }
+        return -1;
+    }
+
+    func contains(name: string) -> bool {
+        return this.offsetOf(name) >= 0;
+    }
+
+    func fieldCount() -> int {
+        return this._names.length();
+    }
+}
+
+// Buffer owns one allocation and hands out typed views of it.
+class Buffer {
+    using &this;
+
+
+    // 引用语义：本类持有原生资源或共享表项。值语义下「读字段」就会复制一份，
+    // 副本析构时 [~] 会把同一个句柄释放掉（或把状态写在快照上）。
+    func operator[@=]() -> &Buffer {
+        return this;
+    }
+
+    var address: int = 0;
+    var size = 0;
+
+    func init(byteCount: int) {
+        if (byteCount < 0) {
+            throw new Exception("ctypes buffer size cannot be negative");
+        }
+        this.size = byteCount;
+        if (byteCount == 0) {
+            this.address = 0;
+            return;
+        }
+        this.address = malloc(byteCount);
+        if (this.address == 0) {
+            this.size = 0;
+            throw new Exception("ctypes buffer allocation failed");
+        }
+        this.zero();
+    }
+
+    func zero() {
+        if (this.address == 0) return;
+        platformZero(this.address, 0, this.size);
+    }
+
+    func release() {
+        if (this.address == 0) return;
+        free(this.address);
+        this.address = 0;
+    }
+
+    // Gives up the allocation without freeing it and returns its address, for a
+    // block that has to outlive this object.
+    //
+    // A Buffer kept in a field does not keep the memory alive: the object that
+    // allocated it still owns it and frees it in its destructor, which leaves
+    // the field pointing at freed memory. Anything whose lifetime has to extend
+    // past the function that built it must detach first, and free the returned
+    // address itself.
+    func detach() -> int {
+        let address = this.address;
+        this.address = 0;
+        return address;
+    }
+
+    // Explicit release() remains available for deterministic cleanup. During
+    // VM exit, imported package globals outlive root-owned object destructors.
+    func operator[~]() {
+        if (this.address == 0) return;
+        free(this.address);
+        this.address = 0;
+    }
+
+    func check(offset: int, width: int) {
+        if (this.address == 0) {
+            throw new Exception("ctypes buffer is already released");
+        }
+        if (offset < 0 || width <= 0 || offset > this.size ||
+            width > this.size - offset) {
+            throw new Exception(
+                "ctypes access at offset " + str(offset) +
+                " width " + str(width) +
+                " is outside the " + str(this.size) + " byte block");
+        }
+    }
+
+    func i8(offset: int) -> int {
+        this.check(offset, 1);
+        return @faddr(this.address + offset, 1) -> int;
+    }
+
+    // Unsigned companions, for reading raw octets: i8 is signed, so a byte
+    // above 127 would come back negative.
+    func u8(offset: int) -> int {
+        this.check(offset, 1);
+        let value = @faddr(this.address + offset, 1) -> int;
+        if (value < 0) {
+            return value + 256;
+        }
+        return value;
+    }
+
+    func setI8(offset: int, value: int) {
+        this.check(offset, 1);
+        @faddr(this.address + offset, 1) -> int = value;
+    }
+
+    func i16(offset: int) -> int {
+        this.check(offset, 2);
+        return @faddr(this.address + offset, 2) -> int;
+    }
+
+    func setI16(offset: int, value: int) {
+        this.check(offset, 2);
+        @faddr(this.address + offset, 2) -> int = value;
+    }
+
+    func i32(offset: int) -> int {
+        this.check(offset, 4);
+        return @faddr(this.address + offset, 4) -> int;
+    }
+
+    func setI32(offset: int, value: int) {
+        this.check(offset, 4);
+        @faddr(this.address + offset, 4) -> int = value;
+    }
+
+    func i64(offset: int) -> int {
+        this.check(offset, 8);
+        return @faddr(this.address + offset, 8) -> int;
+    }
+
+    func setI64(offset: int, value: int) {
+        this.check(offset, 8);
+        @faddr(this.address + offset, 8) -> int = value;
+    }
+
+    // A pointer field is the same eight bytes as an i64 on every target Zeus
+    // supports; the separate name keeps declarations readable.
+    func pointer(offset: int) -> int {
+        return this.i64(offset);
+    }
+
+    func setPointer(offset: int, value: int) {
+        this.setI64(offset, value);
+    }
+
+    // Writes UTF-16LE with a NUL terminator and returns the number of bytes
+    // consumed, terminator included. This is what the W-suffixed Win32 entry
+    // points expect for both strings and command lines.
+    func utf16(offset: int, text: string) -> int {
+        let required = wideByteLength(text);
+        this.check(offset, required);
+        return writeWide(this.address + offset, text);
+    }
+
+    // Writes UTF-8 after checking the complete destination range. The string's
+    // data address is a native pointer in AOT, so copy its bytes as one block.
+    func writeCString(offset: int, text: string) -> int {
+        let length = text.length();
+        this.check(offset, length + 1);
+        if (length > 0) {
+            platformMove(this.address + offset, text.dataAddress(), length);
+        }
+        platformZero(this.address + offset + length, 0, 1);
+        return length + 1;
+    }
+
+    // Writes UTF-8 with a NUL terminator for the A-suffixed entry points.
+    func utf8(offset: int, text: string) -> int {
+        return this.writeCString(offset, text);
+    }
+
+    func readCString(offset: int, capBytes: int = 1024) -> string {
+        this.check(offset, 1);
+        let octets = [];
+        let limit = this.size - offset;
+        if (limit > capBytes) limit = capBytes;
+        for (0..limit) [const &i] {
+            let b = this.u8(offset + i);
+            if (b == 0) break;
+            octets.append(b);
+        }
+        return bytes(octets).decode();
+    }
+
+    func writeBytes(offset: int, data: bytes) -> int {
+        if (this.address == 0) {
+            throw new Exception("ctypes buffer is already released");
+        }
+        if (offset < 0 || offset > this.size) {
+            throw new Exception("ctypes byte write is outside the block");
+        }
+        let byteCount = data.length();
+        if (byteCount > this.size - offset) {
+            throw new Exception("ctypes byte write is outside the block");
+        }
+        if (byteCount > 0) {
+            memcpy(data.dataAddress(), byteCount, this.address + offset);
+        }
+        return byteCount;
+    }
+}
+
+// Turns a list of octets into a bytes value, and decodes one back to text.
+// Both are kept separate because the runtime currently resolves a bytes method
+// only inside a guarded region.
+func bytesFromValues(values: list) -> bytes {
+    return bytes(values);
+}
+
+func decodeBytes(data: bytes) -> string {
+    try {
+        return data.decode();
+    } catch (&e) {
+        throw new Exception("ctypes bytes are not valid UTF-8");
+    }
+}
+
+// Decodes one UTF-8 code point starting at source + index and returns the
+// number of bytes it occupied. Continuation bytes are handled by the caller.
+func utf8SequenceLength(firstByte: int) -> int {
+    if (firstByte < 128) return 1;
+    if (firstByte < 224) return 2;
+    if (firstByte < 240) return 3;
+    if (firstByte < 248) return 4;
+    return 1;
+}
+
+// Decodes the code point at source + index using the byte count in length.
+func utf8CodePoint(source: int, index: int, length: int) -> int {
+    let firstByte = @faddr(source + index, 1) -> int;
+    if (length == 1) return firstByte;
+    if (length == 2) {
+        return (firstByte - 192) * 64 +
+            (@faddr(source + index + 1, 1) -> int - 128);
+    }
+    if (length == 3) {
+        return (firstByte - 224) * 4096 +
+            (@faddr(source + index + 1, 1) -> int - 128) * 64 +
+            (@faddr(source + index + 2, 1) -> int - 128);
+    }
+    return (firstByte - 240) * 262144 +
+        (@faddr(source + index + 1, 1) -> int - 128) * 4096 +
+        (@faddr(source + index + 2, 1) -> int - 128) * 64 +
+        (@faddr(source + index + 3, 1) -> int - 128);
+}
+
+// Computes the full UTF-16LE size before a buffer is modified. This lets the
+// Buffer reject an undersized destination without partially writing into it.
+func wideByteLength(text: string) -> int {
+    let source = text.dataAddress();
+    let length = text.length();
+    let written = 0;
+    let index = 0;
+    for (true) {
+        if (index >= length) break;
+        let sequence = utf8SequenceLength(@faddr(source + index, 1) -> int);
+        let codePoint = utf8CodePoint(source, index, sequence);
+        if (codePoint < 65536) {
+            written = written + 2;
+        } else {
+            written = written + 4;
+        }
+        index = index + sequence;
+    }
+    return written + 2;
+}
+
+// Writes text as UTF-16LE plus a NUL terminator. Code points above the basic
+// multilingual plane become a surrogate pair, which is what a UTF-16 consumer
+// expects to read back.
+func writeWide(address: int, text: string) -> int {
+    let source = text.dataAddress();
+    let length = text.length();
+    let written = 0;
+    let index = 0;
+    for (true) {
+        if (index >= length) break;
+        let sequence = utf8SequenceLength(@faddr(source + index, 1) -> int);
+        let codePoint = utf8CodePoint(source, index, sequence);
+        index = index + sequence;
+
+        if (codePoint < 65536) {
+            @faddr(address + written, 2) -> int = codePoint;
+            written = written + 2;
+        } else {
+            let shifted = codePoint - 65536;
+            @faddr(address + written, 2) -> int = 55296 + shifted / 1024;
+            @faddr(address + written + 2, 2) -> int = 56320 + shifted % 1024;
+            written = written + 4;
+        }
+    }
+    @faddr(address + written, 2) -> int = 0;
+    return written + 2;
+}
+
+// Encodes one code point as UTF-8 octets, the inverse of utf8CodePoint(). The
+// caller only passes list-oriented storage, so text building stays decoupled
+// from where the code point came from.
+func appendCodePoint(octets: list, codePoint: int) {
+    if (codePoint < 128) {
+        octets.append(codePoint);
+        return;
+    }
+    if (codePoint < 2048) {
+        octets.append(192 + int(codePoint / 64));
+        octets.append(128 + codePoint % 64);
+        return;
+    }
+    if (codePoint < 65536) {
+        octets.append(224 + int(codePoint / 4096));
+        octets.append(128 + int(codePoint / 64) % 64);
+        octets.append(128 + codePoint % 64);
+        return;
+    }
+    octets.append(240 + int(codePoint / 262144));
+    octets.append(128 + int(codePoint / 4096) % 64);
+    octets.append(128 + int(codePoint / 64) % 64);
+    octets.append(128 + codePoint % 64);
+}
+
+// Reads the NUL-terminated UTF-16LE string the platform wrote into our memory,
+// the counterpart of writeWide(). capUnits bounds how far a missing terminator
+// can wander; surrogates decode to one code point, and a lone or reversed half
+// degrades to U+FFFD instead of mis-shaping the following units.
+func readWide(address: int, capUnits: int) -> string {
+    if (address == 0 || capUnits <= 0) {
+        return "";
+    }
+    let octets = [];
+    let offset = 0;
+    let units = 0;
+    for (true) {
+        if (units >= capUnits) break;
+        let unit = @faddr(address + offset, 2) -> int;
+        if (unit < 0) {
+            unit = unit + 65536;
+        }
+        if (unit == 0) break;
+        units = units + 1;
+        let codePoint = 0;
+        if (unit >= 55296 and unit < 56320) {
+            if (units < capUnits) {
+                let low = @faddr(address + offset + 2, 2) -> int;
+                if (low < 0) {
+                    low = low + 65536;
+                }
+                if (low >= 56320 and low < 57344) {
+                    units = units + 1;
+                    offset = offset + 4;
+                    codePoint = (unit - 55296) * 1024 + (low - 56320) + 65536;
+                } else {
+                    offset = offset + 2;
+                    codePoint = 65533;
+                }
+            } else {
+                offset = offset + 2;
+                codePoint = 65533;
+            }
+        } else {
+            offset = offset + 2;
+            if (unit >= 56320 and unit < 57344) {
+                codePoint = 65533;
+            } else {
+                codePoint = unit;
+            }
+        }
+        appendCodePoint(octets, codePoint);
+    }
+    return bytes(octets).decode();
+}

@@ -1,0 +1,953 @@
+// requests.zeu - synchronous HTTP/1.1 client inspired by Python requests.
+//
+// Chunked bodies, nonblocking socket I/O, redirects, and cookies are not
+// included. HTTPS goes through zeus.ssl, which folds the transport into a
+// schannel stream before the request is written.
+
+import zeus.socket;
+import zeus.ssl;
+import zeus.url;
+import zeus.byte;
+import zeus.json;
+import zeus.string;
+import zeus.exception;
+import zeus.dict;
+
+let __REQUESTS_HEADER_LIMIT: int = 65536;
+let __REQUESTS_CHUNK_SIZE: int = 4096;
+
+class HTTPURL {
+    using &this;
+    let scheme: string = "http";
+    let host: string = "";
+    let port: int = 80;
+    let authority: string = "";
+    let target: string = "/";
+    let fullURL: string = "";
+}
+
+class Response {
+    using &this;
+    let status_code: int = 0;
+    let reason: string = "";
+    let headers: Dict;
+    let content: bytes = b"";
+    let url: string = "";
+
+    func init() {
+        this.headers = new Dict();
+    }
+
+    func text(encoding: string="utf-8") -> string {
+        return this.content.decode(encoding);
+    }
+
+    func json() {
+        let parser: JSONParser = new JSONParser(this.text());
+        return parser.parse();
+    }
+
+    func getHeader(name: string, defaultValue=nil) {
+        let key: string = name.lower();
+        if (type(this.headers) == "Dict") {
+            if (!this.headers.hasKey(key)) return defaultValue;
+            return this.headers.get(key);
+        }
+        return dict_get(this.headers, key, defaultValue);
+    }
+
+    func ok() -> bool {
+        return this.status_code < 400;
+    }
+
+    func raise_for_status() {
+        if (this.status_code >= 400) {
+            throw new Exception(
+                "HTTP " + str(this.status_code) + " " + this.reason + " for " + this.url);
+        }
+        return this;
+    }
+}
+
+func __requests_trim(value: string) -> string {
+    let start: int = 0;
+    let end: int = value.length();
+    for (0..value.length()) [const &i] {
+        let character: string = value.slice(i, i + 1);
+        if (i == start and (character == " " or character == "\t")) {
+            start = start + 1;
+        } else {
+            break;
+        }
+    }
+    for (0..value.length()) [const &offset] {
+        let index: int = value.length() - 1 - offset;
+        if (index >= start and
+            (value.slice(index, index + 1) == " " or value.slice(index, index + 1) == "\t")) {
+            end = index;
+        } else {
+            break;
+        }
+    }
+    return value.slice(start, end);
+}
+
+func __requests_parse_port(value: string) -> int {
+    if (value.length() == 0) throw new Exception("requests: URL port is empty");
+    let result: int = 0;
+    let digits: string = "0123456789";
+    for (0..value.length()) [const &i] {
+        let digit: int = digits.index(value.slice(i, i + 1));
+        if (digit < 0) throw new Exception("requests: URL port must be numeric");
+        result = result * 10 + digit;
+        if (result > 65535) throw new Exception("requests: URL port is out of range");
+    }
+    if (result == 0) throw new Exception("requests: URL port must be between 1 and 65535");
+    return result;
+}
+
+func __requests_query_string(params) -> string {
+    if (type(params) == "QueryParams") return params.toString();
+
+    let query: QueryParams = new QueryParams();
+    for (params) [&key: &value] {
+        if (value != nil) query.append(str(key), str(value));
+    }
+    return query.toString();
+}
+
+func __requests_url(url: string, params: dict? = nil) -> HTTPURL {
+    let parts: URLParts = URL.parse(url);
+    if (parts.scheme != "http" and parts.scheme != "https") {
+        throw new Exception(
+            "requests: URL scheme must be http:// or https://, got " + parts.scheme);
+    }
+    if (!parts.hasAuthority or parts.authority.length() == 0) {
+        throw new Exception("requests: URL must include a host");
+    }
+    if (parts.authority.index("@") >= 0) {
+        throw new Exception("requests: URL user information is not supported");
+    }
+
+    let host: string = parts.authority;
+    let port: int = 80;
+    if (parts.scheme == "https") port = 443;
+    let firstColon: int = parts.authority.index(":");
+    let lastColon: int = parts.authority.rindex(":");
+    if (firstColon >= 0) {
+        if (firstColon != lastColon) {
+            throw new Exception("requests: IPv6 URL authorities are not supported");
+        }
+        host = parts.authority.slice(0, firstColon);
+        port = __requests_parse_port(
+            parts.authority.slice(firstColon + 1, parts.authority.length()));
+    }
+    if (host.length() == 0) throw new Exception("requests: URL host is empty");
+
+    let target: string = parts.path;
+    if (target.length() == 0) target = "/";
+    if (!target.startswith("/")) {
+        throw new Exception("requests: URL path must use origin form");
+    }
+
+    let query: string = parts.query;
+    if (params != nil) {
+        let extra: string = __requests_query_string(params);
+        if (extra.length() > 0) {
+            if (query.length() > 0) query = query + "&" + extra;
+            else query = extra;
+        }
+    }
+    if (parts.hasQuery or query.length() > 0) target = target + "?" + query;
+
+    let result: HTTPURL = new HTTPURL();
+    result.scheme = parts.scheme;
+    result.host = host;
+    result.port = port;
+    result.authority = parts.authority;
+    result.target = target;
+    result.fullURL = parts.scheme + "://" + parts.authority + target;
+    return result;
+}
+
+func __requests_has_header(headers: dict?, name: string) -> bool {
+    if (headers == nil) return false;
+    let expected: string = name.lower();
+    for (headers) [&key: &value] {
+        if (str(key).lower() == expected) return true;
+    }
+    return false;
+}
+
+func __requests_valid_header_name(name: string) -> bool {
+    if (name.length() == 0) return false;
+    let allowed: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'*+-.^_`|~";
+    for (0..name.length()) [const &i] {
+        if (allowed.index(name.slice(i, i + 1)) < 0) return false;
+    }
+    return true;
+}
+
+func __requests_header_text(headers: dict?, endpoint: HTTPURL, payload: bytes, hasJson: bool) -> string {
+    let output: string = "";
+    if (!__requests_has_header(headers, "host")) {
+        output = output + "Host: " + endpoint.authority + "\r\n";
+    }
+    if (!__requests_has_header(headers, "user-agent")) {
+        output = output + "User-Agent: Zeus-requests/0.1\r\n";
+    }
+    if (!__requests_has_header(headers, "accept")) {
+        output = output + "Accept: */*\r\n";
+    }
+    if (hasJson and !__requests_has_header(headers, "content-type")) {
+        output = output + "Content-Type: application/json\r\n";
+    }
+    if (payload.length() > 0) {
+        output = output + "Content-Length: " + str(payload.length()) + "\r\n";
+    }
+
+    if (headers != nil) {
+        for (headers) [&key: &value] {
+            let name: string = str(key);
+            let lowerName: string = name.lower();
+            let text: string = str(value);
+            if (!__requests_valid_header_name(name)) {
+                throw new Exception("requests: invalid HTTP header name");
+            }
+            if (text.index("\r") >= 0 or text.index("\n") >= 0) {
+                throw new Exception("requests: HTTP header value contains a line break");
+            }
+            if (lowerName == "content-length" or lowerName == "transfer-encoding") {
+                throw new Exception("requests: Content-Length and Transfer-Encoding are managed by the client");
+            }
+            if (lowerName == "connection" and text.lower() != "close") {
+                throw new Exception("requests: this client requires Connection: close");
+            }
+            output = output + name + ": " + text + "\r\n";
+        }
+    }
+    if (!__requests_has_header(headers, "connection")) {
+        output = output + "Connection: close\r\n";
+    }
+    return output;
+}
+
+func __requests_read_more(socket, buffer: ByteBuffer) -> bool {
+    let chunk: bytes = socket.recv(__REQUESTS_CHUNK_SIZE);
+    if (chunk.length() == 0) return false;
+    buffer.append(chunk);
+    return true;
+}
+
+func __requests_read_header_end(socket, buffer: ByteBuffer) -> int {
+    let headerEnd: int = buffer.indexOf(bytes("\r\n\r\n"));
+    for (headerEnd < 0) {
+        if (buffer.length() > __REQUESTS_HEADER_LIMIT) {
+            throw new Exception("requests: response headers exceed 65536 bytes");
+        }
+        if (!__requests_read_more(socket, buffer)) {
+            throw new Exception("requests: connection closed before response headers arrived");
+        }
+        headerEnd = buffer.indexOf(bytes("\r\n\r\n"));
+    }
+    if (headerEnd > __REQUESTS_HEADER_LIMIT) {
+        throw new Exception("requests: response headers exceed 65536 bytes");
+    }
+    return headerEnd;
+}
+
+func __requests_parse_status_line(line: string, response: Response) {
+    let firstSpace: int = line.index(" ");
+    if (firstSpace <= 0) throw new Exception("requests: invalid HTTP status line");
+    let version: string = line.slice(0, firstSpace);
+    if (!version.startswith("HTTP/1.")) {
+        throw new Exception("requests: unsupported HTTP response version");
+    }
+    let remainder: string = __requests_trim(line.slice(firstSpace + 1, line.length()));
+    let secondSpace: int = remainder.index(" ");
+    let statusText: string = remainder;
+    let reason: string = "";
+    if (secondSpace >= 0) {
+        statusText = remainder.slice(0, secondSpace);
+        reason = remainder.slice(secondSpace + 1, remainder.length());
+    }
+    let status: int = __requests_parse_port(statusText);
+    if (status < 100 or status > 599) throw new Exception("requests: invalid HTTP status code");
+    response.status_code = status;
+    response.reason = reason;
+}
+
+func __requests_parse_header_block(headerText: string) -> Response {
+    let lines: list = headerText.split("\r\n");
+    if (lines.length() == 0) throw new Exception("requests: empty HTTP response");
+    let response: Response = new Response();
+    __requests_parse_status_line(lines[0], response);
+
+    for (1..lines.length()) [const &i] {
+        let line: string = lines[i];
+        if (line.length() > 0) {
+            let colon: int = line.index(":");
+            if (colon <= 0) throw new Exception("requests: malformed HTTP response header");
+            let name: string = __requests_trim(line.slice(0, colon));
+            let value: string = __requests_trim(line.slice(colon + 1, line.length()));
+            if (!__requests_valid_header_name(name)) {
+                throw new Exception("requests: invalid HTTP response header name");
+            }
+            if (value.index("\r") >= 0 or value.index("\n") >= 0) {
+                throw new Exception("requests: invalid HTTP response header value");
+            }
+            let key: string = name.lower();
+            if (response.headers.hasKey(key)) {
+                let previous: string = str(response.headers.get(key));
+                if (key == "content-length" and previous != value) {
+                    throw new Exception("requests: conflicting Content-Length response headers");
+                }
+                if (key != "content-length") {
+                    response.headers.set(key, previous + ", " + value);
+                }
+            } else {
+                response.headers.set(key, value);
+            }
+        }
+    }
+    return response;
+}
+
+func __requests_read_final_headers(socket, buffer: ByteBuffer) -> Response {
+    let informationalCount: int = 0;
+    for (true) {
+        let headerEnd: int = __requests_read_header_end(socket, buffer);
+        let headerText: string = buffer.slice(0, headerEnd).decode("utf-8");
+        buffer.consume(headerEnd + 4);
+        let response: Response = __requests_parse_header_block(headerText);
+        if (response.status_code >= 100 and response.status_code < 200 and
+            response.status_code != 101) {
+            informationalCount = informationalCount + 1;
+            if (informationalCount > 8) {
+                throw new Exception("requests: too many informational HTTP responses");
+            }
+        } else {
+            return response;
+        }
+    }
+    throw new Exception("requests: response parser exited without a final response");
+}
+
+func __requests_parse_content_length(value: string) -> int {
+    if (value.length() == 0) throw new Exception("requests: empty Content-Length response header");
+    let result: int = 0;
+    let digits: string = "0123456789";
+    for (0..value.length()) [const &i] {
+        let digit: int = digits.index(value.slice(i, i + 1));
+        if (digit < 0) throw new Exception("requests: invalid Content-Length response header");
+        if (result > 461168601842738790 or
+            (result == 461168601842738790 and digit > 3)) {
+            throw new Exception("requests: response body is too large");
+        }
+        result = result * 10 + digit;
+    }
+    return result;
+}
+
+func __requests_parse_chunk_size(line: string) -> int {
+    let extensionAt: int = line.index(";");
+    let sizeText: string = line;
+    if (extensionAt >= 0) sizeText = line.slice(0, extensionAt);
+    sizeText = __requests_trim(sizeText);
+    if (sizeText.length() == 0) throw new Exception("requests: empty HTTP chunk size");
+    let result: int = 0;
+    let digits: string = "0123456789abcdef";
+    let text: string = sizeText.lower();
+    for (0..text.length()) [const &i] {
+        let digit: int = digits.index(text.slice(i, i + 1));
+        if (digit < 0) throw new Exception("requests: invalid HTTP chunk size");
+        if (result > 461168601842738790) {
+            throw new Exception("requests: response body is too large");
+        }
+        result = result * 16 + digit;
+    }
+    return result;
+}
+
+func __requests_read_line(socket, buffer: ByteBuffer) -> string {
+    let lineEnd: int = buffer.indexOf(bytes("\r\n"));
+    for (lineEnd < 0) {
+        if (buffer.length() > __REQUESTS_HEADER_LIMIT) {
+            throw new Exception("requests: HTTP chunk line exceeds 65536 bytes");
+        }
+        if (!__requests_read_more(socket, buffer)) {
+            throw new Exception("requests: connection closed in HTTP chunk framing");
+        }
+        lineEnd = buffer.indexOf(bytes("\r\n"));
+    }
+    let line: string = buffer.slice(0, lineEnd).decode("utf-8");
+    buffer.consume(lineEnd + 2);
+    return line;
+}
+
+func __requests_read_exact(socket, buffer: ByteBuffer, size: int) -> bytes {
+    for (buffer.length() < size) {
+        let remaining: int = size - buffer.length();
+        let readSize: int = __REQUESTS_CHUNK_SIZE;
+        if (readSize > remaining) readSize = remaining;
+        let chunk: bytes = socket.recv(readSize);
+        if (chunk.length() == 0) {
+            throw new Exception("requests: connection closed before the response body was complete");
+        }
+        buffer.append(chunk);
+    }
+    let result: bytes = buffer.slice(0, size);
+    buffer.consume(size);
+    return result;
+}
+
+func __requests_read_content_length(socket, buffer: ByteBuffer, size: int) -> bytes {
+    return __requests_read_exact(socket, buffer, size);
+}
+
+func __requests_join_chunks(chunks: Array, start: int, end: int) -> bytes {
+    let count: int = end - start;
+    if (count <= 0) return b"";
+    if (count == 1) return chunks[start];
+    let middle: int = start + int(count / 2);
+    return __requests_join_chunks(chunks, start, middle) +
+        __requests_join_chunks(chunks, middle, end);
+}
+
+func __requests_read_chunked(socket, buffer: ByteBuffer) -> bytes {
+    let chunks: Array = [];
+    let trailerBytes: int = 0;
+    for (true) {
+        let chunkSize: int = __requests_parse_chunk_size(__requests_read_line(socket, buffer));
+        if (chunkSize == 0) {
+            for (true) {
+                let trailer: string = __requests_read_line(socket, buffer);
+                trailerBytes = trailerBytes + trailer.length() + 2;
+                if (trailerBytes > __REQUESTS_HEADER_LIMIT) {
+                    throw new Exception("requests: HTTP trailers exceed 65536 bytes");
+                }
+                if (trailer.length() == 0) break;
+            }
+            return __requests_join_chunks(chunks, 0, chunks.length());
+        }
+
+        let chunk: bytes = __requests_read_exact(socket, buffer, chunkSize);
+        chunks.append(chunk);
+        let delimiter: bytes = __requests_read_exact(socket, buffer, 2);
+        if (delimiter[0] != 13 or delimiter[1] != 10) {
+            throw new Exception("requests: invalid HTTP chunk delimiter");
+        }
+    }
+    throw new Exception("requests: chunked body parser exited without a terminal chunk");
+}
+
+func __requests_read_to_eof(socket, buffer: ByteBuffer) -> bytes {
+    let chunks: Array = [];
+    if (buffer.length() > 0) {
+        chunks.append(buffer.toBytes());
+        buffer.consume(buffer.length());
+    }
+    for (true) {
+        let chunk: bytes = socket.recv(__REQUESTS_CHUNK_SIZE);
+        if (chunk.length() == 0) break;
+        chunks.append(chunk);
+    }
+    return __requests_join_chunks(chunks, 0, chunks.length());
+}
+
+// A body without Content-Length or chunked framing ends when the server
+// closes the connection. A server that also advertises a persistent
+// connection expects follow-up requests and never keeps closing, so waiting
+// for the close would block forever. That server is contradicting the
+// close-delimited framing itself; fail fast instead of hanging.
+func __requests_can_read_to_eof(response: Response) -> bool {
+    let connection: string = response.getHeader("connection", "").lower();
+    return connection.index("keep-alive") < 0;
+}
+
+func __requests_read_body(method: string, response: Response, socket, buffer: ByteBuffer) -> bytes {
+    if (method == "HEAD" or
+        (response.status_code >= 100 and response.status_code < 200) or
+        response.status_code == 204 or response.status_code == 304) {
+        return b"";
+    }
+
+    let transferEncoding: string = response.getHeader("transfer-encoding", "");
+    let contentLength: string? = response.getHeader("content-length", nil);
+    if (transferEncoding.length() > 0 and contentLength != nil) {
+        throw new Exception("requests: response has both Transfer-Encoding and Content-Length");
+    }
+    if (transferEncoding.length() > 0) {
+        if (transferEncoding.lower() != "chunked") {
+            throw new Exception("requests: unsupported response Transfer-Encoding");
+        }
+        return __requests_read_chunked(socket, buffer);
+    }
+    if (contentLength != nil) {
+        return __requests_read_content_length(
+            socket, buffer, __requests_parse_content_length(str(contentLength)));
+    }
+    if (!__requests_can_read_to_eof(response)) {
+        throw new Exception(
+            "requests: response declares a persistent connection without " +
+            "Content-Length or chunked framing, so the body can never end " +
+            "while the connection stays open. This client requested " +
+            "Connection: close; the server ignores it. Pass a timeout " +
+            "argument to bound the wait, or contact a server that sends " +
+            "Content-Length, Transfer-Encoding: chunked, or Connection: close");
+    }
+    return __requests_read_to_eof(socket, buffer);
+}
+
+func __requests_timeout_millis(timeout) -> int {
+    if (timeout == nil) return -1;
+    let timeoutType: string = type(timeout);
+    when (timeoutType) {
+        "int", "float": {}
+        else: throw new Exception("requests: timeout must be a positive number of seconds or nil");
+    }
+    if (timeout <= 0) throw new Exception("requests: timeout must be greater than zero");
+    let rawMillis = timeout * 1000;
+    let result: int = int(rawMillis);
+    if (result < rawMillis) result = result + 1;
+    if (result > 2147483647) throw new Exception("requests: timeout is too large");
+    if (result < 1) result = 1;
+    return result;
+}
+
+// One exchange for both wire flavors: the caller tunes the wire first (the
+// transport carries the timeout, the stream carries the record frame), so the
+// helper only has to send, read the head, read the body, and close. Every
+// variable here is single-flavored, which keeps both the interpreter and the
+// ahead-of-time compiler from seeing one name carry two kinds of stream.
+func __requests_exchange(socket, verb: string, requestBytes: bytes, endpoint: HTTPURL, timeoutMillis: int) -> Response {
+    socket.sendAll(requestBytes);
+
+    let buffer: ByteBuffer = new ByteBuffer();
+    let response: Response = __requests_read_final_headers(socket, buffer);
+    response.url = endpoint.fullURL;
+    response.content = __requests_read_body(verb, response, socket, buffer);
+    socket.close();
+    return response;
+}
+
+func request(method: string, url: string, params: dict? = nil, headers: dict? = nil, json=nil,
+        timeout=nil, verify: bool? = nil, checkHostname: bool? = nil) -> Response {
+    let verb: string = method.upper();
+    when (verb) {
+        "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE": {}
+        else: throw new Exception("requests: method must be GET, HEAD, POST, PUT, PATCH, or DELETE");
+    }
+    let endpoint: HTTPURL = __requests_url(url, params);
+    let timeoutMillis: int = __requests_timeout_millis(timeout);
+    let payload: bytes = b"";
+    let hasJson: bool = json != nil;
+    if (hasJson) payload = bytes(__json_stringify(json));
+
+    let requestBytes: bytes = bytes(
+        verb + " " + endpoint.target + " HTTP/1.1\r\n" +
+        __requests_header_text(headers, endpoint, payload, hasJson) + "\r\n") + payload;
+
+    let transport: Socket = new Socket();
+    if (endpoint.scheme == "https") {
+        // The trust decisions live in one place: a caller passing verify=false
+        // takes over the whole certificate question, and the host check
+        // follows along unless it is pinned separately.
+        let context: SSLContext = new SSLContext(true, true);
+        if (verify == false) {
+            let checkName: bool = true;
+            if (checkHostname == false) checkName = false;
+            context = new SSLContext(false, checkName);
+        }
+        try {
+            // The wire is timed before the handshake starts, so a slow opening
+            // exchange fails like a slow request would.
+            if (timeoutMillis < 0) transport.connect(endpoint.host, endpoint.port);
+            else transport.connect(endpoint.host, endpoint.port, timeoutMillis);
+            transport.setTimeout(timeoutMillis);
+            // The handshake runs inside the wrap: what comes back is a stream,
+            // never the plain wire, and the wrap holds its own reference to it
+            // for the whole call.
+            let stream: SSLSocket = context.wrapSocket(transport, endpoint.host);
+            let response: Response = __requests_exchange(stream, verb, requestBytes, endpoint, timeoutMillis);
+            transport.close();
+            return response;
+        } catch (&error) {
+            transport.close();
+            throw error;
+        }
+    } else {
+        try {
+            if (timeoutMillis < 0) transport.connect(endpoint.host, endpoint.port);
+            else transport.connect(endpoint.host, endpoint.port, timeoutMillis);
+            transport.setTimeout(timeoutMillis);
+            let response: Response = __requests_exchange(transport, verb, requestBytes, endpoint, timeoutMillis);
+            return response;
+        } catch (&error) {
+            transport.close();
+            throw error;
+        }
+    }
+}
+
+func get(url: string, params: dict? = nil, headers: dict? = nil, json=nil, timeout=nil,
+        verify: bool? = nil, checkHostname: bool? = nil) -> Response {
+    return request("GET", url, params, headers, json, timeout, verify, checkHostname);
+}
+
+func head(url: string, params: dict? = nil, headers: dict? = nil, timeout=nil,
+        verify: bool? = nil, checkHostname: bool? = nil) -> Response {
+    return request("HEAD", url, params, headers, nil, timeout, verify, checkHostname);
+}
+
+func post(url: string, params: dict? = nil, headers: dict? = nil, json=nil, timeout=nil,
+        verify: bool? = nil, checkHostname: bool? = nil) -> Response {
+    return request("POST", url, params, headers, json, timeout, verify, checkHostname);
+}
+
+func put(url: string, params: dict? = nil, headers: dict? = nil, json=nil, timeout=nil,
+        verify: bool? = nil, checkHostname: bool? = nil) -> Response {
+    return request("PUT", url, params, headers, json, timeout, verify, checkHostname);
+}
+
+func patch(url: string, params: dict? = nil, headers: dict? = nil, json=nil, timeout=nil,
+        verify: bool? = nil, checkHostname: bool? = nil) -> Response {
+    return request("PATCH", url, params, headers, json, timeout, verify, checkHostname);
+}
+
+func deleteRequest(url: string, params: dict? = nil, headers: dict? = nil, json=nil, timeout=nil,
+        verify: bool? = nil, checkHostname: bool? = nil) -> Response {
+    return request("DELETE", url, params, headers, json, timeout, verify, checkHostname);
+}
+
+// ===== Streaming (SSE) support =====
+//
+// `stream()` performs the same exchange as `request()` but stops after the
+// response head and hands the caller a ResponseStream instead of a buffered
+// body. The caller pumps it with readLineSlice(), which returns one
+// de-framed line at a time:
+//
+//   - chunked bodies are de-chunked incrementally (chunk-size lines and
+//     trailers never leak to the caller);
+//   - content-length bodies stop after exactly that many bytes;
+//   - close-delimited bodies end when the peer closes (only allowed when the
+//     server advertised Connection: close, same rule as the buffered path);
+//   - 1xx/204/304/HEAD responses finish immediately.
+//
+// readLineSlice(timeoutMillis) returns nil when no line arrives within the
+// slice instead of throwing, so the caller can heartbeat or check its own
+// stop flag between slices — the same soft-timeout loop the long-lived
+// NexoraCoreClient uses. A nil return with finished == true means the body
+// is over; any other nil just means "try again". close() is required,
+// mirroring nexora_core_close: the socket stays open until then.
+//
+// Timeouts: `timeout` only bounds connect (and the per-recv socket wait
+// inside each slice). A wire is potentially endless, so there is no total
+// deadline; each read carries its own slice budget. A quiet peer yields nil
+// slices, never an exception. A mid-body close is an error, except for
+// close-delimited framing where it is the terminator.
+
+class ResponseStream {
+    using &this;
+
+    // Reference semantics like NexoraCoreClient: copies of this handle
+    // would each try to close the same socket on finalize. Bind instead.
+    func operator[@=]() -> &ResponseStream {
+        return this;
+    }
+
+    let transport: Socket? = nil;
+    let socket = nil;
+    let buffer: ByteBuffer = new ByteBuffer();
+    let data: ByteBuffer = new ByteBuffer();
+    let framing: string = "";
+    let remaining: int = 0;
+    let chunkLeft: int = -1;
+    let finished: bool = false;
+    let separateTransport: bool = false;
+    let status_code: int = 0;
+    let headers: Dict? = nil;
+
+    func readLineSlice(timeoutMillis: int = 2000) {
+        if (this.socket == nil) {
+            throw new Exception("requests: response wire is closed");
+        }
+        this.socket.setTimeout(timeoutMillis);
+        for (true) {
+            let line: string? = __requests_stream_take_data_line(this);
+            if (line != nil) return line;
+            if (this.finished) {
+                if (this.data.length() > 0) {
+                    throw new Exception("requests: response body ends mid-line");
+                }
+                return nil;
+            }
+            if (!__requests_stream_pump(this)) return nil;
+        }
+        throw new Exception("requests: wire read loop exited without a line");
+    }
+
+    func close() {
+        if (this.socket != nil) {
+            try {
+                this.socket.close();
+            } catch (&error) {}
+            this.socket = nil;
+        }
+        if (this.separateTransport and this.transport != nil) {
+            try {
+                this.transport.close();
+            } catch (&error) {}
+            this.transport = nil;
+        }
+    }
+}
+
+// Split one \n-terminated line off the de-framed data buffer. Returns nil
+// when no complete line is buffered yet. A trailing \r is stripped (SSE
+// framing uses \n; servers may send \r\n).
+func __requests_stream_take_data_line(wire: ResponseStream) {
+    let at: int = wire.data.indexOf(bytes("\n"));
+    if (at < 0) return nil;
+    let raw: bytes = wire.data.slice(0, at);
+    wire.data.consume(at + 1);
+    let text: string = raw.decode("utf-8");
+    if (text.endswith("\r")) text = text.slice(0, text.length() - 1);
+    return text;
+}
+
+// Split one \n-terminated line off the raw (still framed) buffer.
+func __requests_stream_take_raw_line(wire: ResponseStream) {
+    let at: int = wire.buffer.indexOf(bytes("\n"));
+    if (at < 0) return nil;
+    let raw: bytes = wire.buffer.slice(0, at);
+    wire.buffer.consume(at + 1);
+    let text: string = raw.decode("utf-8");
+    if (text.endswith("\r")) text = text.slice(0, text.length() - 1);
+    return text;
+}
+
+// True when the value looks like a socket-timeout rejection (WSAETIMEDOUT).
+// The message text is produced by socket.zeu itself, in this same package.
+func __requests_is_slice_timeout(error) -> bool {
+    let message: string = "";
+    try {
+        message = str(error.getMessage());
+    } catch (&ignored) {
+        return false;
+    }
+    return message.index("10060") >= 0;
+}
+
+// Move newly arrived bytes from the socket into the raw buffer.
+// Returns false on a timeout slice (resume on the next call); throws on
+// I/O errors and on unexpected closes (except close-delimited framing,
+// where the close is the terminator).
+func __requests_stream_fill(wire: ResponseStream) -> bool {
+    let chunk: bytes = b"";
+    try {
+        chunk = wire.socket.recv(4096);
+    } catch (&error) {
+        if (__requests_is_slice_timeout(error)) return false;
+        throw error;
+    }
+    if (chunk.length() == 0) {
+        if (wire.framing != "close") {
+            throw new Exception("requests: connection closed mid-body");
+        }
+        wire.finished = true;
+        return true;
+    }
+    wire.buffer.append(chunk);
+    return true;
+}
+
+// Move buffered raw bytes into the de-framed data buffer according to the
+// negotiated framing. Returns false when more network bytes are needed
+// (the caller retries after the next slice); finished is set exactly once
+// the terminator is consumed.
+func __requests_stream_pump(wire: ResponseStream) -> bool {
+    when (wire.framing) {
+        "chunked": {
+            if (wire.chunkLeft == -1) {
+                let sizeLine: string? = __requests_stream_take_raw_line(wire);
+                if (sizeLine == nil) return __requests_stream_fill(wire);
+                let size: int = __requests_parse_chunk_size(sizeLine);
+                if (size == 0) {
+                    for (true) {
+                        let trailer: string? = __requests_stream_take_raw_line(wire);
+                        if (trailer == nil) return __requests_stream_fill(wire);
+                        if (trailer == "") break;
+                    }
+                    wire.finished = true;
+                    return true;
+                }
+                wire.chunkLeft = size;
+            }
+            if (wire.chunkLeft == -2) {
+                if (wire.buffer.length() < 2) return __requests_stream_fill(wire);
+                let mark: string = wire.buffer.slice(0, 2).decode("utf-8");
+                if (mark != "\r\n") {
+                    throw new Exception("requests: invalid HTTP chunk delimiter");
+                }
+                wire.buffer.consume(2);
+                wire.chunkLeft = -1;
+                return true;
+            }
+            if (wire.chunkLeft == 0) {
+                wire.chunkLeft = -2;
+                return true;
+            }
+            let take: int = wire.chunkLeft;
+            if (take > wire.buffer.length()) take = wire.buffer.length();
+            if (take == 0) return __requests_stream_fill(wire);
+            wire.data.append(wire.buffer.slice(0, take));
+            wire.buffer.consume(take);
+            wire.chunkLeft = wire.chunkLeft - take;
+            return true;
+        }
+        "length": {
+            if (wire.remaining <= 0) {
+                wire.finished = true;
+                return true;
+            }
+            let take: int = wire.remaining;
+            if (take > wire.buffer.length()) take = wire.buffer.length();
+            if (take == 0) return __requests_stream_fill(wire);
+            wire.data.append(wire.buffer.slice(0, take));
+            wire.buffer.consume(take);
+            wire.remaining = wire.remaining - take;
+            return true;
+        }
+        else: {
+            if (wire.buffer.length() == 0) return __requests_stream_fill(wire);
+            wire.data.append(wire.buffer.toBytes());
+            wire.buffer.consume(wire.buffer.length());
+            return true;
+        }
+    }
+}
+
+func stream(method: string, url: string, params: dict? = nil, headers: dict? = nil, json=nil,
+        timeout=nil, verify: bool? = nil, checkHostname: bool? = nil) -> ResponseStream {
+    let verb: string = method.upper();
+    when (verb) {
+        "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE": {}
+        else: throw new Exception("requests: method must be GET, HEAD, POST, PUT, PATCH, or DELETE");
+    }
+    let endpoint: HTTPURL = __requests_url(url, params);
+    let timeoutMillis: int = __requests_timeout_millis(timeout);
+    let payload: bytes = b"";
+    let hasJson: bool = json != nil;
+    if (hasJson) payload = bytes(__json_stringify(json));
+
+    let requestBytes: bytes = bytes(
+        verb + " " + endpoint.target + " HTTP/1.1\r\n" +
+        __requests_header_text(headers, endpoint, payload, hasJson) + "\r\n") + payload;
+
+    let transport: Socket = new Socket();
+    try {
+        if (timeoutMillis < 0) transport.connect(endpoint.host, endpoint.port);
+        else transport.connect(endpoint.host, endpoint.port, timeoutMillis);
+        transport.setTimeout(timeoutMillis);
+        if (endpoint.scheme == "https") {
+            let context: SSLContext = new SSLContext(true, true);
+            if (verify == false) {
+                let checkName: bool = true;
+                if (checkHostname == false) checkName = false;
+                context = new SSLContext(false, checkName);
+            }
+            // The HTTPS flavor keeps its own name (single-flavor locals, and
+            // no shadowing of this very function): wrapSocket returns the TLS
+            // stream, never the plain wire.
+            let tls: SSLSocket = context.wrapSocket(transport, endpoint.host);
+            tls.setTimeout(timeoutMillis);
+            tls.sendAll(requestBytes);
+            let tlsBuffer: ByteBuffer = new ByteBuffer();
+            let tlsHead: Response = __requests_read_final_headers(tls, tlsBuffer);
+            let openedTls: ResponseStream = __requests_open_stream(tls, transport, true,
+                verb, endpoint, tlsHead, tlsBuffer);
+            // Socket/SSLSocket are reference types (operator[@=]), so the
+            // stream and this local name the same wrappers. Nothing to neuter:
+            // one object means one finalizer.
+            return openedTls;
+        } else {
+            transport.sendAll(requestBytes);
+            let plainBuffer: ByteBuffer = new ByteBuffer();
+            let plainHead: Response = __requests_read_final_headers(transport, plainBuffer);
+            return __requests_open_stream(transport, transport, false,
+                verb, endpoint, plainHead, plainBuffer);
+        }
+    } catch (&error) {
+        if (transport.isOpen) {
+            try {
+                transport.close();
+            } catch (&cleanupError) {}
+        }
+        throw error;
+    }
+}
+
+// Negotiate framing from the response head and wrap everything the pump
+// needs in a ResponseStream. Throws on contradictory framing, mirroring
+// __requests_read_body. `head` and `buffer` arrive as direct locals (not
+// through an intermediate dict) so no extra wrapper copies alias them.
+func __requests_open_stream(socket, transport, separateTransport: bool, verb: string, endpoint: HTTPURL, head: Response, buffer: ByteBuffer) -> ResponseStream {
+    head.url = endpoint.fullURL;
+
+    let transferEncoding: string = head.getHeader("transfer-encoding", "");
+    let contentLength: string? = head.getHeader("content-length", nil);
+    let framing: string = "";
+    let remaining: int = 0;
+    if (verb == "HEAD" or
+        (head.status_code >= 100 and head.status_code < 200) or
+        head.status_code == 204 or head.status_code == 304) {
+        framing = "empty";
+    } else if (transferEncoding.length() > 0 and contentLength != nil) {
+        throw new Exception("requests: response has both Transfer-Encoding and Content-Length");
+    } else if (transferEncoding.length() > 0) {
+        if (transferEncoding.lower() != "chunked") {
+            throw new Exception("requests: unsupported response Transfer-Encoding");
+        }
+        framing = "chunked";
+    } else if (contentLength != nil) {
+        remaining = __requests_parse_content_length(str(contentLength));
+        framing = "length";
+    } else {
+        if (!__requests_can_read_to_eof(head)) {
+            throw new Exception(
+                "requests: response declares a persistent connection without " +
+                "Content-Length or chunked framing, so the body can never end " +
+                "while the connection stays open. This client requested " +
+                "Connection: close; the server ignores it. Pass a timeout " +
+                "argument to bound the wait, or contact a server that sends " +
+                "Content-Length, Transfer-Encoding: chunked, or Connection: close");
+        }
+        framing = "close";
+    }
+
+    let opened: ResponseStream = new ResponseStream();
+    opened.transport = transport;
+    opened.separateTransport = separateTransport;
+    opened.socket = socket;
+    // Reuse the head buffer: a coalesced first recv may already hold body
+    // bytes after the headers, and dropping them would lose the first chunk.
+    opened.buffer = buffer;
+    opened.data = new ByteBuffer();
+    opened.framing = framing;
+    opened.remaining = remaining;
+    opened.chunkLeft = -1;
+    if (framing == "empty" or (framing == "length" and remaining == 0)) {
+        opened.finished = true;
+    }
+    opened.status_code = head.status_code;
+    // Copy the headers into a fresh dict instead of aliasing the response's:
+    // `head` dies when open_stream returns, and a shared Dict wrapper must
+    // not outlive the object graph it was built from.
+    let headerCopy: dict = {};
+    for (head.headers) [&headerKey: &headerValue] {
+        headerCopy[headerKey] = headerValue;
+    }
+    opened.headers = headerCopy;
+    return opened;
+}

@@ -1,0 +1,145 @@
+class ReceiverBox {
+    using &this;
+    var value: int = 0;
+    func init(value: int) { this.value = value; }
+    func add(delta: int) { this.value = this.value + delta; return this; }
+    func copied() -> ReceiverBox { return this; }
+    func trySelf(flag: bool) {
+        try {
+            if (flag) { throw "handled receiver error"; }
+            return this;
+        } catch (&error) {
+            return this;
+        }
+    }
+    func shareSelf() -> &ReceiverBox { return this; }
+    func choose(flag: bool) {
+        if (flag) { return this; }
+        else { return (this); }
+    }
+    func fresh() {
+        let result = new ReceiverBox(this.value);
+        return result;
+    }
+    func checkedSelf(flag: bool) {
+        if (flag) { throw "receiver check rejected"; }
+        else { return this; }
+    }
+}
+
+class ClassMethodReturn {
+    using &this;
+    var value: int = 0;
+    func self() { return this; }
+    func forward() { return this.self(); }
+}
+
+class OtherClassMethodReturn {
+    using &this;
+    func self() { return this; }
+}
+
+class ImplMethodReturn {
+    var value: int = 0;
+}
+impl ImplMethodReturn {
+    using &this;
+    func self() { return this; }
+    func forward() { return this.self(); }
+}
+
+class AliasedReceiver {
+    using &me;
+    var value: int = 0;
+    func add(delta: int) { me.value = me.value + delta; return ((me)); }
+}
+
+class ShadowedReceiver {
+    using &me;
+    var value: int = 1;
+    func fresh() {
+        let me = new ShadowedReceiver();
+        return me;
+    }
+}
+
+@type(T)
+class GenericReceiver {
+    using &this;
+    var value: T;
+    func init(value: T) { this.value = value; }
+    func self() { return this; }
+}
+
+func main() {
+    let box = new ReceiverBox(1);
+    box.add(2).add(3);
+    if (box.value != 6) throw "inferred receiver chain lost identity";
+
+    let inferred = box.add(1);
+    inferred.value = 8;
+    if (box.value != 8) throw "inferred receiver assignment copied instance";
+
+    let copy = box.copied();
+    copy.value = 20;
+    if (box.value != 8 or copy.value != 20) throw "explicit value return lost copy";
+    let tryNormal = box.trySelf(false);
+    tryNormal.value = 80;
+    if (box.value != 80) throw "try receiver return lost identity";
+    let tryCaught = box.trySelf(true);
+    tryCaught.value = 81;
+    if (box.value != 81) throw "catch receiver return lost identity";
+
+    let sharedAlias = box.shareSelf();
+    sharedAlias.value = 9;
+    if (box.value != 9) throw "explicit shared return lost identity";
+
+    let firstBranch = box.choose(true);
+    firstBranch.value = 10;
+    let secondBranch = box.choose(false);
+    secondBranch.value = 11;
+    if (box.value != 11) throw "receiver branches lost identity";
+
+    let classMethodOwner = new ClassMethodReturn();
+    let classMethodResult = classMethodOwner.forward();
+    classMethodResult.value = 15;
+    if (classMethodOwner.value != 15) {
+        throw "class method reference return was not preserved through a call";
+    }
+    let implMethodOwner = new ImplMethodReturn();
+    let implMethodResult = implMethodOwner.forward();
+    implMethodResult.value = 16;
+    if (implMethodOwner.value != 16) {
+        throw "impl method reference return was not preserved through a call";
+    }
+
+    let checkedAlias = box.checkedSelf(false);
+    checkedAlias.value = 12;
+    if (box.value != 12) throw "throw branch lost receiver identity";
+
+    let aliased = new AliasedReceiver();
+    aliased.add(2).add(3);
+    if (aliased.value != 5) throw "parenthesized receiver alias was not inferred";
+
+    let generic = new GenericReceiver<int>(12);
+    let genericAlias = generic.self();
+    genericAlias.value = 13;
+    if (generic.value != 13) throw "generic receiver lost identity";
+
+    let fresh = box.fresh();
+    fresh.value = 30;
+    let freshCopy = fresh;
+    freshCopy.value = 31;
+    if (box.value != 12 or fresh.value != 30 or freshCopy.value != 31) {
+        throw "local object return changed value semantics";
+    }
+    let shadowOwner = new ShadowedReceiver();
+    let shadowValue = shadowOwner.fresh();
+    let shadowCopy = shadowValue;
+    shadowCopy.value = 3;
+    if (shadowValue.value != 1 or shadowCopy.value != 3) {
+        throw "shadowed receiver was inferred as the original receiver";
+    }
+    print("RECEIVER_RETURN_INFERENCE_PASS");
+}
+main();

@@ -1,0 +1,114 @@
+import zeus.dict;
+import zeus.exception;
+import samples.NexoraCodeCore.sse;
+import samples.NexoraCodeCore.stream_session;
+
+// SSE 中继的冒烟测试：两个事件帧 + [DONE] 收尾。
+// 运行器在本地起一个分块编码的 mock SSE 服务，把 __PORT__ 换成实际端口。
+var const SSE_PORT = "__PORT__";
+
+func __sse_url() -> string {
+    return "http://127.0.0.1:" + SSE_PORT + "/events";
+}
+
+func testSseEvents() {
+    let session = nexora_open_session(__sse_url());
+    if (session.statusCode != 200) {
+        throw new Exception("SSE 握手失败: " + str(session.statusCode));
+    }
+
+    let frames = nexora_stream_collect(session, 1000, 5000);
+    session.close();
+
+    let events: Array = [];
+    let done = false;
+    for (frames) [frame] {
+        let frameType = str(frame["type"]);
+        if (frameType == "done") done = true;
+        if (frameType == "event") events.append(str(frame["data"]));
+    }
+
+    if (!done) throw new Exception("SSE 流没有以 [DONE] 收尾");
+    if (events.length() != 2) {
+        throw new Exception("期望两个 SSE 事件，实得 " + str(events.length()));
+    }
+    if (events[0] != "{\"n\":1}" or events[1] != "{\"n\":2}") {
+        throw new Exception("SSE 事件内容不对: " + events[0] + " / " + events[1]);
+    }
+    print("NEXORA_SSE_TEST_PASS");
+}
+
+// 假的行源：把整段 SSE 文本按行喂给会话，用来测取消、多行 data 这类
+// 和 socket 无关的行为（真的关连接会被 mock 端记成失败）。
+class FakeSseLines {
+    using &this;
+
+    let lines = [];
+    let cursor = 0;
+    let finished = false;
+    let status_code = 200;
+    let closed = false;
+
+    func operator[@=]() -> &FakeSseLines {
+        return this;
+    }
+
+    func init(linesValue: Array) {
+        this.lines = linesValue;
+        this.cursor = 0;
+        this.finished = false;
+        this.closed = false;
+    }
+
+    func readLineSlice(timeoutMillis: int = 1000) {
+        if (this.cursor >= this.lines.length()) {
+            this.finished = true;
+            return nil;
+        }
+        let line = this.lines[this.cursor];
+        this.cursor = this.cursor + 1;
+        return line;
+    }
+
+    func close() {
+        this.closed = true;
+    }
+}
+
+func testSseSessionCancel() {
+    let source = new FakeSseLines(["data: {\"n\":1}", "", "data: [DONE]", ""]);
+    let session = nexora_stream_session(source);
+    if (session.statusCode != 200) throw new Exception("假会话状态码应沿用行源");
+
+    session.cancel();
+    let frame = session.next(10);
+    if (str(frame["type"]) != "cancelled") {
+        throw new Exception("cancel 后 next() 应返回 cancelled");
+    }
+    session.close();
+    print("NEXORA_SSE_CANCEL_TEST_PASS");
+}
+
+func testSseMultiLineData() {
+    let source = new FakeSseLines(["data: first", "data: second", "", "data: [DONE]", ""]);
+    let session = nexora_stream_session(source);
+
+    let frames = nexora_stream_collect(session, 10, 100);
+    session.close();
+
+    let events: Array = [];
+    for (frames) [frame] {
+        if (str(frame["type"]) == "event") events.append(str(frame["data"]));
+    }
+    if (events.length() != 1) {
+        throw new Exception("多行 data 应折成一个事件，实得 " + str(events.length()));
+    }
+    if (events[0] != "first\nsecond") {
+        throw new Exception("多行 data 应以换行连接: " + events[0]);
+    }
+    print("NEXORA_SSE_MULTILINE_TEST_PASS");
+}
+
+testSseEvents();
+testSseSessionCancel();
+testSseMultiLineData();

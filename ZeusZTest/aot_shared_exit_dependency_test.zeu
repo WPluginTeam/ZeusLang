@@ -1,0 +1,36 @@
+import zeus.exception;
+import zeus.thread;
+
+let exitLock = new Lock();
+var exitCounter = 0;
+
+class ExitDependency {
+    using &this;
+    var value: int = 73;
+
+    func verify() {
+        exitLock.acquire();
+        if (this.value != 73) throw new Exception("ordinary exit dependency is unavailable");
+        exitCounter = exitCounter + 1;
+        exitLock.release();
+    }
+
+    func operator[~]() { print("ORDINARY_EXIT_DEPENDENCY_DESTROYED"); }
+}
+
+let ordinaryDependency = new ExitDependency();
+
+class SharedExitResource {
+    using &this;
+    func operator[~]() {
+        ordinaryDependency.verify();
+        if (exitCounter != 1) throw new Exception("exit finalizer counter mismatch");
+        print("SHARED_EXIT_DEPENDENCY_PASS");
+    }
+}
+
+var shared exitResource = new SharedExitResource();
+// This alias also owns the instance. Releasing its last owner must run the
+// destructor while the earlier ordinary globals remain alive.
+let exitAlias = exitResource;
+print("AOT_SHARED_EXIT_ENTRY_DONE"); // AOT_SHARED_EXIT_MODE

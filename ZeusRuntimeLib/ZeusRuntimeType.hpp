@@ -13,6 +13,10 @@ inline std::string canonicalTypeName(const std::string& typeName) {
         return "&" + canonicalTypeName(typeName.substr(1));
     }
 
+    // Native pointer aliases cross the dynamic VM boundary as raw integer
+    // addresses, so their runtime value type is int.
+    if (ZeusBuiltins::isNativePointerTypeName(typeName)) return "int";
+
     if (const auto* implementation = ZeusBuiltins::findTypeImplementation(typeName)) {
         switch (implementation->category) {
             case ZeusBuiltins::TypeCategory::String:
@@ -28,6 +32,8 @@ inline std::string canonicalTypeName(const std::string& typeName) {
         }
     }
 
+    if (ZeusBuiltins::isNativeFloatingPointType(typeName)) return "float";
+
     if (const auto* abi = ZeusBuiltins::findNativeTypeABI(typeName)) {
         return abi->canonicalName == "func"
             ? "function"
@@ -37,7 +43,7 @@ inline std::string canonicalTypeName(const std::string& typeName) {
     if (typeName == "array" || typeName == "list") return "Array";
     if (typeName == "map" || typeName == "dict") return "dict";
     if (typeName == "str" || typeName == "String") return "string";
-    if (typeName == "int32" || typeName == "int64") return "int";
+    if (typeName == "int64") return "int";
     if (typeName == "float32" || typeName == "float64") return "float";
     if (typeName == "func" || typeName == "closure" ||
         typeName == "native_function") return "function";
@@ -46,6 +52,7 @@ inline std::string canonicalTypeName(const std::string& typeName) {
 
 inline bool isPrimitiveTypeName(const std::string& typeName) {
     const std::string canonical = canonicalTypeName(typeName);
+    if (ZeusBuiltins::findNativeIntegerABI(canonical)) return true;
     return canonical == "nil" || canonical == "int" || canonical == "bigint" ||
         canonical == "float" || canonical == "bool" || canonical == "char" ||
         canonical == "string" || canonical == "bytes" || canonical == "Array" ||
@@ -62,12 +69,26 @@ inline bool isCompatible(const std::string& expectedType, const std::string& act
         isReference ? actualType.substr(1) : actualType);
 
     if (expectsReference && !isReference) return false;
+    if (!expectsReference && !isReference &&
+        ZeusBuiltins::isNativeFloatingPointType(expectedType) &&
+        (actual == "float" || actual == "int" || actual == "bigint")) return true;
+    // VM numbers retain their ordinary integer representation. The declared
+    // native width is enforced separately at each typed storage boundary.
+    if (!expectsReference && !isReference) {
+        const bool expectedNative = ZeusBuiltins::findNativeIntegerABI(expected) != nullptr;
+        const bool actualNative = ZeusBuiltins::findNativeIntegerABI(actual) != nullptr;
+        if (expectedNative && (actualNative || actual == "int" || actual == "bigint" ||
+                               actual == "float")) return true;
+        if (actualNative && (expected == "int" || expected == "bigint")) return true;
+    }
     if (!expectsReference && isReference &&
         expected != "int" && expected != "bool") return false;
 
     if (expected == "object") {
-        return actual == "object" ||
-            (actual != "unknown" && !isPrimitiveTypeName(actual));
+        // Dictionaries are heap objects too; keep accepting them even though
+        // "dict" is listed as primitive below.
+        if (actual == "object" || actual == "dict") return true;
+        return actual != "unknown" && !isPrimitiveTypeName(actual);
     }
     return expected == actual;
 }

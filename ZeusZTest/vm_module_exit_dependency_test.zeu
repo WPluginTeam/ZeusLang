@@ -1,0 +1,12 @@
+import zeus.io [&io];
+
+class ExitPackageDependency {
+    using &this;
+
+    func operator[~]() {
+        io.print("VM_MODULE_EXIT_DEPENDENCY_PASS");
+    }
+}
+
+let exitDependency = new ExitPackageDependency();
+io.print("VM_MODULE_EXIT_ENTRY_DONE");

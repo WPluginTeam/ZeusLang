@@ -1,0 +1,35 @@
+// Dynamic integer arithmetic cost under static compilation.
+//
+// The accumulator is a local, so the addition goes through the dynamic
+// binary operator instead of a folded constant. The read only loop is the
+// baseline: it pays for the loop and the native call, but no arithmetic.
+using original;
+
+@native("zeus_bytes_get")
+decl func __bytes_get(data: bytes, index: int) -> int;
+
+func main() {
+    let iterations = 500000;
+    let data = bytes("0123456789abcdef");
+
+    let acc = 0;
+    let started = __time_perf_counter_ns();
+    for (0..iterations) [const &i] {
+        acc = acc + __bytes_get(data, 3);
+    }
+    let withAdd = __time_perf_counter_ns() - started;
+
+    let readOnly = 0;
+    let startedRead = __time_perf_counter_ns();
+    for (0..iterations) [const &i] {
+        readOnly = __bytes_get(data, 3);
+    }
+    let read = __time_perf_counter_ns() - startedRead;
+
+    print("INT_ARITH_NS add", withAdd, "read", read,
+          "ns_per_op add", withAdd / iterations, "read", read / iterations,
+          "sums", acc, readOnly);
+    print("INT_ARITH_BENCH_PASS");
+}
+
+main();

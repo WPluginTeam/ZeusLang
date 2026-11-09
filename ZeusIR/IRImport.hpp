@@ -8,6 +8,7 @@
 #include <fstream>
 #include <sstream>
 #include <utility>
+#include <cctype>
 #include "../ZeusDebug/Utils.hpp"
 
 namespace IRImport {
@@ -99,6 +100,56 @@ namespace IRImport {
         }
 
         ZEUS_DEBUG_PRINT("[IRImport] Set working directory: %s", currentWorkingDir.c_str());
+    }
+
+    // A bare module name such as "kernel32" or "bcrypt" names a library the OS
+    // already knows how to find. Such a name carries no directory part, so it
+    // must not be turned into a path next to the importing source; the platform
+    // loader runs its own search instead, which also covers the executable
+    // directory for libraries shipped beside Zeus.
+    inline bool isBareLibraryName(const std::string& libraryPath) {
+        if (libraryPath.empty()) return false;
+        if (libraryPath.find('/') != std::string::npos ||
+            libraryPath.find('\\') != std::string::npos) {
+            return false;
+        }
+        const auto endsWithIgnoreCase = [&](const std::string& suffix) {
+            if (libraryPath.size() < suffix.size()) return false;
+            const size_t offset = libraryPath.size() - suffix.size();
+            for (size_t index = 0; index < suffix.size(); ++index) {
+                const unsigned char actual = static_cast<unsigned char>(
+                    libraryPath[offset + index]);
+                const unsigned char expected = static_cast<unsigned char>(suffix[index]);
+                if (std::tolower(actual) != std::tolower(expected)) return false;
+            }
+            return true;
+        };
+
+        if (libraryPath.find('.') == std::string::npos) return true;
+        return endsWithIgnoreCase(".dll") ||
+            endsWithIgnoreCase(".so") ||
+            endsWithIgnoreCase(".dylib") ||
+            libraryPath.find(".so.") != std::string::npos;
+    }
+
+    // Native-library paths are anchored to the source file that declares the
+    // import, then stored as absolute paths so .zir and AOT builds remain stable
+    // when the process is launched from another working directory. Bare module
+    // names are passed through unchanged so the platform loader resolves them.
+    inline std::string resolveNativeLibraryPath(const std::string& libraryPath) {
+        if (isBareLibraryName(libraryPath)) {
+            ZEUS_DEBUG_PRINT(
+                "[IRImport] Native library '%s' is a module name; "
+                "leaving it to the platform loader",
+                libraryPath.c_str());
+            return libraryPath;
+        }
+        std::filesystem::path path(libraryPath);
+        if (path.is_absolute()) return absoluteNormalizedPath(path).string();
+        const std::filesystem::path base = currentWorkingDir.empty()
+            ? absoluteNormalizedPath(std::filesystem::current_path())
+            : std::filesystem::path(currentWorkingDir);
+        return absoluteNormalizedPath(base / path).string();
     }
 
     // Resolve compiler modules and project modules from explicit roots.

@@ -1,0 +1,245 @@
+var withExitOrder = 0;
+
+class WithTryResource {
+    using &this;
+    let enterCount = 0;
+    let exitCount = 0;
+    let exitRank = 0;
+    let failEntry = false;
+    let failExit = false;
+    let exitError = "with-exit";
+
+    func operator[with]() {
+        this.enterCount = this.enterCount + 1;
+        if (this.failEntry) throw "with-entry";
+        return nil;
+    }
+
+    func operator[~with]() {
+        this.exitCount = this.exitCount + 1;
+        withExitOrder = withExitOrder * 10 + this.exitRank;
+        if (this.failExit) throw this.exitError;
+        return nil;
+    }
+}
+
+func checkWithTry(condition: bool, message: string) {
+    if (!condition) {
+        print("WITH_TRY_CATCH_ASSERT_FAIL", message);
+        throw new Exception("with/try-catch failed: " + message);
+    }
+}
+
+func passFinIdentifier(fin: bool) -> bool {
+    return fin;
+}
+
+func throwFromWith(resource: WithTryResource) {
+    with (resource) [&localResource] {
+        throw "cross-function";
+    }
+}
+
+var finCounter = 0;
+
+func returnThroughFin() -> int {
+    try {
+        return 42;
+    } fin {
+        finCounter = finCounter + 1;
+    }
+}
+
+func returnFromCatchThroughFin() -> int {
+    try {
+        throw "return-from-catch";
+    } catch (&error) {
+        return 7;
+    } fin {
+        finCounter = finCounter + 1;
+    }
+}
+
+func replaceExceptionInFin() {
+    try {
+        throw "original-exception";
+    } fin {
+        throw "replacement-exception";
+    }
+}
+
+func runWithTryCatchTest() -> bool {
+    checkWithTry(passFinIdentifier(true),
+        "fin stays usable as an identifier outside its block header");
+
+    let outer = new WithTryResource();
+    var outerCaught = false;
+    try {
+        with (outer) [&resource] {
+            throw "outer-catch";
+        }
+    } catch (&error) {
+        outerCaught = error == "outer-catch";
+    }
+    checkWithTry(outerCaught, "catch outside with receives the original exception");
+    checkWithTry(outer.enterCount == 1, "with entry runs once before an escaping throw");
+    checkWithTry(outer.exitCount == 1, "with exit runs before an outer catch");
+
+    let innerCatch = new WithTryResource();
+    var innerCaught = false;
+    with (innerCatch) [&resource] {
+        checkWithTry(resource.enterCount == 1,
+            "reference capture sees the entered with receiver");
+        try {
+            throw "inner-catch";
+        } catch (&error) {
+            innerCaught = error == "inner-catch";
+        }
+    }
+    checkWithTry(innerCaught, "catch inside with receives the original exception");
+    checkWithTry(innerCatch.enterCount == 1, "inner catch does not repeat with entry");
+    checkWithTry(innerCatch.exitCount == 1, "inner catch leaves with exactly once");
+
+    let rethrowResource = new WithTryResource();
+    var rethrowCaught = false;
+    try {
+        with (rethrowResource) [&resource] {
+            try {
+                throw "rethrow-with";
+            } catch (&innerError) {
+                throw innerError;
+            }
+        }
+    } catch (&outerError) {
+        rethrowCaught = outerError == "rethrow-with";
+    }
+    checkWithTry(rethrowCaught, "rethrow inside with reaches the outer catch");
+    checkWithTry(rethrowResource.exitCount == 1, "rethrow leaves with exactly once");
+
+    let crossFunctionResource = new WithTryResource();
+    var crossFunctionCaught = false;
+    try {
+        throwFromWith(crossFunctionResource);
+    } catch (&error) {
+        crossFunctionCaught = error == "cross-function";
+    }
+    checkWithTry(crossFunctionCaught, "an exception leaves with across a function call");
+    checkWithTry(crossFunctionResource.exitCount == 1,
+        "uncaught function exception runs the with exit hook");
+
+    let failedEntry = new WithTryResource();
+    failedEntry.failEntry = true;
+    var entryCaught = false;
+    try {
+        with (failedEntry) [&resource] {
+            throw "unreachable";
+        }
+    } catch (&error) {
+        entryCaught = error == "with-entry";
+    }
+    checkWithTry(entryCaught, "with entry failure reaches the surrounding catch");
+    checkWithTry(failedEntry.enterCount == 1, "failing with entry starts once");
+    checkWithTry(failedEntry.exitCount == 0, "failed with entry does not call with exit");
+
+    let nestedOuter = new WithTryResource();
+    let nestedInner = new WithTryResource();
+    nestedOuter.exitRank = 1;
+    nestedInner.exitRank = 2;
+    withExitOrder = 0;
+    var nestedCaught = false;
+    try {
+        with (nestedOuter) [&outerResource] {
+            with (nestedInner) [&innerResource] {
+                throw "nested-catch";
+            }
+        }
+    } catch (&error) {
+        nestedCaught = error == "nested-catch";
+    }
+    checkWithTry(nestedCaught, "outer catch receives a nested with exception");
+    checkWithTry(nestedOuter.exitCount == 1, "nested outer with exits once");
+    checkWithTry(nestedInner.exitCount == 1, "nested inner with exits once");
+    checkWithTry(withExitOrder == 21, "nested with exits from inner to outer");
+
+    let normalFinBefore = finCounter;
+    var normalFinCaught = false;
+    try {
+        finCounter = finCounter + 1;
+    } fin {
+        finCounter = finCounter + 1;
+    }
+    checkWithTry(finCounter == normalFinBefore + 2,
+        "fin runs after the normal try path without a catch");
+
+    var caughtBeforeFin = false;
+    var catchFinRuns = 0;
+    try {
+        throw "caught-before-fin";
+    } catch (&error) {
+        caughtBeforeFin = error == "caught-before-fin";
+    } fin {
+        catchFinRuns = catchFinRuns + 1;
+    }
+    checkWithTry(caughtBeforeFin, "catch runs before fin");
+    checkWithTry(catchFinRuns == 1, "catch plus fin runs fin once");
+
+    let returnedValue = returnThroughFin();
+    checkWithTry(returnedValue == 42, "return value survives fin");
+    checkWithTry(finCounter == normalFinBefore + 3,
+        "return runs fin before leaving the function");
+
+    let caughtReturnValue = returnFromCatchThroughFin();
+    checkWithTry(caughtReturnValue == 7,
+        "return value survives fin after a catch");
+    checkWithTry(finCounter == normalFinBefore + 4,
+        "return from catch runs fin before leaving the function");
+
+    var loopFinRuns = 0;
+    var loopFinAfter = 0;
+    try {
+        for (0..3) [const &index] {
+            try {
+                if (index < 2) continue;
+                break;
+            } fin {
+                loopFinRuns = loopFinRuns + 1;
+            }
+        }
+    } fin {
+        loopFinAfter = loopFinAfter + 1;
+    }
+    checkWithTry(loopFinRuns == 3,
+        "continue and break each run the fin they leave");
+    checkWithTry(loopFinAfter == 1,
+        "loop exits keep their surrounding fin active");
+
+    var replacementCaught = false;
+    try {
+        replaceExceptionInFin();
+    } catch (&error) {
+        replacementCaught = error == "replacement-exception";
+    }
+    checkWithTry(replacementCaught,
+        "an exception thrown by fin replaces the pending exception");
+
+    let exitFailure = new WithTryResource();
+    exitFailure.failExit = true;
+    exitFailure.exitError = "exit-replaced-exception";
+    var exitFailureCaught = false;
+    try {
+        with (exitFailure) [&resource] {
+            throw "body-exception";
+        }
+    } catch (&error) {
+        exitFailureCaught = error == "exit-replaced-exception";
+    }
+    checkWithTry(exitFailureCaught,
+        "with exit failure replaces the pending body exception");
+    checkWithTry(exitFailure.exitCount == 1,
+        "a throwing with exit hook is called once");
+
+    print("WITH_TRY_CATCH_PASS");
+    return true;
+}
+
+if (!runWithTryCatchTest()) throw new Exception("with/try-catch test failed");

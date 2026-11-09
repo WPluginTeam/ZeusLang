@@ -1,0 +1,207 @@
+import zeus.exception;
+import zeus.json;
+import zeus.thread;
+import zeus.websocket;
+import samples.NexoraCodeCore.connection;
+import samples.NexoraCodeCore.task_events;
+
+func assertConnection(condition, message: string) {
+    if (!condition) throw new Exception("Nexora connection test failed: " + message);
+}
+
+func __test_frame_type(frame) -> string {
+    for (frame) [&key: &value] {
+        if (key == "type") {
+            if (value == nil) return "";
+            return str(value);
+        }
+    }
+    return "";
+}
+
+func __test_count_type(sent, wanted: string) -> int {
+    let count = 0;
+    for (sent) [&text] {
+        if (__test_frame_type(JSON.parse(text)) == wanted) count = count + 1;
+    }
+    return count;
+}
+
+func __test_has_stream(sent, wanted: string) -> bool {
+    for (sent) [&text] {
+        let frame = JSON.parse(text);
+        if (__test_frame_type(frame) == "task_lifecycle" and
+            frame["stream_id"] == wanted) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 假连接：按脚本返回帧；脚本用完就抛软超时，peerClosed 打开后返回 nil（对端关闭）。
+// 拷贝协议让绑定保持同一实例，测试才能从主线程看到 worker 写下的字段。
+class FakeNexoraConnection {
+    using &this;
+
+    let frames = [];
+    let cursor = 0;
+    let peerClosed = false;
+    let sent = [];
+    let closed = false;
+
+    func operator[@=]() -> &FakeNexoraConnection {
+        return this;
+    }
+
+    func sendText(text: string) {
+        this.sent.append(text);
+    }
+
+    func receive(timeoutMillis: int) {
+        if (this.cursor < this.frames.length()) {
+            let frame = this.frames[this.cursor];
+            this.cursor = this.cursor + 1;
+            return frame;
+        }
+        if (this.peerClosed) return nil;
+        thread_sleep(1);
+        throw new WebSocketTimeout(timeoutMillis);
+    }
+
+    func close(code: int, reason: string) {
+        this.closed = true;
+    }
+}
+
+// 假工厂：按顺序交付预置连接；没有连接时就像对端拒绝一样失败。
+class FakeNexoraFactory {
+    using &this;
+
+    let pending = [];
+    let opens = 0;
+
+    func operator[@=]() -> &FakeNexoraFactory {
+        return this;
+    }
+
+    func open(serverUrl, deviceId, deviceToken, sslContext) {
+        this.opens = this.opens + 1;
+        if (this.pending.length() == 0) {
+            throw new Exception("fake peer refused the connection");
+        }
+        let connection = this.pending[0];
+        this.pending.remove(0);
+        return connection;
+    }
+}
+
+// 1. 连不上时按退避重试，错误留痕，停止后不再重试。
+func testConnectionRetryBackoff() {
+    let lock = new Lock();
+    let buffer = nexora_core_task_event_buffer(lock);
+    let factory = new FakeNexoraFactory();
+    let client = new NexoraCoreClient(
+        "https://127.0.0.1:1", "device", "token", nil, buffer);
+    client.connectFn = factory.open;
+    client.backoffStartMillis = 10;
+    client.backoffMillis = 10;
+    client.backoffCapMillis = 20;
+    client.receiveMillis = 5;
+
+    client.start();
+    thread_sleep(120);
+    client.requestStop();
+    client.join();
+
+    assertConnection(client.getAttempts() >= 3, "a refused connection is retried");
+    assertConnection(!client.isOnline(), "a refused client stays offline");
+    assertConnection(client.status()["error"] != "", "the last failure is reported");
+    assertConnection(client.status()["online"] == false, "status reports the offline state");
+}
+
+// 2. 连上之后：心跳按间隔发送，生命周期帧先发出去，停止能及时退出。
+func testConnectionSession() {
+    let lock = new Lock();
+    let buffer = nexora_core_task_event_buffer(lock);
+    let connection = new FakeNexoraConnection();
+    let factory = new FakeNexoraFactory();
+    factory.pending = [connection];
+
+    let client = new NexoraCoreClient(
+        "https://127.0.0.1:1", "device", "token", nil, buffer);
+    client.connectFn = factory.open;
+    client.heartbeatMillis = 30;
+    client.receiveMillis = 5;
+    client.backoffStartMillis = 10;
+    client.backoffMillis = 10;
+
+    let payload = {
+        "type": "task_started",
+        "stream_id": "stream-before",
+        "conversation_id": "conv_0123456789",
+        "status": "running"
+    };
+    assertConnection(nexora_core_task_event_enqueue(buffer, payload),
+        "the lifecycle event enters the buffer");
+
+    client.start();
+    thread_sleep(140);
+    assertConnection(client.isOnline(), "the client reports itself online");
+    assertConnection(client.getAttempts() == 1, "a healthy session does not reconnect");
+
+    client.requestStop();
+    client.join();
+
+    assertConnection(!client.isOnline(), "the client reports itself offline after stop");
+    assertConnection(__test_count_type(connection.sent, "task_lifecycle") == 1,
+        "the pending lifecycle frame is flushed once");
+    assertConnection(__test_has_stream(connection.sent, "stream-before"),
+        "the flushed frame keeps its stream ID");
+    assertConnection(__test_count_type(connection.sent, "ping") >= 2,
+        "heartbeats go out on the configured interval");
+    assertConnection(connection.closed, "the connection is closed on stop");
+}
+
+// 3. 对端关闭后重连，断线期间入队的事件在下一条连接上发出。
+func testConnectionReconnect() {
+    let lock = new Lock();
+    let buffer = nexora_core_task_event_buffer(lock);
+
+    let first = new FakeNexoraConnection();
+    let second = new FakeNexoraConnection();
+    let factory = new FakeNexoraFactory();
+    factory.pending = [first, second];
+
+    let client = new NexoraCoreClient(
+        "https://127.0.0.1:1", "device", "token", nil, buffer);
+    client.connectFn = factory.open;
+    client.heartbeatMillis = 1000;
+    client.receiveMillis = 5;
+    client.backoffStartMillis = 10;
+    client.backoffMillis = 10;
+
+    client.start();
+    thread_sleep(30);
+    assertConnection(client.getAttempts() == 1, "the first connection is established");
+
+    first.peerClosed = true;
+    thread_sleep(40);
+
+    let later = {"type": "task_finished", "stream_id": "stream-after"};
+    nexora_core_task_event_enqueue(buffer, later);
+    thread_sleep(40);
+
+    client.requestStop();
+    client.join();
+
+    assertConnection(client.getAttempts() >= 2, "a closed peer triggers a reconnect");
+    assertConnection(__test_has_stream(second.sent, "stream-after"),
+        "events queued while offline go out on the next connection");
+    assertConnection(!client.isOnline(), "the client ends offline");
+}
+
+func testConnectionStateMachine() {
+    testConnectionRetryBackoff();
+    testConnectionSession();
+    testConnectionReconnect();
+}

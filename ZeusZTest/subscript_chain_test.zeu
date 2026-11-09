@@ -1,0 +1,56 @@
+import zeus.exception;
+
+// 链式下标赋值：a[b][c] = v 曾经把值写到 a[b] 上（外层下标取的是第一个 '['），
+// 容器被静默改坏。现在按最后一个 '[' 分组，前缀作为表达式求值。
+
+func testNestedDictWrite() {
+    let outer = {"inner": {"k": 1}};
+    outer["inner"]["k"] = 2;
+    if (outer["inner"]["k"] != 2) throw new Exception("nested dict write");
+    if (outer["inner"] == nil) throw new Exception("nested dict container survived");
+}
+
+func testNestedListWrite() {
+    let rows = [[1, 2], [3, 4]];
+    rows[1][0] = 9;
+    if (rows[1][0] != 9) throw new Exception("nested list write");
+    if (rows[0][0] != 1) throw new Exception("the other row was not touched");
+}
+
+func testMixedWrite() {
+    let holders = [{"v": 1}, {"v": 2}];
+    holders[0]["v"] = 5;
+    if (holders[0]["v"] != 5) throw new Exception("list of dict write");
+    if (holders[1]["v"] != 2) throw new Exception("the second holder was not touched");
+}
+
+func testDeepWrite() {
+    let deep = {"a": {"b": {"c": 0}}};
+    deep["a"]["b"]["c"] = 7;
+    if (deep["a"]["b"]["c"] != 7) throw new Exception("three-level write");
+}
+
+func testPlainWriteStillWorks() {
+    let dict = {"k": 1};
+    dict["k"] = 3;
+    if (dict["k"] != 3) throw new Exception("single subscript write");
+
+    let list = [1, 2];
+    list[0] = 4;
+    if (list[0] != 4) throw new Exception("single list subscript write");
+}
+
+func testNestedSubscriptRead() {
+    let deep = {"a": {"b": 1}};
+    if (deep["a"]["b"] != 1) throw new Exception("chained read");
+    let rows = [[1, 2]];
+    if (rows[0][1] != 2) throw new Exception("chained list read");
+}
+
+testNestedDictWrite();
+testNestedListWrite();
+testMixedWrite();
+testDeepWrite();
+testPlainWriteStillWorks();
+testNestedSubscriptRead();
+print("SUBSCRIPT_CHAIN_PASS");

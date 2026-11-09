@@ -1,0 +1,292 @@
+import zeus.dict;
+import zeus.string;
+import zeus.url;
+
+import samples.NexoraCodeCore.provider_templates;
+import samples.NexoraCodeCore.storage;
+
+func __nexora_provider_settings_text(value, fallback: string="") -> string {
+    if (value == nil or value == false or value == "") return fallback;
+    if ((type(value) == "int" or type(value) == "float") and value == 0) {
+        return fallback;
+    }
+    return str(value);
+}
+
+func __nexora_provider_settings_number(value, fallback: float) -> float {
+    if (type(value) == "int" or type(value) == "float") return float(value);
+    if (type(value) == "string") {
+        try {
+            return float(value.strip());
+        } catch (&invalidNumber) {}
+    }
+    return fallback;
+}
+
+func __nexora_provider_settings_integer(value, fallback: int) -> int {
+    if (type(value) == "int") return value;
+    if (type(value) == "float") return int(value);
+    if (type(value) == "string") {
+        try {
+            return int(value.strip());
+        } catch (&invalidNumber) {}
+    }
+    return fallback;
+}
+
+func __nexora_provider_settings_id(provider: dict) -> string {
+    let value = __nexora_provider_settings_text(
+        dict_get(provider, "id", nil)).strip();
+    if (value == "") {
+        value = __nexora_provider_settings_text(
+            dict_get(provider, "provider_id", nil)).strip();
+    }
+    return value;
+}
+
+func __nexora_provider_settings_find(doc: dict, providerId: string) {
+    if (providerId == "") return nil;
+    for (dict_get(doc, "providers", [])) [entry] {
+        if (type(entry) != "dict") continue;
+        if (__nexora_provider_settings_id(entry) == providerId) return entry;
+    }
+    return nil;
+}
+
+func __nexora_provider_settings_trim_slashes(value: string) -> string {
+    let normalized = value.strip();
+    for (normalized.endswith("/") and normalized.length() > 0) {
+        normalized = normalized.slice(0, normalized.length() - 1);
+    }
+    return normalized;
+}
+
+func __nexora_provider_settings_endpoint_matches(provider: dict,
+        templateId: string, baseUrl: string) -> bool {
+    let providerTemplateId = __nexora_provider_settings_text(
+        dict_get(provider, "template_id", nil), "custom").strip();
+    if (providerTemplateId == "") providerTemplateId = "custom";
+    if (providerTemplateId != templateId) return false;
+    if (templateId != "custom") return true;
+    return __nexora_provider_settings_trim_slashes(
+        str(dict_get(provider, "base_url", ""))) ==
+        __nexora_provider_settings_trim_slashes(baseUrl);
+}
+
+func __nexora_provider_settings_infer_name(baseUrl: string, model: string) -> string {
+    let authority = "";
+    try {
+        let parsed = URL.parse(baseUrl.strip());
+        if (parsed.hasAuthority) authority = parsed.authority;
+    } catch (&invalidUrl) {}
+
+    let at = authority.rindex("@");
+    if (at >= 0) authority = authority.slice(at + 1, authority.length());
+    if (authority.startswith("[")) {
+        let end = authority.index("]");
+        if (end >= 0) authority = authority.slice(0, end + 1);
+    } else {
+        let colon = authority.index(":");
+        if (colon >= 0) authority = authority.slice(0, colon);
+    }
+    if (authority.startswith("www.")) {
+        authority = authority.slice(4, authority.length());
+    }
+    if (authority != "") return authority;
+
+    let modelText = model.strip();
+    if (modelText != "") {
+        let modelParts = modelText.split("/");
+        modelText = modelParts[modelParts.length() - 1];
+        let versionParts = modelText.split(":");
+        modelText = versionParts[0];
+        if (modelText != "") return modelText;
+    }
+    return "自定义供应商";
+}
+
+func nexora_provider_settings_public(doc: dict) -> dict {
+    let output: Array = [];
+    for (dict_get(doc, "providers", [])) [entry] {
+        if (type(entry) != "dict") continue;
+        let providerId = __nexora_provider_settings_id(entry);
+        let name = __nexora_provider_settings_text(
+            dict_get(entry, "name", nil)).strip();
+        let model = __nexora_provider_settings_text(
+            dict_get(entry, "model", nil)).strip();
+        let baseUrl = __nexora_provider_settings_text(
+            dict_get(entry, "base_url", nil)).strip();
+        if (name == "") name = __nexora_provider_settings_infer_name(baseUrl, model);
+        let temperature = __nexora_provider_settings_number(
+            dict_get(entry, "temperature", 0.7), 0.7);
+        if (temperature == 0) temperature = 0.7;
+        let maxTokens = __nexora_provider_settings_integer(
+            dict_get(entry, "max_tokens", 4096), 4096);
+        if (maxTokens == 0) maxTokens = 4096;
+        let contextWindow = __nexora_provider_settings_integer(
+            dict_get(entry, "context_window", 128000), 128000);
+        let key = __nexora_provider_settings_text(
+            dict_get(entry, "api_key", nil)).strip();
+        let thinkingProtocol = __nexora_provider_settings_text(
+            dict_get(entry, "thinking_protocol", nil), "none")
+            .strip().lower();
+        if (thinkingProtocol != "deepseek" and thinkingProtocol != "dashscope" and
+                thinkingProtocol != "ollama") thinkingProtocol = "none";
+        let templateId = __nexora_provider_settings_text(
+            dict_get(entry, "template_id", nil), "custom").strip();
+        if (templateId == "") templateId = "custom";
+        output.append({
+            "id": providerId, "name": name, "base_url": baseUrl,
+            "model": model, "temperature": temperature,
+            "max_tokens": maxTokens, "context_window": contextWindow,
+            "has_api_key": key != "", "thinking_protocol": thinkingProtocol,
+            "template_id": templateId
+        });
+    }
+    return {"default_id": __nexora_provider_settings_text(
+            dict_get(doc, "default_id", nil)),
+        "providers": output};
+}
+
+func nexora_provider_settings_prepare(current: dict, payload: dict) -> dict {
+    let rawProviders = dict_get(payload, "providers", nil);
+    if (type(rawProviders) != "Array") {
+        return {"ok": false, "message": "provider list must be an array"};
+    }
+
+    let output: Array = [];
+    for (rawProviders) [item] {
+        if (type(item) != "dict") continue;
+
+        let providerId = __nexora_provider_settings_text(
+            dict_get(item, "id", nil)).strip();
+        if (providerId == "") {
+            providerId = "p_" + nexora_core_uuid_hex().slice(0, 8);
+        }
+        let templateId = __nexora_provider_settings_text(
+            dict_get(item, "template_id", nil), "custom").strip();
+        if (templateId == "") templateId = "custom";
+        let template = nil;
+        if (templateId != "custom") {
+            template = nexora_find_provider_template(templateId);
+            if (template == nil) {
+                return {"ok": false, "message": "Provider template is invalid; select it again"};
+            }
+        }
+
+        let name = "";
+        let baseUrl = "";
+        if (template != nil) {
+            name = str(template["name"]);
+            baseUrl = str(template["base_url"]);
+        } else {
+            name = __nexora_provider_settings_text(
+                dict_get(item, "name", nil)).strip();
+            baseUrl = __nexora_provider_settings_text(
+                dict_get(item, "base_url", nil)).strip();
+        }
+        let model = __nexora_provider_settings_text(
+            dict_get(item, "model", nil)).strip();
+        if (name == "") name = __nexora_provider_settings_infer_name(baseUrl, model);
+
+        let apiKey = __nexora_provider_settings_text(
+            dict_get(item, "api_key", nil)).strip();
+        let oldProvider = __nexora_provider_settings_find(current, providerId);
+        if (apiKey == "" and oldProvider != nil) {
+            if (__nexora_provider_settings_endpoint_matches(oldProvider,
+                    templateId, baseUrl)) {
+                apiKey = __nexora_provider_settings_text(
+                    dict_get(oldProvider, "api_key", nil)).strip();
+            }
+        }
+        let keySourceId = __nexora_provider_settings_text(
+            dict_get(item, "key_source_id", nil)).strip();
+        if (apiKey == "" and keySourceId != "") {
+            let keySource = __nexora_provider_settings_find(current, keySourceId);
+            if (keySource != nil) {
+                if (__nexora_provider_settings_endpoint_matches(keySource,
+                        templateId, baseUrl)) {
+                    apiKey = __nexora_provider_settings_text(
+                        dict_get(keySource, "api_key", nil)).strip();
+                }
+            }
+        }
+
+        if (template != nil and apiKey == "") {
+            return {"ok": false,
+                "message": "Please enter the API key for the selected provider"};
+        }
+        if (template != nil and model == "") {
+            return {"ok": false, "message": "Please enter a model name"};
+        }
+
+        let temperature = __nexora_provider_settings_number(
+            dict_get(item, "temperature", 0.7), 0.7);
+        if (temperature == 0) temperature = 0.7;
+        let maxTokens = __nexora_provider_settings_integer(
+            dict_get(item, "max_tokens", 4096), 4096);
+        if (maxTokens == 0) maxTokens = 4096;
+        let contextWindow = __nexora_provider_settings_integer(
+            dict_get(item, "context_window", 128000), 128000);
+        if (contextWindow <= 0) {
+            return {"ok": false, "message": "provider context_window must be greater than 0"};
+        }
+        if (maxTokens <= 0) {
+            return {"ok": false, "message": "provider max_tokens must be greater than 0"};
+        }
+        if (maxTokens >= contextWindow) {
+            return {"ok": false,
+                "message": "provider max_tokens must be smaller than context_window"};
+        }
+
+        let thinkingProtocol = __nexora_provider_settings_text(
+            dict_get(item, "thinking_protocol", nil), "none")
+            .strip().lower();
+        if (thinkingProtocol == "") thinkingProtocol = "none";
+        if (thinkingProtocol != "none" and thinkingProtocol != "deepseek" and
+                thinkingProtocol != "dashscope" and thinkingProtocol != "ollama") {
+            return {"ok": false,
+                "message": "unsupported thinking protocol: " + thinkingProtocol};
+        }
+
+        output.append({
+            "id": providerId, "name": name, "base_url": baseUrl,
+            "api_key": apiKey, "model": model,
+            "temperature": temperature, "max_tokens": maxTokens,
+            "context_window": contextWindow, "timeout_seconds": 120.0,
+            "thinking_protocol": thinkingProtocol,
+            "template_id": templateId
+        });
+    }
+
+    let defaultId = __nexora_provider_settings_text(
+        dict_get(payload, "default_id", nil)).strip();
+    if (defaultId == "" and output.length() > 0) {
+        defaultId = str(dict_get(output[0], "id", ""));
+    }
+    return {"ok": true, "document": {
+        "default_id": defaultId, "providers": output}};
+}
+
+func nexora_provider_settings_resolve_api_key(current: dict, payload: dict,
+        templateId: string, baseUrl: string) -> string {
+    let apiKey = __nexora_provider_settings_text(
+        dict_get(payload, "api_key", nil)).strip();
+    if (apiKey != "") return apiKey;
+
+    let sourceId = __nexora_provider_settings_text(
+        dict_get(payload, "key_source_id", nil)).strip();
+    if (sourceId == "") {
+        sourceId = __nexora_provider_settings_text(
+            dict_get(payload, "provider_id", nil)).strip();
+    }
+    if (sourceId == "") return "";
+
+    let source = __nexora_provider_settings_find(current, sourceId);
+    if (source == nil) return "";
+    if (!__nexora_provider_settings_endpoint_matches(source, templateId, baseUrl)) {
+        return "";
+    }
+    return __nexora_provider_settings_text(
+        dict_get(source, "api_key", nil)).strip();
+}

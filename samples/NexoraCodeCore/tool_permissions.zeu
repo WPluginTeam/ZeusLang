@@ -1,0 +1,63 @@
+import zeus.dict;
+import zeus.string;
+
+func nexora_tool_permission_mode_valid(modeValue: string) -> bool {
+    let mode = modeValue.strip().lower();
+    return mode == "read_only" or mode == "confirm" or mode == "full" or
+        mode == "auto";
+}
+
+// Read operations are safe in each mode. Unknown operation kinds are denied.
+func nexora_tool_permission_decision(modeValue: string, operationValue: string) -> string {
+    let mode = modeValue.strip().lower();
+    let operation = operationValue.strip().lower();
+    if (operation == "read") return "allow";
+    if (operation != "write" and operation != "command" and operation != "plugin") {
+        return "deny";
+    }
+    if (mode == "full") return "allow";
+    if (mode == "confirm") return "confirm";
+    if (mode == "auto") return "auto";
+    return "deny";
+}
+
+func nexora_tool_approval_summary(call: dict, operation: string) -> string {
+    let name = str(dict_get(call, "name", "tool"));
+    let arguments = dict_get(call, "arguments", {});
+    if (name == "local_terminal") {
+        let action = str(dict_get(arguments, "action", "")).strip().lower();
+        if (action == "run") {
+            let command = str(dict_get(arguments, "command", "")).replace("\r", " ")
+                .replace("\n", " ").replace("\t", " ").strip();
+            let cwd = str(dict_get(arguments, "cwd", "")).replace("\r", " ")
+                .replace("\n", " ").replace("\t", " ").strip();
+            let terminalSummary = "Run terminal command: " + command;
+            if (cwd != "") terminalSummary = terminalSummary + " (cwd: " + cwd + ")";
+            if (terminalSummary.length() > 180) {
+                terminalSummary = terminalSummary.slice(0, 177) + "...";
+            }
+            return terminalSummary;
+        }
+        if (action == "terminate") {
+            return "Terminate terminal session " +
+                str(dict_get(arguments, "terminal_id", ""));
+        }
+    }
+    if (name == "local_shell_exec") {
+        let command = str(dict_get(arguments, "command", "")).replace("\r", " ")
+            .replace("\n", " ").replace("\t", " ").strip();
+        let cwd = str(dict_get(arguments, "cwd", "")).replace("\r", " ")
+            .replace("\n", " ").replace("\t", " ").strip();
+        let commandSummary = "Run command: " + command;
+        if (cwd != "") commandSummary = commandSummary + " (cwd: " + cwd + ")";
+        if (commandSummary.length() > 180) {
+            commandSummary = commandSummary.slice(0, 177) + "...";
+        }
+        return commandSummary;
+    }
+    let path = str(dict_get(arguments, "path", "")).strip();
+    let summary = "Run " + operation + " tool " + name;
+    if (path != "") summary = summary + " on workspace path " + path;
+    if (summary.length() > 180) summary = summary.slice(0, 177) + "...";
+    return summary;
+}

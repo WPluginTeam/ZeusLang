@@ -1,0 +1,63 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.file [&file];
+import zeus.json;
+import zeus.string;
+import zeus.thread;
+
+import samples.NexoraCodeCore.storage;
+
+let __nexora_tool_permission_events_lock: RLock = new RLock();
+
+func nexora_tool_permission_event_record(pathValue: string, event: dict) {
+    let path = pathValue.strip();
+    if (path == "" or type(event) != "dict") return false;
+    if (str(dict_get(event, "mode", "")) != "auto" or
+            str(dict_get(event, "stage", "")) != "auto_model") return false;
+    let operation = str(dict_get(event, "operation", ""));
+    if (operation != "command" and operation != "write" and
+            operation != "network") return false;
+
+    with (__nexora_tool_permission_events_lock) {
+        let handle = file.open(path, "a");
+        try {
+            handle.write(JSON.stringify(event) + "\n");
+            handle.flush();
+        } catch (&error) {
+            handle.close();
+            throw error;
+        }
+        handle.close();
+    }
+    return true;
+}
+
+func nexora_tool_permission_events_read(pathValue: string, limitValue: int=50) -> Array {
+    let output: Array = [];
+    let path = pathValue.strip();
+    if (path == "" or !file.exists(path)) return output;
+    let text = nexora_core_read_text(path);
+    let lines = text.split("\n");
+    let limit = limitValue;
+    if (limit < 1) limit = 1;
+    if (limit > 100) limit = 100;
+    let inspected = 0;
+    for (lines.length() > 0 and inspected < 5000) {
+        let index = lines.length() - 1 - inspected;
+        if (index < 0) break;
+        let line = str(lines[index]).strip();
+        inspected = inspected + 1;
+        if (line == "") continue;
+        let event = nil;
+        try {
+            event = JSON.parse(line);
+        } catch (&invalidLine) {
+            continue;
+        }
+        if (type(event) != "dict" or str(dict_get(event, "mode", "")) != "auto" or
+                str(dict_get(event, "stage", "")) != "auto_model") continue;
+        output.append(event);
+        if (output.length() >= limit) break;
+    }
+    return output;
+}

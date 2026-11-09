@@ -1,0 +1,122 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.string;
+import samples.NexoraCodeCore.core;
+import samples.NexoraCodeCore.policy;
+
+// 远程 RPC 的宿主接缝：白名单判定留在样例里，真正干活的是注入的 localApi。
+// 它只暴露一个 dispatch(method, path, query, body) -> {"status": int, "body": ...}，
+// 基线里的 Flask test_client 就落在这一层后面。
+
+func nexora_core_rpc_message(status: int, message: string) {
+    let body = {"message": message};
+    let answer = {"status": status, "body": body};
+    return answer;
+}
+
+// 帧里的 payload；不是字典或缺失时返回 nil（字典是值类型，类型名报 "object"，
+// 所以用一次试探性的 dict_get 判断而不是比较 type()）。
+func nexora_core_rpc_payload(frame) {
+    let payload = nil;
+    try {
+        payload = dict_get(frame, "payload", nil);
+    } catch (&error) {
+        return nil;
+    }
+    if (payload == nil) return nil;
+
+    let probe = nil;
+    try {
+        probe = dict_get(payload, "path", nil);
+    } catch (&error) {
+        return nil;
+    }
+    if (probe == nil) {
+        // 允许没有 path 的 payload 走白名单拒绝，但不能是别的类型。
+        probe = dict_get(payload, "method", nil);
+        if (probe == nil) return nil;
+    }
+    return payload;
+}
+
+func nexora_core_rpc_request(payload) {
+    if (payload == nil) return nil;
+
+    let request = nil;
+    try {
+        let method = dict_get(payload, "method", "GET");
+        if (method == nil) method = "GET";
+        let path = dict_get(payload, "path", "");
+        if (path == nil) path = "";
+
+        request = {
+            "method": str(method).upper(),
+            "path": str(path),
+            "query": dict_get(payload, "query", nil),
+            "body": dict_get(payload, "body", nil)
+        };
+    } catch (&error) {
+        return nil;
+    }
+    return request;
+}
+
+// 返回 {"status", "body"}。403 是白名单拒绝，500 是宿主抛错，502 是宿主没给出
+// 能当 JSON 的结果——与基线的三态一致。
+func nexora_core_dispatch_rpc(payload, localApi) {
+    let request = nexora_core_rpc_request(payload);
+    if (request == nil) {
+        return nexora_core_rpc_message(400, "RPC 请求缺少 payload");
+    }
+
+    if (!nexora_core_allowed_request(request["method"], request["path"])) {
+        return nexora_core_rpc_message(403, "远程接口不在允许范围内");
+    }
+
+    if (localApi == nil) {
+        return nexora_core_rpc_message(500, "电脑处理请求失败，请查看本地日志");
+    }
+
+    let answer = nil;
+    try {
+        answer = localApi.dispatch(
+            request["method"], request["path"], request["query"], request["body"]);
+    } catch (&error) {
+        return nexora_core_rpc_message(500, "电脑处理请求失败，请查看本地日志");
+    }
+
+    let status = nil;
+    try {
+        status = dict_get(answer, "status", nil);
+    } catch (&error) {
+        return nexora_core_rpc_message(502, "本地接口返回了非 JSON 响应");
+    }
+    if (status == nil) {
+        return nexora_core_rpc_message(502, "本地接口返回了非 JSON 响应");
+    }
+
+    return answer;
+}
+
+class NexoraCoreRpcHandler {
+    using &this;
+
+    let localApi = nil;
+
+    func init(localApiValue) {
+        this.localApi = localApiValue;
+    }
+
+    // 客户端的 onRpc 钩子：回帧需要连接，所以连接随帧一起传进来。
+    func handle(frame, connection) {
+        let requestId = dict_get(frame, "request_id", "");
+        if (requestId == nil) return false;
+        if (type(requestId) != "string") return false;
+        if (requestId.length() == 0) return false;
+
+        let result = nexora_core_dispatch_rpc(
+            nexora_core_rpc_payload(frame), this.localApi);
+        nexora_core_send_rpc_result(connection, requestId, result);
+        return true;
+    }
+}

@@ -86,17 +86,7 @@ class Dict {
 
     inline func hasKey(key) {
         let targetKey = __dict_normalize_key(key);
-        using LLVM {
-            return __dict_has_key(this.data, targetKey) != 0;
-        }
-        using VM {
-            for (this.data) [&entryKey: &entryValue] {
-                if (__dict_normalize_key(entryKey) == targetKey) {
-                    return true;
-                }
-            }
-            return false;
-        }
+        return __dict_has_key(this.data, targetKey) != 0;
     }
 
     func keys() {
@@ -124,12 +114,7 @@ class Dict {
     }
 
     @no_safepoint inline func length() -> int {
-        using LLVM {
-            return __dict_length_i64(this.data);
-        }
-        using VM {
-            return len(this.keys());
-        }
+        return __dict_length_i64(this.data);
     }
 
     inline func deleteKey(key) {
@@ -176,5 +161,37 @@ class Dict {
         using VM {
             return this.data[normalizedKey];
         }
+    }
+}
+
+// The built-in dictionary type is globally available as a class value.
+class dict {}
+
+// dict 字面量是值类型（不是对象）：`new Dict()` 上的 get 缺键即抛；
+// 缺键又要返回默认值时，用自由函数 dict_get，或字面量方法 `d.get(k, fb)`
+// （见文件尾的 `impl dict`）。
+func dict_get(source, key, fallback = nil) {
+    for (source) [&entryKey: &entryValue] {
+        if (entryKey == key) return entryValue;
+    }
+    return fallback;
+}
+
+// 写入一个键，容器本身是共享的，所以写进去对持有者是可见的。
+//
+// 收一个无类型形参是刻意的：局部变量的静态类型来自动态返回值（JSON.parse、
+// dict_get）时，直接写 `local[key] = value` 会被 AOT 判成"type 没有匹配的
+// 下标 operator"。走形参之后按动态值处理，两个后端行为一致。
+func dict_set(source, key, value) {
+    source[key] = value;
+}
+
+// 字面量的方法分发：`{"a": 1}.get("a")` 走这里。缺键回 fallback，
+// 与自由函数 dict_get 同口径（Dict 类的 get 缺键抛，不适合字面量）。
+impl dict {
+    using &this;
+
+    func get(key, fallback = nil) {
+        return dict_get(this, key, fallback);
     }
 }

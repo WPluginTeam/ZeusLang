@@ -1,0 +1,20 @@
+import zeus.ctypes;
+
+@native decl IntegerType = INTEGER;
+@native decl BoolType = BOOL;
+@native decl PointerType = PTR;
+@native decl StringType = STRING;
+@native decl BytesType = BYTES;
+@native decl RawBytesRangeType = RAW_BYTES_RANGE;
+
+@native("unused_pointer") decl func pointerImport(value: PointerType);
+
+func integerIdentity(value: IntegerType) -> IntegerType { return value; }
+func boolIdentity(value: BoolType) -> BoolType { return value; }
+func stringIdentity(value: StringType) -> StringType { return value; }
+func bytesIdentity(value: BytesType) -> BytesType { return value; }
+func rawBytesRangeIdentity(value: RawBytesRangeType) -> RawBytesRangeType {
+    return value;
+}
+
+print("NATIVE_TYPE_IDS_PASS");

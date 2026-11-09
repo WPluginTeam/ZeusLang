@@ -1,4 +1,4 @@
-
+﻿
 #ifndef TreeType_hpp
 #define TreeType_hpp
 
@@ -11,12 +11,14 @@ enum class CodeBlockType {
     IMPL,
     TRY,    // try block
     CATCH,  // catch block
+    FIN,    // fin cleanup block
     WITH,   // with block
     USING,  // using original { ... } block
 
     BLOCK, // undefined
     USING_LLVM,
-    USING_VM
+    USING_VM,
+    USING_PLATFORM
 };
 
 enum class NodeType {
@@ -34,6 +36,7 @@ enum class NodeType {
     
     IMPORT_STMT,    // import package.name;
     USING_STMT,     // using original;
+    USING_EXPORTS_STMT, // using {name, ...}; module export allowlist
     USING_BLOCK_STMT, // using original { ... };  范围限制的using original
 
     IF_DECL_STMT,
@@ -52,8 +55,10 @@ enum class NodeType {
     WAIT,
 
     MAIN,
+    STATIC_FILE_STMT,
     USING_LLVM_BLOCK_STMT,
-    USING_VM_BLOCK_STMT
+    USING_VM_BLOCK_STMT,
+    USING_PLATFORM_BLOCK_STMT
 };
 
 namespace Debug {
@@ -67,13 +72,16 @@ namespace Debug {
             case NodeType::CONTINUE_STMT: return "CONTINUE_STMT";
             case NodeType::DELETE_STMT: return "DELETE_STMT";
             case NodeType::THROW_STMT: return "THROW_STMT";
+            case NodeType::STATIC_FILE_STMT: return "STATIC_FILE_STMT";
             case NodeType::FUNC_FWD_DECL_STMT: return "FUNC_FWD_DECL_STMT";
             case NodeType::INTERFACE_METHOD_DECL_STMT: return "INTERFACE_METHOD_DECL_STMT";
             case NodeType::IMPORT_STMT: return "IMPORT_STMT";
             case NodeType::USING_STMT: return "USING_STMT";
+            case NodeType::USING_EXPORTS_STMT: return "USING_EXPORTS_STMT";
             case NodeType::USING_BLOCK_STMT: return "USING_BLOCK_STMT";
             case NodeType::USING_LLVM_BLOCK_STMT: return "USING_LLVM_BLOCK_STMT";
             case NodeType::USING_VM_BLOCK_STMT: return "USING_VM_BLOCK_STMT";
+            case NodeType::USING_PLATFORM_BLOCK_STMT: return "USING_PLATFORM_BLOCK_STMT";
             case NodeType::IF_DECL_STMT: return "IF_DECL_STMT";
             case NodeType::FOR_DECL_STMT: return "FOR_DECL_STMT";
             case NodeType::FUNC_DECL_STMT: return "FUNC_DECL_STMT";
@@ -97,10 +105,12 @@ namespace Debug {
             case CodeBlockType::IMPL: return "IMPL";
             case CodeBlockType::TRY: return "TRY";
             case CodeBlockType::CATCH: return "CATCH";
+            case CodeBlockType::FIN: return "FIN";
             case CodeBlockType::WITH: return "WITH";
             case CodeBlockType::USING: return "USING";
             case CodeBlockType::USING_LLVM: return "USING_LLVM";
             case CodeBlockType::USING_VM: return "USING_VM";
+            case CodeBlockType::USING_PLATFORM: return "USING_PLATFORM";
             default: return "UNKNOWN";
         }
     }

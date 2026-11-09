@@ -1,0 +1,25 @@
+import zeus.ctypes [&ctypes];
+
+@native decl Double = ctypes.DOUBLE;
+@native decl LongLong = ctypes.LONGLONG;
+@native decl Int32 = ctypes.INT32;
+@native decl Int8 = ctypes.INT8;
+
+@native("zeus_native_decl_add_double")
+decl func addDouble(left: Double, right: Double) -> Double;
+@native("zeus_native_decl_add_i64")
+decl func addWide(left: LongLong, right: LongLong) -> LongLong;
+@native("zeus_native_decl_add_i32")
+decl func addMedium(left: Int32, right: Int32) -> Int32;
+@native("zeus_native_decl_add_i8")
+decl func addSmall(left: Int8, right: Int8) -> Int8;
+@native("zeus_native_decl_mixed")
+decl func mixed(real: Double, wide: LongLong, medium: Int32, small: Int8) -> Double;
+
+if (addDouble(1.25, 2.5) != 3.75) throw "extern C double ABI";
+if (addWide(4294967296, -1) != 4294967295) throw "extern C long long ABI";
+if (addMedium(-1234567, 2345678) != 1111111) throw "extern C int32 ABI";
+if (addSmall(-120, 7) != -113) throw "extern C int8 ABI";
+if (mixed(0.5, 4294967296, -12345, -120) != 4294954831.5) throw "mixed scalar ABI";
+
+print("NATIVE_DECL_ABI_PASS");

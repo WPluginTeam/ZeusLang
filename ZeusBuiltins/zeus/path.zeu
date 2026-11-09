@@ -1,0 +1,145 @@
+// Cross-platform lexical path helpers. Separators in normalized results use '/'.
+
+import zeus.exception;
+import zeus.byte;
+import zeus.string;
+
+func __path_normalize_separators(value: string) -> string {
+    let raw: bytes = bytes(value);
+    let output: bytes = b"";
+    for (0..raw.length()) [const &i] {
+        if (raw.get(i) == 92) {
+            output = output + bytes([47]);
+        } else {
+            output = output + raw.slice(i, i + 1);
+        }
+    }
+    return output.decode("utf-8");
+}
+
+func __path_drive_prefix(path: string) -> bool {
+    if (path.length() < 2) return false;
+    return path.slice(1, 2) == ":";
+}
+
+class Path {
+    func static isAbsolute(path: string) -> bool {
+        let normalized: string = __path_normalize_separators(path);
+        if (normalized.startswith("/")) return true;
+        return __path_drive_prefix(normalized) and
+            normalized.length() >= 3 and normalized.slice(2, 3) == "/";
+    }
+
+    func static normalize(path: string) -> string {
+        if (path.length() == 0) return ".";
+        let source: string = __path_normalize_separators(path);
+        let prefix: string = "";
+        let start: int = 0;
+        let absolute: bool = false;
+
+        if (__path_drive_prefix(source)) {
+            prefix = source.slice(0, 2);
+            start = 2;
+            if (source.length() >= 3 and source.slice(2, 3) == "/") {
+                prefix = prefix + "/";
+                start = 3;
+                absolute = true;
+            }
+        } else if (source.startswith("//")) {
+            prefix = "//";
+            start = 2;
+            absolute = true;
+        } else if (source.startswith("/")) {
+            prefix = "/";
+            start = 1;
+            absolute = true;
+        }
+
+        let segments: list = source.slice(start, source.length()).split("/");
+        let normalizedSegments: list = [];
+        for (0..segments.length()) [const &i] {
+            let segment: string = segments.get(i);
+            if (segment.length() > 0 and segment != ".") {
+                if (segment == "..") {
+                    let count: int = normalizedSegments.length();
+                    if (count > 0 and normalizedSegments.get(count - 1) != "..") {
+                        normalizedSegments.pop();
+                    } else if (!absolute) {
+                        normalizedSegments.append(segment);
+                    }
+                } else {
+                    normalizedSegments.append(segment);
+                }
+            }
+        }
+
+        let result: string = prefix;
+        for (0..normalizedSegments.length()) [const &i] {
+            if (i > 0 or (result.length() > 0 and !result.endswith("/") and
+                !__path_drive_prefix(result))) {
+                result = result + "/";
+            }
+            result = result + normalizedSegments.get(i);
+        }
+        if (result.length() == 0) return ".";
+        return result;
+    }
+
+    func static join(left: string, right: string) -> string {
+        if (right.length() == 0) return Path.normalize(left);
+        if (Path.isAbsolute(right)) return Path.normalize(right);
+        if (left.length() == 0) return Path.normalize(right);
+        if (left.endswith("/") or left.endswith("\\")) {
+            return Path.normalize(left + right);
+        }
+        if (__path_drive_prefix(left) and left.length() == 2) {
+            return Path.normalize(left + right);
+        }
+        return Path.normalize(left + "/" + right);
+    }
+
+    func static basename(path: string) -> string {
+        let normalized: string = Path.normalize(path);
+        if (normalized == "/" or normalized == "//" or
+            (__path_drive_prefix(normalized) and normalized.endswith("/"))) return normalized;
+        let end: int = normalized.length();
+        for (end > 0 and normalized.slice(end - 1, end) == "/") {
+            end = end - 1;
+        }
+        if (end == 0) return "/";
+        let trimmed: string = normalized.slice(0, end);
+        let separator: int = trimmed.rindex("/");
+        if (separator < 0) return trimmed;
+        return trimmed.slice(separator + 1, trimmed.length());
+    }
+
+    func static dirname(path: string) -> string {
+        let normalized: string = Path.normalize(path);
+        if (normalized == "/" or normalized == "//" or
+            (__path_drive_prefix(normalized) and normalized.endswith("/"))) return normalized;
+        let end: int = normalized.length();
+        for (end > 0 and normalized.slice(end - 1, end) == "/") {
+            end = end - 1;
+        }
+        let trimmed: string = normalized.slice(0, end);
+        let separator: int = trimmed.rindex("/");
+        if (separator < 0) {
+            if (__path_drive_prefix(trimmed)) return trimmed.slice(0, 2);
+            return ".";
+        }
+        if (separator == 0) return "/";
+        if (separator == 1 and trimmed.startswith("//")) return "//";
+        if (separator == 2 and __path_drive_prefix(trimmed)) {
+            return trimmed.slice(0, 3);
+        }
+        return trimmed.slice(0, separator);
+    }
+
+    // Returns the final extension including its leading dot. Dotfiles have no extension.
+    func static extension(path: string) -> string {
+        let name: string = Path.basename(path);
+        let dot: int = name.rindex(".");
+        if (dot <= 0) return "";
+        return name.slice(dot, name.length());
+    }
+}

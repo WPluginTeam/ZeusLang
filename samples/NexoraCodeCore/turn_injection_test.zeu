@@ -1,0 +1,149 @@
+import zeus.exception;
+import samples.NexoraCodeCore.context;
+import samples.NexoraCodeCore.turn_injection;
+
+func assertTurnInjection(condition: bool, message: string) {
+    if (!condition) throw new Exception("turn injection 测试失败: " + message);
+}
+
+func testTurnInjectionFullAndBaseline() {
+    let plan = nexora_plan_injection(
+        {"project_conventions": "第一行\n第二行", "custom_instructions": ""}, {});
+    assertTurnInjection(plan["blocks"].length() == 1, "首次应全量注入一个通道");
+    assertTurnInjection(str(plan["blocks"][0]).index("## Project conventions") == 0,
+        "全量注入应带项目标记");
+    assertTurnInjection(str(plan["blocks"][0]).index("第二行") >= 0,
+        "全量注入应保留完整内容");
+    assertTurnInjection(plan["baseline"]["project_conventions"]["lines"].length() == 2,
+        "基线应保存规范化后的原始行");
+    assertTurnInjection(plan["diagnostics"][0]["mode"] == "full",
+        "首次诊断模式应为 full");
+    assertTurnInjection(plan["diagnostics"][0]["rows"][0]["kind"] == "added",
+        "全量诊断应把每行标为新增");
+}
+
+func testTurnInjectionNoChangeAndDiff() {
+    let sources = {"custom_instructions": "旧要求\n保留行"};
+    let first = nexora_plan_injection(sources, {});
+    let unchanged = nexora_plan_injection(sources, first["baseline"]);
+    assertTurnInjection(unchanged["blocks"].length() == 0, "内容未变时不应重复注入");
+
+    let changed = nexora_plan_injection(
+        {"custom_instructions": "新要求\n保留行"}, first["baseline"]);
+    assertTurnInjection(changed["blocks"].length() == 1, "变化后应生成一条 diff 注入");
+    assertTurnInjection(str(changed["blocks"][0]).index("- 旧要求") >= 0,
+        "diff 应包含删除行");
+    assertTurnInjection(str(changed["blocks"][0]).index("+ 新要求") >= 0,
+        "diff 应包含新增行");
+    assertTurnInjection(str(changed["blocks"][0]).index("保留行") < 0,
+        "未变化行不应进入 diff");
+    assertTurnInjection(changed["diagnostics"][0]["mode"] == "diff",
+        "变化诊断模式应为 diff");
+}
+
+func testTurnInjectionMultipleEditsStayLocal() {
+    let oldLines = ["A", "B", "C", "D", "E"];
+    let newLines = ["A", "X", "C", "D", "Y"];
+    let rows = __nexora_injection_diff_rows(oldLines, newLines);
+    assertTurnInjection(rows.length() == 4, "两处修改只应产生四条变更行");
+    assertTurnInjection(rows[0]["kind"] == "removed" and rows[1]["kind"] == "added",
+        "替换行应按删除、添加顺序排列");
+    assertTurnInjection(rows[2]["kind"] == "removed" and rows[3]["kind"] == "added",
+        "末尾替换应保留顺序");
+}
+
+func testTurnInjectionClearAndNormalize() {
+    let normalized = nexora_injection_normalize_lines("\n第一行  \r\n第二行\t\r\n");
+    assertTurnInjection(normalized.length() == 2, "首尾空行应移除");
+    assertTurnInjection(normalized[0] == "第一行", "行尾空白应规范化");
+
+    let first = nexora_plan_injection({"custom_instructions": "旧要求"}, {});
+    let cleared = nexora_plan_injection({"custom_instructions": ""}, first["baseline"]);
+    assertTurnInjection(cleared["blocks"].length() == 1, "清空内容应生成删除 diff");
+    assertTurnInjection(str(cleared["blocks"][0]).index("- 旧要求") >= 0,
+        "清空 diff 应指出被移除的要求");
+    assertTurnInjection(cleared["baseline"].get("custom_instructions", nil) == nil,
+        "清空后应移除该通道基线");
+}
+
+func testTurnInjectionChannelsAndVersion() {
+    let plan = nexora_plan_injection(
+        {"project_conventions": "约定A", "custom_instructions": "要求A"}, {});
+    let changed = nexora_plan_injection(
+        {"project_conventions": "约定A", "custom_instructions": "要求B"}, plan["baseline"]);
+    assertTurnInjection(changed["blocks"].length() == 1,
+        "两个注入通道应各自比较");
+    assertTurnInjection(str(changed["blocks"][0]).index("Custom instructions") >= 0,
+        "只变化的自定义指令应单独注入");
+
+    let oldState = {"injection_version": 1, "injection_baseline": plan["baseline"]};
+    assertTurnInjection(nexora_injection_state_baseline(oldState).get(
+        "project_conventions", nil) == nil, "旧版本应强制全量迁移");
+    let currentState = {"injection_version": NEXORA_INJECTION_VERSION,
+        "injection_baseline": plan["baseline"]};
+    assertTurnInjection(nexora_injection_state_baseline(currentState).get(
+        "project_conventions", nil) != nil, "当前版本应复用已保存基线");
+}
+
+func testTurnInjectionMessagePayloadAndPermissionMode() {
+    let plan = nexora_plan_injection({"custom_instructions": "按约定回答"}, {});
+    let messages = nexora_injection_build_messages(plan["blocks"], plan["diagnostics"]);
+    assertTurnInjection(nexora_injection_is_message(messages[0]),
+        "注入消息应带专用 metadata 标记");
+    let payload = nexora_message_payload(messages[0]);
+    assertTurnInjection(payload.get("metadata", nil) == nil,
+        "历史 metadata 不得透传到 provider payload");
+
+    let autoMessage = nexora_injection_permission_message("auto");
+    assertTurnInjection(str(autoMessage["content"]).index("自动审批") >= 0,
+        "auto 模式应说明自动审批规则");
+    let confirmMessage = nexora_injection_permission_message("confirm");
+    assertTurnInjection(str(confirmMessage["content"]).index("confirm") >= 0 and
+        str(confirmMessage["content"]).index("读取操作可直接使用") >= 0,
+        "确认模式应标明当前模式和自动允许的读取操作");
+    let readOnlyMessage = nexora_injection_permission_message("read_only");
+    assertTurnInjection(str(readOnlyMessage["content"]).index("只读模式") >= 0 and
+        str(readOnlyMessage["content"]).index("不要调用写入") >= 0,
+        "只读模式应说明允许读取且禁止变更操作");
+    let fullMessage = nexora_injection_permission_message("full");
+    assertTurnInjection(str(fullMessage["content"]).index("无需等待权限审批") >= 0,
+        "完全权限模式应明确无需等待审批");
+}
+
+func testTurnInjectionDiffLimitAndStepCollapse() {
+    let oldLines: Array = [];
+    let newLines: Array = [];
+    for (0..100) [const &index] {
+        oldLines.append("old");
+        newLines.append("new");
+    }
+    let limited = __nexora_injection_limit_diff_rows(
+        __nexora_injection_diff_rows(oldLines, newLines));
+    assertTurnInjection(limited.length() == 41, "长 diff 应限制为 40 行并附一条说明");
+    assertTurnInjection(str(limited[40]["text"]).index("未展示") >= 0,
+        "截断说明应包含剩余行数提示");
+
+    let oldEvent = {"type": "context_injection", "blocks": ["old"]};
+    let latestEvent = {"type": "context_injection", "blocks": ["latest"]};
+    let collapsed = nexora_injection_collapse_steps([
+        oldEvent,
+        {"type": "function_call"},
+        latestEvent,
+        {"type": "function_result"}
+    ]);
+    assertTurnInjection(collapsed.length() == 3, "同一响应应折叠为一条注入事件");
+    assertTurnInjection(collapsed[0]["blocks"][0] == "latest",
+        "应显示最后一次注入快照");
+    assertTurnInjection(collapsed[1]["type"] == "function_call",
+        "折叠后应保留首个注入事件的位置");
+}
+
+func testTurnInjection() {
+    testTurnInjectionFullAndBaseline();
+    testTurnInjectionNoChangeAndDiff();
+    testTurnInjectionMultipleEditsStayLocal();
+    testTurnInjectionClearAndNormalize();
+    testTurnInjectionChannelsAndVersion();
+    testTurnInjectionMessagePayloadAndPermissionMode();
+    testTurnInjectionDiffLimitAndStepCollapse();
+}

@@ -1,0 +1,4 @@
+import zeus.socket;
+
+let exitSocket = new Socket();
+print("VM_SOCKET_EXIT_ENTRY_DONE");

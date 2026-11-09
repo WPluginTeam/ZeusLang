@@ -1,0 +1,25 @@
+func makeExplicitDictReference() -> &Dict {
+    return new Dict();
+}
+
+let values = new Dict();
+let chained = values.set("alpha", 1).set("beta", 2);
+if (chained.length() != 2) throw "inferred Dict reference return failed";
+
+chained.deleteKey("alpha");
+if (values.length() != 1 or values.hasKey("alpha")) {
+    throw "Dict.deleteKey reference return lost the receiver";
+}
+
+let explicit = makeExplicitDictReference();
+explicit.set("explicit", 5);
+if (explicit.length() != 1 or explicit.get("explicit") != 5) {
+    throw "explicit Dict reference return failed";
+}
+
+values.clear().set("delta", 4);
+if (values.length() != 1 or values.get("delta") != 4) {
+    throw "Dict.clear reference chain failed";
+}
+
+print("DICT_REFERENCE_RETURN_PASS");

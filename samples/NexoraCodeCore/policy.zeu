@@ -1,0 +1,154 @@
+import zeus.byte;
+import zeus.exception;
+import zeus.url;
+
+func __nexora_url_is_whitespace(character: string) -> bool {
+    return character == " " or character == "\t" or character == "\n" or
+        character == "\r" or character == "\f" or character == "\v";
+}
+
+func __nexora_trim_url(value: string) -> string {
+    let start: int = 0;
+    let end: int = value.length();
+    for (start < end) {
+        if (!__nexora_url_is_whitespace(value.slice(start, start + 1))) break;
+        start = start + 1;
+    }
+    for (start < end) {
+        if (!__nexora_url_is_whitespace(value.slice(end - 1, end))) break;
+        end = end - 1;
+    }
+    return value.slice(start, end);
+}
+
+func __nexora_hostname(authority: string) -> string {
+    if (authority.index("@") >= 0) return "";
+    if (authority.startswith("[")) {
+        let closingBracket: int = authority.index("]");
+        if (closingBracket <= 1) return "";
+        let remainder: string = authority.slice(closingBracket + 1, authority.length());
+        if (remainder.length() > 0 and !remainder.startswith(":")) return "";
+        return authority.slice(1, closingBracket).lower();
+    }
+
+    let colon: int = authority.index(":");
+    if (colon >= 0) return authority.slice(0, colon).lower();
+    return authority.lower();
+}
+
+func nexora_core_normalize_server_url(value: string) -> string {
+    let parsed: URLParts = URL.parse(__nexora_trim_url(value));
+    if (!parsed.hasAuthority or parsed.authority.length() == 0) {
+        throw new Exception("remote server URL is missing a host");
+    }
+    if (parsed.authority.index("@") >= 0 or parsed.hasQuery or
+        parsed.hasFragment or (parsed.path != "" and parsed.path != "/")) {
+        throw new Exception("remote server URL cannot include credentials, query, fragment, or path");
+    }
+
+    let hostname: string = __nexora_hostname(parsed.authority);
+    if (hostname.length() == 0) {
+        throw new Exception("remote server URL is missing a valid host");
+    }
+    if (parsed.scheme != "https" and
+        !(parsed.scheme == "http" and
+            (hostname == "localhost" or hostname == "127.0.0.1"))) {
+        throw new Exception("remote server requires HTTPS");
+    }
+    return parsed.scheme + "://" + parsed.authority;
+}
+
+func nexora_core_websocket_url(serverUrl: string) -> string {
+    let normalized: string = nexora_core_normalize_server_url(serverUrl);
+    let parsed: URLParts = URL.parse(normalized);
+    let scheme: string = "ws";
+    if (parsed.scheme == "https") scheme = "wss";
+    return scheme + "://" + parsed.authority + "/ws/nexoracode";
+}
+
+func __nexora_is_hex(value: string, expectedLength: int) -> bool {
+    if (value.length() != expectedLength) return false;
+    let data = bytes(value);
+    for (0..expectedLength) [const &index] {
+        let current = __bytes_get(data, index);
+        if (!((current >= 48 and current <= 57) or
+            (current >= 97 and current <= 102))) return false;
+    }
+    return true;
+}
+
+func __nexora_is_queue_id(value: string) -> bool {
+    let length = value.length();
+    if (length < 1 or length > 64) return false;
+    let data = bytes(value);
+    for (0..length) [const &index] {
+        let current = __bytes_get(data, index);
+        let valid = (current >= 48 and current <= 57) or
+            (current >= 65 and current <= 90) or
+            (current >= 97 and current <= 122) or
+            current == 45 or current == 95;
+        if (!valid) return false;
+    }
+    return true;
+}
+
+func __nexora_conversation_path(path: string, allowedSuffix) -> bool {
+    let prefix = "/api/conversations/conv_";
+    if (!path.startswith(prefix)) return false;
+    let tail = path.slice(prefix.length(), path.length());
+    if (tail.length() < 10) return false;
+    if (!__nexora_is_hex(tail.slice(0, 10), 10)) return false;
+    let suffix = tail.slice(10, tail.length());
+    for (allowedSuffix) [&candidate] {
+        if (suffix == candidate) return true;
+    }
+    return false;
+}
+
+func __nexora_task_path(path: string, suffix: string) -> bool {
+    let prefix = "/api/local/tasks/";
+    if (!path.startswith(prefix)) return false;
+    let tail = path.slice(prefix.length(), path.length());
+    if (tail.length() != 32 + suffix.length()) return false;
+    return __nexora_is_hex(tail.slice(0, 32), 32) and
+        tail.slice(32, tail.length()) == suffix;
+}
+
+func __nexora_queue_item_path(path: string, suffix: string) -> bool {
+    let prefix = "/api/chat/queue/";
+    if (!path.startswith(prefix)) return false;
+    let tail = path.slice(prefix.length(), path.length());
+    if (suffix.length() > 0) {
+        if (!tail.endswith(suffix)) return false;
+        tail = tail.slice(0, tail.length() - suffix.length());
+    }
+    return __nexora_is_queue_id(tail);
+}
+
+func nexora_core_allowed_request(method: string, path: string) -> bool {
+    if (method == "GET") {
+        if (path == "/api/config" or path == "/api/conversations" or
+            path == "/api/local/tasks" or path == "/api/local/permissions" or
+            path == "/api/chat/queue") return true;
+        return __nexora_conversation_path(path,
+                ["", "/messages", "/turns", "/settings"]) or
+            __nexora_task_path(path, "/events");
+    }
+
+    if (method == "POST") {
+        if (path == "/api/conversations" or path == "/api/local/tasks" or
+            path == "/api/agent/permission/grant" or
+            path == "/api/agent/tool-permission/resolve" or
+            path == "/api/local/permissions" or path == "/api/chat/queue") {
+            return true;
+        }
+        return __nexora_conversation_path(path, ["/settings"]) or
+            __nexora_task_path(path, "/cancel") or
+            __nexora_queue_item_path(path, "/steer");
+    }
+
+    if (method == "PATCH" or method == "DELETE") {
+        return __nexora_queue_item_path(path, "");
+    }
+    return false;
+}

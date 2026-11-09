@@ -134,6 +134,60 @@ namespace ZeusTypeInfer {
             return -1;
         }
 
+        struct ConditionalParts {
+            size_t question = 0;
+            size_t colon = 0;
+            bool elvis = false;
+        };
+
+        static bool findTopLevelConditional(
+            const std::vector<LexerType::Token>& tokens,
+            size_t begin,
+            size_t end,
+            ConditionalParts& parts
+        ) {
+            int parenDepth = 0;
+            int bracketDepth = 0;
+            int braceDepth = 0;
+            int nestedConditionals = 0;
+            bool foundQuestion = false;
+
+            for (size_t i = begin; i < end; ++i) {
+                if (isOperator(tokens[i], "(")) ++parenDepth;
+                else if (isOperator(tokens[i], ")")) --parenDepth;
+                else if (isOperator(tokens[i], "[")) ++bracketDepth;
+                else if (isOperator(tokens[i], "]")) --bracketDepth;
+                else if (isOperator(tokens[i], "{")) ++braceDepth;
+                else if (isOperator(tokens[i], "}")) --braceDepth;
+
+                if (parenDepth != 0 || bracketDepth != 0 || braceDepth != 0) continue;
+
+                if (isOperator(tokens[i], "?")) {
+                    if (i + 1 < end && isOperator(tokens[i + 1], ".")) continue;
+                    if (!foundQuestion) {
+                        foundQuestion = true;
+                        parts.question = i;
+                        if (i + 1 < end && isOperator(tokens[i + 1], ":")) {
+                            parts.colon = i + 1;
+                            parts.elvis = true;
+                            return true;
+                        }
+                    } else {
+                        ++nestedConditionals;
+                    }
+                } else if (foundQuestion && isOperator(tokens[i], ":")) {
+                    if (nestedConditionals > 0) {
+                        --nestedConditionals;
+                    } else {
+                        parts.colon = i;
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
         static InferredType mergeNumericTypes(InferredType left, InferredType right) {
             if (left == InferredType::Float || right == InferredType::Float) {
                 return InferredType::Float;
@@ -202,6 +256,27 @@ namespace ZeusTypeInfer {
             }
 
             if (begin >= end) return InferredType::Unknown;
+
+            ConditionalParts conditional;
+            if (findTopLevelConditional(tokens, begin, end, conditional)) {
+                const size_t leftBegin = conditional.elvis
+                    ? begin : conditional.question + 1;
+                const size_t leftEnd = conditional.elvis
+                    ? conditional.question : conditional.colon;
+                const InferredType left = inferExpressionRange(
+                    tokens, leftBegin, leftEnd, environment);
+                const size_t rightBegin = conditional.colon + 1;
+                const InferredType right = inferExpressionRange(
+                    tokens, rightBegin, end, environment);
+                if (conditional.elvis && left == InferredType::Nil) return right;
+                if (left == right) return left;
+                if (left == InferredType::Nil) return right;
+                if (right == InferredType::Nil) return left;
+                if (isNumeric(left) && isNumeric(right)) {
+                    return mergeNumericTypes(left, right);
+                }
+                return InferredType::Unknown;
+            }
 
             int selectedPrecedence = std::numeric_limits<int>::max();
             size_t selectedOperator = end;
@@ -604,6 +679,50 @@ namespace ZeusTypeInfer {
                 info.parameterNames.emplace_back();
             }
             externalFunctions[name] = std::move(info);
+        }
+
+        void registerExternalMethod(
+            const std::string& ownerType,
+            const std::string& name,
+            const std::string& returnType,
+            const std::vector<std::string>& parameterNames,
+            const std::vector<std::string>& parameterTypes,
+            const std::vector<std::string>& typeParameterNames,
+            const std::vector<std::string>& ownerTypeParameterNames,
+            bool isStaticMethod
+        ) {
+            FunctionInfo info;
+            info.ownerType = ownerType;
+            if (const auto* builtin = ZeusBuiltins::findTypeImplementation(info.ownerType)) {
+                info.ownerType = std::string(builtin->canonicalName);
+            }
+            info.name = info.ownerType + "::" + name;
+            info.returnTypeName = returnType;
+            info.returnType = ZeusTypeInfer::parseTypeName(returnType);
+            info.dynamicReturn = returnType.empty();
+            info.returnsReference = ZeusTypeInfer::parseTypeRef(returnType).isReference;
+            info.isClassMethod = true;
+            info.isStaticMethod = isStaticMethod;
+            info.typeParameterNames = typeParameterNames;
+            info.ownerTypeParameterNames = ownerTypeParameterNames;
+            info.parameterNames = parameterNames;
+            info.parameterTypes.reserve(parameterTypes.size());
+            info.parameterTypeNames = parameterTypes;
+            for (const auto& parameterType : parameterTypes) {
+                const bool isMethodTypeParameter = std::find(
+                    typeParameterNames.begin(), typeParameterNames.end(), parameterType) !=
+                    typeParameterNames.end();
+                const bool isOwnerTypeParameter = std::find(
+                    ownerTypeParameterNames.begin(), ownerTypeParameterNames.end(),
+                    parameterType) != ownerTypeParameterNames.end();
+                info.parameterTypes.push_back(isMethodTypeParameter || isOwnerTypeParameter
+                    ? InferredType::TypeParameter
+                    : ZeusTypeInfer::parseTypeName(parameterType));
+            }
+            if (info.parameterNames.size() < info.parameterTypes.size()) {
+                info.parameterNames.resize(info.parameterTypes.size());
+            }
+            externalFunctions[info.name] = std::move(info);
         }
 
         InferredType inferExpression(

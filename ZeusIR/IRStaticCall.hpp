@@ -318,6 +318,7 @@ namespace IRStaticCall {
                 switch (instruction.op) {
                     case VMOperator::JUMP:
                     case VMOperator::LOOP_BREAK:
+                    case VMOperator::LOOP_CONTINUE:
                         if (readIntegerArg(instruction, 0, offset)) {
                             addPredecessor(
                                 pc, static_cast<long long>(pc) + 1 + offset);
@@ -611,6 +612,7 @@ namespace IRStaticCall {
                     case VMOperator::JUMP_IF_TRUE:
                     case VMOperator::JUMP_IF_FALSE:
                     case VMOperator::LOOP_BREAK:
+                    case VMOperator::LOOP_CONTINUE:
                     case VMOperator::TRY_BEGIN:
                     case VMOperator::TRY_END:
                     case VMOperator::CATCH_BEGIN:

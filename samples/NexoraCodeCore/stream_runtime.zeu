@@ -1,0 +1,630 @@
+import zeus.dict;
+import zeus.exception;
+import zeus.json;
+import zeus.string;
+import zeus.thread;
+import zeus.time [&zeusTime];
+
+import samples.NexoraCodeCore.journal;
+import samples.NexoraCodeCore.storage;
+
+let NEXORA_CORE_STREAM_MEMORY_CHUNKS = 500;
+let NEXORA_CORE_STREAM_FLUSH_CHUNKS = 16;
+let NEXORA_CORE_STREAM_RETENTION_SECONDS = 604800;
+
+func __nexora_runtime_terminal_status(status: string) -> bool {
+    return status == "done" or status == "cancelled" or status == "error" or
+        status == "max_rounds" or status == "context_overflow" or
+        status == "interrupted" or status == "awaiting_approval";
+}
+
+func __nexora_runtime_safe_metadata(source) {
+    let safe = {};
+    if (type(source) != "dict") return safe;
+    for (["provider", "model", "request_id", "parent_stream_id", "kind"]) [key] {
+        let value = dict_get(source, key, nil);
+        if (value != nil) dict_set(safe, key, value);
+    }
+    return safe;
+}
+
+func __nexora_runtime_meta_copy(source) {
+    let copy = {};
+    for (source) [&key: &value] {
+        dict_set(copy, key, value);
+    }
+    return copy;
+}
+
+func __nexora_runtime_event_copy(source) {
+    if (type(source) == "dict") {
+        let copy = {};
+        for (source) [&key: &value] {
+            if (key == "_stream_seq") continue;
+            dict_set(copy, key, value);
+        }
+        return copy;
+    }
+    return {"type": "message", "data": str(source)};
+}
+
+class NexoraCoreStreamContext {
+    using &this;
+
+    let runtime = nil;
+    let streamId = "";
+
+    func init(runtimeValue, streamIdValue: string) {
+        this.runtime = runtimeValue;
+        this.streamId = streamIdValue;
+    }
+
+    func operator[@=]() -> &NexoraCoreStreamContext {
+        return this;
+    }
+
+    func pushChunk(event) {
+        return this.runtime.pushChunk(this.streamId, event);
+    }
+
+    func getStreamId() -> string {
+        return this.streamId;
+    }
+
+    func onEvent(event) {
+        return this.runtime.pushChunk(this.streamId, event);
+    }
+
+    func setConversationId(conversationId: string) {
+        return this.runtime.setConversationId(this.streamId, conversationId);
+    }
+
+    func setStage(stage: string) {
+        return this.runtime.setStage(this.streamId, stage);
+    }
+
+    func isCancelRequested() -> bool {
+        return this.runtime.isCancelRequested(this.streamId);
+    }
+
+    func shouldCancel() -> bool {
+        return this.runtime.isCancelRequested(this.streamId);
+    }
+}
+
+class NexoraCoreRuntimeTask {
+    using &this;
+
+    let runtime = nil;
+    let streamId = "";
+    let worker = nil;
+    let context = nil;
+
+    func init(runtimeValue, streamIdValue: string, workerValue) {
+        this.runtime = runtimeValue;
+        this.streamId = streamIdValue;
+        this.worker = workerValue;
+        this.context = new NexoraCoreStreamContext(runtimeValue, streamIdValue);
+    }
+
+    func operator[@=]() -> &NexoraCoreRuntimeTask {
+        return this;
+    }
+
+    func releaseRunReferences() {
+        this.worker = nil;
+        this.context = nil;
+        this.runtime = nil;
+        this.streamId = "";
+    }
+
+    func run() {
+        let result = nil;
+        let runtime = this.runtime;
+        let streamId = this.streamId;
+        let worker = nil;
+        let context = nil;
+        try {
+            runtime.setStage(streamId, "working");
+            worker = this.worker;
+            context = this.context;
+            result = worker(context);
+            worker = nil;
+            context = nil;
+            this.worker = nil;
+            this.context = nil;
+            let status = "done";
+            if (type(result) == "dict") {
+                let workerStatus = dict_get(result, "status", "done");
+                if (__nexora_runtime_terminal_status(str(workerStatus))) {
+                    status = str(workerStatus);
+                }
+            }
+            runtime.finishSession(streamId, status, "", result);
+        } catch (&error) {
+            worker = nil;
+            context = nil;
+            this.worker = nil;
+            this.context = nil;
+            try {
+                runtime.finishSession(streamId, "error", str(error), nil);
+            } catch (&finishError) {
+                print("NEXORA_CORE_RUNTIME_FINISH_ERROR stream=" + streamId +
+                    " error=" + str(finishError));
+            }
+        }
+        runtime = nil;
+        streamId = "";
+        this.releaseRunReferences();
+    }
+}
+
+class NexoraCoreStreamRuntime {
+    using &this;
+
+    let journal = nil;
+    let records = [];
+    let lockId = -1;
+    let memoryChunkLimit = NEXORA_CORE_STREAM_MEMORY_CHUNKS;
+    let flushChunkLimit = NEXORA_CORE_STREAM_FLUSH_CHUNKS;
+    let retentionSeconds = NEXORA_CORE_STREAM_RETENTION_SECONDS;
+    let lastCleanupAt = 0;
+
+    func init(journalValue, memoryChunks: int=NEXORA_CORE_STREAM_MEMORY_CHUNKS,
+            flushChunks: int=NEXORA_CORE_STREAM_FLUSH_CHUNKS) {
+        if (memoryChunks < 1) throw new Exception("stream runtime: memory chunk limit must be positive");
+        if (flushChunks < 1) throw new Exception("stream runtime: flush chunk limit must be positive");
+        this.journal = journalValue;
+        this.records = [];
+        this.lockId = create_shared_lock();
+        this.memoryChunkLimit = memoryChunks;
+        this.flushChunkLimit = flushChunks;
+    }
+
+    func operator[@=]() -> &NexoraCoreStreamRuntime {
+        return this;
+    }
+
+    func _recordIndexUnsafe(streamId: string) -> int {
+        for (0..this.records.length()) [const &index] {
+            if (this.records[index]["stream_id"] == streamId) return index;
+        }
+        return -1;
+    }
+
+    func _recordUnsafe(streamId: string) -> dict {
+        let index = this._recordIndexUnsafe(streamId);
+        if (index < 0) return {};
+        return this.records[index];
+    }
+
+    func _persistMetaUnsafe(record) {
+        let saved = this.journal.saveMeta(dict_get(record, "meta", {}));
+        dict_set(record, "meta", saved);
+    }
+
+    func _flushUnsafe(record) {
+        let pending = dict_get(record, "pending", []);
+        if (pending.length() > 0) {
+            this.journal.append(dict_get(record, "stream_id", ""), pending);
+            dict_set(record, "pending", []);
+        }
+        this._persistMetaUnsafe(record);
+    }
+
+    func _appendUnsafe(record, source, persist: bool) {
+        let event = __nexora_runtime_event_copy(source);
+        let meta = dict_get(record, "meta", {});
+        let sequence = dict_get(meta, "last_seq", 0) + 1;
+        dict_set(event, "_stream_seq", sequence);
+        dict_set(meta, "last_seq", sequence);
+        dict_set(record, "meta", meta);
+
+        let chunks = dict_get(record, "chunks", []);
+        chunks.append(event);
+        dict_set(record, "chunks", chunks);
+        if (chunks.length() > this.memoryChunkLimit) {
+            let retained = [];
+            for (chunks) [chunk] {
+                if (dict_get(chunk, "_stream_seq", 0) >= sequence - this.memoryChunkLimit + 1) {
+                    retained.append(chunk);
+                }
+            }
+            dict_set(record, "chunks", retained);
+        }
+        let currentChunks = dict_get(record, "chunks", []);
+        let headSeq = dict_get(currentChunks[0], "_stream_seq", sequence);
+        dict_set(meta, "head_seq", headSeq);
+        dict_set(record, "meta", meta);
+
+        if (dict_get(event, "type", "") == "text") {
+            let contentParts = dict_get(record, "contentParts", []);
+            contentParts.append(str(dict_get(event, "text", "")));
+            dict_set(record, "contentParts", contentParts);
+        }
+        if (persist) {
+            let pending = dict_get(record, "pending", []);
+            pending.append(event);
+            dict_set(record, "pending", pending);
+            if (pending.length() >= this.flushChunkLimit) this._flushUnsafe(record);
+        }
+        return sequence;
+    }
+
+    func _safeResult(result) {
+        if (type(result) != "dict") return nil;
+        let safe = {};
+        for (["status", "rounds", "toolCalls", "truncated", "compressed",
+                "finishReasons", "usage", "error"]) [key] {
+            let value = dict_get(result, key, nil);
+            if (value != nil) dict_set(safe, key, value);
+        }
+        return safe;
+    }
+
+    func startSession(conversationId: string, worker, metadata=nil, streamId=nil) -> string {
+        if (worker == nil) throw new Exception("stream runtime: worker is required");
+        let id = streamId;
+        if (id == nil or id == "") id = nexora_core_uuid_hex();
+        if (!nexora_core_is_stream_id(id)) throw new Exception("stream runtime: invalid stream id");
+
+        let now = zeusTime.time();
+        let meta = {
+            "stream_id": id,
+            "conversation_id": conversationId,
+            "status": "running",
+            "stage": "queued",
+            "head_seq": 1,
+            "last_seq": 0,
+            "created_at": now,
+            "updated_at": now,
+            "metadata": __nexora_runtime_safe_metadata(metadata)
+        };
+        let record = {
+            "stream_id": id,
+            "meta": meta,
+            "chunks": [],
+            "pending": [],
+            "cancel_requested": false,
+            "contentParts": [],
+            "task": nil,
+            "thread": nil
+        };
+
+        lock_acquire(this.lockId);
+        let existing = this._recordUnsafe(id);
+        let duplicate = dict_get(existing, "stream_id", nil) != nil;
+        try {
+            if (duplicate or this.journal.tryMeta(id) != nil) {
+                throw new Exception("stream runtime: stream id already exists");
+            }
+            this.journal.saveMeta(meta);
+            this.records.append(record);
+        } catch (&error) {
+            lock_release(this.lockId);
+            throw error;
+        }
+        lock_release(this.lockId);
+
+        let task = new NexoraCoreRuntimeTask(this, id, worker);
+        let thread = new Thread(task.run, [], "nexora-" + id.slice(0, 8));
+        lock_acquire(this.lockId);
+        dict_set(record, "task", task);
+        dict_set(record, "thread", thread);
+        lock_release(this.lockId);
+        try {
+            thread.start();
+        } catch (&error) {
+            this.finishSession(id, "error", str(error), nil);
+            throw error;
+        }
+        return id;
+    }
+
+    func pushChunk(streamId: string, event) -> int {
+        lock_acquire(this.lockId);
+        let sequence = 0;
+        try {
+            let record = this._recordUnsafe(streamId);
+            if (dict_get(record, "stream_id", nil) == nil) {
+                throw new Exception("stream runtime: session not found");
+            }
+            if (__nexora_runtime_terminal_status(str(dict_get(
+                    dict_get(record, "meta", {}), "status", "")))) {
+                lock_release(this.lockId);
+                return 0;
+            }
+            sequence = this._appendUnsafe(record, event, true);
+        } catch (&error) {
+            lock_release(this.lockId);
+            throw error;
+        }
+        lock_release(this.lockId);
+        return sequence;
+    }
+
+    func setStage(streamId: string, stage: string) -> bool {
+        lock_acquire(this.lockId);
+        let changed = false;
+        try {
+            let record = this._recordUnsafe(streamId);
+            if (dict_get(record, "stream_id", nil) == nil) {
+                lock_release(this.lockId);
+                return false;
+            }
+            let meta = dict_get(record, "meta", {});
+            let status = str(dict_get(meta, "status", ""));
+            if (__nexora_runtime_terminal_status(status)) {
+                lock_release(this.lockId);
+                return false;
+            }
+            if (status != "cancelling") {
+                dict_set(meta, "stage", stage);
+                dict_set(record, "meta", meta);
+                this._persistMetaUnsafe(record);
+                changed = true;
+            }
+        } catch (&error) {
+            lock_release(this.lockId);
+            throw error;
+        }
+        lock_release(this.lockId);
+        return changed;
+    }
+
+    func setConversationId(streamId: string, conversationId: string) -> bool {
+        lock_acquire(this.lockId);
+        let changed = false;
+        try {
+            let record = this._recordUnsafe(streamId);
+            let meta = dict_get(record, "meta", {});
+            if (dict_get(record, "stream_id", nil) != nil and !__nexora_runtime_terminal_status(
+                    str(dict_get(meta, "status", "")))) {
+                dict_set(meta, "conversation_id", conversationId);
+                dict_set(record, "meta", meta);
+                this._persistMetaUnsafe(record);
+                changed = true;
+            }
+        } catch (&error) {
+            lock_release(this.lockId);
+            throw error;
+        }
+        lock_release(this.lockId);
+        return changed;
+    }
+
+    func isCancelRequested(streamId: string) -> bool {
+        lock_acquire(this.lockId);
+        let record = this._recordUnsafe(streamId);
+        let cancelled = false;
+        if (dict_get(record, "stream_id", nil) != nil) {
+            cancelled = dict_get(record, "cancel_requested", false) == true;
+        }
+        lock_release(this.lockId);
+        return cancelled;
+    }
+
+    func requestCancel(streamId: string) -> bool {
+        lock_acquire(this.lockId);
+        let accepted = false;
+        try {
+            let record = this._recordUnsafe(streamId);
+            if (dict_get(record, "stream_id", nil) != nil) {
+                let meta = dict_get(record, "meta", {});
+                let status = str(dict_get(meta, "status", ""));
+                if (!__nexora_runtime_terminal_status(status)) {
+                    dict_set(record, "cancel_requested", true);
+                    dict_set(meta, "status", "cancelling");
+                    dict_set(meta, "stage", "cancelling");
+                    dict_set(record, "meta", meta);
+                    this._persistMetaUnsafe(record);
+                    accepted = true;
+                }
+            }
+        } catch (&error) {
+            lock_release(this.lockId);
+            throw error;
+        }
+        lock_release(this.lockId);
+        return accepted;
+    }
+
+    func finishSession(streamId: string, requestedStatus: string="done",
+            errorMessage: string="", result=nil) -> bool {
+        lock_acquire(this.lockId);
+        let finished = false;
+        try {
+            let record = this._recordUnsafe(streamId);
+            if (dict_get(record, "stream_id", nil) == nil) {
+                lock_release(this.lockId);
+                return false;
+            }
+            let meta = dict_get(record, "meta", {});
+            let currentStatus = str(dict_get(meta, "status", ""));
+            if (__nexora_runtime_terminal_status(currentStatus)) {
+                lock_release(this.lockId);
+                return false;
+            }
+            let status = requestedStatus;
+            if (dict_get(record, "cancel_requested", false) == true) status = "cancelled";
+            if (!__nexora_runtime_terminal_status(status)) status = "error";
+
+            dict_set(meta, "status", status);
+            dict_set(meta, "stage", status);
+            dict_set(meta, "finished_at", zeusTime.time());
+            if (errorMessage != "") dict_set(meta, "error", errorMessage);
+            let safeResult = this._safeResult(result);
+            if (safeResult != nil) dict_set(meta, "result", safeResult);
+            dict_set(record, "meta", meta);
+
+            if (status == "cancelled") {
+                this._appendUnsafe(record, {"type": "cancelled"}, false);
+            }
+            this._appendUnsafe(record, {"type": "task_finished", "status": status,
+                "error": errorMessage}, true);
+            this._flushUnsafe(record);
+            this.journal.markFinished(streamId);
+            dict_set(record, "contentParts", []);
+            dict_set(record, "task", nil);
+            finished = true;
+        } catch (&error) {
+            lock_release(this.lockId);
+            throw error;
+        }
+        lock_release(this.lockId);
+        return finished;
+    }
+
+    func getSessionMeta(streamId: string) {
+        lock_acquire(this.lockId);
+        let record = this._recordUnsafe(streamId);
+        if (dict_get(record, "stream_id", nil) != nil) {
+            let meta = __nexora_runtime_meta_copy(dict_get(record, "meta", {}));
+            lock_release(this.lockId);
+            return meta;
+        }
+        lock_release(this.lockId);
+        let answer = this.journal.read(streamId, 0, 0);
+        return dict_get(answer, "meta", nil);
+    }
+
+    func readSessionChunks(streamId: string, afterSeq: int=0, limit: int=500) {
+        lock_acquire(this.lockId);
+        let record = this._recordUnsafe(streamId);
+        if (dict_get(record, "stream_id", nil) != nil) {
+            let meta = __nexora_runtime_meta_copy(dict_get(record, "meta", {}));
+            let headSeq = dict_get(meta, "head_seq", 1);
+            let gap = afterSeq + 1 < headSeq;
+            let chunks = [];
+            if (!gap and limit > 0) {
+                for (dict_get(record, "chunks", [])) [chunk] {
+                    if (dict_get(chunk, "_stream_seq", 0) <= afterSeq) continue;
+                    if (chunks.length() >= limit) break;
+                    chunks.append(__nexora_runtime_meta_copy(chunk));
+                }
+            }
+            lock_release(this.lockId);
+            return {"meta": meta, "chunks": chunks, "gap": gap,
+                "head_seq": headSeq};
+        }
+        lock_release(this.lockId);
+
+        let answer = this.journal.read(streamId, afterSeq, limit);
+        let meta = dict_get(answer, "meta", nil);
+        if (meta == nil) return {"meta": nil, "chunks": [], "gap": false, "head_seq": 1};
+        return {"meta": meta, "chunks": dict_get(answer, "chunks", []),
+            "gap": false, "head_seq": dict_get(meta, "head_seq", 1)};
+    }
+
+    func getAccumulatedContent(streamId: string) -> string {
+        lock_acquire(this.lockId);
+        let record = this._recordUnsafe(streamId);
+        if (dict_get(record, "stream_id", nil) != nil) {
+            let meta = dict_get(record, "meta", {});
+            let status = str(dict_get(meta, "status", ""));
+            if (!__nexora_runtime_terminal_status(status)) {
+                let contentParts = dict_get(record, "contentParts", []).copy();
+                lock_release(this.lockId);
+                return string_join(contentParts);
+            }
+        }
+        lock_release(this.lockId);
+
+        let answer = this.journal.read(streamId, 0, 1000000);
+        let restoredParts: Array = [];
+        for (dict_get(answer, "chunks", [])) [chunk] {
+            if (dict_get(chunk, "type", "") == "text") {
+                restoredParts.append(str(dict_get(chunk, "text", "")));
+            }
+        }
+        return string_join(restoredParts);
+    }
+
+    func getMeta(streamId: string) {
+        return this.getSessionMeta(streamId);
+    }
+
+    func iterChunks(streamId: string, afterSeq: int) {
+        let read = this.readSessionChunks(streamId, afterSeq, 1000000);
+        let entries = [];
+        if (dict_get(read, "meta", nil) == nil) return entries;
+        if (dict_get(read, "gap", false)) {
+            entries.append({"seq": nil, "event": {"type": "task_stream_gap",
+                "head_seq": dict_get(read, "head_seq", 1)}});
+            return entries;
+        }
+        for (dict_get(read, "chunks", [])) [chunk] {
+            let event = __nexora_runtime_event_copy(chunk);
+            entries.append({"seq": dict_get(chunk, "_stream_seq", 0), "event": event});
+        }
+        return entries;
+    }
+
+    func listSessions(limit: int=100) {
+        return this.journal.recent(limit);
+    }
+
+    func joinSession(streamId: string, timeoutMillis: int=-1) -> bool {
+        lock_acquire(this.lockId);
+        let record = this._recordUnsafe(streamId);
+        let thread = nil;
+        if (dict_get(record, "stream_id", nil) != nil) thread = dict_get(record, "thread", nil);
+        lock_release(this.lockId);
+        if (thread == nil) return false;
+
+        let joined = thread.join(timeoutMillis);
+        if (joined) {
+            lock_acquire(this.lockId);
+            let current = this._recordUnsafe(streamId);
+            if (dict_get(current, "stream_id", nil) != nil) dict_set(current, "thread", nil);
+            lock_release(this.lockId);
+        }
+        return joined;
+    }
+
+    func cleanupSessionsIfDue(maxAgeSeconds: int=3600,
+            intervalSeconds: int=60) {
+        let now = zeusTime.time();
+        lock_acquire(this.lockId);
+        let shouldCleanup = false;
+        if (now - this.lastCleanupAt >= intervalSeconds) {
+            this.lastCleanupAt = now;
+            shouldCleanup = true;
+        }
+        lock_release(this.lockId);
+        if (!shouldCleanup) return {"memory": 0, "journal": 0};
+        return this.cleanupSessions(maxAgeSeconds);
+    }
+
+    func cleanupSessions(maxAgeSeconds: int=3600) {
+        lock_acquire(this.lockId);
+        let now = zeusTime.time();
+        let retained = [];
+        let removed = 0;
+        for (this.records) [record] {
+            let meta = dict_get(record, "meta", {});
+            let status = str(dict_get(meta, "status", ""));
+            let thread = dict_get(record, "thread", nil);
+            if (__nexora_runtime_terminal_status(status) and thread != nil) {
+                if (thread.join(0)) {
+                    dict_set(record, "thread", nil);
+                    thread = nil;
+                }
+            }
+            let finishedAt = dict_get(meta, "finished_at", now);
+            let finishedAtType = type(finishedAt);
+            let expired = __nexora_runtime_terminal_status(status) and
+                (finishedAtType == "int" or finishedAtType == "float") and
+                now - finishedAt >= maxAgeSeconds;
+            if (expired and thread == nil) {
+                removed = removed + 1;
+                continue;
+            }
+            retained.append(record);
+        }
+        this.records = retained;
+        lock_release(this.lockId);
+        let expiredOnDisk = this.journal.purgeExpired();
+        return {"memory": removed, "journal": expiredOnDisk.length()};
+    }
+}

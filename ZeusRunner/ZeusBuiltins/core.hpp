@@ -52,7 +52,23 @@ namespace ZeusBuiltins {
 
     // 对象系统
     inline std::vector<ZeusType::ClassInfo>* g_vmClasses = nullptr;
+    inline std::string formatClassHandle(const ZeusType::ClassHandle& handle) {
+        if (g_vmClasses && handle.id >= 0 &&
+            handle.id < static_cast<int>(g_vmClasses->size())) {
+            const std::string& name = (*g_vmClasses)[handle.id].name;
+            if (!name.empty()) return "<class '" + name + "'>";
+        }
+        const std::string name = ZeusVMUtils::classHandleName(handle.id);
+        if (!name.empty()) return "<class '" + name + "'>";
+        return "<class:#" + std::to_string(handle.id) + ">";
+    }
     inline std::deque<ZeusType::ObjectInstance>* g_vmObjects = nullptr;
+    inline ZeusType::ObjectInstance* getValidObject(
+        const ZeusType::ObjectHandle& handle) {
+        return g_vmObjects
+            ? ZeusVMUtils::getValidObject(*g_vmObjects, handle)
+            : nullptr;
+    }
     inline std::vector<int>* g_vmFreeObjectSlots = nullptr;
     inline size_t* g_vmFreeObjectSlotsSize = nullptr;
 

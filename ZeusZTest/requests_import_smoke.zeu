@@ -1,0 +1,3 @@
+import zeus.requests [&];
+
+print("REQUESTS_IMPORT_PASS");

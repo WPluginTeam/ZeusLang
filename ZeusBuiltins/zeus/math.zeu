@@ -1,13 +1,67 @@
 
 var const PI = 3.141592653589793;
 
-func fibonacci(n) {
-    if (n <= 0) {
-        return 0;
+func abs(value: int) -> int {
+    if (value < 0) return -value;
+    return value;
+}
+
+func min(left: int, right: int) -> int {
+    if (left < right) return left;
+    return right;
+}
+
+func max(left: int, right: int) -> int {
+    if (left > right) return left;
+    return right;
+}
+
+func clamp(value: int, lower: int, upper: int) -> int {
+    let minimum = min(lower, upper);
+    let maximum = max(lower, upper);
+    if (value < minimum) return minimum;
+    if (value > maximum) return maximum;
+    return value;
+}
+
+func gcd(left: int, right: int) -> int {
+    let a = abs(left);
+    let b = abs(right);
+    for (b != 0) {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
     }
-    if (n == 1) {
-        return 1;
-    }
-    let a = fibonacci(n - 1) + fibonacci(n - 2);
     return a;
+}
+
+func lcm(left: int, right: int) -> int {
+    if (left == 0 or right == 0) return 0;
+    return abs((left / gcd(left, right)) * right);
+}
+
+func factorial(n: int) -> int {
+    if (n < 0) return 0;
+    let result = 1;
+    let factor = 2;
+    for (factor <= n) {
+        result = result * factor;
+        factor = factor + 1;
+    }
+    return result;
+}
+
+func fibonacci(n: int) -> int {
+    if (n <= 0) return 0;
+    if (n == 1) return 1;
+    let previous = 0;
+    let current = 1;
+    let index = 2;
+    for (index <= n) {
+        let next = previous + current;
+        previous = current;
+        current = next;
+        index = index + 1;
+    }
+    return current;
 }

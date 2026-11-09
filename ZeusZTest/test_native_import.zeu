@@ -1,0 +1,7 @@
+@static;
+@native("./test_mcu.h") import mcu [&];
+
+mcu.pinMode(13, 1);
+mcu.digitalWrite(13, 1);
+let state = mcu.digitalRead(13);
+let sum = mcu.addNumbers(10, 20);

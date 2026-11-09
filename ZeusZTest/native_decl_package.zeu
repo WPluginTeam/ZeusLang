@@ -1,0 +1,11 @@
+import zeus.ctypes [&ctypes];
+
+@native decl PackageDouble = ctypes.DOUBLE;
+@native decl PackageInt8 = ctypes.INT8;
+@native decl HiddenDouble = ctypes.DOUBLE;
+
+func packageDoubleSum(left: PackageDouble, right: PackageDouble) -> PackageDouble {
+    return left + right;
+}
+
+using {PackageDouble, PackageInt8, packageDoubleSum};

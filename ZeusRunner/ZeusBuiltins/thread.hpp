@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include "core.hpp"
 #include "ThreadNativeBuiltins.hpp"
 #include "../ZeusThread.hpp"
@@ -131,6 +133,7 @@ namespace ZeusBuiltins {
         int closureIdToRetain = -1;  // 需要 retain 的闭包 ID
         std::optional<ZeusType::ObjectHandle> boundThis;
         std::vector<ZeusType::UniversalVariant> threadArgs;
+        std::vector<void*> targetUpvalues;
 
         if (!ZeusVMUtils::isNull(args[2])) {
             const ZeusType::Array* argumentArray = ZeusVMUtils::getArrayConst(args[2]);
@@ -165,38 +168,34 @@ namespace ZeusBuiltins {
         } else if (std::holds_alternative<ZeusType::ClosureHandle>(args[1])) {
             // 如果是闭包句柄，先 retain 再获取 protoId
             int closureId = std::get<ZeusType::ClosureHandle>(args[1]).id;
-            
-            // 在解析之前先 retain 闭包，防止被释放
-            if (g_vmRetainClosure) {
-                g_vmRetainClosure(closureId);
-                closureIdToRetain = closureId;
+
+            if (!g_vmRetainClosure || !g_vmReleaseClosure) {
+                throw std::runtime_error(
+                    "__thread_start: closure retain/release callbacks are not registered");
             }
+            // The worker needs the closure's captures as well as its prototype.
+            g_vmRetainClosure(closureId);
+            closureIdToRetain = closureId;
             
-            // 使用全局解析器获取 protoId
-            auto resolver = ZeusThread::getGlobalClosureResolver();
-            if (resolver) {
-                protoId = resolver(closureId);
-                
-                // 如果 protoId 为 -1，说明闭包已被释放（可能是竞争条件）
-                if (protoId < 0) {
-                    if (g_vmReleaseClosure && closureIdToRetain >= 0) {
-                        g_vmReleaseClosure(closureIdToRetain);
-                    }
-                    throw std::runtime_error("__thread_start: closure #" + std::to_string(closureId) + 
-                        " has been freed (protoId=-1). This may be a race condition - ensure the closure is retained before starting the thread.");
-                }
-                
-                // 同时获取 boundThis（如果有）
-                auto boundThisResolver = ZeusThread::getGlobalBoundThisResolver();
-                if (boundThisResolver) {
-                    boundThis = boundThisResolver(closureId);
-                }
-            } else {
-                // 解析失败，release 闭包
+            auto resolver = ZeusThread::getGlobalClosureSnapshotResolver();
+            const auto snapshot = resolver ? resolver(closureId) : std::nullopt;
+            if (!snapshot || snapshot->protoId < 0) {
                 if (g_vmReleaseClosure && closureIdToRetain >= 0) {
                     g_vmReleaseClosure(closureIdToRetain);
                 }
-                throw std::runtime_error("__thread_start: closure resolver not registered");
+                throw std::runtime_error(
+                    "__thread_start: closure snapshot is unavailable or has been freed");
+            }
+            protoId = snapshot->protoId;
+            boundThis = snapshot->boundThis;
+            targetUpvalues = snapshot->upvalues;
+            if (std::any_of(targetUpvalues.begin(), targetUpvalues.end(),
+                            [](void* cell) { return cell == nullptr; })) {
+                if (g_vmReleaseClosure && closureIdToRetain >= 0) {
+                    g_vmReleaseClosure(closureIdToRetain);
+                }
+                throw std::runtime_error(
+                    "__thread_start: closure contains an uninitialized capture cell");
             }
         }
 
@@ -268,7 +267,8 @@ namespace ZeusBuiltins {
         bool started = false;
         try {
             started = ZeusThread::getThreadManager().startThread(
-                threadId, protoId, threadArgs, entryFunc, boundThis, sharedObjects);
+                threadId, protoId, threadArgs, entryFunc, boundThis, sharedObjects,
+                closureIdToRetain, g_vmReleaseClosure, targetUpvalues);
         } catch (...) {
             releaseThreadArguments();
             if (retainedBoundThis && g_vmReleaseObject) {
@@ -286,8 +286,9 @@ namespace ZeusBuiltins {
             }
         }
 
-        // 线程启动后，release 闭包
-        // 闭包只是用来传递 protoId，线程使用的是 protoId（函数原型），不是闭包本身
+        // Transfer the retained closure to ThreadInfo. The child VM snapshots
+        // its captures before releasing this source closure.
+        if (started) closureIdToRetain = -1;
         if (g_vmReleaseClosure && closureIdToRetain >= 0) {
             g_vmReleaseClosure(closureIdToRetain);
         }

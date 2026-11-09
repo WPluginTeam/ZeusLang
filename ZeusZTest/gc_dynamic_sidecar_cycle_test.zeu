@@ -54,6 +54,20 @@ func makeSidecarCopyCycle() {
     }
 }
 
+func attachNestedSidecarCycle(parent) {
+    let child = new SidecarOwner();
+    setExtra(parent, child);
+    setExtra(child, parent);
+}
+
+func exerciseNestedSidecarTrace() {
+    let owner = new SidecarOwner();
+    owner.value = 42;
+    attachNestedSidecarCycle(owner);
+    __gc_collect();
+    if (owner.value != 42) fail("nested sidecar trace changed the live owner");
+}
+
 func main() {
     __gc_collect();
     let baseline = __gc_native_nodes();
@@ -76,11 +90,17 @@ func main() {
     print("SIDECAR_COPY_CYCLE", baseline, afterCopy);
     if (afterCopy > baseline) fail("copied dynamic sidecar cycle remained");
 
+    exerciseNestedSidecarTrace();
+    __gc_collect();
+    let afterNested = __gc_native_nodes();
+    print("SIDECAR_NESTED_TRACE", baseline, afterNested);
+    if (afterNested > baseline) fail("nested sidecar cycle remained");
+
     using LLVM {
         runtime_debug_dump();
     }
 
-    if (failures == 0) print("GC_DYNAMIC_SIDECAR_CYCLE_PASS", baseline, afterCopy);
+    if (failures == 0) print("GC_DYNAMIC_SIDECAR_CYCLE_PASS", baseline, afterNested);
     else print("GC_DYNAMIC_SIDECAR_CYCLE_FAIL", failures);
 }
 

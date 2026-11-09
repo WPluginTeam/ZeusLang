@@ -1,0 +1,20 @@
+// The compiler warns when a class or impl block declares no receiver alias,
+// because the member function is then compiled as a static function.
+class WithoutAlias {
+    func noReceiverMethod() -> int { return 1; }
+}
+
+class WithAlias {
+    using &this;
+    func aliasedMethod() -> int { return 2; }
+}
+
+impl int {
+    func implNoReceiver() -> int { return 3; }
+}
+
+func main() {
+    let b = new WithAlias();
+    print(b.aliasedMethod());
+}
+main();

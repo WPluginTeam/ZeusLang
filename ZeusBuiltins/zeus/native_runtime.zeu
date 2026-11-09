@@ -1,0 +1,37 @@
+// Global runtime entry point implemented by ZeusNativeRuntime.dll.
+
+@native("zeus_native_io_input", from="ZeusNativeRuntime")
+decl func __native_input() -> string;
+
+func input() -> string {
+    return __native_input();
+}
+
+@native("zeus_native_io_write", from="ZeusNativeRuntime")
+decl func __native_write(text: string);
+
+func _write(text: string) {
+    __native_write(text);
+}
+
+@native("zeus_native_io_flush", from="ZeusNativeRuntime")
+decl func __native_flush();
+
+func _flush() {
+    __native_flush();
+}
+
+func flush() {
+    __native_flush();
+}
+
+func flushOutput() {
+    __native_flush();
+}
+
+@native("zeus_native_time_perf_counter_ns", from="ZeusNativeRuntime")
+decl func __native_time_perf_counter_ns() -> int64;
+
+func __time_perf_counter_ns() -> int64 {
+    return __native_time_perf_counter_ns();
+}

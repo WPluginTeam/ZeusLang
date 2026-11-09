@@ -1,0 +1,62 @@
+import ZeusZTest.fielddefaults;
+import zeus.exception;
+
+// Class field defaults come from the class layout metadata, which classifies
+// each literal the generator can express. This covers every classified kind so a
+// new kind cannot be added without deciding what it produces, and so the
+// mapping from classification to runtime value stays pinned.
+//
+// The classes here live in a package, which is the side that used to break: a
+// class arriving from an import took its field values from the class object,
+// and that object only holds the right values for a class compiled into the
+// main chunk. Everything below is therefore a regression test as well as a
+// description of the intended behaviour.
+
+func assertEquals(label: string, actual, expected) {
+    if (actual != expected) {
+        throw new Exception("field default mismatch for " + label);
+    }
+    print("ok", label);
+}
+
+let d = new PackageDefaults();
+
+// Integer, including the sign.
+assertEquals("zero", d.zero, 0);
+assertEquals("negative", d.negative, -7);
+
+// Boolean has to arrive as a boolean, not as the integer behind it.
+assertEquals("true", d.yes, true);
+assertEquals("false", d.no, false);
+
+// Strings.
+assertEquals("text", d.text, "hello");
+
+// Nil.
+assertEquals("nil", d.nothing, nil);
+
+// Containers, and each instance has to get its own. An array default shared
+// between instances would show the first instance's appends in the second.
+assertEquals("array length", d.items.length(), 0);
+d.items.append(1);
+assertEquals("array after append", d.items.length(), 1);
+
+let other = new PackageDefaults();
+assertEquals("second instance array", other.items.length(), 0);
+assertEquals("second instance text", other.text, "hello");
+assertEquals("second instance zero", other.zero, 0);
+
+// Writing through one instance must not disturb another.
+other.zero = 99;
+other.text = "changed";
+assertEquals("original still zero", d.zero, 0);
+assertEquals("original text intact", d.text, "hello");
+assertEquals("write visible on owner", other.zero, 99);
+
+// An explicit constructor assigning the same values has to agree with the
+// declared defaults.
+let withInit = new PackageDefaultsWithInit();
+assertEquals("constructed zero", withInit.zero, 0);
+assertEquals("constructed text", withInit.text, "hello");
+
+print("CLASS_FIELD_DEFAULTS_PASS");

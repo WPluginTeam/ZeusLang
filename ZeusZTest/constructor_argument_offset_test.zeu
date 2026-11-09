@@ -1,0 +1,27 @@
+import zeus.exception;
+
+class ConstructorArgumentOffsetProbe {
+    using &this;
+
+    let left: int = 0;
+    let right: string = "";
+    let enabled: bool = true;
+
+    func init(left: int, right: string, enabled: bool = true) {
+        this.left = left;
+        this.right = right;
+        this.enabled = enabled;
+    }
+}
+
+let explicit = new ConstructorArgumentOffsetProbe(41, "second", false);
+if (explicit.left != 41 or explicit.right != "second" or explicit.enabled) {
+    throw new Exception("constructor arguments shifted from their declared parameters");
+}
+
+let defaulted = new ConstructorArgumentOffsetProbe(73, "default");
+if (defaulted.left != 73 or defaulted.right != "default" or !defaulted.enabled) {
+    throw new Exception("constructor default argument mask included the wrong slots");
+}
+
+print("PASS constructor argument offsets");

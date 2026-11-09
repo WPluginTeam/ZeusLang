@@ -1,0 +1,32 @@
+// 模块作用域的 try/catch：catch 块里出现 throw 时，正常路径上的 catch 变量槽
+// 也必须是已初始化的 ZeusValue。
+//
+// 回归的是这样一个编译期缺口：catch 变量槽只在 unwind 路径由
+// zeus_exception_capture 填充，而退出清理信任 nativeLocals —— 当 catch 以
+// throw 结尾、没有 CATCH_END 退役它时，清理会释放一块从未写入的槽，读到垃圾
+// flags，进程在输出全部刷出之后才崩（`invalid value ownership flags`）。
+//
+// 两个变体：模块作用域、以及同样代码放进函数里。刻意只用标量，保持回归最小、
+// 只盯 catch 槽这一件事（`new Exception(...)` 在 v0 发射路径上还不支持
+// OBJ_BUILD，是另一条线，不混进来）。
+
+import zeus.exception;
+
+func guarded() {
+    try {
+        print("SCOPE_FN", 1);
+    } catch (&error) {
+        throw error;
+    }
+}
+
+guarded();
+
+try {
+    print("SCOPE_TOP", 2);
+} catch (&error) {
+    print("SCOPE_TOP_FAIL");
+    throw error;
+}
+
+print("MODULE_SCOPE_THROW_PASS");

@@ -1,0 +1,6 @@
+@native("zeus_test_add", from="native_import_test.so")
+decl func packageNativeAdd(left: int, right: int) -> int;
+
+func wrappedNativeAdd(left: int, right: int) -> int {
+    return packageNativeAdd(left, right);
+}
