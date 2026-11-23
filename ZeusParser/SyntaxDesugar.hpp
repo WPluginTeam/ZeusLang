@@ -5,44 +5,15 @@
 #include <variant>
 #include <atomic>
 #include "LexerType.hpp"
+#include "DesugarTokenUtils.hpp"
+#include "CompoundAssignDesugar.hpp"
+#include "DestructureDesugar.hpp"
 #include "WhenSyntaxDesugar.hpp"
 #include "../ZeusDiagnostics.hpp"
 
 namespace ZeusParser {
 
 namespace DesugarDetail {
-
-inline bool isOp(const LexerType::Token& tk, const std::string& sym) {
-    return std::holds_alternative<LexerType::Operator>(tk) &&
-           std::get<LexerType::Operator>(tk).symbol == sym;
-}
-
-inline bool isKw(const LexerType::Token& tk, const std::string& name) {
-    return std::holds_alternative<LexerType::Keyword>(tk) &&
-           std::get<LexerType::Keyword>(tk).name == name;
-}
-
-inline int getTokenLine(const LexerType::Token& tk) {
-    return std::visit([](const auto& t) { return t.line; }, tk);
-}
-
-inline int getTokenCol(const LexerType::Token& tk) {
-    return std::visit([](const auto& t) { return t.column; }, tk);
-}
-
-inline LexerType::Operator makeOp(const std::string& sym, int line = 0, int col = 0) {
-    LexerType::Operator op(sym);
-    op.line = line;
-    op.column = col;
-    return op;
-}
-
-inline LexerType::Keyword makeKw(const std::string& name, int line = 0, int col = 0) {
-    LexerType::Keyword kw(name);
-    kw.line = line;
-    kw.column = col;
-    return kw;
-}
 
 // 识别严格的 '..' 或 '..=' 范围运算符（排除 '...' 变长参数）
 inline bool isRangeOperator(
@@ -558,6 +529,22 @@ inline std::vector<LexerType::Token> desugarAnonymousFunctions(
                     }
 
                     if (bodyCloseIdx < tokens.size()) {
+                        // 若匿名函数前紧邻 @native / @native("sym") 修饰，将其一并提升到具名函数前。
+                        std::vector<LexerType::Token> decoratorPrefix;
+                        if (out.size() >= 2 &&
+                            isOp(out[out.size() - 2], "@") &&
+                            isKw(out.back(), "native")) {
+                            decoratorPrefix.insert(decoratorPrefix.end(), out.end() - 2, out.end());
+                            out.erase(out.end() - 2, out.end());
+                        } else if (out.size() >= 5 &&
+                                   isOp(out[out.size() - 5], "@") &&
+                                   isKw(out[out.size() - 4], "native") &&
+                                   isOp(out[out.size() - 3], "(") &&
+                                   isOp(out.back(), ")")) {
+                            decoratorPrefix.insert(decoratorPrefix.end(), out.end() - 5, out.end());
+                            out.erase(out.end() - 5, out.end());
+                        }
+
                         // 提取 header tokens (从 paramStart 到 bodyOpenIdx 之前)
                         std::vector<LexerType::Token> headerTokens(tokens.begin() + paramStart, tokens.begin() + bodyOpenIdx);
 
@@ -570,8 +557,9 @@ inline std::vector<LexerType::Token> desugarAnonymousFunctions(
                         // 生成唯一函数名
                         std::string fnName = "__zeus_anon_" + std::to_string(++s_anonCounter);
 
-                        // 组装命名函数声明: func __zeus_anon_N(params) [captures] { desugaredInnerBody }
+                        // 组装命名函数声明: [@native] func __zeus_anon_N(params) [captures] { desugaredInnerBody }
                         std::vector<LexerType::Token> hoistedDecl;
+                        hoistedDecl.insert(hoistedDecl.end(), decoratorPrefix.begin(), decoratorPrefix.end());
                         hoistedDecl.push_back(makeKw("func", line, col));
                         hoistedDecl.push_back(makeKw(fnName, line, col));
                         hoistedDecl.insert(hoistedDecl.end(), headerTokens.begin(), headerTokens.end());
@@ -603,12 +591,13 @@ inline std::vector<LexerType::Token> desugarAnonymousFunctions(
 } // namespace DesugarDetail
 
 // 主入口: 执行所有词法后脱糖
-// 顺序: when 表达式/语句 -> 字典简写 -> 范围关系与独立范围 -> 匿名函数提升
+// 顺序: 复合赋值/自增 -> 解构声明 -> when 表达式/语句 -> 字典简写 -> 范围关系与独立范围 -> 匿名函数提升
 inline std::vector<LexerType::Token> desugarTokens(
     const std::vector<LexerType::Token>& tokens,
     std::vector<ZeusDiagnostics::Diagnostic>* diagnostics = nullptr
 ) {
-    auto t1 = desugarWhenTokens(tokens, diagnostics);
+    auto t0 = DesugarDetail::desugarDestructure(DesugarDetail::desugarCompoundAssign(tokens));
+    auto t1 = desugarWhenTokens(t0, diagnostics);
     auto t2 = DesugarDetail::desugarDictShorthand(t1);
     auto t3 = DesugarDetail::desugarRangeTokens(t2);
     auto t4 = DesugarDetail::desugarAnonymousFunctions(t3);

@@ -169,13 +169,13 @@
                     }
                 } dropInputs{this, &keyItem, &dictItem};
 
-                const ZeusType::UniversalVariant* operatorArguments[] = {
-                    &dictVar, &keyVar
-                };
-                if (tryDispatchTypeImplementationOperator(
-                        "[[]]", operatorArguments, 2, instr, nextInstruction)) break;
-
-                ZeusType::UniversalVariant valueOut = ZeusType::Null();
+                // A `&bytes` value is already a validated {address, length}
+                // view, so an index read only needs the bounds check below.
+                // Handle it before the generic type-operator dispatch and read
+                // the byte directly: the dispatch builds a type name and does a
+                // registry lookup per byte, and ZeusVMAddress::fetch re-runs
+                // type canonicalization for a plain width-1 load. Both dominated
+                // the cost of scanning a view in the VM.
                 if (const auto* range =
                         std::get_if<ZeusType::RawBytesRange>(&dictVar)) {
                     int64_t index = 0;
@@ -191,19 +191,20 @@
                             ._throw(vmstat, currentChunk);
                         break;
                     }
-                    const uintptr_t address = range->address +
-                        static_cast<uintptr_t>(index);
-                    std::string error;
-                    if (!ZeusVMAddress::fetch(
-                            reinterpret_cast<void*>(address), "int",
-                            valueOut, error, 1)) {
-                        VMException::VMException(error, __line, instr)
-                            ._throw(vmstat, currentChunk);
-                        break;
-                    }
-                    stack.push_back(std::move(valueOut));
+                    const uint8_t byte = *reinterpret_cast<const uint8_t*>(
+                        static_cast<uintptr_t>(range->address) +
+                        static_cast<uintptr_t>(index));
+                    stack.push_back(LexerType::Value(static_cast<int64_t>(byte)));
                     break;
                 }
+
+                const ZeusType::UniversalVariant* operatorArguments[] = {
+                    &dictVar, &keyVar
+                };
+                if (tryDispatchTypeImplementationOperator(
+                        "[[]]", operatorArguments, 2, instr, nextInstruction)) break;
+
+                ZeusType::UniversalVariant valueOut = ZeusType::Null();
 
                 // default missing value -> nil (ZeusType::Null)
                 // 处理下标/键访问（数组或对象）
@@ -368,12 +369,8 @@
                     }
                 } dropInputs{this, &newItem, &keyItem, &dictItem};
 
-                const ZeusType::UniversalVariant* operatorArguments[] = {
-                    &dictVar, &keyVar, &newVal
-                };
-                if (tryDispatchTypeImplementationOperator(
-                        "[[]=]", operatorArguments, 3, instr, nextInstruction)) break;
-
+                // See the load path above: a `&bytes` view is already validated,
+                // so skip the generic dispatch and write the byte directly.
                 if (const auto* range =
                         std::get_if<ZeusType::RawBytesRange>(&dictVar)) {
                     int64_t index = 0;
@@ -397,20 +394,20 @@
                             __line, instr)._throw(vmstat, currentChunk);
                         break;
                     }
-                    const uintptr_t address = range->address +
-                        static_cast<uintptr_t>(index);
-                    std::string error;
-                    if (!ZeusVMAddress::store(
-                            reinterpret_cast<void*>(address), "int",
-                            newVal, error, 1)) {
-                        VMException::VMException(error, __line, instr)
-                            ._throw(vmstat, currentChunk);
-                        break;
-                    }
+                    *reinterpret_cast<uint8_t*>(
+                        static_cast<uintptr_t>(range->address) +
+                        static_cast<uintptr_t>(index)) =
+                        static_cast<uint8_t>(byteValue);
                     stack.push_back(std::move(newItem.value));
                     newItem.owner = 0;
                     break;
                 }
+
+                const ZeusType::UniversalVariant* operatorArguments[] = {
+                    &dictVar, &keyVar, &newVal
+                };
+                if (tryDispatchTypeImplementationOperator(
+                        "[[]=]", operatorArguments, 3, instr, nextInstruction)) break;
 
                 if (std::holds_alternative<ZeusType::Variant>(dictVar)) {
                     ZeusType::Variant &dv = std::get<ZeusType::Variant>(dictVar);

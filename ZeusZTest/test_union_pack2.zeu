@@ -1,0 +1,32 @@
+import zeus.mem;
+
+@type(..Ts) class Union {
+    using &this;
+
+    func operator[@=]() -> &Union {
+        return this;
+    }
+
+    var dataAddress: int = 0;
+    var currentTag: int = 0;
+    var allocatedSize: int = 0;
+
+    func init() {
+        using LLVM {
+            let maxSz = sizeof(Ts);
+            this.allocatedSize = maxSz;
+            this.dataAddress = malloc(maxSz);
+        }
+    }
+
+    inline func size() -> int {
+        return this.allocatedSize;
+    }
+}
+
+func main() {
+    let u1 = new Union<bool, int>();
+    let u2 = new Union<bool, i16, f32>();
+}
+
+main();

@@ -75,7 +75,7 @@ namespace ZeusTypeInfer {
         if (name == "char") return InferredType::Char;
         if (name == "string" || name == "str") return InferredType::String;
         if (name == "bytes") return InferredType::Bytes;
-        if (name == "nil") return InferredType::Nil;
+        if (name == "nil" || name == "void") return InferredType::Nil;
         if (name == "list" || name == "array") return InferredType::List;
         if (name == "dict" || name == "map") return InferredType::Dict;
         if (name == "object") return InferredType::Object;

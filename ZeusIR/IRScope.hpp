@@ -212,6 +212,7 @@ namespace IRScope {
     struct FuncEnv {
         std::unordered_map<std::string, int> locals;   // 名字 -> 本函数的局部槽位
         std::unordered_map<std::string, int> upvalues; // 名字 -> 本函数的 upvalue 槽位
+        std::unordered_set<std::string> localFunctions; // 直接声明在本函数体内的子函数名
         std::vector<Capture> captures;                 // 捕获记录（顺序即为目标 upvalue 槽位）
         std::unordered_set<std::string> referencedOuters; // 在严格模式下记录引用了外层变量但未显式捕获的名字
         std::unordered_set<std::string> constLocals;    // 标记为 const 的本地变量名集合（用于解析阶段报错）
@@ -415,7 +416,19 @@ namespace IRScope {
         };
         // 若在函数内：先解析词法局部和捕获，再查全局符号。
         if (!funcStack.empty()) {
-            // 1) 当前函数的局部
+            // Lexical bindings introduced by a branch (for example if-let)
+            // shadow function-wide local slots and disappear with that scope.
+            const int activeDepth = static_cast<int>(funcStack.size());
+            for (int si = static_cast<int>(scopeStack.size()) - 1; si >= 0; --si) {
+                const Scope& scope = scopeStack[static_cast<size_t>(si)];
+                if (scope.functionDepth != activeDepth) continue;
+                auto scoped = scope.nameToLocal.find(name);
+                if (scoped != scope.nameToLocal.end()) {
+                    return SymRef{ Kind::LOCAL, scoped->second };
+                }
+            }
+
+            // 1) Current function's regular locals.
             FuncEnv& cur = funcStack.back();
             auto itL = cur.locals.find(name);
             if (itL != cur.locals.end()) {

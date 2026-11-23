@@ -1,0 +1,107 @@
+import zeus.linalg;
+
+func checkMatrix(condition, message) {
+    if (!condition) throw "Matrix test failed: " + message;
+}
+
+let sourceValues = [1, 2, 3, 4, 5, 6];
+let left = new Matrix(2, 3, sourceValues);
+checkMatrix(left.rows() == 2 and left.columns() == 3, "shape from explicit dimensions");
+checkMatrix(left.get(0, 0) == 1 and left.get(1, 2) == 6, "row-major input layout");
+
+sourceValues[0] = 99;
+checkMatrix(left.get(0, 0) == 1, "constructor copies input Array");
+left.set(0, 1, 20);
+checkMatrix(left.get(0, 1) == 20, "set and get");
+
+let right = new Matrix(2, 3, [6, 5, 4, 3, 2, 1]);
+let added = left + right;
+checkMatrix(added.get(0, 0) == 7 and added.get(0, 1) == 25 and added.get(1, 2) == 7,
+    "matrix addition");
+let difference = left - right;
+checkMatrix(difference.get(0, 0) == -5 and difference.get(1, 2) == 5,
+    "matrix subtraction");
+
+let transposed = left.transpose();
+checkMatrix(transposed.rows() == 3 and transposed.columns() == 2,
+    "transpose shape");
+checkMatrix(transposed.get(0, 1) == 4, "transpose first value");
+checkMatrix(transposed.get(1, 0) == 20, "transpose second value");
+checkMatrix(transposed.get(2, 1) == 6, "transpose last value");
+
+let scaled = left.scale(2.0);
+checkMatrix(scaled.get(0, 1) == 40 and scaled.get(1, 2) == 12,
+    "scalar multiplication");
+
+let decimalMatrix = new Matrix(1, 2, [1.25, 2]);
+let decimalScaled = decimalMatrix.scale(2.0);
+checkMatrix(decimalScaled.get(0, 0) == 2.5 and decimalScaled.get(0, 1) == 4.0,
+    "double input conversion");
+
+let multiplier = new Matrix(3, 2, [7, 8, 9, 10, 11, 12]);
+let product = left * multiplier;
+checkMatrix(product.rows() == 2 and product.columns() == 2, "product shape");
+checkMatrix(product.get(0, 0) == 220 and product.get(0, 1) == 244 and
+    product.get(1, 0) == 139 and product.get(1, 1) == 154,
+    "matrix multiplication");
+
+var boundsCaught = false;
+try {
+    let ignored = left.get(2, 0);
+} catch (&error) {
+    boundsCaught = true;
+}
+checkMatrix(boundsCaught, "bounds check");
+
+var shapeCaught = false;
+try {
+    let ignored = new Matrix(2, 2, [1, 2, 3]);
+} catch (&error) {
+    shapeCaught = true;
+}
+checkMatrix(shapeCaught, "array length validation");
+
+var multiplyShapeCaught = false;
+try {
+    let ignored = left * new Matrix(2, 1, [1, 2]);
+} catch (&error) {
+    multiplyShapeCaught = true;
+}
+checkMatrix(multiplyShapeCaught, "multiplication dimension validation");
+
+let copiedMatrix = left;
+copiedMatrix.set(0, 0, -100);
+checkMatrix(left.get(0, 0) == 1 and copiedMatrix.get(0, 0) == -100,
+    "Matrix copy keeps independent value semantics");
+
+let sharedView = left.view();
+checkMatrix(sharedView.rows() == left.rows() and
+    sharedView.columns() == left.columns(), "view shape");
+sharedView.set(0, 0, 10);
+checkMatrix(left.get(0, 0) == 10, "view writes share Matrix storage");
+
+let copiedView = sharedView;
+copiedView.set(1, 2, 60);
+checkMatrix(sharedView.get(1, 2) == 60 and left.get(1, 2) == 60,
+    "MatrixView copies retain shared storage");
+
+func makeRetainedView() -> MatrixView {
+    let owner = new Matrix(2, 2, [11, 12, 13, 14]);
+    return owner.view();
+}
+
+let retainedView = makeRetainedView();
+checkMatrix(retainedView.get(1, 1) == 14,
+    "view keeps storage alive after Matrix owner leaves scope");
+
+let externalBuffer = new MatrixBuffer(4);
+externalBuffer.append(21.0);
+externalBuffer.append(22.0);
+externalBuffer.append(23.0);
+externalBuffer.append(24.0);
+let fromBuffer = Matrix.fromBuffer(2, 2, externalBuffer);
+externalBuffer.set(0, 99.0);
+checkMatrix(fromBuffer.get(0, 0) == 99.0,
+    "fromBuffer shares the provided typed storage");
+
+print("LINALG_MATRIX_TEST_PASS");

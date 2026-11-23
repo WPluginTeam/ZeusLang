@@ -233,6 +233,15 @@ private:
             }
             const std::string intrinsicName =
                 std::get<LexerType::Keyword>(tokens_[position_]).name;
+            if (intrinsicName == "no_safepoint") {
+                ++position_;
+                if (!atOperator("@") || position_ + 1 >= tokens_.size() ||
+                    !std::holds_alternative<LexerType::Keyword>(tokens_[position_ + 1]) ||
+                    std::get<LexerType::Keyword>(tokens_[position_ + 1]).name != "faddr") {
+                    return fail("expected '@faddr' after '@no_safepoint'");
+                }
+                return parsePrimary();
+            }
             const bool isAddress = intrinsicName == "addr";
             const bool isReveal = intrinsicName == "reveal";
             const bool isFetchAddress = intrinsicName == "faddr";

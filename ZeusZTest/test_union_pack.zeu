@@ -1,0 +1,74 @@
+import zeus.mem;
+
+@type(..Ts) class Union {
+    using &this;
+
+    func operator[@=]() -> &Union {
+        return this;
+    }
+
+    var dataAddress: int = 0;
+    var currentTag: int = 0;
+    var allocatedSize: int = 0;
+    var vmValue = nil;
+
+    func init() {
+        using LLVM {
+            let maxSz = sizeof(Ts);
+            this.allocatedSize = maxSz;
+            this.dataAddress = malloc(maxSz);
+        }
+        using VM {
+            this.allocatedSize = 8;
+        }
+    }
+
+    @type(T)
+    inline func set(tag: int, value: T) {
+        this.currentTag = tag;
+        using LLVM {
+            @faddr(this.dataAddress) -> T = value;
+        }
+        using VM {
+            this.vmValue = value;
+        }
+    }
+
+    @type(T)
+    inline func get(exemplar: T) -> T {
+        using LLVM {
+            return @faddr(this.dataAddress) -> T;
+        }
+        using VM {
+            return this.vmValue;
+        }
+    }
+
+    inline func size() -> int {
+        return this.allocatedSize;
+    }
+
+    func operator[~]() {
+        using LLVM {
+            if (this.dataAddress != 0) {
+                free(this.dataAddress);
+                this.dataAddress = 0;
+            }
+        }
+    }
+}
+
+func main() {
+    let u = new Union<bool, int>();
+    if (u.size() != 8) {
+        throw "Expected max size to be 8 for Union<bool, int>";
+    }
+    u.set(1, 123456);
+    let val: int = u.get(0);
+    if (val != 123456) {
+        throw "Expected get to be 123456";
+    }
+    print("Union<bool, int> pass!");
+}
+
+main();

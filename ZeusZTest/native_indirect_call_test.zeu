@@ -1,0 +1,74 @@
+@native("zeus_test_indirect_binary_add") decl func getBinaryAdd() -> ptr;
+@native("zeus_test_indirect_sensor") decl func getSensor() -> ptr;
+@native("zeus_test_indirect_sensor_fn") decl func getSensorFn(which: i32) -> ptr;
+@native("zeus_test_indirect_sensor_bump") decl func getSensorBump() -> ptr;
+@native("zeus_test_indirect_sensor_level") decl func sensorLevel() -> i32;
+
+// One declaration per C signature; the callee address is the first argument.
+@native(addr) decl func callBinary(fn: ptr, a: i32, b: i32) -> i32;
+@native(addr) decl func callSetter(fn: ptr, self: ptr, v: i32) -> i32;
+@native(addr) decl func callBump(fn: ptr, self: ptr, delta: i32) -> void;
+
+@native func zeusMul(a: i32, b: i32) -> i32 {
+    return a * b;
+}
+
+// 1. Function pointer obtained from C.
+if (callBinary(getBinaryAdd(), 20, 22) != 42) {
+    throw "indirect call through a C function pointer failed";
+}
+
+// 2. sensor_t-style struct: self pointer is forwarded as a normal argument.
+let sensor = getSensor();
+if (callSetter(getSensorFn(0), sensor, 21) != 42 or sensorLevel() != 21) {
+    throw "indirect call with a struct self pointer failed";
+}
+
+// 3. void return.
+callBump(getSensorBump(), sensor, 4);
+if (sensorLevel() != 25) {
+    throw "indirect void call failed";
+}
+
+// 4. @addr(@native func) round trip through the same declaration.
+if (callBinary(@addr(zeusMul), 6, 7) != 42) {
+    throw "indirect call into a Zeus @native func failed";
+}
+
+// 5. Anonymous @native func with @addr(...) and @faddr(...) -> ptr.
+if (callBinary(@addr(@native func(a: i32, b: i32) -> i32 {
+        return a - b;
+    }), 50, 8) != 42) {
+    throw "anonymous @native func with @addr failed";
+}
+
+using LLVM {
+    var fnSlot: i64 = 0;
+    @faddr(@addr(fnSlot)) -> ptr = @addr(@native func(a: i32, b: i32) -> i32 {
+        return a * 10 + b;
+    });
+    let loadedFn = @faddr(@addr(fnSlot)) -> ptr;
+    if (callBinary(loadedFn, 4, 2) != 42) {
+        throw "@faddr -> ptr = @addr(@native func() {}) failed";
+    }
+}
+
+func runInsideFunction() -> i32 {
+    using LLVM {
+        var localFnSlot: i64 = 0;
+        let localSlotAddr = @addr(localFnSlot);
+        @faddr(localSlotAddr) -> ptr = @addr(@native func(a: i32, b: i32) -> i32 {
+            return a + b * 2;
+        });
+        return callBinary(@faddr(localSlotAddr) -> ptr, 20, 11);
+    }
+    using VM {
+        return 0;
+    }
+}
+
+if (runInsideFunction() != 42) {
+    throw "anonymous @native func inside function failed";
+}
+
+print("NATIVE_INDIRECT_CALL_PASS");

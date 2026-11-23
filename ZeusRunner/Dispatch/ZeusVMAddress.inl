@@ -24,6 +24,13 @@
 
                 const int index = static_cast<int>(rawIndex);
                 const std::string& scope = std::get<std::string>(instr.args[0]);
+                if (scope == "function") {
+                    VMException::VMException(
+                        "@addr on a @native function requires LLVM/AOT compilation",
+                        __line, instr)
+                        ._throw(vmstat, currentChunk);
+                    break;
+                }
                 Cell* cell = nullptr;
                 std::shared_ptr<ZeusShared::SharedCell> sharedCell;
                 if (scope == "shared") {
@@ -163,10 +170,22 @@
                 if (error.empty()) {
                     void* nativeAddress = reinterpret_cast<void*>(
                         static_cast<uintptr_t>(static_cast<uint64_t>(addressBits)));
-                    if (!addressSlots.fetch(
-                            *this, nativeAddress, targetType,
-                            loaded, error, accessSize)) {
-                        // The registered slot or tracked memory contract supplies the error.
+                    if (instr.metadata.tag == "unchecked_raw_faddr") {
+                        if (targetType != "int" ||
+                            (accessSize != 1 && accessSize != 2 &&
+                             accessSize != 4 && accessSize != 8)) {
+                            error = "@no_safepoint @faddr requires an integer width access";
+                        } else {
+                            if (!ZeusVMAddress::fetch(
+                                    nativeAddress, targetType, loaded, error, accessSize) &&
+                                error.empty()) {
+                                error = "unchecked @faddr integer read failed";
+                            }
+                        }
+                    } else if (!addressSlots.fetch(
+                                   *this, nativeAddress, targetType,
+                                   loaded, error, accessSize)) {
+                        // Checked accesses report through the registered slot or allocation.
                     }
                 }
                 dropStackItem(addressItem);
@@ -222,9 +241,23 @@
                 } else if (error.empty()) {
                     void* nativeAddress = reinterpret_cast<void*>(
                         static_cast<uintptr_t>(static_cast<uint64_t>(addressBits)));
-                    addressSlots.store(
-                        *this, nativeAddress, std::get<std::string>(instr.args[0]),
-                        valueItem.value, error, accessSize);
+                    if (instr.metadata.tag == "unchecked_raw_faddr") {
+                        if (std::get<std::string>(instr.args[0]) != "int" ||
+                            (accessSize != 1 && accessSize != 2 &&
+                             accessSize != 4 && accessSize != 8)) {
+                            error = "@no_safepoint @faddr requires an integer width access";
+                        } else {
+                            if (!ZeusVMAddress::store(
+                                    nativeAddress, "int", valueItem.value,
+                                    error, accessSize) && error.empty()) {
+                                error = "unchecked @faddr integer write failed";
+                            }
+                        }
+                    } else {
+                        addressSlots.store(
+                            *this, nativeAddress, std::get<std::string>(instr.args[0]),
+                            valueItem.value, error, accessSize);
+                    }
                 }
                 dropStackItem(valueItem);
                 dropStackItem(addressItem);

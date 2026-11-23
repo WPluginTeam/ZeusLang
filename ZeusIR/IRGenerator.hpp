@@ -1,4 +1,4 @@
-﻿
+
 #ifndef IRGenerator_hpp
 #define IRGenerator_hpp
 
@@ -520,16 +520,21 @@ namespace IRGen {
         const std::string nativeLibraryPath = signature.nativeLibraryPath.empty()
             ? std::string()
             : IRImport::resolveNativeLibraryPath(signature.nativeLibraryPath);
-        if (!signature.nativeSymbol.empty()) {
-            annotation.args.push_back(signature.nativeSymbol);
+        // An indirect declaration has no C symbol of its own: it lowers to a
+        // private thunk, so give it a name unique to the declaring module.
+        const std::string nativeSymbol = signature.nativeIndirect
+            ? "__zeus_indirect_" + signatureName
+            : signature.nativeSymbol;
+        if (!nativeSymbol.empty()) {
+            annotation.args.push_back(nativeSymbol);
             annotation.args.push_back(signature.nativeReferenceABI);
             annotation.args.push_back(nativeLibraryPath);
         }
         annotation.metadata = IRType::IRMetadata::externalFunctionSignature(
             signatureName, returnType, std::move(parameterTypes),
-            signature.nativeSymbol, std::move(parameterNames),
+            nativeSymbol, std::move(parameterNames),
             std::move(parameterIsReference), signature.nativeReferenceABI,
-            nativeLibraryPath
+            nativeLibraryPath, signature.nativeIndirect
         );
         return annotation;
     }
@@ -940,6 +945,16 @@ namespace IRGen {
         }
 
         if (_isOperator(tk) && _opSym(tk) == "@") {
+            bool uncheckedRawFaddr = false;
+            if (pos + 4 < tokens.size() && _isKeyword(tokens[pos + 1]) &&
+                std::get<LexerType::Keyword>(tokens[pos + 1]).name == "no_safepoint" &&
+                _isOperator(tokens[pos + 2]) && _opSym(tokens[pos + 2]) == "@" &&
+                _isKeyword(tokens[pos + 3]) &&
+                std::get<LexerType::Keyword>(tokens[pos + 3]).name == "faddr" &&
+                _isOperator(tokens[pos + 4]) && _opSym(tokens[pos + 4]) == "(") {
+                uncheckedRawFaddr = true;
+                pos += 2;
+            }
             if (pos + 2 >= tokens.size() || !_isKeyword(tokens[pos + 1]) ||
                 !_isOperator(tokens[pos + 2]) || _opSym(tokens[pos + 2]) != "(") {
                 return false;
@@ -951,7 +966,7 @@ namespace IRGen {
             const bool isReveal = intrinsicName == "reveal";
             const bool isFetchAddress = intrinsicName == "faddr";
             if (!isAddress && !isFetchAddress) return false;
-            const int addressLine = _getTokenLine(tk);
+            const int addressLine = _getTokenLine(tokens[pos]);
             const size_t addressExpressionStart = out.size();
             size_t sizeExpressionStart = 0;
             size_t sizeExpressionEnd = 0;
@@ -974,26 +989,54 @@ namespace IRGen {
                 const std::string variableName =
                     std::get<LexerType::Keyword>(tokens[pos]).name;
                 const IRScope::SymRef variable = IRScope::resolve(variableName);
+                const bool isFunctionTarget =
+                    (variable.kind == IRScope::Kind::LOCAL &&
+                     !IRScope::funcStack.empty() &&
+                     IRScope::funcStack.back().localFunctions.count(variableName) != 0) ||
+                    (variable.kind == IRScope::Kind::GLOBAL &&
+                     IRScope::isStaticFunctionNameAt(variableName, variable.index)) ||
+                    (variable.kind == IRScope::Kind::UNDEFINED &&
+                     IRScope::isStaticFunctionName(variableName));
                 std::string storageKind;
-                switch (variable.kind) {
-                    case IRScope::Kind::LOCAL: storageKind = "local"; break;
-                    case IRScope::Kind::GLOBAL: storageKind = "global"; break;
-                    case IRScope::Kind::UPVALUE: storageKind = "upvalue"; break;
-                    case IRScope::Kind::SHARED: storageKind = "shared"; break;
-                    default: {
+                int locatorIndex = variable.index;
+                std::string locatorName = variableName;
+                if (isFunctionTarget) {
+                    if (isReveal) {
                         TreeParser::Node dummy;
                         dummy.sourceLine = addressLine;
                         IRExceptionNS::IRException ex(
-                            "@addr requires a local, global, shared, or captured variable",
+                            "@reveal requires a local, global, shared, or captured variable",
                             0, dummy);
                         ex._throw(ctx.status);
                         return false;
                     }
+                    storageKind = "function";
+                    locatorIndex = 0;
+                    locatorName = IRScope::functionTargetName(variableName);
+                } else {
+                    switch (variable.kind) {
+                        case IRScope::Kind::LOCAL: storageKind = "local"; break;
+                        case IRScope::Kind::GLOBAL: storageKind = "global"; break;
+                        case IRScope::Kind::UPVALUE: storageKind = "upvalue"; break;
+                        case IRScope::Kind::SHARED: storageKind = "shared"; break;
+                        default: {
+                            TreeParser::Node dummy;
+                            dummy.sourceLine = addressLine;
+                            IRExceptionNS::IRException ex(
+                                isReveal
+                                    ? "@reveal requires a local, global, shared, or captured variable"
+                                    : "@addr requires a local, global, shared, captured variable, or @native function",
+                                0, dummy);
+                            ex._throw(ctx.status);
+                            return false;
+                        }
+                    }
                 }
-                intrinsic.metadata.symbol.isConst = variable.isConst;
+                intrinsic.metadata.symbol.isConst =
+                    storageKind == "function" ? true : variable.isConst;
                 intrinsic.args.push_back(storageKind);
-                intrinsic.args.push_back(LexerType::Value(variable.index));
-                intrinsic.args.push_back(variableName);
+                intrinsic.args.push_back(LexerType::Value(locatorIndex));
+                intrinsic.args.push_back(locatorName);
                 intrinsic.args.push_back(std::string(isReveal ? "reveal" : "addr"));
                 ++pos;
             } else {
@@ -1063,6 +1106,17 @@ namespace IRGen {
                 const bool isIntegerType = targetType == "int" ||
                     targetType == "int32" || targetType == "int64" ||
                     ZeusBuiltins::findNativeIntegerABI(targetType) != nullptr;
+                if (uncheckedRawFaddr &&
+                    (targetType != "int" || !hasSizeArgument ||
+                     !nativeSlotMode.empty())) {
+                    TreeParser::Node dummy;
+                    dummy.sourceLine = addressLine;
+                    IRExceptionNS::IRException ex(
+                        "@no_safepoint @faddr supports only @faddr(address, width) -> int",
+                        0, dummy);
+                    ex._throw(ctx.status);
+                    return false;
+                }
                 if (isRawBytesRange && (!hasSizeArgument || !nativeSlotMode.empty())) {
                     TreeParser::Node dummy;
                     dummy.sourceLine = addressLine;
@@ -1122,6 +1176,9 @@ namespace IRGen {
                         ex._throw(ctx.status);
                         return false;
                     }
+                }
+                if (uncheckedRawFaddr) {
+                    intrinsic.metadata.tag = "unchecked_raw_faddr";
                 }
             }
             out.push_back(std::move(intrinsic));
@@ -3931,16 +3988,33 @@ void parseVarAssignStmt(
     }
 
     // 提取基础变量名（左侧第一个 keyword）
-    if (leftTokens.size() >= 7 &&
+    size_t faddrStart = 0;
+    bool uncheckedRawFaddr = false;
+    if (leftTokens.size() >= 5 &&
         std::holds_alternative<LexerType::Operator>(leftTokens[0]) &&
         std::get<LexerType::Operator>(leftTokens[0]).symbol == "@" &&
         std::holds_alternative<LexerType::Keyword>(leftTokens[1]) &&
-        std::get<LexerType::Keyword>(leftTokens[1]).name == "faddr" &&
+        std::get<LexerType::Keyword>(leftTokens[1]).name == "no_safepoint" &&
         std::holds_alternative<LexerType::Operator>(leftTokens[2]) &&
-        std::get<LexerType::Operator>(leftTokens[2]).symbol == "(") {
+        std::get<LexerType::Operator>(leftTokens[2]).symbol == "@" &&
+        std::holds_alternative<LexerType::Keyword>(leftTokens[3]) &&
+        std::get<LexerType::Keyword>(leftTokens[3]).name == "faddr" &&
+        std::holds_alternative<LexerType::Operator>(leftTokens[4]) &&
+        std::get<LexerType::Operator>(leftTokens[4]).symbol == "(") {
+        faddrStart = 2;
+        uncheckedRawFaddr = true;
+    }
+
+    if (leftTokens.size() >= faddrStart + 5 &&
+        std::holds_alternative<LexerType::Operator>(leftTokens[faddrStart]) &&
+        std::get<LexerType::Operator>(leftTokens[faddrStart]).symbol == "@" &&
+        std::holds_alternative<LexerType::Keyword>(leftTokens[faddrStart + 1]) &&
+        std::get<LexerType::Keyword>(leftTokens[faddrStart + 1]).name == "faddr" &&
+        std::holds_alternative<LexerType::Operator>(leftTokens[faddrStart + 2]) &&
+        std::get<LexerType::Operator>(leftTokens[faddrStart + 2]).symbol == "(") {
         size_t close = leftTokens.size();
         int depth = 0;
-        for (size_t i = 2; i < leftTokens.size(); ++i) {
+        for (size_t i = faddrStart + 2; i < leftTokens.size(); ++i) {
             if (!std::holds_alternative<LexerType::Operator>(leftTokens[i])) continue;
             const std::string& symbol = std::get<LexerType::Operator>(leftTokens[i]).symbol;
             if (symbol == "(") ++depth;
@@ -3963,7 +4037,7 @@ void parseVarAssignStmt(
             std::holds_alternative<LexerType::Keyword>(leftTokens[close + 2]);
         const bool validFaddrTarget = hasArrow &&
             (isRawBytesRangeTarget || isSimpleFaddrTarget);
-        if (!validFaddrTarget || close <= 3 || exprTokens.empty()) {
+        if (!validFaddrTarget || close <= faddrStart + 3 || exprTokens.empty()) {
             IR_THROW_NODE(0, mirror, "invalid @faddr assignment; expected @faddr(address[, width]) -> T = value", status);
             return;
         }
@@ -3972,7 +4046,7 @@ void parseVarAssignStmt(
         int nestedParen = 0;
         int nestedSquare = 0;
         int nestedBrace = 0;
-        for (size_t i = 3; i < close; ++i) {
+        for (size_t i = faddrStart + 3; i < close; ++i) {
             if (!std::holds_alternative<LexerType::Operator>(leftTokens[i])) continue;
             const std::string& symbol = std::get<LexerType::Operator>(leftTokens[i]).symbol;
             if (symbol == "(") ++nestedParen;
@@ -4002,6 +4076,13 @@ void parseVarAssignStmt(
             ZeusBuiltins::findNativeIntegerABI(targetType) != nullptr;
         const bool isStringType = targetType == "string" ||
             targetType == "str" || targetType == "String";
+        if (uncheckedRawFaddr &&
+            (targetType != "int" || !hasSizeArgument || hasNativeSlotArgument)) {
+            IR_THROW_NODE(0, mirror,
+                "@no_safepoint @faddr supports only @faddr(address, width) -> int",
+                status);
+            return;
+        }
         int64_t integerWidth = 0;
         if (hasSizeArgument && !hasNativeSlotArgument) {
             if (isStringType) {
@@ -4026,7 +4107,7 @@ void parseVarAssignStmt(
         }
 
         std::vector<LexerType::Token> addressTokens(
-            leftTokens.begin() + 3,
+            leftTokens.begin() + static_cast<std::ptrdiff_t>(faddrStart + 3),
             leftTokens.begin() + static_cast<std::ptrdiff_t>(sizeSeparator));
         auto addressIR = IRGen::emitExprIR(
             status, strictDecl, futureFuncDefs, addressTokens);
@@ -4063,7 +4144,7 @@ void parseVarAssignStmt(
 
         IRType::IRInstr store;
         store.op = VMOperator::LLVM_FSTORE;
-        store.line = IRGen::_getTokenLine(leftTokens[0]);
+        store.line = IRGen::_getTokenLine(leftTokens[faddrStart]);
         store.args.push_back(targetType);
         if (hasNativeSlotArgument) {
             store.args.push_back(std::string("slot"));
@@ -4075,6 +4156,9 @@ void parseVarAssignStmt(
             } else {
                 store.args.push_back(LexerType::Value(integerWidth));
             }
+        }
+        if (uncheckedRawFaddr) {
+            store.metadata.tag = "unchecked_raw_faddr";
         }
         instructions.push_back(std::move(store));
         return;
@@ -5093,7 +5177,8 @@ namespace IRGen {
                             );
                             if (signature.valid && !signature.name.empty()) {
                                 IRScope::functionNames.insert(signature.name);
-                                if (!signature.nativeSymbol.empty()) {
+                                if (!signature.nativeSymbol.empty() &&
+                                    !signature.nativeIndirect) {
                                     int handle = 0;
                                     if (!signature.nativeLibraryPath.empty()) {
                                         ZeusBuiltins::DynamicNativeImportDescriptor dynamic;
@@ -6957,6 +7042,9 @@ namespace IRGen {
                         // GLOBAL 情况（不期望在此出现），降级为局部声明
                         parentStoreSlot = IRScope::declareLocal(codeBlock.funcName);
                     }
+                    if (!IRScope::funcStack.empty()) {
+                        IRScope::funcStack.back().localFunctions.insert(codeBlock.funcName);
+                    }
                 }
 
                 IRScope::beginFunction();
@@ -7052,6 +7140,9 @@ namespace IRGen {
                             auto existing = IRScope::resolve(cbPtr->funcName);
                             if (existing.kind == IRScope::Kind::UNDEFINED) {
                                 IRScope::declareLocal(cbPtr->funcName);
+                                if (!IRScope::funcStack.empty()) {
+                                    IRScope::funcStack.back().localFunctions.insert(cbPtr->funcName);
+                                }
                             }
                             localFuncNames.insert(cbPtr->funcName);
                         }
@@ -7431,9 +7522,65 @@ namespace IRGen {
                 
           ZEUS_DEBUG_PRINT("[IRGen] .. IF BEGIN addr=%p condTokens=%zu thenCount=%zu hasElse=%d", (void*)&codeBlock, codeBlock.conditionTokens.size(), thenCount, hasElse ? 1 : 0);
 
+                // `if (let name = expr)` stores the result once in this IF
+                // scope, then evaluates a nil check through the scoped name.
+                int conditionBindingSlot = -1;
+                bool hadFunctionBinding = false;
+                int previousFunctionBindingSlot = -1;
+                if (codeBlock.hasConditionBinding) {
+                    auto valueIR = IRGen::emitExprIR(
+                        status, strictDecl, futureFuncDefs, codeBlock.conditionTokens);
+                    if (!valueIR.empty()) {
+                        ifIR.insert(ifIR.end(), valueIR.begin(), valueIR.end());
+                    }
+
+                    conditionBindingSlot = IRScope::allocateInternalLocal();
+                    IRType::IRInstr store;
+                    store.op = VMOperator::STORE_VALUE_LOCAL;
+                    store.args.push_back(LexerType::Value(conditionBindingSlot));
+                    store.args.push_back(std::string("const"));
+                    const auto bindingType = inferredBindingTypesByNode.find(codeBlock.id);
+                    if (bindingType != inferredBindingTypesByNode.end()) {
+                        store.metadata = IRType::IRMetadata::localBindingType(
+                            bindingType->second);
+                    }
+                    if (!valueIR.empty()) ifIR.push_back(std::move(store));
+
+                    IRScope::scopeStack.back().nameToLocal[
+                        codeBlock.conditionBindingName] = conditionBindingSlot;
+                    if (!IRScope::funcStack.empty()) {
+                        auto& functionLocals = IRScope::funcStack.back().locals;
+                        const auto previous = functionLocals.find(
+                            codeBlock.conditionBindingName);
+                        if (previous != functionLocals.end()) {
+                            hadFunctionBinding = true;
+                            previousFunctionBindingSlot = previous->second;
+                        }
+                        functionLocals[codeBlock.conditionBindingName] =
+                            conditionBindingSlot;
+                    }
+                }
+
                 // 条件表达式 IR
                 if (!codeBlock.conditionTokens.empty()) {
-                    auto condIR = IRGen::emitExprIR(status, strictDecl, futureFuncDefs, codeBlock.conditionTokens);
+                    std::vector<LexerType::Token> conditionTokens = codeBlock.conditionTokens;
+                    if (codeBlock.hasConditionBinding) {
+                        conditionTokens.clear();
+                        LexerType::Keyword boundName(codeBlock.conditionBindingName);
+                        boundName.line = codeBlock.sourceLine;
+                        boundName.column = codeBlock.sourceColumn;
+                        conditionTokens.push_back(std::move(boundName));
+                        LexerType::Operator notEqual("!=");
+                        notEqual.line = codeBlock.sourceLine;
+                        notEqual.column = codeBlock.sourceColumn;
+                        conditionTokens.push_back(std::move(notEqual));
+                        LexerType::Keyword nilKeyword("nil");
+                        nilKeyword.line = codeBlock.sourceLine;
+                        nilKeyword.column = codeBlock.sourceColumn;
+                        conditionTokens.push_back(std::move(nilKeyword));
+                    }
+                    auto condIR = IRGen::emitExprIR(
+                        status, strictDecl, futureFuncDefs, conditionTokens);
                     ZEUS_DEBUG_PRINT("[IRGen] .. IF condIR size=%zu", condIR.size());
                     ifIR.insert(ifIR.end(), condIR.begin(), condIR.end());
                     if (condIR.empty()) {
@@ -7460,6 +7607,16 @@ namespace IRGen {
                     }
                 }
 
+                if (codeBlock.hasConditionBinding && !IRScope::funcStack.empty()) {
+                    auto& functionLocals = IRScope::funcStack.back().locals;
+                    if (hadFunctionBinding) {
+                        functionLocals[codeBlock.conditionBindingName] =
+                            previousFunctionBindingSlot;
+                    } else {
+                        functionLocals.erase(codeBlock.conditionBindingName);
+                    }
+                }
+
                 // 如果有 else，需要一个跳过 else 的无条件跳转
                 size_t jmpOverElseIndex = (size_t)-1;
                 if (hasElse) {
@@ -7475,6 +7632,10 @@ namespace IRGen {
 
                 // 生成 else IR
                 if (hasElse) {
+                    if (codeBlock.hasConditionBinding) {
+                        IRScope::scopeStack.back().nameToLocal.erase(
+                            codeBlock.conditionBindingName);
+                    }
                     const auto& en = codeBlock.nodes.back();  // else 块是最后一个节点
                     ZEUS_DEBUG_PRINT("[IRGen] .. IF else-child variantKind=%d", en.index());
                     if (std::holds_alternative<TreeParser::Node>(en)) {

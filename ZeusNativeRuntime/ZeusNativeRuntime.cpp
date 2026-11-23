@@ -17,7 +17,6 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <shellapi.h>
 #endif
 
 #if defined(_WIN32)
@@ -58,37 +57,109 @@ bool convertTimestamp(double timestamp, bool utc, std::tm& result) noexcept {
 
 bool collectProcessArguments(std::vector<std::string>& arguments) noexcept {
 #if defined(_WIN32)
-    int count = 0;
-    LPWSTR* wideArguments = CommandLineToArgvW(GetCommandLineW(), &count);
-    if (!wideArguments || count < 1) return false;
-    bool success = true;
+    auto encodeWideArg = [](const wchar_t* wideArg, std::string& out) -> bool {
+        const int required = WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, wideArg, -1,
+            nullptr, 0, nullptr, nullptr);
+        if (required <= 0) return false;
+        out.assign(static_cast<size_t>(required), '\0');
+        if (required > 1 && WideCharToMultiByte(
+                CP_UTF8, WC_ERR_INVALID_CHARS, wideArg, -1,
+                out.data(), required, nullptr, nullptr) != required) {
+            return false;
+        }
+        out.resize(static_cast<size_t>(required - 1));
+        return true;
+    };
+
+    LPCWSTR cmdLine = GetCommandLineW();
+    if (!cmdLine) return false;
+
+    using CommandLineToArgvWFn = LPWSTR* (WINAPI*)(LPCWSTR, int*);
+    HMODULE shell32 = GetModuleHandleA("shell32.dll");
+    if (!shell32) shell32 = LoadLibraryA("shell32.dll");
+    auto* toArgv = shell32
+        ? reinterpret_cast<CommandLineToArgvWFn>(GetProcAddress(shell32, "CommandLineToArgvW"))
+        : nullptr;
+    if (toArgv) {
+        int count = 0;
+        LPWSTR* wideArguments = toArgv(cmdLine, &count);
+        if (!wideArguments || count < 1) return false;
+        bool success = true;
+        try {
+            arguments.clear();
+            arguments.reserve(static_cast<size_t>(count - 1));
+            for (int index = 1; index < count; ++index) {
+                std::string value;
+                if (!encodeWideArg(wideArguments[index], value)) {
+                    success = false;
+                    break;
+                }
+                arguments.push_back(std::move(value));
+            }
+        } catch (...) {
+            success = false;
+        }
+        LocalFree(wideArguments);
+        if (!success) arguments.clear();
+        return success;
+    }
+
+    // Fallback when shell32.dll cannot initialize (e.g. headless/restricted tokens).
     try {
+        std::vector<std::wstring> parsed;
+        const wchar_t* p = cmdLine;
+        while (*p) {
+            while (*p == L' ' || *p == L'\t') ++p;
+            if (!*p) break;
+            std::wstring arg;
+            bool inQuotes = false;
+            while (*p) {
+                if (!inQuotes && (*p == L' ' || *p == L'\t')) break;
+                size_t backslashes = 0;
+                while (*p == L'\\') {
+                    ++backslashes;
+                    ++p;
+                }
+                if (*p == L'"') {
+                    arg.append(backslashes / 2, L'\\');
+                    if (backslashes % 2 == 0) {
+                        if (inQuotes && p[1] == L'"') {
+                            arg.push_back(L'"');
+                            ++p;
+                        } else {
+                            inQuotes = !inQuotes;
+                        }
+                    } else {
+                        arg.push_back(L'"');
+                    }
+                    ++p;
+                } else {
+                    arg.append(backslashes, L'\\');
+                    if (*p) {
+                        arg.push_back(*p);
+                        ++p;
+                    }
+                }
+            }
+            parsed.push_back(std::move(arg));
+        }
+        if (parsed.empty()) return false;
         arguments.clear();
-        arguments.reserve(static_cast<size_t>(count - 1));
-        for (int index = 1; index < count; ++index) {
-            const int required = WideCharToMultiByte(
-                CP_UTF8, WC_ERR_INVALID_CHARS, wideArguments[index], -1,
-                nullptr, 0, nullptr, nullptr);
-            if (required <= 0) {
-                success = false;
-                break;
+        arguments.reserve(parsed.size() - 1);
+        for (size_t index = 1; index < parsed.size(); ++index) {
+            std::string value;
+            if (!encodeWideArg(parsed[index].c_str(), value)) {
+                arguments.clear();
+                return false;
             }
-            std::string value(static_cast<size_t>(required), '\0');
-            if (required > 1 && WideCharToMultiByte(
-                    CP_UTF8, WC_ERR_INVALID_CHARS, wideArguments[index], -1,
-                    value.data(), required, nullptr, nullptr) != required) {
-                success = false;
-                break;
-            }
-            value.resize(static_cast<size_t>(required - 1));
             arguments.push_back(std::move(value));
         }
+        return true;
     } catch (...) {
-        success = false;
+        arguments.clear();
+        return false;
     }
-    LocalFree(wideArguments);
-    if (!success) arguments.clear();
-    return success;
 #else
     (void)arguments;
     return false;

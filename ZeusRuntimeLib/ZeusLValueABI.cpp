@@ -11,8 +11,10 @@
 #include <algorithm>
 #include <limits>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -31,10 +33,10 @@ struct OwnedRawRange {
     uint64_t size = 0;
     bool writable = false;
 };
-std::mutex& lvalueMutex() {
+std::shared_mutex& lvalueMutex() {
     // Native buffers can be released by static Zeus cells during process
     // teardown; keep the address registry available for their unregister path.
-    static auto* value = new std::mutex();
+    static auto* value = new std::shared_mutex();
     return *value;
 }
 std::unordered_map<void*, LValueSlot>& lvalueSlots() {
@@ -68,7 +70,7 @@ void registerOwnedRawRanges(void* owner, const OwnedRawRange* ranges, size_t cou
     for (size_t index = 0; index < count; ++index)
         validateRawRange(ranges[index].address, ranges[index].size);
 
-    std::lock_guard<std::mutex> lock(lvalueMutex());
+    std::unique_lock<std::shared_mutex> lock(lvalueMutex());
     size_t additions = 0;
     for (size_t index = 0; index < count; ++index) {
         const auto found = std::find_if(
@@ -219,7 +221,7 @@ bool findRegisteredBuffer(void* address, const std::string& type,
     const uintptr_t headerAddress = dataAddress - sizeof(uint64_t);
     const uint64_t terminator = type == "string" ? 1 : 0;
 
-    std::lock_guard<std::mutex> lock(lvalueMutex());
+    std::shared_lock<std::shared_mutex> lock(lvalueMutex());
     for (const auto& header : ownedRawRanges()) {
         if (reinterpret_cast<uintptr_t>(header.address) != headerAddress ||
             header.size < sizeof(uint64_t)) {
@@ -270,7 +272,7 @@ bool findRegisteredBuffer(void* address, const std::string& type,
 LValueSlot resolveLValue(void* address, const std::string& type, bool writing) {
     if (!address) throw std::runtime_error("@faddr received a null address");
     {
-        std::lock_guard<std::mutex> lock(lvalueMutex());
+        std::shared_lock<std::shared_mutex> lock(lvalueMutex());
         auto found = lvalueSlots().find(address);
         if (found != lvalueSlots().end() && found->second.abi != 2) {
             auto slot = found->second;
@@ -294,7 +296,7 @@ LValueSlot resolveLValue(void* address, const std::string& type, bool writing) {
 }
 extern "C" void* zeus_lvalue_register(void* slot, const char* type, int32_t abi, uint64_t size, int32_t writable) noexcept(false) {
     if (!slot || abi < 0 || abi > 1 || !size) throw std::runtime_error("invalid lvalue slot registration");
-    std::lock_guard<std::mutex> lock(lvalueMutex());
+    std::unique_lock<std::shared_mutex> lock(lvalueMutex());
     auto& slots = lvalueSlots();
     auto& tokenByStorage = lvalueTokenByStorage();
     const auto existing = tokenByStorage.find(slot);
@@ -323,7 +325,7 @@ extern "C" void* zeus_lvalue_register(void* slot, const char* type, int32_t abi,
 }
 extern "C" void zeus_lvalue_register_raw(void* address, uint64_t size, int32_t writable) noexcept(false) {
     if (!address || !size) return;
-    std::lock_guard<std::mutex> lock(lvalueMutex());
+    std::unique_lock<std::shared_mutex> lock(lvalueMutex());
     lvalueSlots()[address] = LValueSlot{"", 2, size, writable != 0, {}};
 }
 extern "C" void zeus_lvalue_register_raw_owned(void* owner, void* address, uint64_t size, int32_t writable) noexcept(false) {
@@ -331,11 +333,11 @@ extern "C" void zeus_lvalue_register_raw_owned(void* owner, void* address, uint6
     registerOwnedRawRanges(owner, &range, 1);
 }
 extern "C" void zeus_lvalue_unregister_revealed(void* owner) noexcept {
-    std::lock_guard<std::mutex> lock(lvalueMutex());
+    std::unique_lock<std::shared_mutex> lock(lvalueMutex());
     unregisterOwnedRawRangesUnlocked(owner);
 }
 extern "C" void zeus_lvalue_unregister(void* slot) noexcept {
-    std::lock_guard<std::mutex> lock(lvalueMutex());
+    std::unique_lock<std::shared_mutex> lock(lvalueMutex());
     for (auto entry = lvalueSlots().begin(); entry != lvalueSlots().end();) {
         if (entry->first == slot || entry->second.storage == slot) {
             if (entry->second.storage) {
@@ -365,7 +367,7 @@ extern "C" void zeus_lvalue_require_raw(void* address, uint64_t size, int32_t wr
     if (tryDepth() == 0) return;
     const auto target = reinterpret_cast<uintptr_t>(address);
     {
-        std::lock_guard<std::mutex> lock(lvalueMutex());
+        std::shared_lock<std::shared_mutex> lock(lvalueMutex());
         const auto exact = lvalueSlots().find(address);
         if (exact != lvalueSlots().end() && exact->second.abi != 2)
             throw std::runtime_error("raw @faddr cannot reinterpret a typed variable slot");
@@ -598,14 +600,14 @@ extern "C" void* zeus_shared_value_slot_address(const char* name,const char* typ
     auto cell=ZeusShared::getGlobalHeap().find(name);
     if(!cell) throw std::runtime_error("undefined shared slot");
     void* address=nextLValueToken();
-    std::lock_guard<std::mutex> lock(lvalueMutex());
+    std::unique_lock<std::shared_mutex> lock(lvalueMutex());
     lvalueSlots()[address]=LValueSlot{lvalueType(type),3,sizeof(void*),writable!=0,cell,nullptr};
     return address;
 }
 
 extern "C" void zeus_lvalue_unregister_span(void* address,uint64_t size) noexcept {
     const auto base=reinterpret_cast<uintptr_t>(address);
-    std::lock_guard<std::mutex> lock(lvalueMutex());
+    std::unique_lock<std::shared_mutex> lock(lvalueMutex());
     for(auto it=lvalueSlots().begin();it!=lvalueSlots().end();) {
         const auto target=reinterpret_cast<uintptr_t>(it->first);
         const auto storage = reinterpret_cast<uintptr_t>(it->second.storage);

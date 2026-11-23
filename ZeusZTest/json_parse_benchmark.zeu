@@ -35,6 +35,14 @@ func buildEscaped(count: int) -> string {
     return buildArray(count, "\"line\\nfeed\\ttab\\\\slash\\\"quote\"");
 }
 
+func buildEscapedSparse(count: int) -> string {
+    return buildArray(count, "\"a mostly plain string with one\\n escape\"");
+}
+
+func buildEscapedDense(count: int) -> string {
+    return buildArray(count, "\"\\n\\n\\n\\n\\n\\n\\n\\n\"");
+}
+
 func measure(label: string, text: string, iterations: int) {
     let warm = JSON.parse(text);
     if (warm == nil) throw new Exception("benchmark parse produced nil");
@@ -66,11 +74,15 @@ func main() {
     let numbers = buildNumbers(200);
     let objects = buildObjects(200);
     let escaped = buildEscaped(200);
+    let escapedSparse = buildEscapedSparse(200);
+    let escapedDense = buildEscapedDense(200);
 
     measure("strings", strings, 20);
     measure("numbers", numbers, 20);
     measure("objects", objects, 20);
     measure("escaped", escaped, 20);
+    measure("escaped_sparse", escapedSparse, 20);
+    measure("escaped_dense", escapedDense, 20);
 
     // Scaling series: the time per input byte must stay flat. A growing
     // per-byte cost means the parser copies the source more than once.

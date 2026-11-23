@@ -1,0 +1,88 @@
+import zeus.ctypes [&ctypes];
+
+@native decl Int32 = ctypes.INT32;
+@native decl Int64 = ctypes.LONGLONG;
+
+@native("zeus_test_invoke_i32_callback")
+decl func invokeI32Callback(cb: Int64, left: Int32, right: Int32) -> Int32;
+
+@native("zeus_test_invoke_void_callback")
+decl func invokeVoidCallback(cb: Int64, delta: Int32) -> void;
+
+@native("zeus_test_register_ctx_handler")
+decl func registerCtxHandler(cb: Int64, userCtx: Int64) -> void;
+
+@native("zeus_test_dispatch_ctx_handler")
+decl func dispatchCtxHandler(input: Int32) -> Int32;
+
+@native("zeus_test_c_target")
+decl func cTarget(value: Int32) -> Int32;
+
+@native("zeus_test_verify_c_target_addr")
+decl func verifyCTargetAddr(addr: Int64, arg: Int32) -> Int32;
+
+@native("zeus_test_only_addr_target")
+decl func onlyAddrTarget(value: Int32) -> Int32;
+
+@native("zeus_test_call_unary")
+decl func callUnary(fnAddr: Int64, arg: Int32) -> Int32;
+
+var g_counter: int = 10;
+
+// 1. Forward reference at top level before definition
+let forwardAddr = @addr(forwardMul);
+if (invokeI32Callback(forwardAddr, 6, 7) != 42) {
+    throw "forward @native func @addr callback failed";
+}
+
+@native func forwardMul(a: Int32, b: Int32) -> Int32 {
+    return a * b;
+}
+
+// 2. Custom symbol name @native("...") func after definition + inside helper func
+@native("zeus_custom_add_cb") func customAdd(a: Int32, b: Int32) -> Int32 {
+    return a + b;
+}
+
+func getCustomAddAddr() -> int {
+    return @addr(customAdd);
+}
+
+if (invokeI32Callback(getCustomAddAddr(), 15, 27) != 42) {
+    throw "custom @native func @addr callback failed";
+}
+
+// 3. Void @native func mutating module global state via C callback
+@native func bumpCounter(delta: Int32) {
+    g_counter = g_counter + delta;
+}
+
+invokeVoidCallback(@addr(bumpCounter), 5);
+if (g_counter != 15) {
+    throw "void @native func global mutation via C callback failed";
+}
+
+// 4. user_ctx pattern: C stores and passes context pointer back to @native func
+@native func ctxHandler(userCtx: Int64, input: Int32) -> Int32 {
+    let base = @faddr(userCtx, 4) -> int;
+    @faddr(userCtx, 4) -> int = base + input;
+    return base + input;
+}
+
+let ctxState = new ctypes.Buffer(4);
+ctxState.setI32(0, 100);
+registerCtxHandler(@addr(ctxHandler), ctxState.address);
+if (dispatchCtxHandler(23) != 123 or ctxState.i32(0) != 123) {
+    throw "user_ctx @native func callback failed";
+}
+ctxState.release();
+
+// 5. @addr on @native decl func (external C function, including address-only reference)
+if (verifyCTargetAddr(@addr(cTarget), 10) != 31) {
+    throw "@addr on direct-callable decl func failed";
+}
+if (callUnary(@addr(onlyAddrTarget), 23) != 123) {
+    throw "@addr on address-only decl func failed";
+}
+
+print("NATIVE_FUNC_ADDR_PASS");

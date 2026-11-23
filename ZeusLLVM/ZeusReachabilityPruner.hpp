@@ -26,6 +26,8 @@ struct ReachabilityPruneResult {
     size_t prunedPackageFunctions = 0;
     size_t unreachablePackageFunctions = 0;
     size_t prunedNamespaceMarkers = 0;
+    size_t originalGlobalSlots = 0;
+    size_t compactedGlobalSlots = 0;
     std::vector<std::string> activeModules;
     std::vector<std::string> prunedModules;
     std::map<std::string, std::set<std::string>> moduleReasons;
@@ -73,6 +75,66 @@ inline int namespaceAliasGlobalIndex(
         }
     }
     return -1;
+}
+
+inline bool isPureGlobalStoreChunk(
+    const std::vector<IRType::IRInstr>& chunk,
+    std::vector<int64_t>& storedSlots
+) {
+    if (chunk.empty()) return false;
+    storedSlots.clear();
+    bool hasStore = false;
+
+    for (const auto& ins : chunk) {
+        if (ins.op == VMOperator::STORE_VALUE_GLOBAL ||
+            ins.op == VMOperator::ASSIGN_VALUE_GLOBAL) {
+            int64_t slot = -1;
+            if (readIntegerArgument(ins, 0, slot) && slot >= 0) {
+                storedSlots.push_back(slot);
+                hasStore = true;
+            } else {
+                return false;
+            }
+            continue;
+        }
+
+        switch (ins.op) {
+            case VMOperator::PUSH:
+            case VMOperator::PUSH_NAMED:
+            case VMOperator::IR_ANNOTATION:
+            case VMOperator::ADD:
+            case VMOperator::SUBTRACT:
+            case VMOperator::MULTIPLY:
+            case VMOperator::DIVIDE:
+            case VMOperator::MODULUS:
+            case VMOperator::EQUL:
+            case VMOperator::NOT_EQUAL:
+            case VMOperator::GREATER_THAN:
+            case VMOperator::LESS_THAN:
+            case VMOperator::GREATER_EQUAL:
+            case VMOperator::LESS_EQUAL:
+            case VMOperator::LOGICAL_AND:
+            case VMOperator::LOGICAL_OR:
+            case VMOperator::LOGICAL_NOT:
+            case VMOperator::POP:
+            case VMOperator::CLEAR:
+            case VMOperator::COPY:
+            case VMOperator::SWAP:
+                break;
+            case VMOperator::LOAD_VALUE: {
+                if (ins.args.size() >= 2 &&
+                    std::holds_alternative<std::string>(ins.args[0]) &&
+                    std::get<std::string>(ins.args[0]) == "global") {
+                    break;
+                }
+                return false;
+            }
+            default:
+                return false;
+        }
+    }
+
+    return hasStore;
 }
 
 } // namespace ReachabilityPrunerDetail
@@ -223,6 +285,17 @@ inline ReachabilityPruneResult pruneUnreachablePackageCode(
     std::map<size_t, ZeusLLVM::detail::FunctionSignature> finalFunctionSignatures;
     bool converged = false;
 
+    std::map<int64_t, std::vector<size_t>> pureStoreChunksBySlot;
+    for (size_t ci = 0; ci < compiled.program.size(); ++ci) {
+        std::vector<int64_t> storedSlots;
+        if (ReachabilityPrunerDetail::isPureGlobalStoreChunk(compiled.program[ci], storedSlots)) {
+            for (int64_t slot : storedSlots) {
+                pureStoreChunksBySlot[slot].push_back(ci);
+            }
+        }
+    }
+    std::set<size_t> activatedPureStoreChunks;
+
     const size_t iterationLimit = moduleGraph.dependencyOrder.size() + 2;
     for (size_t iteration = 0; iteration < iterationLimit; ++iteration) {
         std::set<size_t> rootChunks;
@@ -234,9 +307,15 @@ inline ReachabilityPruneResult pruneUnreachablePackageCode(
                 continue;
             }
             const std::string& owner = packageOwners[ci];
-            if (sourceFileIds[ci] == 0 || owner.empty() ||
-                activeModules.find(owner) != activeModules.end()) {
+            if (sourceFileIds[ci] == 0 || owner.empty()) {
                 rootChunks.insert(ci);
+            } else if (activeModules.find(owner) != activeModules.end()) {
+                std::vector<int64_t> storedSlots;
+                if (!ReachabilityPrunerDetail::isPureGlobalStoreChunk(chunk, storedSlots)) {
+                    rootChunks.insert(ci);
+                } else if (activatedPureStoreChunks.find(ci) != activatedPureStoreChunks.end()) {
+                    rootChunks.insert(ci);
+                }
             }
         }
 
@@ -293,6 +372,16 @@ inline ReachabilityPruneResult pruneUnreachablePackageCode(
                 namespaceAliasReads.insert(slot);
                 globalChanged = activateModule(
                     importedNamespace->second, "namespace alias use") || globalChanged;
+            }
+            if (isRead) {
+                const auto defs = pureStoreChunksBySlot.find(globalIndex);
+                if (defs != pureStoreChunksBySlot.end()) {
+                    for (size_t defCi : defs->second) {
+                        if (activatedPureStoreChunks.insert(defCi).second) {
+                            globalChanged = true;
+                        }
+                    }
+                }
             }
             return globalChanged;
         };
@@ -427,7 +516,140 @@ inline ReachabilityPruneResult pruneUnreachablePackageCode(
                 ++result.prunedNamespaceMarkers;
                 chunk.clear();
             }
+            continue;
         }
+
+        if (!owner.empty() && sourceFileIds[ci] != 0) {
+            std::vector<int64_t> storedSlots;
+            if (ReachabilityPrunerDetail::isPureGlobalStoreChunk(chunk, storedSlots)) {
+                if (activatedPureStoreChunks.find(ci) == activatedPureStoreChunks.end()) {
+                    ++result.prunedModuleChunks;
+                    chunk.clear();
+                }
+            }
+        }
+    }
+
+    std::set<int64_t> referencedSlots;
+    for (const auto& chunk : compiled.program) {
+        for (const auto& ins : chunk) {
+            if (ins.op == VMOperator::STORE_VALUE_GLOBAL ||
+                ins.op == VMOperator::ASSIGN_VALUE_GLOBAL) {
+                int64_t slot = -1;
+                if (ReachabilityPrunerDetail::readIntegerArgument(ins, 0, slot) && slot >= 0) {
+                    referencedSlots.insert(slot);
+                }
+            } else if (ins.op == VMOperator::LOAD_VALUE && ins.args.size() >= 2 &&
+                       std::holds_alternative<std::string>(ins.args[0]) &&
+                       std::get<std::string>(ins.args[0]) == "global") {
+                int64_t slot = -1;
+                if (ReachabilityPrunerDetail::readIntegerArgument(ins, 1, slot) && slot >= 0) {
+                    referencedSlots.insert(slot);
+                }
+            } else if (ins.op == VMOperator::IMPORT && ins.args.size() > 3) {
+                int64_t slot = -1;
+                if (ReachabilityPrunerDetail::readIntegerArgument(ins, 3, slot) && slot >= 0) {
+                    referencedSlots.insert(slot);
+                }
+            } else if (ins.op == VMOperator::DELETE_VAR && ins.args.size() >= 3 &&
+                       std::holds_alternative<std::string>(ins.args[1]) &&
+                       std::get<std::string>(ins.args[1]) == "global") {
+                int64_t slot = -1;
+                if (ReachabilityPrunerDetail::readIntegerArgument(ins, 2, slot) && slot >= 0) {
+                    referencedSlots.insert(slot);
+                }
+            }
+            for (size_t i = 0; i + 2 < ins.args.size(); ++i) {
+                if (std::holds_alternative<std::string>(ins.args[i]) &&
+                    std::get<std::string>(ins.args[i]) == "__zeus_receiver_source" &&
+                    std::holds_alternative<std::string>(ins.args[i + 1]) &&
+                    std::get<std::string>(ins.args[i + 1]) == "global") {
+                    int64_t slot = -1;
+                    if (ReachabilityPrunerDetail::readIntegerArgument(ins, i + 2, slot) && slot >= 0) {
+                        referencedSlots.insert(slot);
+                    }
+                }
+            }
+        }
+    }
+
+    result.originalGlobalSlots = compiled.globalNames.size();
+    if (!referencedSlots.empty()) {
+        std::map<int64_t, int64_t> slotRemap;
+        int64_t newSlot = 0;
+        for (int64_t oldSlot : referencedSlots) {
+            slotRemap[oldSlot] = newSlot++;
+        }
+
+        for (auto& chunk : compiled.program) {
+            for (auto& ins : chunk) {
+                if (ins.op == VMOperator::STORE_VALUE_GLOBAL ||
+                    ins.op == VMOperator::ASSIGN_VALUE_GLOBAL) {
+                    int64_t slot = -1;
+                    if (ReachabilityPrunerDetail::readIntegerArgument(ins, 0, slot)) {
+                        const auto it = slotRemap.find(slot);
+                        if (it != slotRemap.end()) {
+                            ins.args[0] = LexerType::Value(static_cast<int>(it->second));
+                        }
+                    }
+                } else if (ins.op == VMOperator::LOAD_VALUE && ins.args.size() >= 2 &&
+                           std::holds_alternative<std::string>(ins.args[0]) &&
+                           std::get<std::string>(ins.args[0]) == "global") {
+                    int64_t slot = -1;
+                    if (ReachabilityPrunerDetail::readIntegerArgument(ins, 1, slot)) {
+                        const auto it = slotRemap.find(slot);
+                        if (it != slotRemap.end()) {
+                            ins.args[1] = LexerType::Value(static_cast<int>(it->second));
+                        }
+                    }
+                } else if (ins.op == VMOperator::IMPORT && ins.args.size() > 3) {
+                    int64_t slot = -1;
+                    if (ReachabilityPrunerDetail::readIntegerArgument(ins, 3, slot)) {
+                        const auto it = slotRemap.find(slot);
+                        if (it != slotRemap.end()) {
+                            ins.args[3] = LexerType::Value(static_cast<int>(it->second));
+                        }
+                    }
+                } else if (ins.op == VMOperator::DELETE_VAR && ins.args.size() >= 3 &&
+                           std::holds_alternative<std::string>(ins.args[1]) &&
+                           std::get<std::string>(ins.args[1]) == "global") {
+                    int64_t slot = -1;
+                    if (ReachabilityPrunerDetail::readIntegerArgument(ins, 2, slot)) {
+                        const auto it = slotRemap.find(slot);
+                        if (it != slotRemap.end()) {
+                            ins.args[2] = LexerType::Value(static_cast<int>(it->second));
+                        }
+                    }
+                }
+                for (size_t i = 0; i + 2 < ins.args.size(); ++i) {
+                    if (std::holds_alternative<std::string>(ins.args[i]) &&
+                        std::get<std::string>(ins.args[i]) == "__zeus_receiver_source" &&
+                        std::holds_alternative<std::string>(ins.args[i + 1]) &&
+                        std::get<std::string>(ins.args[i + 1]) == "global") {
+                        int64_t slot = -1;
+                        if (ReachabilityPrunerDetail::readIntegerArgument(ins, i + 2, slot)) {
+                            const auto it = slotRemap.find(slot);
+                            if (it != slotRemap.end()) {
+                                ins.args[i + 2] = LexerType::Value(static_cast<int>(it->second));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        std::vector<std::string> newGlobalNames(slotRemap.size());
+        for (const auto& pair : slotRemap) {
+            if (static_cast<size_t>(pair.first) < compiled.globalNames.size()) {
+                newGlobalNames[static_cast<size_t>(pair.second)] =
+                    compiled.globalNames[static_cast<size_t>(pair.first)];
+            }
+        }
+        compiled.globalNames = std::move(newGlobalNames);
+        result.compactedGlobalSlots = compiled.globalNames.size();
+    } else {
+        compiled.globalNames.clear();
+        result.compactedGlobalSlots = 0;
     }
 
     for (const auto& module : moduleGraph.dependencyOrder) {
@@ -448,6 +670,11 @@ inline void reportReachabilityPruning(const ReachabilityPruneResult& result) {
               << " unused namespace markers; "
               << result.unreachablePackageFunctions
               << " active package functions are omitted by the emitter" << std::endl;
+    if (result.originalGlobalSlots > 0) {
+        std::cout << "[emit-llvm] compacted global slots from "
+                  << result.originalGlobalSlots << " to "
+                  << result.compactedGlobalSlots << std::endl;
+    }
     if (!result.activeModules.empty()) {
         std::cout << "[emit-llvm] active modules:";
         for (const auto& name : result.activeModules) {

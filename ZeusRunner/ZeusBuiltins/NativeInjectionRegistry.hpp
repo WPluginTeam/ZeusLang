@@ -7,6 +7,7 @@
 #include "dict.hpp"
 #include "process.hpp"
 #include "strings.hpp"
+#include "math.hpp"
 #include "../../ZeusBuiltins/NativeTypeIDs.hpp"
 #include "../../ZeusBuiltins/NativeTypeABI.hpp"
 #include "../../ZeusRuntimeLib/ZeusSignedInteger.hpp"
@@ -664,7 +665,67 @@ inline const std::vector<NativeInjectionDescriptor>& nativeInjections() {
         {"__str_index", "zeus_native_string_index", builtin_str_index, 2, 2},
         {"__str_rindex", "zeus_native_string_rindex", builtin_str_rindex, 2, 2},
         {"__str_startswith", "zeus_native_string_startswith",
-         builtin_str_startswith, 2, 2}
+         builtin_str_startswith, 2, 2},
+        // Native math builtins (C standard library / libc math)
+        {"__math_sin", "sin", builtin_sin, 1, 1},
+        {"__math_cos", "cos", builtin_cos, 1, 1},
+        {"__math_tan", "tan", builtin_tan, 1, 1},
+        {"__math_asin", "asin", builtin_asin, 1, 1},
+        {"__math_acos", "acos", builtin_acos, 1, 1},
+        {"__math_atan", "atan", builtin_atan, 1, 1},
+        {"__math_atan2", "atan2", builtin_atan2, 2, 2},
+        {"__math_sinh", "sinh", builtin_sinh, 1, 1},
+        {"__math_cosh", "cosh", builtin_cosh, 1, 1},
+        {"__math_tanh", "tanh", builtin_tanh, 1, 1},
+        {"__math_asinh", "asinh", builtin_asinh, 1, 1},
+        {"__math_acosh", "acosh", builtin_acosh, 1, 1},
+        {"__math_atanh", "atanh", builtin_atanh, 1, 1},
+        {"__math_sqrt", "sqrt", builtin_sqrt, 1, 1},
+        {"__math_cbrt", "cbrt", builtin_cbrt, 1, 1},
+        {"__math_hypot", "hypot", builtin_hypot, 2, 2},
+        {"__math_pow", "pow", builtin_pow, 2, 2},
+        {"__math_exp", "exp", builtin_exp, 1, 1},
+        {"__math_exp2", "exp2", builtin_exp2, 1, 1},
+        {"__math_log", "log", builtin_log, 1, 1},
+        {"__math_log2", "log2", builtin_log2, 1, 1},
+        {"__math_log10", "log10", builtin_log10, 1, 1},
+        {"__math_floor", "floor", builtin_floor, 1, 1},
+        {"__math_ceil", "ceil", builtin_ceil, 1, 1},
+        {"__math_round", "round", builtin_round, 1, 1},
+        {"__math_trunc", "trunc", builtin_trunc, 1, 1},
+        {"__math_fabs", "fabs", builtin_fabs, 1, 1},
+        {"__math_copysign", "copysign", builtin_copysign, 2, 2},
+        {"__math_fmod", "fmod", builtin_fmod, 2, 2},
+        // Float single-precision versions (hardware FPU accelerated)
+        {"__math_sinf", "sinf", builtin_sinf, 1, 1},
+        {"__math_cosf", "cosf", builtin_cosf, 1, 1},
+        {"__math_tanf", "tanf", builtin_tanf, 1, 1},
+        {"__math_asinf", "asinf", builtin_asinf, 1, 1},
+        {"__math_acosf", "acosf", builtin_acosf, 1, 1},
+        {"__math_atanf", "atanf", builtin_atanf, 1, 1},
+        {"__math_atan2f", "atan2f", builtin_atan2f, 2, 2},
+        {"__math_sinhf", "sinhf", builtin_sinhf, 1, 1},
+        {"__math_coshf", "coshf", builtin_coshf, 1, 1},
+        {"__math_tanhf", "tanhf", builtin_tanhf, 1, 1},
+        {"__math_asinhf", "asinhf", builtin_asinhf, 1, 1},
+        {"__math_acoshf", "acoshf", builtin_acoshf, 1, 1},
+        {"__math_atanhf", "atanhf", builtin_atanhf, 1, 1},
+        {"__math_sqrtf", "sqrtf", builtin_sqrtf, 1, 1},
+        {"__math_cbrtf", "cbrtf", builtin_cbrtf, 1, 1},
+        {"__math_hypotf", "hypotf", builtin_hypotf, 2, 2},
+        {"__math_powf", "powf", builtin_powf, 2, 2},
+        {"__math_expf", "expf", builtin_expf, 1, 1},
+        {"__math_exp2f", "exp2f", builtin_exp2f, 1, 1},
+        {"__math_logf", "logf", builtin_logf, 1, 1},
+        {"__math_log2f", "log2f", builtin_log2f, 1, 1},
+        {"__math_log10f", "log10f", builtin_log10f, 1, 1},
+        {"__math_floorf", "floorf", builtin_floorf, 1, 1},
+        {"__math_ceilf", "ceilf", builtin_ceilf, 1, 1},
+        {"__math_roundf", "roundf", builtin_roundf, 1, 1},
+        {"__math_truncf", "truncf", builtin_truncf, 1, 1},
+        {"__math_fabsf", "fabsf", builtin_fabsf, 1, 1},
+        {"__math_copysignf", "copysignf", builtin_copysignf, 2, 2},
+        {"__math_fmodf", "fmodf", builtin_fmodf, 2, 2}
     };
     return injections;
 }

@@ -37,6 +37,9 @@ let exponentNumbers = JSON.parseValue("[1e2,1e-2]");
 assertJSON(exponentNumbers[0] == 100 and exponentNumbers[1] == 0.01,
     "positive and negative exponent parsing");
 
+let multiEscaped = JSON.parse("\"A\\nB\\tC\\\\D\\\"E\\bF\\fG\\rH\"");
+assertJSON(multiEscaped == "A\nB\tC\\D\"E\bF\fG\rH",
+    "multiple escaped fragments");
 let rocket = JSON.parse("\"\\uD83D\\uDE80\"");
 assertJSON(rocket == "🚀", "surrogate pair decoding");
 assertJSON(JSON.stringify(rocket) == "\"🚀\"", "Unicode serialization");

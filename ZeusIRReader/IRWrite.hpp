@@ -20,7 +20,7 @@ namespace IRBinary {
 
     // Magic + version
     static const unsigned char MAGIC[4] = { 'Z', 'I', 'R', '1' };
-    static const uint16_t VERSION = 10;
+    static const uint16_t VERSION = 11;
 
     // Arg type tags（尾部追加：老 .zir 里不可能出现新 tag，前向兼容）
     enum ArgTag : uint8_t {

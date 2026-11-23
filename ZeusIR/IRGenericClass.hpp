@@ -111,6 +111,14 @@ namespace IRGenericClass {
         return prototypeId;
     }
 
+    inline bool isVariadicParameter(const std::string& param) {
+        return param.rfind("..", 0) == 0;
+    }
+
+    inline std::string unwrapVariadicParameter(const std::string& param) {
+        return isVariadicParameter(param) ? param.substr(2) : param;
+    }
+
     inline bool isGenericClassTemplateMarker(
         const IRType::IRInstr& instruction
     ) {
@@ -453,9 +461,16 @@ namespace IRGenericClass {
 
             for (const auto& entry : templates) {
                 const std::vector<size_t> methods = methodChunks(program, entry.first);
+                std::vector<std::string> expandedParams;
+                for (const auto& p : entry.second.parameters) {
+                    expandedParams.push_back(p);
+                    if (isVariadicParameter(p)) {
+                        expandedParams.push_back(unwrapVariadicParameter(p));
+                    }
+                }
                 for (const size_t methodChunk : methods) {
                     markGenericClassTemplateMethod(
-                        program[methodChunk], entry.second.parameters);
+                        program[methodChunk], expandedParams);
                 }
             }
 
@@ -469,7 +484,12 @@ namespace IRGenericClass {
                     const auto type = templates.find(owner);
                     if (type != templates.end()) {
                         auto& parameters = genericFunctionTypeParameters[name];
-                        parameters.insert(type->second.parameters.begin(), type->second.parameters.end());
+                        for (const auto& p : type->second.parameters) {
+                            parameters.insert(p);
+                            if (isVariadicParameter(p)) {
+                                parameters.insert(unwrapVariadicParameter(p));
+                            }
+                        }
                     }
                     break;
                 }
@@ -510,15 +530,28 @@ namespace IRGenericClass {
                     specializedName = className;
                     return true;
                 }
+                const auto& params = found->second.parameters;
+                const bool hasVariadic = !params.empty() && isVariadicParameter(params.back());
+                const size_t fixedCount = hasVariadic ? params.size() - 1 : params.size();
+
                 if (typeArguments.empty()) {
                     return fail(source,
                         "new " + className + " requires explicit @type arguments",
                         outError, outErrorLine);
                 }
-                if (typeArguments.size() != found->second.parameters.size()) {
+                if (hasVariadic) {
+                    if (typeArguments.size() < fixedCount + 1) {
+                        return fail(source,
+                            "new " + className + " expects at least " +
+                            std::to_string(fixedCount + 1) +
+                            " type argument(s), got " +
+                            std::to_string(typeArguments.size()),
+                            outError, outErrorLine);
+                    }
+                } else if (typeArguments.size() != params.size()) {
                     return fail(source,
                         "new " + className + " expects " +
-                        std::to_string(found->second.parameters.size()) +
+                        std::to_string(params.size()) +
                         " type argument(s), got " +
                         std::to_string(typeArguments.size()),
                         outError, outErrorLine);
@@ -543,8 +576,19 @@ namespace IRGenericClass {
                     value.specializedName = key;
                     value.typeArguments = typeArguments;
                     value.templateChunk = found->second.chunkIndex;
-                    for (size_t i = 0; i < typeArguments.size(); ++i) {
-                        value.substitutions[found->second.parameters[i]] = typeArguments[i];
+                    for (size_t i = 0; i < fixedCount; ++i) {
+                        value.substitutions[params[i]] = typeArguments[i];
+                    }
+                    if (hasVariadic) {
+                        const std::string variadicParam = params.back();
+                        const std::string bareParam = unwrapVariadicParameter(variadicParam);
+                        std::string packString = "__zeus_pack:";
+                        for (size_t i = fixedCount; i < typeArguments.size(); ++i) {
+                            if (i > fixedCount) packString += ",";
+                            packString += typeArguments[i];
+                        }
+                        value.substitutions[variadicParam] = packString;
+                        value.substitutions[bareParam] = packString;
                     }
                     concreteClasses.emplace(key, std::move(value));
                 }

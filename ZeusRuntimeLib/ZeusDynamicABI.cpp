@@ -496,6 +496,17 @@ int32_t zeus_value_is_array(const ZeusValue* value) {
     }
 }
 
+int32_t zeus_value_is_dict(const ZeusValue* value) {
+    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
+    if (!value) return 0;
+    try {
+        OwnedZeusBox boxedValue = boxFromValue(value);
+        return getDict(boxedValue.get()) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
 void zeus_value_array_length(ZeusValue* out, const ZeusValue* array) {
     if (!out) valueContainerPanic("null array length output");
     zeus_value_init_nil(out);

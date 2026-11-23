@@ -1,0 +1,293 @@
+// Fixed-shape linear algebra matrices with double-precision elements.
+import zeus.list;
+import zeus.static;
+
+// Shared owner for typed contiguous matrix storage. Copying the handle aliases
+// the same storage; Matrix's own copy hook still provides value semantics.
+class MatrixBuffer {
+    using &this;
+
+    var elements: StaticArray<double>;
+
+    func init(capacity: int) {
+        if (capacity <= 0) {
+            throw "MatrixBuffer capacity must be positive";
+        }
+        this.elements = new StaticArray<double>(capacity);
+    }
+
+    func operator[@=]() -> &MatrixBuffer {
+        return this;
+    }
+
+    @no_safepoint
+    inline func length() -> int {
+        return this.elements.length();
+    }
+
+    inline func append(value: double) {
+        this.elements.append(value);
+    }
+
+    inline func get(index: int) -> double {
+        return this.elements.getTyped(index, 0.0);
+    }
+
+    inline func set(index: int, value: double) {
+        this.elements.setTyped(index, value, 0.0);
+    }
+
+    func copy() -> MatrixBuffer {
+        let result = new MatrixBuffer(this.length());
+        let index = 0;
+        for (index < this.length()) {
+            result.append(this.get(index));
+            index = index + 1;
+        }
+        return result;
+    }
+
+}
+
+class MatrixView {
+    using &this;
+
+    var rowCountValue: int = 0;
+    var columnCountValue: int = 0;
+    var buffer: MatrixBuffer;
+
+    func init(rows: int, columns: int, source: MatrixBuffer) {
+        let elementCount = rows * columns;
+        if (rows <= 0 or columns <= 0 or elementCount <= 0 or
+            elementCount / columns != rows) {
+            throw "MatrixView dimensions must be positive and valid";
+        }
+        if (source.length() != elementCount) {
+            throw "MatrixView data length must match its dimensions";
+        }
+
+        this.rowCountValue = rows;
+        this.columnCountValue = columns;
+        this.buffer = source;
+    }
+
+    // Copy the descriptor while retaining its shared MatrixBuffer.
+    func operator[@=]() -> MatrixView {
+        return new MatrixView(
+            this.rowCountValue, this.columnCountValue, this.buffer);
+    }
+
+    @no_safepoint
+    inline func rows() -> int {
+        return this.rowCountValue;
+    }
+
+    @no_safepoint
+    inline func columns() -> int {
+        return this.columnCountValue;
+    }
+
+    func linearIndex(row: int, column: int) -> int {
+        if (row < 0 or row >= this.rowCountValue or
+            column < 0 or column >= this.columnCountValue) {
+            throw "MatrixView index out of range";
+        }
+        return row * this.columnCountValue + column;
+    }
+
+    inline func get(row: int, column: int) -> double {
+        return this.buffer.get(this.linearIndex(row, column));
+    }
+
+    inline func set(row: int, column: int, value: double) {
+        this.buffer.set(this.linearIndex(row, column), value);
+    }
+}
+
+class Matrix {
+    using &this;
+
+    var rowCountValue: int = 0;
+    var columnCountValue: int = 0;
+    var buffer: MatrixBuffer;
+
+    // Array input is copied; a MatrixBuffer input is adopted without an
+    // element-wise conversion. Both paths produce the same owned buffer handle.
+    func init(rows: int, columns: int, values) {
+        let elementCount = rows * columns;
+        if (rows <= 0 or columns <= 0 or elementCount <= 0 or
+            elementCount / columns != rows) {
+            throw "Matrix dimensions must be positive and valid";
+        }
+
+        if (type(values) == "MatrixBuffer") {
+            if (values.length() != elementCount) {
+                throw "Matrix data length must match its dimensions";
+            }
+            this.rowCountValue = rows;
+            this.columnCountValue = columns;
+            this.buffer = values;
+            return;
+        }
+
+        if (type(values) != "Array") {
+            throw "Matrix values must be an Array or MatrixBuffer";
+        }
+        if (values.length() != elementCount) {
+            throw "Matrix data length must match its dimensions";
+        }
+
+        this.rowCountValue = rows;
+        this.columnCountValue = columns;
+        this.buffer = new MatrixBuffer(elementCount);
+
+        let index = 0;
+        for (index < elementCount) {
+            this.buffer.append(float(values[index]));
+            index = index + 1;
+        }
+    }
+
+    // Construct a Matrix from an already filled contiguous buffer.
+    func static fromBuffer(rows: int, columns: int,
+        source: MatrixBuffer) -> Matrix {
+        return new Matrix(rows, columns, source);
+    }
+
+    // Matrix copies remain independent even though their buffer handles share.
+    func operator[@=]() -> Matrix {
+        return Matrix.fromBuffer(
+            this.rowCountValue, this.columnCountValue, this.buffer.copy());
+    }
+
+    @no_safepoint
+    inline func rows() -> int {
+        return this.rowCountValue;
+    }
+
+    @no_safepoint
+    inline func columns() -> int {
+        return this.columnCountValue;
+    }
+
+    func linearIndex(row: int, column: int) -> int {
+        if (row < 0 or row >= this.rowCountValue or
+            column < 0 or column >= this.columnCountValue) {
+            throw "Matrix index out of range";
+        }
+        return row * this.columnCountValue + column;
+    }
+
+    inline func get(row: int, column: int) -> double {
+        return this.buffer.get(this.linearIndex(row, column));
+    }
+
+    inline func set(row: int, column: int, value: double) {
+        this.buffer.set(this.linearIndex(row, column), value);
+    }
+
+    func view() -> MatrixView {
+        return new MatrixView(
+            this.rowCountValue, this.columnCountValue, this.buffer);
+    }
+
+    func add(other: Matrix) -> Matrix {
+        if (this.rowCountValue != other.rows() or
+            this.columnCountValue != other.columns()) {
+            throw "Matrix addition requires equal dimensions";
+        }
+
+        let resultBuffer = new MatrixBuffer(this.buffer.length());
+        let index = 0;
+        for (index < this.buffer.length()) {
+            resultBuffer.append(
+                this.buffer.get(index) + other.buffer.get(index));
+            index = index + 1;
+        }
+        return Matrix.fromBuffer(
+            this.rowCountValue, this.columnCountValue, resultBuffer);
+    }
+
+    func subtract(other: Matrix) -> Matrix {
+        if (this.rowCountValue != other.rows() or
+            this.columnCountValue != other.columns()) {
+            throw "Matrix subtraction requires equal dimensions";
+        }
+
+        let resultBuffer = new MatrixBuffer(this.buffer.length());
+        let index = 0;
+        for (index < this.buffer.length()) {
+            resultBuffer.append(
+                this.buffer.get(index) - other.buffer.get(index));
+            index = index + 1;
+        }
+        return Matrix.fromBuffer(
+            this.rowCountValue, this.columnCountValue, resultBuffer);
+    }
+
+    func multiply(other: Matrix) -> Matrix {
+        if (this.columnCountValue != other.rowCountValue) {
+            throw "Matrix multiplication dimensions do not match";
+        }
+
+        let resultBuffer = new MatrixBuffer(
+            this.rowCountValue * other.columnCountValue);
+        let row = 0;
+        for (row < this.rowCountValue) {
+            let column = 0;
+            for (column < other.columnCountValue) {
+                let sum = 0.0;
+                let inner = 0;
+                for (inner < this.columnCountValue) {
+                    sum = sum + this.get(row, inner) * other.get(inner, column);
+                    inner = inner + 1;
+                }
+                resultBuffer.append(sum);
+                column = column + 1;
+            }
+            row = row + 1;
+        }
+
+        return Matrix.fromBuffer(
+            this.rowCountValue, other.columnCountValue, resultBuffer);
+    }
+
+    func scale(factor: double) -> Matrix {
+        let resultBuffer = new MatrixBuffer(this.buffer.length());
+        let index = 0;
+        for (index < this.buffer.length()) {
+            resultBuffer.append(this.buffer.get(index) * factor);
+            index = index + 1;
+        }
+        return Matrix.fromBuffer(
+            this.rowCountValue, this.columnCountValue, resultBuffer);
+    }
+
+    func transpose() -> Matrix {
+        let resultBuffer = new MatrixBuffer(
+            this.columnCountValue * this.rowCountValue);
+        let column = 0;
+        for (column < this.columnCountValue) {
+            let row = 0;
+            for (row < this.rowCountValue) {
+                resultBuffer.append(this.get(row, column));
+                row = row + 1;
+            }
+            column = column + 1;
+        }
+        return Matrix.fromBuffer(
+            this.columnCountValue, this.rowCountValue, resultBuffer);
+    }
+
+    func operator[+](other: Matrix) -> Matrix {
+        return this.add(other);
+    }
+
+    func operator[-](other: Matrix) -> Matrix {
+        return this.subtract(other);
+    }
+
+    func operator[*](other: Matrix) -> Matrix {
+        return this.multiply(other);
+    }
+}

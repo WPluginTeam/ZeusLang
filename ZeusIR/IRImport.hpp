@@ -152,53 +152,179 @@ namespace IRImport {
         return absoluteNormalizedPath(base / path).string();
     }
 
-    // Resolve compiler modules and project modules from explicit roots.
-    //   zeus.mem          -> <compiler-dir>/ZeusBuiltins/zeus/mem.zeu
-    //   ZeusBuiltins.mem  -> canonicalized to zeus.mem
-    //   package.math      -> importer directory/package/math.zeu, then process CWD
+    // 在指定根目录下探测模块候选：
+    // 1. 单文件形式: <root>/<pkg>.zeu
+    // 2. 目录包形式: <root>/<pkg>/mod.zeu
+    // 3. 目录包形式: <root>/<pkg>/main.zeu
+    // 4. 目录包形式: <root>/<pkg>/<last>.zeu
+    inline std::string tryResolveInRoot(const std::filesystem::path& root, const std::string& packageName) {
+        if (root.empty()) return "";
+
+        std::filesystem::path relativeDir;
+        std::string lastSegment;
+        size_t segmentStart = 0;
+        while (segmentStart <= packageName.size()) {
+            const size_t dot = packageName.find('.', segmentStart);
+            const size_t segmentEnd = (dot == std::string::npos) ? packageName.size() : dot;
+            const std::string segment = packageName.substr(segmentStart, segmentEnd - segmentStart);
+            if (segment.empty() || segment == "." || segment == ".." ||
+                segment.find('/') != std::string::npos ||
+                segment.find('\\') != std::string::npos ||
+                segment.find(':') != std::string::npos) {
+                return "";
+            }
+            relativeDir /= segment;
+            lastSegment = segment;
+            if (dot == std::string::npos) break;
+            segmentStart = dot + 1;
+        }
+
+        // 候选 1: 单文件形式 <root>/<relativeDir>.zeu
+        std::filesystem::path candidateFile = absoluteNormalizedPath(root / (relativeDir.string() + ".zeu"));
+        if (std::filesystem::is_regular_file(candidateFile)) {
+            return candidateFile.string();
+        }
+
+        // 候选 2: 目录包入口 <root>/<relativeDir>/mod.zeu
+        std::filesystem::path candidateMod = absoluteNormalizedPath(root / relativeDir / "mod.zeu");
+        if (std::filesystem::is_regular_file(candidateMod)) {
+            return candidateMod.string();
+        }
+
+        // 候选 3: 目录包入口 <root>/<relativeDir>/main.zeu
+        std::filesystem::path candidateMain = absoluteNormalizedPath(root / relativeDir / "main.zeu");
+        if (std::filesystem::is_regular_file(candidateMain)) {
+            return candidateMain.string();
+        }
+
+        // 候选 4: 目录同名文件 <root>/<relativeDir>/<lastSegment>.zeu
+        std::filesystem::path candidateSelf = absoluteNormalizedPath(root / relativeDir / (lastSegment + ".zeu"));
+        if (std::filesystem::is_regular_file(candidateSelf)) {
+            return candidateSelf.string();
+        }
+
+        return "";
+    }
+
+    // 获取用户主目录下的全局 packages 目录 (~/.zeus/packages)
+    inline std::filesystem::path getUserPackagesDir() {
+        const char* home = std::getenv("USERPROFILE");
+        if (!home || !*home) {
+            home = std::getenv("HOME");
+        }
+        if (home && *home) {
+            return absoluteNormalizedPath(std::filesystem::path(home) / ".zeus" / "packages");
+        }
+        return {};
+    }
+
+    // 获取环境变量 ZEUS_PATH 指定的目录列表
+    inline std::vector<std::filesystem::path> getZeusPathDirs() {
+        std::vector<std::filesystem::path> result;
+        const char* zeusPath = std::getenv("ZEUS_PATH");
+        if (zeusPath && *zeusPath) {
+            std::stringstream ss(zeusPath);
+            std::string item;
+            char delimiter = ';';
+#ifndef _WIN32
+            delimiter = ':';
+#endif
+            while (std::getline(ss, item, delimiter)) {
+                if (!item.empty()) {
+                    result.push_back(absoluteNormalizedPath(std::filesystem::path(item)));
+                }
+            }
+        }
+        return result;
+    }
+
+    // Resolve compiler modules, site-packages, user packages, and project modules:
+    //   1. zeus.*          -> <compiler-dir>/ZeusBuiltins/zeus/*.zeu
+    //   2. project modules -> importer directory / CWD (single file or package dir)
+    //   3. ZEUS_PATH       -> directories in environment variable
+    //   4. site-packages   -> <compiler-dir>/packages/ (single file or package dir)
+    //   5. user-packages   -> ~/.zeus/packages/
     inline std::string resolvePackagePath(const std::string& packageName) {
         const std::string canonicalName = canonicalPackageName(packageName);
-        std::filesystem::path relativePath;
-        if (!packageNameToRelativePath(canonicalName, relativePath)) {
-            ZEUS_DEBUG_PRINT("[IRImport] Invalid package name: %s", packageName.c_str());
-            return "";
-        }
 
+        // 1. 如果是以 zeus. 开头的内置标准库，直接优先查找 ZeusBuiltins
         const bool isZeusModule = hasPackagePrefix(canonicalName, "zeus");
-        if (isZeusModule) {
-            if (zeusExecutableDir.empty()) return "";
+        if (isZeusModule && !zeusExecutableDir.empty()) {
             const std::filesystem::path builtinRoot =
                 std::filesystem::path(zeusExecutableDir) / "ZeusBuiltins";
-            const std::filesystem::path builtinPath = absoluteNormalizedPath(builtinRoot / relativePath);
-            ZEUS_DEBUG_PRINT("[IRImport] Trying compiler module path: %s", builtinPath.string().c_str());
-            if (std::filesystem::exists(builtinPath)) {
+            std::string found = tryResolveInRoot(builtinRoot, canonicalName);
+            if (!found.empty()) {
                 ZEUS_DEBUG_PRINT("[IRImport] Found compiler module: '%s' -> '%s'",
-                    canonicalName.c_str(), builtinPath.string().c_str());
-                return builtinPath.string();
+                    canonicalName.c_str(), found.c_str());
+                return found;
             }
-
-            ZEUS_DEBUG_PRINT("[IRImport] Compiler module '%s' not found under '%s'",
-                canonicalName.c_str(), builtinRoot.string().c_str());
-            return "";
         }
 
-        // Project modules are relative to the importing source, then the process CWD.
+        // 2. 当前导入源文件所在目录（本地工程私有模块，支持单文件与目录包）
         if (!currentWorkingDir.empty()) {
-            const std::filesystem::path workingPath =
-                absoluteNormalizedPath(std::filesystem::path(currentWorkingDir) / relativePath);
-            ZEUS_DEBUG_PRINT("[IRImport] Trying importer path: %s", workingPath.string().c_str());
-            if (std::filesystem::exists(workingPath)) {
+            std::string found = tryResolveInRoot(std::filesystem::path(currentWorkingDir), canonicalName);
+            if (!found.empty()) {
                 ZEUS_DEBUG_PRINT("[IRImport] Found project module: '%s' -> '%s'",
-                    packageName.c_str(), workingPath.string().c_str());
-                return workingPath.string();
+                    packageName.c_str(), found.c_str());
+                return found;
             }
         }
 
-        const std::filesystem::path currentPath = absoluteNormalizedPath(relativePath);
-        if (std::filesystem::exists(currentPath)) {
-            ZEUS_DEBUG_PRINT("[IRImport] Found project module in CWD: '%s' -> '%s'",
-                packageName.c_str(), currentPath.string().c_str());
-            return currentPath.string();
+        // 3. 当前运行工作目录 (CWD)
+        {
+            std::string found = tryResolveInRoot(std::filesystem::current_path(), canonicalName);
+            if (!found.empty()) {
+                ZEUS_DEBUG_PRINT("[IRImport] Found module in CWD: '%s' -> '%s'",
+                    packageName.c_str(), found.c_str());
+                return found;
+            }
+        }
+
+        // 4. 环境变量 ZEUS_PATH 指定的目录列表 (类似于 PYTHONPATH)
+        for (const auto& pathDir : getZeusPathDirs()) {
+            std::string found = tryResolveInRoot(pathDir, canonicalName);
+            if (!found.empty()) {
+                ZEUS_DEBUG_PRINT("[IRImport] Found module in ZEUS_PATH '%s': '%s' -> '%s'",
+                    pathDir.string().c_str(), packageName.c_str(), found.c_str());
+                return found;
+            }
+        }
+
+        // 5. 编译器同级全局包仓库（Site-Packages：<compiler-dir>/packages）
+        if (!zeusExecutableDir.empty()) {
+            const std::filesystem::path sitePackagesRoot =
+                std::filesystem::path(zeusExecutableDir) / "packages";
+            std::string found = tryResolveInRoot(sitePackagesRoot, canonicalName);
+            if (!found.empty()) {
+                ZEUS_DEBUG_PRINT("[IRImport] Found global package: '%s' -> '%s'",
+                    packageName.c_str(), found.c_str());
+                return found;
+            }
+        }
+
+        // 6. 用户主目录全局包仓库 (~/.zeus/packages)
+        {
+            std::filesystem::path userPackages = getUserPackagesDir();
+            if (!userPackages.empty()) {
+                std::string found = tryResolveInRoot(userPackages, canonicalName);
+                if (!found.empty()) {
+                    ZEUS_DEBUG_PRINT("[IRImport] Found user package: '%s' -> '%s'",
+                        packageName.c_str(), found.c_str());
+                    return found;
+                }
+            }
+        }
+
+        // 7. 回退 fallback 到 ZeusBuiltins
+        if (!isZeusModule && !zeusExecutableDir.empty()) {
+            const std::filesystem::path builtinRoot =
+                std::filesystem::path(zeusExecutableDir) / "ZeusBuiltins";
+            std::string found = tryResolveInRoot(builtinRoot, canonicalName);
+            if (!found.empty()) {
+                ZEUS_DEBUG_PRINT("[IRImport] Found module in builtins fallback: '%s' -> '%s'",
+                    canonicalName.c_str(), found.c_str());
+                return found;
+            }
         }
 
         ZEUS_DEBUG_PRINT("[IRImport] Package '%s' not found in any search path", packageName.c_str());

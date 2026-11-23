@@ -125,6 +125,8 @@ namespace IRType {
         std::string nativeSymbol;
         std::string nativeReferenceABI = "raw";
         std::string nativeLibraryPath;
+        // `@native(addr) decl func`: callee address is the first call argument.
+        bool nativeIndirect = false;
         std::string moduleName;
         int captureCount = 0;
         bool hasCaptureCount = false;
@@ -182,7 +184,8 @@ namespace IRType {
             std::vector<std::string> names = {},
             std::vector<bool> byReference = {},
             std::string nativeReferenceABI = "raw",
-            std::string nativeLibraryPath = {}
+            std::string nativeLibraryPath = {},
+            bool nativeIndirect = false
         ) {
             IRMetadata result = functionSignature(
                 name, returnType, 0, std::move(parameterTypes), {}, {}, false,
@@ -193,6 +196,7 @@ namespace IRType {
             result.nativeSymbol = std::move(nativeSymbol);
             result.nativeReferenceABI = std::move(nativeReferenceABI);
             result.nativeLibraryPath = std::move(nativeLibraryPath);
+            result.nativeIndirect = nativeIndirect;
             return result;
         }
 
@@ -354,7 +358,8 @@ namespace IRType {
             std::vector<std::string>* names = nullptr,
             std::vector<bool>* byReference = nullptr,
             std::string* nativeRefABI = nullptr,
-            std::string* nativeLibrary = nullptr
+            std::string* nativeLibrary = nullptr,
+            bool* nativeIndirectOut = nullptr
         ) const {
             if ((kind != IRMetadataKind::FunctionSignature &&
                  kind != IRMetadataKind::ExternalFunctionSignature) ||
@@ -375,6 +380,7 @@ namespace IRType {
             if (native) *native = nativeSymbol;
             if (nativeRefABI) *nativeRefABI = nativeReferenceABI;
             if (nativeLibrary) *nativeLibrary = nativeLibraryPath;
+            if (nativeIndirectOut) *nativeIndirectOut = nativeIndirect;
             return true;
         }
 

@@ -45,6 +45,7 @@
 #include <string_view>
 #include <cctype>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -495,8 +496,8 @@ const ZeusType::RawBytesRange* rawBytesRangeUniversalValue(
     return std::get_if<ZeusType::RawBytesRange>(&value);
 }
 
-std::mutex& nativeStringPoolMutex() {
-    static std::mutex mutex;
+std::shared_mutex& nativeStringPoolMutex() {
+    static std::shared_mutex mutex;
     return mutex;
 }
 
@@ -632,7 +633,7 @@ __attribute__((noinline))
 #endif
 void nativeStringValidateImpl(ZeusNativeString value) {
     if (!value) dynamicValuePanic("null native string pointer");
-    std::lock_guard<std::mutex> lock(nativeStringPoolMutex());
+    std::shared_lock<std::shared_mutex> lock(nativeStringPoolMutex());
     if (nativeStringAddresses().find(value) == nativeStringAddresses().end()) {
 #if defined(_MSC_VER)
         void* caller = _ReturnAddress();
@@ -650,7 +651,7 @@ void nativeStringValidateImpl(ZeusNativeString value) {
 }
 
 ZeusNativeString internImmortalNativeString(std::string text) {
-    std::lock_guard<std::mutex> lock(nativeStringPoolMutex());
+    std::unique_lock<std::shared_mutex> lock(nativeStringPoolMutex());
     auto& pool = nativeStringLiteralPool();
     const size_t hash = std::hash<std::string_view>{}(text);
     auto& candidates = pool[hash];
@@ -671,7 +672,7 @@ ZeusNativeString internImmortalNativeString(std::string text) {
 }
 
 ZeusNativeString internNativeString(std::string text) {
-    std::lock_guard<std::mutex> lock(nativeStringPoolMutex());
+    std::unique_lock<std::shared_mutex> lock(nativeStringPoolMutex());
     auto& pool = nativeStringWeakInternPool();
     const size_t hash = std::hash<std::string_view>{}(text);
     auto& candidates = pool[hash];
@@ -715,7 +716,7 @@ ZeusNativeString allocateNativeString(std::string_view text) {
         text, 1);
     const ZeusNativeString value = header->data;
     try {
-        std::lock_guard<std::mutex> lock(nativeStringPoolMutex());
+        std::unique_lock<std::shared_mutex> lock(nativeStringPoolMutex());
         nativeStringAddresses().insert(value);
         ZeusRuntimeDebug::trackCreated(
             ZeusRuntimeDebug::ResourceKind::NativeString,
@@ -730,7 +731,7 @@ ZeusNativeString allocateNativeString(std::string_view text) {
 
 void retainNativeString(ZeusNativeString value) {
     if (!value) return;
-    std::lock_guard<std::mutex> lock(nativeStringPoolMutex());
+    std::unique_lock<std::shared_mutex> lock(nativeStringPoolMutex());
     if (nativeStringAddresses().find(value) == nativeStringAddresses().end()) {
         dynamicValuePanic("cannot retain a released native string");
     }
@@ -752,7 +753,7 @@ void releaseNativeString(ZeusNativeString value) {
     if (!value) return;
     NativeStringHeader* released = nullptr;
     {
-        std::lock_guard<std::mutex> lock(nativeStringPoolMutex());
+        std::unique_lock<std::shared_mutex> lock(nativeStringPoolMutex());
         auto& addresses = nativeStringAddresses();
         const auto found = addresses.find(value);
         if (found == addresses.end()) {
@@ -1919,16 +1920,20 @@ void zeus_value_validate_argument_type(
         }
         return;
     }
-    std::string expectedName = expectedType;
-    bool expectedNullable = false;
-    if (!expectedName.empty() && expectedName.back() == '?') {
-        expectedNullable = true;
-        expectedName.pop_back();
+    std::string_view expectedView(expectedType);
+    const bool expectedNullable = !expectedView.empty() && expectedView.back() == '?';
+    if (expectedNullable) {
+        if (value->tag == ZEUS_VALUE_TAG_NIL) return;
+        expectedView.remove_suffix(1);
     }
-    if (expectedNullable && value != nullptr &&
-        value->tag == ZEUS_VALUE_TAG_NIL) {
+    if ((expectedView == "int" && value->tag == ZEUS_VALUE_TAG_INT64) ||
+        (expectedView == "bool" && value->tag == ZEUS_VALUE_TAG_BOOL) ||
+        (expectedView == "float" && value->tag == ZEUS_VALUE_TAG_BIGDECIMAL) ||
+        (expectedView == "string" && value->tag == ZEUS_VALUE_TAG_STRING) ||
+        (expectedView == "bytes" && value->tag == ZEUS_VALUE_TAG_BYTES)) {
         return;
     }
+    std::string expectedName(expectedView);
     const std::string expected = ZeusRuntimeType::canonicalTypeName(expectedName);
     const std::string actual = ZeusRuntimeType::canonicalTypeName(
         dynamicValueTypeName(value));
@@ -2986,6 +2991,10 @@ ZeusBox* zeus_value_to_box(const ZeusValue* value) {
             default:
                 dynamicValuePanic("unknown value tag");
         }
+    } catch (const std::exception& error) {
+        const std::string detail =
+            std::string("failed to materialize boxed runtime value: ") + error.what();
+        dynamicValuePanic(detail.c_str());
     } catch (...) {
         dynamicValuePanic("failed to materialize boxed runtime value");
     }
@@ -3218,6 +3227,108 @@ ZeusNativeString zeus_bytes_decode(
     }
 }
 
+ZeusNativeString zeus_json_unescape(
+    ZeusNativeBytes bytes,
+    int64_t start,
+    int64_t end
+) {
+    const uint64_t length = nativeBytesLength(bytes);
+    if (start < 0 || end < start || static_cast<uint64_t>(end) > length) {
+        dynamicValuePanic("JSON unescape range is out of bounds");
+    }
+
+    try {
+        std::string result;
+        result.reserve(static_cast<size_t>(end - start));
+        int64_t index = start;
+        const auto hexDigit = [](uint8_t value) -> int32_t {
+            if (value >= '0' && value <= '9') return value - '0';
+            if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+            if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+            return -1;
+        };
+        const auto readHex4 = [&](int64_t& cursor) -> uint32_t {
+            if (cursor > end - 4) {
+                dynamicValuePanic("JSON unescape received an incomplete Unicode escape");
+            }
+            uint32_t value = 0;
+            for (int digitIndex = 0; digitIndex < 4; ++digitIndex) {
+                const int32_t digit = hexDigit(bytes[cursor++]);
+                if (digit < 0) {
+                    dynamicValuePanic("JSON unescape received an invalid Unicode escape");
+                }
+                value = value * 16 + static_cast<uint32_t>(digit);
+            }
+            return value;
+        };
+        const auto appendCodepoint = [&](uint32_t codepoint) {
+            if (codepoint <= 0x7F) {
+                result.push_back(static_cast<char>(codepoint));
+            } else if (codepoint <= 0x7FF) {
+                result.push_back(static_cast<char>(0xC0 | (codepoint >> 6)));
+                result.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+            } else if (codepoint <= 0xFFFF) {
+                result.push_back(static_cast<char>(0xE0 | (codepoint >> 12)));
+                result.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+                result.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+            } else {
+                result.push_back(static_cast<char>(0xF0 | (codepoint >> 18)));
+                result.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
+                result.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+                result.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+            }
+        };
+
+        while (index < end) {
+            const uint8_t current = bytes[index++];
+            if (current != '\\') {
+                result.push_back(static_cast<char>(current));
+                continue;
+            }
+            if (index >= end) {
+                dynamicValuePanic("JSON unescape received an incomplete escape");
+            }
+
+            const uint8_t escape = bytes[index++];
+            switch (escape) {
+            case '"': result.push_back('"'); break;
+            case '\\': result.push_back('\\'); break;
+            case '/': result.push_back('/'); break;
+            case 'b': result.push_back('\b'); break;
+            case 'f': result.push_back('\f'); break;
+            case 'n': result.push_back('\n'); break;
+            case 'r': result.push_back('\r'); break;
+            case 't': result.push_back('\t'); break;
+            case 'u': {
+                uint32_t codepoint = readHex4(index);
+                if (codepoint >= 0xD800 && codepoint <= 0xDBFF) {
+                    if (index > end - 6 || bytes[index] != '\\' || bytes[index + 1] != 'u') {
+                        dynamicValuePanic("JSON unescape received an invalid high surrogate");
+                    }
+                    index += 2;
+                    const uint32_t lowSurrogate = readHex4(index);
+                    if (lowSurrogate < 0xDC00 || lowSurrogate > 0xDFFF) {
+                        dynamicValuePanic("JSON unescape received an invalid low surrogate");
+                    }
+                    codepoint = 0x10000 +
+                        ((codepoint - 0xD800) << 10) + (lowSurrogate - 0xDC00);
+                } else if (codepoint >= 0xDC00 && codepoint <= 0xDFFF) {
+                    dynamicValuePanic("JSON unescape received an unexpected low surrogate");
+                }
+                appendCodepoint(codepoint);
+                break;
+            }
+            default:
+                dynamicValuePanic("JSON unescape received an invalid escape");
+            }
+        }
+        return zeus_string_from_data(
+            result.data(), static_cast<int64_t>(result.size()));
+    } catch (...) {
+        dynamicValuePanic("failed to unescape a validated JSON string");
+    }
+}
+
 void zeus_bytes_to_list(ZeusValue* out, ZeusNativeBytes bytes) {
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     if (!out) dynamicValuePanic("null Bytes list output pointer");
@@ -3255,6 +3366,10 @@ ZeusNativeString zeus_string_join_values(
 
     try {
         std::string result;
+        if (count > 0) {
+            result.reserve(static_cast<size_t>(count) * 4 +
+                separatorText.size() * static_cast<size_t>(count - 1));
+        }
         const size_t maxLength = static_cast<size_t>(std::min<uint64_t>(
             std::numeric_limits<size_t>::max(),
             static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
@@ -3268,8 +3383,17 @@ ZeusNativeString zeus_string_join_values(
             if (index != 0) append(separatorText);
             OwnedZeusValue part;
             zeus_value_array_load_i64(&part.value, values, index);
-            const std::string text = nativeStringValueText(&part.value);
-            append(text);
+            if (part.value.tag == ZEUS_VALUE_TAG_STRING) {
+                uint64_t partLength = 0;
+                const uint8_t* partData = requireOwnedBufferData(
+                    &part.value, ZEUS_VALUE_TAG_STRING, &partLength);
+                append(std::string_view(
+                    reinterpret_cast<const char*>(partData),
+                    static_cast<size_t>(partLength)));
+            } else {
+                const std::string text = nativeStringValueText(&part.value);
+                append(text);
+            }
         }
         return zeus_string_from_data(result.data(),
             static_cast<int64_t>(result.size()));
@@ -4235,7 +4359,17 @@ void zeus_value_local_delete(int idx) {
 }
 
 void zeus_value_delete_object(ZeusValue* value) {
-    if (!value) return;
+    if (!value || value->tag == ZEUS_VALUE_TAG_NIL ||
+        value->tag == ZEUS_VALUE_TAG_DELETED) {
+        return;
+    }
+    if (value->tag == ZEUS_VALUE_TAG_BOXED) {
+        if (value->flags != ZEUS_VALUE_FLAG_OWNS_BOX || value->payload == 0) {
+            dynamicValuePanic("invalid owned ZeusBox value");
+        }
+        destroyLLVMClassValue(valueReference(value)->v);
+        return;
+    }
     std::unique_ptr<ZeusBox, decltype(&zeus_box_release)> boxed(
         zeus_value_to_box(value), &zeus_box_release);
     if (boxed) destroyLLVMClassValue(boxed->v);

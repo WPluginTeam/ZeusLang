@@ -1,6 +1,21 @@
+// Zeus Standard Math Library
+// Provides standard IEEE 754 floating-point operations, trigonometric,
+// logarithmic, exponential, rounding, and utility functions for double and float.
 
-var const PI = 3.141592653589793;
+// ==========================================
+// Math Constants
+// ==========================================
+var const PI: double = 3.14159265358979323846;
+var const TAU: double = 6.28318530717958647692;
+var const HALF_PI: double = 1.57079632679489661923;
+var const E: double = 2.71828182845904523536;
+var const SQRT2: double = 1.41421356237309504880;
+var const LN2: double = 0.69314718055994530942;
+var const LN10: double = 2.30258509299404568402;
 
+// ==========================================
+// Integer Math Operations
+// ==========================================
 func abs(value: int) -> int {
     if (value < 0) return -value;
     return value;
@@ -64,4 +79,341 @@ func fibonacci(n: int) -> int {
         index = index + 1;
     }
     return current;
+}
+
+// ==========================================
+// Native Double Math Declarations
+// ==========================================
+@native("sin")
+decl func __math_sin(x: double) -> double;
+
+@native("cos")
+decl func __math_cos(x: double) -> double;
+
+@native("tan")
+decl func __math_tan(x: double) -> double;
+
+@native("asin")
+decl func __math_asin(x: double) -> double;
+
+@native("acos")
+decl func __math_acos(x: double) -> double;
+
+@native("atan")
+decl func __math_atan(x: double) -> double;
+
+@native("atan2")
+decl func __math_atan2(y: double, x: double) -> double;
+
+@native("sinh")
+decl func __math_sinh(x: double) -> double;
+
+@native("cosh")
+decl func __math_cosh(x: double) -> double;
+
+@native("tanh")
+decl func __math_tanh(x: double) -> double;
+
+@native("asinh")
+decl func __math_asinh(x: double) -> double;
+
+@native("acosh")
+decl func __math_acosh(x: double) -> double;
+
+@native("atanh")
+decl func __math_atanh(x: double) -> double;
+
+@native("sqrt")
+decl func __math_sqrt(x: double) -> double;
+
+@native("cbrt")
+decl func __math_cbrt(x: double) -> double;
+
+@native("hypot")
+decl func __math_hypot(x: double, y: double) -> double;
+
+@native("pow")
+decl func __math_pow(base: double, exponent: double) -> double;
+
+@native("exp")
+decl func __math_exp(x: double) -> double;
+
+@native("exp2")
+decl func __math_exp2(x: double) -> double;
+
+@native("log")
+decl func __math_log(x: double) -> double;
+
+@native("log2")
+decl func __math_log2(x: double) -> double;
+
+@native("log10")
+decl func __math_log10(x: double) -> double;
+
+@native("floor")
+decl func __math_floor(x: double) -> double;
+
+@native("ceil")
+decl func __math_ceil(x: double) -> double;
+
+@native("round")
+decl func __math_round(x: double) -> double;
+
+@native("trunc")
+decl func __math_trunc(x: double) -> double;
+
+@native("fabs")
+decl func __math_fabs(x: double) -> double;
+
+@native("copysign")
+decl func __math_copysign(magnitude: double, sign: double) -> double;
+
+@native("fmod")
+decl func __math_fmod(x: double, y: double) -> double;
+
+// ==========================================
+// Native Float (Single-Precision f32) Declarations
+// ==========================================
+@native("sinf")
+decl func __math_sinf(x: f32) -> f32;
+
+@native("cosf")
+decl func __math_cosf(x: f32) -> f32;
+
+@native("tanf")
+decl func __math_tanf(x: f32) -> f32;
+
+@native("asinf")
+decl func __math_asinf(x: f32) -> f32;
+
+@native("acosf")
+decl func __math_acosf(x: f32) -> f32;
+
+@native("atanf")
+decl func __math_atanf(x: f32) -> f32;
+
+@native("atan2f")
+decl func __math_atan2f(y: f32, x: f32) -> f32;
+
+@native("sinhf")
+decl func __math_sinhf(x: f32) -> f32;
+
+@native("coshf")
+decl func __math_coshf(x: f32) -> f32;
+
+@native("tanhf")
+decl func __math_tanhf(x: f32) -> f32;
+
+@native("asinhf")
+decl func __math_asinhf(x: f32) -> f32;
+
+@native("acoshf")
+decl func __math_acoshf(x: f32) -> f32;
+
+@native("atanhf")
+decl func __math_atanhf(x: f32) -> f32;
+
+@native("sqrtf")
+decl func __math_sqrtf(x: f32) -> f32;
+
+@native("cbrtf")
+decl func __math_cbrtf(x: f32) -> f32;
+
+@native("hypotf")
+decl func __math_hypotf(x: f32, y: f32) -> f32;
+
+@native("powf")
+decl func __math_powf(base: f32, exponent: f32) -> f32;
+
+@native("expf")
+decl func __math_expf(x: f32) -> f32;
+
+@native("exp2f")
+decl func __math_exp2f(x: f32) -> f32;
+
+@native("logf")
+decl func __math_logf(x: f32) -> f32;
+
+@native("log2f")
+decl func __math_log2f(x: f32) -> f32;
+
+@native("log10f")
+decl func __math_log10f(x: f32) -> f32;
+
+@native("floorf")
+decl func __math_floorf(x: f32) -> f32;
+
+@native("ceilf")
+decl func __math_ceilf(x: f32) -> f32;
+
+@native("roundf")
+decl func __math_roundf(x: f32) -> f32;
+
+@native("truncf")
+decl func __math_truncf(x: f32) -> f32;
+
+@native("fabsf")
+decl func __math_fabsf(x: f32) -> f32;
+
+@native("copysignf")
+decl func __math_copysignf(magnitude: f32, sign: f32) -> f32;
+
+@native("fmodf")
+decl func __math_fmodf(x: f32, y: f32) -> f32;
+
+// ==========================================
+// Double Math Public Functions
+// ==========================================
+func sin(x: double) -> double { return __math_sin(x); }
+func cos(x: double) -> double { return __math_cos(x); }
+func tan(x: double) -> double { return __math_tan(x); }
+func asin(x: double) -> double { return __math_asin(x); }
+func acos(x: double) -> double { return __math_acos(x); }
+func atan(x: double) -> double { return __math_atan(x); }
+func atan2(y: double, x: double) -> double { return __math_atan2(y, x); }
+func sinh(x: double) -> double { return __math_sinh(x); }
+func cosh(x: double) -> double { return __math_cosh(x); }
+func tanh(x: double) -> double { return __math_tanh(x); }
+func asinh(x: double) -> double { return __math_asinh(x); }
+func acosh(x: double) -> double { return __math_acosh(x); }
+func atanh(x: double) -> double { return __math_atanh(x); }
+func sqrt(x: double) -> double { return __math_sqrt(x); }
+func cbrt(x: double) -> double { return __math_cbrt(x); }
+func hypot(x: double, y: double) -> double { return __math_hypot(x, y); }
+func pow(base: double, exponent: double) -> double { return __math_pow(base, exponent); }
+func exp(x: double) -> double { return __math_exp(x); }
+func exp2(x: double) -> double { return __math_exp2(x); }
+func log(x: double) -> double { return __math_log(x); }
+func log2(x: double) -> double { return __math_log2(x); }
+func log10(x: double) -> double { return __math_log10(x); }
+func floor(x: double) -> double { return __math_floor(x); }
+func ceil(x: double) -> double { return __math_ceil(x); }
+func round(x: double) -> double { return __math_round(x); }
+func trunc(x: double) -> double { return __math_trunc(x); }
+func fabs(x: double) -> double { return __math_fabs(x); }
+func copysign(magnitude: double, sign: double) -> double { return __math_copysign(magnitude, sign); }
+func fmod(x: double, y: double) -> double { return __math_fmod(x, y); }
+
+// ==========================================
+// Float (f32) Public Functions
+// ==========================================
+func sinf(x: f32) -> f32 { return __math_sinf(x); }
+func cosf(x: f32) -> f32 { return __math_cosf(x); }
+func tanf(x: f32) -> f32 { return __math_tanf(x); }
+func asinf(x: f32) -> f32 { return __math_asinf(x); }
+func acosf(x: f32) -> f32 { return __math_acosf(x); }
+func atanf(x: f32) -> f32 { return __math_atanf(x); }
+func atan2f(y: f32, x: f32) -> f32 { return __math_atan2f(y, x); }
+func sinhf(x: f32) -> f32 { return __math_sinhf(x); }
+func coshf(x: f32) -> f32 { return __math_coshf(x); }
+func tanhf(x: f32) -> f32 { return __math_tanhf(x); }
+func asinhf(x: f32) -> f32 { return __math_asinhf(x); }
+func acoshf(x: f32) -> f32 { return __math_acoshf(x); }
+func atanhf(x: f32) -> f32 { return __math_atanhf(x); }
+func sqrtf(x: f32) -> f32 { return __math_sqrtf(x); }
+func cbrtf(x: f32) -> f32 { return __math_cbrtf(x); }
+func hypotf(x: f32, y: f32) -> f32 { return __math_hypotf(x, y); }
+func powf(base: f32, exponent: f32) -> f32 { return __math_powf(base, exponent); }
+func expf(x: f32) -> f32 { return __math_expf(x); }
+func exp2f(x: f32) -> f32 { return __math_exp2f(x); }
+func logf(x: f32) -> f32 { return __math_logf(x); }
+func log2f(x: f32) -> f32 { return __math_log2f(x); }
+func log10f(x: f32) -> f32 { return __math_log10f(x); }
+func floorf(x: f32) -> f32 { return __math_floorf(x); }
+func ceilf(x: f32) -> f32 { return __math_ceilf(x); }
+func roundf(x: f32) -> f32 { return __math_roundf(x); }
+func truncf(x: f32) -> f32 { return __math_truncf(x); }
+func fabsf(x: f32) -> f32 { return __math_fabsf(x); }
+func copysignf(magnitude: f32, sign: f32) -> f32 { return __math_copysignf(magnitude, sign); }
+func fmodf(x: f32, y: f32) -> f32 { return __math_fmodf(x, y); }
+
+// ==========================================
+// High-Level Utility Functions
+// ==========================================
+func fmin(left: double, right: double) -> double {
+    if (left < right) return left;
+    return right;
+}
+
+func fmax(left: double, right: double) -> double {
+    if (left > right) return left;
+    return right;
+}
+
+func fclamp(value: double, lower: double, upper: double) -> double {
+    let minimum = fmin(lower, upper);
+    let maximum = fmax(lower, upper);
+    if (value < minimum) return minimum;
+    if (value > maximum) return maximum;
+    return value;
+}
+
+func fminf(left: f32, right: f32) -> f32 {
+    if (left < right) return left;
+    return right;
+}
+
+func fmaxf(left: f32, right: f32) -> f32 {
+    if (left > right) return left;
+    return right;
+}
+
+func fclampf(value: f32, lower: f32, upper: f32) -> f32 {
+    let minimum = fminf(lower, upper);
+    let maximum = fmaxf(lower, upper);
+    if (value < minimum) return minimum;
+    if (value > maximum) return maximum;
+    return value;
+}
+
+func lerp(a: double, b: double, t: double) -> double {
+    return a + (b - a) * t;
+}
+
+func lerpf(a: f32, b: f32, t: f32) -> f32 {
+    return a + (b - a) * t;
+}
+
+func inv_lerp(a: double, b: double, value: double) -> double {
+    if (b == a) return 0.0;
+    return (value - a) / (b - a);
+}
+
+func inv_lerpf(a: f32, b: f32, value: f32) -> f32 {
+    if (b == a) return 0.0;
+    return (value - a) / (b - a);
+}
+
+func map(value: double, in_min: double, in_max: double, out_min: double, out_max: double) -> double {
+    if (in_max == in_min) return out_min;
+    return out_min + (out_max - out_min) * ((value - in_min) / (in_max - in_min));
+}
+
+func mapf(value: f32, in_min: f32, in_max: f32, out_min: f32, out_max: f32) -> f32 {
+    if (in_max == in_min) return out_min;
+    return out_min + (out_max - out_min) * ((value - in_min) / (in_max - in_min));
+}
+
+func radians(deg: double) -> double {
+    return deg * (PI / 180.0);
+}
+
+func degrees(rad: double) -> double {
+    return rad * (180.0 / PI);
+}
+
+func radiansf(deg: f32) -> f32 {
+    return deg * (3.1415927 / 180.0);
+}
+
+func degreesf(rad: f32) -> f32 {
+    return rad * (180.0 / 3.1415927);
+}
+
+func isnan(x: double) -> bool {
+    return x != x;
+}
+
+func isnanf(x: f32) -> bool {
+    return x != x;
 }

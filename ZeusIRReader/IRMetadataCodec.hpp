@@ -165,7 +165,7 @@ namespace IRMetadataCodec {
             !metadata.fieldInitializerNames.empty() ||
             !metadata.ownerType.empty() || !metadata.operatorSymbol.empty() ||
             !metadata.nativeSymbol.empty() || metadata.nativeReferenceABI != "raw" ||
-            !metadata.nativeLibraryPath.empty() ||
+            !metadata.nativeLibraryPath.empty() || metadata.nativeIndirect ||
             !metadata.moduleName.empty() || metadata.captureCount != 0 ||
             metadata.hasCaptureCount || metadata.isStaticMethod || metadata.isInline ||
             metadata.isNoSafepoint || !isDefault(metadata.subscriptWritebackTarget) ||
@@ -222,6 +222,7 @@ namespace IRMetadataCodec {
             writeString(stream, metadata.nativeSymbol) &&
             writeString(stream, metadata.nativeReferenceABI) &&
             writeString(stream, metadata.nativeLibraryPath) &&
+            writeUint8(stream, metadata.nativeIndirect ? 1 : 0) &&
             writeString(stream, metadata.moduleName) &&
             writeInt32(stream, static_cast<int32_t>(metadata.captureCount)) &&
             writeUint8(stream, metadata.hasCaptureCount ? 1 : 0) &&
@@ -319,6 +320,12 @@ namespace IRMetadataCodec {
         metadata.nativeLibraryPath.clear();
         if (version >= 10 && !readString(stream, metadata.nativeLibraryPath)) {
             return false;
+        }
+        metadata.nativeIndirect = false;
+        if (version >= 11) {
+            uint8_t indirect = 0;
+            if (!readUint8(stream, indirect) || indirect > 1) return false;
+            metadata.nativeIndirect = indirect != 0;
         }
         if (!readString(stream, metadata.moduleName) ||
             !readInt32(stream, captureCount)) {

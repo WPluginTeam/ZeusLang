@@ -1,8 +1,16 @@
 #include "ZeusStringNativeABI.hpp"
 
+#include "ZeusDynamicABI.hpp"
+
+#include <charconv>
 #include <initializer_list>
 
 namespace {
+
+void setDynamicStringLiteral(ZeusValue* out, const char* text, int64_t length) {
+    const ZeusNativeString literal = zeus_string_literal_from_data(text, length);
+    zeus_value_from_native_string(out, literal);
+}
 
 void invokeStringBuiltin(
     ZeusValue* out,
@@ -22,10 +30,76 @@ void invokeStringBuiltin(
 extern "C" {
 
 void zeus_string_builtin_str(ZeusValue* out, const ZeusValue* value) {
+    if (out && value) {
+        switch (value->tag) {
+        case ZEUS_VALUE_TAG_NIL:
+            setDynamicStringLiteral(out, "nil", 3);
+            return;
+        case ZEUS_VALUE_TAG_BOOL:
+            if (value->bool_payload) {
+                setDynamicStringLiteral(out, "true", 4);
+            } else {
+                setDynamicStringLiteral(out, "false", 5);
+            }
+            return;
+        case ZEUS_VALUE_TAG_INT64: {
+            char buffer[32];
+            const auto result = std::to_chars(
+                buffer, buffer + sizeof(buffer), value->int64_payload);
+            const ZeusNativeString text = zeus_string_from_data(
+                buffer, static_cast<int64_t>(result.ptr - buffer));
+            zeus_value_from_native_string(out, text);
+            zeus_string_release(text);
+            return;
+        }
+        case ZEUS_VALUE_TAG_STRING:
+            zeus_value_clone(out, value);
+            return;
+        default:
+            break;
+        }
+    }
     invokeStringBuiltin(out, "__builtin_str", {value});
 }
 
 void zeus_string_builtin_type(ZeusValue* out, const ZeusValue* value) {
+    if (out && value) {
+        switch (value->tag) {
+        case ZEUS_VALUE_TAG_NIL:
+            setDynamicStringLiteral(out, "nil", 3);
+            return;
+        case ZEUS_VALUE_TAG_BOOL:
+        case ZEUS_VALUE_TAG_REF_BOOL:
+            setDynamicStringLiteral(out, "bool", 4);
+            return;
+        case ZEUS_VALUE_TAG_INT64:
+        case ZEUS_VALUE_TAG_BIGINT:
+        case ZEUS_VALUE_TAG_REF_INT64:
+            setDynamicStringLiteral(out, "int", 3);
+            return;
+        case ZEUS_VALUE_TAG_BIGDECIMAL:
+            setDynamicStringLiteral(out, "float", 5);
+            return;
+        case ZEUS_VALUE_TAG_STRING:
+            setDynamicStringLiteral(out, "string", 6);
+            return;
+        case ZEUS_VALUE_TAG_BYTES:
+            setDynamicStringLiteral(out, "bytes", 5);
+            return;
+        case ZEUS_VALUE_TAG_BOXED:
+            if (zeus_value_is_array(value) == 1) {
+                setDynamicStringLiteral(out, "Array", 5);
+                return;
+            }
+            if (zeus_value_is_dict(value) == 1) {
+                setDynamicStringLiteral(out, "dict", 4);
+                return;
+            }
+            break;
+        default:
+            break;
+        }
+    }
     invokeStringBuiltin(out, "type", {value});
 }
 

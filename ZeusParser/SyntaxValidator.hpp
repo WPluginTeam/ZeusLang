@@ -1,4 +1,4 @@
-﻿#ifndef ZEUS_PARSER_SYNTAX_VALIDATOR_HPP
+#ifndef ZEUS_PARSER_SYNTAX_VALIDATOR_HPP
 #define ZEUS_PARSER_SYNTAX_VALIDATOR_HPP
 
 #include <algorithm>
@@ -813,6 +813,15 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
             continue;
         }
 
+        if (i + 4 < tokens.size() &&
+            isSyntaxKeyword(tokens[i + 1], "no_safepoint") &&
+            isSyntaxOperator(tokens[i + 2], "@") &&
+            isSyntaxKeyword(tokens[i + 3], "faddr") &&
+            isSyntaxOperator(tokens[i + 4], "(")) {
+            ++i;
+            continue;
+        }
+
         if (i + 2 < tokens.size() &&
             std::holds_alternative<LexerType::Keyword>(tokens[i + 1]) &&
             (std::get<LexerType::Keyword>(tokens[i + 1]).name == "addr" ||
@@ -941,9 +950,16 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
                     continue;
                 }
                 std::unordered_set<std::string> uniqueParameters;
-                for (const auto& parameter : parameters) {
-                    if (parameter.empty() || !uniqueParameters.insert(parameter).second) {
+                for (size_t pIndex = 0; pIndex < parameters.size(); ++pIndex) {
+                    const auto& parameter = parameters[pIndex];
+                    const bool isVariadic = parameter.rfind("..", 0) == 0;
+                    const std::string bareName = isVariadic ? parameter.substr(2) : parameter;
+                    if (bareName.empty() || !uniqueParameters.insert(bareName).second) {
                         addDiagnostic("P0038", "@type class parameters must be distinct identifiers",
+                                      tokens[i]);
+                    }
+                    if (isVariadic && pIndex + 1 != parameters.size()) {
+                        addDiagnostic("P0038", "variadic @type parameter must be the last parameter",
                                       tokens[i]);
                     }
                 }
@@ -977,6 +993,17 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
                                   tokens[i]);
                 } else if (decorator.hasArgument && decorator.argument.empty()) {
                     addDiagnostic("P0038", "@native symbol must not be empty", tokens[i]);
+                }
+                if (decorator.argumentIsIdentifier) {
+                    if (decoratesDefinition) {
+                        addDiagnostic("P0038",
+                                      "@native(addr) only decorates a 'decl func' declaration",
+                                      tokens[i]);
+                    } else if (decorator.argument != "addr" || decorator.hasSecondaryArgument) {
+                        addDiagnostic("P0038",
+                                      "@native(addr) takes no other arguments",
+                                      tokens[i]);
+                    }
                 }
                 if (decorator.hasSecondaryArgument &&
                     ((decorator.secondaryArgumentName.empty() &&
@@ -1024,11 +1051,18 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateSyntax(
                                   tokens[i]);
                 } else {
                     std::unordered_set<std::string> uniqueParameters;
-                    for (const auto& parameter : decorator.typeArguments) {
-                        if (parameter.empty() ||
-                            !uniqueParameters.insert(parameter).second) {
+                    for (size_t pIndex = 0; pIndex < decorator.typeArguments.size(); ++pIndex) {
+                        const auto& parameter = decorator.typeArguments[pIndex];
+                        const bool isVariadic = parameter.rfind("..", 0) == 0;
+                        const std::string bareName = isVariadic ? parameter.substr(2) : parameter;
+                        if (bareName.empty() ||
+                            !uniqueParameters.insert(bareName).second) {
                             addDiagnostic("P0038",
                                           "@type parameters must be distinct identifiers",
+                                          tokens[i]);
+                        }
+                        if (isVariadic && pIndex + 1 != decorator.typeArguments.size()) {
+                            addDiagnostic("P0038", "variadic @type parameter must be the last parameter",
                                           tokens[i]);
                         }
                     }
@@ -1252,13 +1286,24 @@ inline std::vector<ZeusDiagnostics::Diagnostic> validateParsedSyntax(
         return std::vector<LexerType::Token>(tokens.begin() + assignment + 1, tokens.end());
     };
     const auto isFaddrLValue = [](const std::vector<LexerType::Token>& tokens) {
-        if (tokens.size() < 7 || !isSyntaxOperator(tokens[0], "@") ||
-            !std::holds_alternative<LexerType::Keyword>(tokens[1]) ||
-            std::get<LexerType::Keyword>(tokens[1]).name != "faddr" ||
-            !isSyntaxOperator(tokens[2], "(")) {
+        size_t faddrStart = 0;
+        if (tokens.size() >= 5 && isSyntaxOperator(tokens[0], "@") &&
+            std::holds_alternative<LexerType::Keyword>(tokens[1]) &&
+            std::get<LexerType::Keyword>(tokens[1]).name == "no_safepoint" &&
+            isSyntaxOperator(tokens[2], "@") &&
+            std::holds_alternative<LexerType::Keyword>(tokens[3]) &&
+            std::get<LexerType::Keyword>(tokens[3]).name == "faddr" &&
+            isSyntaxOperator(tokens[4], "(")) {
+            faddrStart = 2;
+        }
+        if (tokens.size() < faddrStart + 7 ||
+            !isSyntaxOperator(tokens[faddrStart], "@") ||
+            !std::holds_alternative<LexerType::Keyword>(tokens[faddrStart + 1]) ||
+            std::get<LexerType::Keyword>(tokens[faddrStart + 1]).name != "faddr" ||
+            !isSyntaxOperator(tokens[faddrStart + 2], "(")) {
             return false;
         }
-        const size_t close = matchingSyntaxDelimiter(tokens, 2);
+        const size_t close = matchingSyntaxDelimiter(tokens, faddrStart + 2);
         const bool simpleType = close + 3 == tokens.size() &&
             close + 1 < tokens.size() && isSyntaxOperator(tokens[close + 1], "->") &&
             std::holds_alternative<LexerType::Keyword>(tokens[close + 2]);

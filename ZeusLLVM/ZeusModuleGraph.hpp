@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <algorithm>
 #include <filesystem>
@@ -368,7 +368,14 @@ inline bool initializerTokensMayHaveSideEffects(
         }
         const std::string op = operatorText(token);
         if (op == "[" || op == "]" || op == "{" || op == "}" ||
-            op == "," || op == ":") {
+            op == "(" || op == ")" ||
+            op == "," || op == ":" || op == ";" ||
+            op == "+" || op == "-" || op == "*" || op == "/" || op == "%" ||
+            op == "&" || op == "|" || op == "^" || op == "~" ||
+            op == "<<" || op == ">>" ||
+            op == "!" || op == "&&" || op == "||" ||
+            op == "==" || op == "!=" || op == "<" || op == "<=" ||
+            op == ">" || op == ">=") {
             continue;
         }
         return true;
@@ -417,6 +424,7 @@ inline bool hasTopLevelSideEffects(
                 case NodeType::INTERFACE_DECL_STMT:
                 case NodeType::IMPL_DECL_STMT:
                 case NodeType::INTERFACE_METHOD_DECL_STMT:
+                case NodeType::STATIC_FILE_STMT:
                     break;
                 case NodeType::VAR_DECL_STMT:
                     if (!initializerTokensMayHaveSideEffects(statement.tokens)) break;
@@ -474,28 +482,20 @@ class Builder {
         std::string source;
         std::string canonicalPath;
         if (!nativeHeaderPath.empty()) {
-            std::filesystem::path hPath(nativeHeaderPath);
-            if (hPath.is_relative()) {
-                std::filesystem::path base = std::filesystem::path(importerPath).parent_path();
-                hPath = base / hPath;
-            }
-            std::error_code ec;
-            std::filesystem::path resolvedH = hPath.lexically_normal();
-            if (!std::filesystem::exists(resolvedH)) {
-                resolvedH = std::filesystem::absolute(hPath, ec);
-            }
-            if (!std::filesystem::exists(resolvedH)) {
+            std::filesystem::path resolvedH = ZeusParser::CHeaderScanner::resolveHeaderPath(nativeHeaderPath, importerPath);
+            if (resolvedH.empty() || !std::filesystem::exists(resolvedH)) {
                 result.error = "[emit-llvm] @native header file not found: '" + nativeHeaderPath + "' (imported from '" + importerPath + "')";
                 return false;
             }
             canonicalPath = normalizedPath(resolvedH.string());
+            std::vector<ZeusParser::CConstantDeclaration> constants;
             std::vector<ZeusParser::CFunctionDeclaration> decls;
             std::string scanError;
-            if (!ZeusParser::CHeaderScanner::scanHeader(canonicalPath, decls, scanError)) {
+            if (!ZeusParser::CHeaderScanner::scanHeader(canonicalPath, constants, decls, scanError)) {
                 result.error = "[emit-llvm] " + scanError;
                 return false;
             }
-            source = ZeusParser::CHeaderScanner::generateZeusDeclarations(decls);
+            source = ZeusParser::CHeaderScanner::generateZeusDeclarations(constants, decls);
         } else {
         const std::string oldWorkingDirectory = IRImport::currentWorkingDir;
         IRImport::setWorkingDirectory(importerPath);

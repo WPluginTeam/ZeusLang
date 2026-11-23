@@ -1,0 +1,168 @@
+﻿func check(cond: bool, msg: string) {
+    if (!cond) {
+        print("FAIL:", msg);
+        throw msg;
+    }
+}
+
+let moduleTarget = [4];
+moduleTarget[0] += 1;
+check(moduleTarget[0] == 5, "top-level compound target uses scoped temporaries");
+
+func testCompoundAssign() {
+    let a = 10;
+
+    a += 5;
+    check(a == 15, "a += 5");
+
+    a -= 3;
+    check(a == 12, "a -= 3");
+
+    a *= 2 + 1;
+    check(a == 36, "a *= 2 + 1 keeps rhs grouped");
+
+    a /= 4;
+    check(a == 9, "a /= 4");
+
+    a %= 5;
+    check(a == 4, "a %= 5");
+}
+
+func testStep() {
+    let i = 0;
+
+    i++;
+    i++;
+    check(i == 2, "i++");
+
+    i--;
+    check(i == 1, "i--");
+}
+
+func testTargets() {
+    let list = [1, 2, 3];
+
+    list[1] += 40;
+    check(list[1] == 42, "list[1] += 40");
+
+    list[2]++;
+    check(list[2] == 4, "list[2]++");
+
+    if (list[0] > 0) list[0] += 1;
+    check(list[0] == 2, "compound target in braceless if");
+
+    let total = 0;
+
+    for (list) [item] {
+        total += item;
+    }
+    check(total == 48, "compound assign inside for body");
+
+    if (total > 0) total -= 7;
+    check(total == 41, "compound assign in braceless if");
+}
+
+let targetCalls = 0;
+let indexCalls = 0;
+let targetValues = [2];
+
+func getCompoundTarget() {
+    targetCalls += 1;
+    return targetValues;
+}
+
+func getCompoundIndex() {
+    indexCalls += 1;
+    return 0;
+}
+
+func testCompoundTargetEvaluatedOnce() {
+    targetCalls = 0;
+    indexCalls = 0;
+    getCompoundTarget()[getCompoundIndex()] += 3;
+    check(targetCalls == 1, "compound receiver evaluated once");
+    check(indexCalls == 1, "compound index evaluated once");
+    check(targetValues[0] == 5, "compound update writes through saved receiver");
+
+    targetCalls = 0;
+    indexCalls = 0;
+    getCompoundTarget()[getCompoundIndex()]++;
+    check(targetCalls == 1, "increment receiver evaluated once");
+    check(indexCalls == 1, "increment index evaluated once");
+    check(targetValues[0] == 6, "increment writes through saved receiver");
+}
+
+let conditionCalls = 0;
+
+func getConditionValue() {
+    conditionCalls += 1;
+    return 0;
+}
+
+func testIfLet() {
+    let frame = 99;
+    conditionCalls = 0;
+    if (let frame = getConditionValue()) {
+        check(frame == 0, "if-let binds zero");
+    } else {
+        throw "non-nil if-let value took else branch";
+    }
+    check(conditionCalls == 1, "if-let initializer evaluated once");
+    check(frame == 99, "if-let binding does not escape then branch");
+
+    if (let flag = false) {
+        check(flag == false, "if-let binds false");
+    } else {
+        throw "false if-let value took else branch";
+    }
+
+    if (let missing = nil) {
+        throw "nil if-let value took then branch";
+    } else {
+        check(true, "nil if-let value takes else branch");
+    }
+
+    if (let singleStatement = 5) check(singleStatement == 5, "single-statement if-let");
+}
+
+func testDestructure() {
+    let list = [7, 8, 9];
+
+    let a, b, c = list;
+    check(a == 7 and b == 8 and c == 9, "let a, b, c = list");
+
+    let first, _, last = list;
+    check(first == 7 and last == 9, "placeholder skips binding");
+}
+
+func makePair() {
+    return [1, 2];
+}
+
+func testDestructureCall() {
+    let x, y = makePair();
+    check(x == 1 and y == 2, "destructure call result");
+}
+
+func testDestructureMismatch() {
+    let failed = false;
+
+    try {
+        let p, q = [1, 2, 3];
+        print(p, q);
+    } catch () {
+        failed = true;
+    }
+    check(failed, "length mismatch throws");
+}
+
+testCompoundAssign();
+testStep();
+testTargets();
+testCompoundTargetEvaluatedOnce();
+testIfLet();
+testDestructure();
+testDestructureCall();
+testDestructureMismatch();
+
+print("COMPOUND_DESTRUCTURE_PASS");

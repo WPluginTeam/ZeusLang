@@ -59,6 +59,8 @@ void zeus_value_dict_build(
 );
 // Returns 1 only when value contains a dynamic array.
 int32_t zeus_value_is_array(const ZeusValue* value);
+// Returns 1 only when value contains a dynamic dictionary.
+int32_t zeus_value_is_dict(const ZeusValue* value);
 void zeus_value_array_length(ZeusValue* out, const ZeusValue* array);
 void zeus_value_array_load(
     ZeusValue* out,

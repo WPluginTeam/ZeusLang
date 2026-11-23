@@ -44,6 +44,10 @@ namespace ZeusParser {
         bool hasVariadicArgs = false;
         bool hasVariadicKwargs = false;
         std::string nativeSymbol;
+        // `@native(addr) decl func`: the callee address is the first argument
+        // and the call goes through an indirect C call. `nativeSymbol` then
+        // only holds a placeholder so native-declaration checks still apply.
+        bool nativeIndirect = false;
         // Scalar `&T` native parameters use raw pointers by default; "slot"
         // keeps the legacy ZeusValue* reference ABI.
         std::string nativeReferenceABI = "raw";
@@ -90,17 +94,28 @@ namespace ZeusParser {
                 ++position;
                 if (decorator.name == "type") {
                     while (true) {
+                        bool isVariadic = false;
+                        if (position + 1 < tokens.size() &&
+                            isOperator(tokens[position], ".") && isOperator(tokens[position + 1], ".")) {
+                            isVariadic = true;
+                            position += 2;
+                            if (position < tokens.size() && isOperator(tokens[position], ".")) {
+                                position += 1;
+                            }
+                        }
                         if (position >= tokens.size() ||
                             !std::holds_alternative<LexerType::Keyword>(tokens[position])) {
                             result.valid = false;
                             return result;
                         }
-                        const std::string typeParameter =
+                        const std::string rawIdentifier =
                             std::get<LexerType::Keyword>(tokens[position++]).name;
-                        if (typeParameter.empty()) {
+                        if (rawIdentifier.empty()) {
                             result.valid = false;
                             return result;
                         }
+                        const std::string typeParameter =
+                            isVariadic ? (".." + rawIdentifier) : rawIdentifier;
                         decorator.typeArguments.push_back(typeParameter);
                         if (position < tokens.size() && isOperator(tokens[position], ",")) {
                             ++position;
@@ -109,6 +124,12 @@ namespace ZeusParser {
                         break;
                     }
                     decorator.argument = decorator.typeArguments.front();
+                    decorator.hasArgument = true;
+                    decorator.argumentIsIdentifier = true;
+                } else if (decorator.name == "native" && position < tokens.size() &&
+                           std::holds_alternative<LexerType::Keyword>(tokens[position])) {
+                    // `@native(addr)`: a bare identifier instead of a symbol string.
+                    decorator.argument = std::get<LexerType::Keyword>(tokens[position++]).name;
                     decorator.hasArgument = true;
                     decorator.argumentIsIdentifier = true;
                 } else {
@@ -219,6 +240,12 @@ namespace ZeusParser {
                       (!decorator.secondaryArgumentName.empty() &&
                        decorator.secondaryArgumentName != "from")))) {
                     return FunctionSignatureSyntax{};
+                }
+                if (decorator.argumentIsIdentifier) {
+                    if (decorator.argument != "addr" || decorator.hasSecondaryArgument) {
+                        return FunctionSignatureSyntax{};
+                    }
+                    signature.nativeIndirect = true;
                 }
                 signature.nativeSymbol = decorator.argument;
                 if (decorator.hasSecondaryArgument &&

@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -44,10 +45,10 @@ struct EmbeddedSlotRecord {
     void* currentObject = nullptr;
 };
 
-std::mutex& recordsMutex() {
+std::shared_mutex& recordsMutex() {
     // Allocation release can inspect these records from late static-cell
     // destructors, so the registry must outlive the heap's static teardown.
-    static auto* mutex = new std::mutex();
+    static auto* mutex = new std::shared_mutex();
     return *mutex;
 }
 
@@ -97,7 +98,7 @@ void finishDestroy(const std::shared_ptr<ObjectRecord>& record) {
     bool freeObject = false;
     bool ownsStorage = false;
     {
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         record->live = false;
         record->destroying = false;
         if (record->references == 0 && record->leases == 0) {
@@ -121,7 +122,7 @@ void finishDestroy(const std::shared_ptr<ObjectRecord>& record) {
 void releaseEmbeddedOwner(void* object) {
     if (!object) return;
     {
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         const auto found = records().find(object);
         if (found != records().end() && found->second->embedded) {
             if (found->second->embeddedOwnerReleased) return;
@@ -141,7 +142,7 @@ extern "C" void zeus_class_ref_register(
     if (!object || !destroy) return;
     try {
         std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         const auto found = records().find(object);
         if (found != records().end()) return;
         auto record = std::make_shared<ObjectRecord>();
@@ -182,7 +183,7 @@ extern "C" void zeus_class_ref_register_embedded(
         }
 
         std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         const auto found = records().find(object);
         if (found != records().end()) {
             const auto& existing = found->second;
@@ -233,7 +234,7 @@ extern "C" int32_t zeus_class_ref_embedded_slot_state(
     }
 
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-    std::lock_guard<std::mutex> lock(recordsMutex());
+    std::unique_lock<std::shared_mutex> lock(recordsMutex());
     const auto found = embeddedSlots().find(slot);
     if (found == embeddedSlots().end()) return 0;
     validateEmbeddedSlot(found->second, owner, type_name, storage_size);
@@ -264,7 +265,7 @@ extern "C" void* zeus_class_ref_embedded_slot_object(
     void* object = nullptr;
     {
         std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         const auto found = embeddedSlots().find(slot);
         if (found == embeddedSlots().end()) {
             throw std::runtime_error("read from an empty embedded class slot");
@@ -299,7 +300,7 @@ extern "C" void zeus_class_ref_embedded_slot_assign(
         std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         void* previous = nullptr;
         {
-            std::lock_guard<std::mutex> lock(recordsMutex());
+            std::unique_lock<std::shared_mutex> lock(recordsMutex());
             auto slotFound = embeddedSlots().find(slot);
             if (slotFound != embeddedSlots().end()) {
                 validateEmbeddedSlot(slotFound->second, owner, type_name, storage_size);
@@ -366,7 +367,7 @@ extern "C" void* zeus_class_ref_embedded_slot_create(
         std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
         void* abandonedObject = nullptr;
         {
-            std::lock_guard<std::mutex> lock(recordsMutex());
+            std::unique_lock<std::shared_mutex> lock(recordsMutex());
             auto slotFound = embeddedSlots().find(slot);
             if (slotFound == embeddedSlots().end()) {
                 slotFound = embeddedSlots().emplace(
@@ -398,7 +399,7 @@ extern "C" void* zeus_class_ref_embedded_slot_create(
         }
         if (abandonedObject) releaseEmbeddedOwner(abandonedObject);
 
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         auto slotFound = embeddedSlots().find(slot);
         if (slotFound == embeddedSlots().end() || slotFound->second.currentObject) {
             throw std::runtime_error("embedded class slot changed during creation");
@@ -461,7 +462,7 @@ extern "C" void zeus_class_ref_embedded_slot_clear(
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     void* object = nullptr;
     {
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         const auto found = embeddedSlots().find(slot);
         if (found == embeddedSlots().end()) return;
         validateEmbeddedSlot(found->second, owner, type_name, storage_size);
@@ -478,7 +479,7 @@ extern "C" void zeus_class_ref_embedded_set_initialized(
 ) noexcept(false) {
     if (!object) throw std::runtime_error("null embedded class slot");
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-    std::lock_guard<std::mutex> lock(recordsMutex());
+    std::unique_lock<std::shared_mutex> lock(recordsMutex());
     const auto found = records().find(object);
     if (found == records().end() || !found->second->embedded ||
         !found->second->live) {
@@ -504,7 +505,7 @@ extern "C" void zeus_class_ref_destroy_embedded_in_allocation(
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     std::vector<void*> objects;
     {
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         for (auto slot = embeddedSlots().begin();
              slot != embeddedSlots().end();) {
             if (slot->second.allocationOwner == allocation) {
@@ -543,7 +544,7 @@ extern "C" int32_t zeus_class_ref_try_retain(void* object) noexcept {
     if (!object) return 0;
     try {
         std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         const auto found = records().find(object);
         if (found == records().end() || !found->second->live ||
             (found->second->embedded &&
@@ -563,7 +564,7 @@ extern "C" void zeus_class_ref_release_lease(void* object) noexcept {
         bool freeObject = false;
         bool ownsStorage = false;
         {
-            std::lock_guard<std::mutex> lock(recordsMutex());
+            std::unique_lock<std::shared_mutex> lock(recordsMutex());
             const auto found = records().find(object);
             if (found == records().end()) return;
             record = found->second;
@@ -590,7 +591,7 @@ extern "C" uint64_t zeus_class_ref_external_reference_count(void* object) noexce
     if (!object) return 0;
     try {
         std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         const auto found = records().find(object);
         if (found == records().end() || !found->second->live ||
             found->second->destroying ||
@@ -605,7 +606,7 @@ extern "C" uint64_t zeus_class_ref_external_reference_count(void* object) noexce
 extern "C" void zeus_class_ref_retain(void* object) noexcept(false) {
     if (!object) return;
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-    std::lock_guard<std::mutex> lock(recordsMutex());
+    std::unique_lock<std::shared_mutex> lock(recordsMutex());
     const auto found = records().find(object);
     if (found == records().end()) return;
     if ((!found->second->live && !found->second->destroying) ||
@@ -618,7 +619,7 @@ extern "C" void zeus_class_ref_retain(void* object) noexcept(false) {
 extern "C" void zeus_class_ref_require_managed_live(void* object) noexcept(false) {
     if (!object) throw std::runtime_error("class result is null");
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-    std::lock_guard<std::mutex> lock(recordsMutex());
+    std::unique_lock<std::shared_mutex> lock(recordsMutex());
     const auto found = records().find(object);
     if (found == records().end()) {
         throw std::runtime_error(
@@ -634,7 +635,7 @@ extern "C" void zeus_class_ref_require_managed_live(void* object) noexcept(false
 extern "C" void zeus_class_ref_retain_owned(void* object) noexcept(false) {
     if (!object) throw std::runtime_error("owning class result is null");
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-    std::lock_guard<std::mutex> lock(recordsMutex());
+    std::unique_lock<std::shared_mutex> lock(recordsMutex());
     const auto found = records().find(object);
     if (found == records().end()) {
         throw std::runtime_error(
@@ -656,7 +657,7 @@ extern "C" void zeus_class_ref_release(void* object) noexcept(false) {
     bool freeObject = false;
     bool ownsStorage = false;
     {
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         const auto found = records().find(object);
         if (found == records().end()) return;
         record = found->second;
@@ -688,7 +689,7 @@ extern "C" void zeus_class_ref_release(void* object) noexcept(false) {
 extern "C" void zeus_class_ref_retain_edge(void* object) noexcept(false) {
     if (!object) return;
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-    std::lock_guard<std::mutex> lock(recordsMutex());
+    std::unique_lock<std::shared_mutex> lock(recordsMutex());
     const auto found = records().find(object);
     if (found == records().end()) return;
     if ((!found->second->live && !found->second->destroying) ||
@@ -707,7 +708,7 @@ extern "C" void zeus_class_ref_release_edge(void* object) noexcept(false) {
     bool freeObject = false;
     bool ownsStorage = false;
     {
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         const auto found = records().find(object);
         if (found == records().end()) return;
         record = found->second;
@@ -742,7 +743,7 @@ extern "C" int32_t zeus_class_ref_destroy_now(void* object) noexcept(false) {
     std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
     std::shared_ptr<ObjectRecord> record;
     {
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         const auto found = records().find(object);
         if (found == records().end()) return 0;
         record = found->second;
@@ -755,8 +756,7 @@ extern "C" int32_t zeus_class_ref_destroy_now(void* object) noexcept(false) {
 
 extern "C" void zeus_class_ref_require_live(void* object) noexcept(false) {
     if (!object) return;
-    std::lock_guard<std::recursive_mutex> graph(ZeusGC::graphMutex());
-    std::lock_guard<std::mutex> lock(recordsMutex());
+    std::shared_lock<std::shared_mutex> lock(recordsMutex());
     const auto found = records().find(object);
     if (found != records().end() &&
         ((!found->second->live && !found->second->destroying) ||
@@ -826,7 +826,7 @@ extern "C" void* zeus_class_copy_object(void* source, void* context) noexcept(fa
     }
     std::string typeName;
     {
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         const auto found = records().find(source);
         if (found == records().end()) throw std::runtime_error("class copy source is not a registered object");
         typeName = found->second->typeName;
@@ -865,7 +865,7 @@ extern "C" void* zeus_class_copy_default_object(void* source, void* context) noe
     }
     std::string typeName;
     {
-        std::lock_guard<std::mutex> lock(recordsMutex());
+        std::unique_lock<std::shared_mutex> lock(recordsMutex());
         const auto found = records().find(source);
         if (found == records().end()) throw std::runtime_error("default class copy source is not registered");
         typeName = found->second->typeName;

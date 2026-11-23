@@ -23,6 +23,7 @@
 #include "./ZeusLLVM/ZeusReachabilityPruner.hpp"
 #include "./ZeusRunner/ZeusThread.hpp"
 #include "./ZeusTyping/TypeChecker.hpp"
+#include "./ZeusPackage/PackageManager.hpp"
 
 #include <algorithm>
 #include <iostream>
@@ -70,6 +71,16 @@ int main(int argc, char* argv[]) {
         std::string a = argv[i];
         if (a == "--mcu" || a == "--arduino") {
             targetMCU = true;
+            continue;
+        }
+        if (a == "-I") {
+            if (i + 1 < argc) {
+                ZeusParser::CHeaderScanner::addIncludePath(argv[++i]);
+            }
+            continue;
+        }
+        if (a.rfind("-I", 0) == 0 && a.size() > 2) {
+            ZeusParser::CHeaderScanner::addIncludePath(a.substr(2));
             continue;
         }
         if (a == "--strict-decl") {
@@ -135,6 +146,14 @@ int main(int argc, char* argv[]) {
 
     while (argIndex < argc) {
         std::string a = argv[argIndex];
+        if (a == "-I") {
+            argIndex += 2;
+            continue;
+        }
+        if (a.rfind("-I", 0) == 0 && a.size() > 2) {
+            argIndex++;
+            continue;
+        }
         if (a == "--strict-decl" ||
             a == "--mcu" ||
             a == "--arduino" ||
@@ -168,6 +187,9 @@ int main(int argc, char* argv[]) {
     }
 
     std::string arg1 = argv[argIndex++];
+    if (arg1 == "pkg" || arg1 == "package") {
+        return ZeusPackage::PackageManager::execute(argc, argv, argIndex);
+    }
     bool compileSingle = false;
     bool emitLLVM = false;
     std::string emitOut;

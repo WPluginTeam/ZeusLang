@@ -82,6 +82,21 @@ decl func __zeus_object_clone(value);
         }
     }
 
+    // The exemplar lets a generic caller provide a concrete element type.
+    @no_safepoint
+    inline func getTyped(index: int, exemplar: T) -> T {
+        if (index < 0 or index >= this.countValue) {
+            throw "StaticArray index out of range";
+        }
+
+        using LLVM {
+            return @faddr(this.dataAddress + index * sizeof(T), slot) -> T;
+        }
+        using VM {
+            return this.vmValues[index];
+        }
+    }
+
     @no_safepoint
     inline func set(index: int, value: T) -> StaticArray {
         this.writeElement(index, value);
@@ -90,6 +105,21 @@ decl func __zeus_object_clone(value);
 
     @no_safepoint
     inline func writeElement(index: int, value: T) {
+        if (index < 0 or index >= this.countValue) {
+            throw "StaticArray index out of range";
+        }
+
+        using LLVM {
+            @faddr(this.dataAddress + index * sizeof(T), slot) -> T = value;
+        }
+        using VM {
+            this.vmValues[index] = __zeus_object_clone(value);
+        }
+    }
+
+    // The exemplar keeps generic writes resolvable by the AOT specializer.
+    @no_safepoint
+    inline func setTyped(index: int, value: T, exemplar: T) {
         if (index < 0 or index >= this.countValue) {
             throw "StaticArray index out of range";
         }
@@ -376,6 +406,62 @@ class StaticDict {
             }
         }
         using VM {
+        }
+    }
+}
+
+
+// 1. 声明可变参数包 ..Ts
+@type(..Ts) class Union {
+    using &this;
+
+    // 绑定单一所有权（RAII 析构时仅释放一次）
+    func operator[@=]() -> &Union {
+        return this;
+    }
+
+    var dataAddress: int = 0;
+    var currentTag: int = 0;
+    var allocatedSize: int = 0;
+
+    func init() {
+        using LLVM {
+            // 编译期自动折叠：计算 Ts 中所有候选类型的最大 sizeof！
+            let maxSize = sizeof(Ts);
+            this.allocatedSize = maxSize;
+            // 自动申请刚好够大的底层物理内存，无溢出与浪费
+            this.dataAddress = malloc(maxSize);
+        }
+    }
+
+    // 强类型安全写入
+    @type(T)
+    inline func set(tag: int, value: T) {
+        this.currentTag = tag;
+        using LLVM {
+            @faddr(this.dataAddress) -> T = value;
+        }
+    }
+
+    // 强类型安全读取
+    @type(T)
+    inline func get(exemplar: T) -> T {
+        using LLVM {
+            return @faddr(this.dataAddress) -> T;
+        }
+    }
+
+    inline func size() -> int {
+        return this.allocatedSize;
+    }
+
+    // 作用域退出自动释放
+    func operator[~]() {
+        using LLVM {
+            if (this.dataAddress != 0) {
+                free(this.dataAddress);
+                this.dataAddress = 0;
+            }
         }
     }
 }

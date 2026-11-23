@@ -6,6 +6,21 @@ func expectMath(actual: int, expected: int, label: string) {
     }
 }
 
+func expectDoubleNear(actual: double, expected: double, epsilon: double, label: string) {
+    let diff = actual - expected;
+    if (diff < 0.0) diff = -diff;
+    if (diff > epsilon) {
+        throw new Exception("math stdlib mismatch (" + label + ")");
+    }
+}
+
+func expectBool(actual: bool, expected: bool, label: string) {
+    if (actual != expected) {
+        throw new Exception("math stdlib mismatch bool: " + label);
+    }
+}
+
+// 1. Integer tests
 expectMath(abs(-17), 17, "abs");
 expectMath(min(3, -2), -2, "min");
 expectMath(max(3, -2), 3, "max");
@@ -18,4 +33,55 @@ expectMath(factorial(10), 3628800, "factorial");
 expectMath(fibonacci(-3), 0, "negative fibonacci");
 expectMath(fibonacci(50), 12586269025, "iterative fibonacci");
 
-print("PASS math standard library");
+// 2. Constants tests
+expectDoubleNear(PI, 3.141592653589793, 0.0000000001, "PI");
+expectDoubleNear(HALF_PI, 1.570796326794896, 0.0000000001, "HALF_PI");
+expectDoubleNear(TAU, 6.283185307179586, 0.0000000001, "TAU");
+expectDoubleNear(E, 2.718281828459045, 0.0000000001, "E");
+
+// 3. Trigonometric tests
+expectDoubleNear(sin(0.0), 0.0, 0.000001, "sin 0");
+expectDoubleNear(sin(HALF_PI), 1.0, 0.000001, "sin half pi");
+expectDoubleNear(cos(0.0), 1.0, 0.000001, "cos 0");
+expectDoubleNear(cos(PI), -1.0, 0.000001, "cos pi");
+expectDoubleNear(tan(0.0), 0.0, 0.000001, "tan 0");
+expectDoubleNear(atan2(1.0, 1.0), PI / 4.0, 0.000001, "atan2 1 1");
+
+// 4. Power & Root & Log tests
+expectDoubleNear(sqrt(16.0), 4.0, 0.000001, "sqrt 16");
+expectDoubleNear(cbrt(27.0), 3.0, 0.000001, "cbrt 27");
+expectDoubleNear(hypot(3.0, 4.0), 5.0, 0.000001, "hypot 3 4");
+expectDoubleNear(pow(2.0, 10.0), 1024.0, 0.000001, "pow 2 10");
+expectDoubleNear(exp(0.0), 1.0, 0.000001, "exp 0");
+expectDoubleNear(log(E), 1.0, 0.000001, "log e");
+expectDoubleNear(log10(100.0), 2.0, 0.000001, "log10 100");
+expectDoubleNear(log2(8.0), 3.0, 0.000001, "log2 8");
+
+// 5. Rounding & Bounds
+expectDoubleNear(floor(3.7), 3.0, 0.000001, "floor");
+expectDoubleNear(ceil(3.2), 4.0, 0.000001, "ceil");
+expectDoubleNear(round(3.5), 4.0, 0.000001, "round");
+expectDoubleNear(trunc(-3.7), -3.0, 0.000001, "trunc");
+expectDoubleNear(fabs(-42.5), 42.5, 0.000001, "fabs");
+expectDoubleNear(fmin(2.5, 7.8), 2.5, 0.000001, "fmin");
+expectDoubleNear(fmax(2.5, 7.8), 7.8, 0.000001, "fmax");
+expectDoubleNear(fclamp(15.0, 0.0, 10.0), 10.0, 0.000001, "fclamp");
+
+// 6. Lerp & Map & Angle Conversions
+expectDoubleNear(lerp(0.0, 100.0, 0.25), 25.0, 0.000001, "lerp");
+expectDoubleNear(inv_lerp(10.0, 20.0, 15.0), 0.5, 0.000001, "inv_lerp");
+expectDoubleNear(map(5.0, 0.0, 10.0, 100.0, 200.0), 150.0, 0.000001, "map");
+expectDoubleNear(radians(180.0), PI, 0.000001, "radians");
+expectDoubleNear(degrees(PI), 180.0, 0.000001, "degrees");
+
+// 7. Float versions
+expectDoubleNear(sinf(0.0), 0.0, 0.0001, "sinf");
+expectDoubleNear(sqrtf(25.0), 5.0, 0.0001, "sqrtf");
+expectDoubleNear(powf(2.0, 3.0), 8.0, 0.0001, "powf");
+expectDoubleNear(lerpf(0.0, 50.0, 0.5), 25.0, 0.0001, "lerpf");
+expectDoubleNear(mapf(50.0, 0.0, 100.0, 0.0, 1.0), 0.5, 0.0001, "mapf");
+
+// 8. Float classification
+expectBool(isnan(0.0), false, "isnan 0");
+
+print("PASS math standard library (full suite)");

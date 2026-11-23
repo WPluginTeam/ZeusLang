@@ -1,4 +1,4 @@
-﻿#ifndef TreeParser_hpp
+#ifndef TreeParser_hpp
 #define TreeParser_hpp
 
 #include <algorithm>
@@ -77,6 +77,10 @@ namespace TreeParser {
         std::vector<std::string> overloadedOps;    // 重载的运算符列表(如 "+", "-", "[]")
         // 仅用于 IF：存放 if( ... ) 的条件表达式 token 序列
         std::vector<Token> conditionTokens;
+        // `if (let name = expr)` evaluates expr once, binds its non-nil value
+        // in the then branch, and tests that value for nil.
+        bool hasConditionBinding = false;
+        std::string conditionBindingName;
         bool isElseBranch = false;
         std::vector<std::variant<Node, std::unique_ptr<CodeBlock>>> nodes;
 
@@ -207,6 +211,35 @@ namespace TreeParser {
             return node;
         };
 
+        auto extractConditionBinding = [](CodeBlock& block) {
+            if (block.type != CodeBlockType::IF || block.conditionTokens.size() < 4 ||
+                !std::holds_alternative<LexerType::Keyword>(block.conditionTokens.front()) ||
+                std::get<LexerType::Keyword>(block.conditionTokens.front()).name != "let" ||
+                !std::holds_alternative<LexerType::Keyword>(block.conditionTokens[1])) {
+                return;
+            }
+
+            const auto assign = std::find_if(
+                block.conditionTokens.begin() + 2,
+                block.conditionTokens.end(),
+                [](const Token& token) {
+                    return std::holds_alternative<LexerType::Operator>(token) &&
+                        std::get<LexerType::Operator>(token).symbol == "=";
+                });
+            if (assign == block.conditionTokens.end() ||
+                assign + 1 == block.conditionTokens.end()) {
+                return;
+            }
+
+            // Accept `let name = expr`; annotated conditions can be added with
+            // an explicit grammar once the annotation's flow semantics are defined.
+            if (assign != block.conditionTokens.begin() + 2) return;
+            block.hasConditionBinding = true;
+            block.conditionBindingName = std::get<LexerType::Keyword>(block.conditionTokens[1]).name;
+            std::vector<Token> initializer(assign + 1, block.conditionTokens.end());
+            block.conditionTokens = std::move(initializer);
+        };
+
         auto leadingFunctionPrefix = [&]() {
             if (stack.empty()) return ZeusParser::FunctionPrefixSyntax{};
             return ZeusParser::parseFunctionPrefix(stack);
@@ -242,7 +275,8 @@ namespace TreeParser {
             const auto prefix = ZeusParser::parseFunctionPrefix(stack);
             if (!prefix.valid) return std::string();
             for (const auto& decorator : prefix.decorators) {
-                if (decorator.name == "native" && decorator.hasArgument) {
+                if (decorator.name == "native" && decorator.hasArgument &&
+                    !decorator.argumentIsIdentifier) {
                     return decorator.argument;
                 }
             }
@@ -721,6 +755,7 @@ namespace TreeParser {
                                     newBlock->conditionTokens.push_back(tk);
                                 }
                             }
+                            extractConditionBinding(*newBlock);
                             
                             CodeBlock* ptr = newBlock.get();
                             
@@ -1283,6 +1318,7 @@ namespace TreeParser {
                                 newBlock->conditionTokens.push_back(tk);
                             }
                         }
+                        extractConditionBinding(*newBlock);
                     }
 
                     // ===== WITH 代码块表达式解析 =====

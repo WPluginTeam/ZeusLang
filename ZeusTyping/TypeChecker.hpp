@@ -2540,7 +2540,10 @@ namespace ZeusTypeInfer {
                 block.classTypeParameters.begin(), block.classTypeParameters.end());
 
             std::unordered_set<std::string> declaredTypeParameters;
-            for (const auto& typeParameter : block.classTypeParameters) {
+            for (const auto& rawTypeParam : block.classTypeParameters) {
+                const std::string typeParameter = (rawTypeParam.rfind("..", 0) == 0)
+                    ? rawTypeParam.substr(2) : rawTypeParam;
+                declaredTypeParameters.insert(rawTypeParam);
                 declaredTypeParameters.insert(typeParameter);
                 if (parseTypeName(typeParameter) != InferredType::Unknown ||
                     ZeusBuiltins::findTypeImplementation(typeParameter) != nullptr ||
@@ -2554,7 +2557,9 @@ namespace ZeusTypeInfer {
                     );
                 }
             }
-            for (const auto& typeParameter : block.typeParameters) {
+            for (const auto& rawTypeParam : block.typeParameters) {
+                const std::string typeParameter = (rawTypeParam.rfind("..", 0) == 0)
+                    ? rawTypeParam.substr(2) : rawTypeParam;
                 if (!declaredTypeParameters.insert(typeParameter).second) {
                     addDiagnostic(
                         nodeIndex,
@@ -2564,6 +2569,7 @@ namespace ZeusTypeInfer {
                         TypeCheckDiagnosticCode::GenericTypeParameterNameInvalid
                     );
                 }
+                declaredTypeParameters.insert(rawTypeParam);
                 if (parseTypeName(typeParameter) != InferredType::Unknown ||
                     ZeusBuiltins::findTypeImplementation(typeParameter) != nullptr ||
                     classNames.count(typeParameter) != 0) {
@@ -3285,7 +3291,8 @@ namespace ZeusTypeInfer {
         ) {
             currentSourceLine = ifBlock.sourceLine;
             currentSourceColumn = ifBlock.sourceColumn;
-            (void)inferExpressionInfo(ifBlock.conditionTokens, baseEnvironment);
+            TypeInfo conditionInfo = inferExpressionInfo(
+                ifBlock.conditionTokens, baseEnvironment);
             checkCallArgumentTypes(ifBlock.conditionTokens, baseEnvironment, nodeIndex);
             const auto branchEntryObserved = observedBindingNodes;
 
@@ -3300,7 +3307,18 @@ namespace ZeusTypeInfer {
             }
 
             Environment thenEnvironment = baseEnvironment;
-            applyNilNarrowing(ifBlock.conditionTokens, true, thenEnvironment);
+            if (ifBlock.hasConditionBinding) {
+                conditionInfo.type.nullable = false;
+                conditionInfo.bindingNodeId = ifBlock.id;
+                thenEnvironment[ifBlock.conditionBindingName] = conditionInfo;
+                setInferredBindingType(
+                    ifBlock.id,
+                    conditionInfo.isKnown()
+                        ? conditionInfo.toIRTypeName()
+                        : std::string("unknown"));
+            } else {
+                applyNilNarrowing(ifBlock.conditionTokens, true, thenEnvironment);
+            }
             thenEnvironment = checkBlock(
                 ifBlock.nodes,
                 std::move(thenEnvironment),

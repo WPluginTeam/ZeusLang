@@ -393,6 +393,11 @@ ZeusNativeString zeus_bytes_decode(
     ZeusNativeBytes bytes,
     ZeusNativeString encoding
 );
+ZeusNativeString zeus_json_unescape(
+    ZeusNativeBytes bytes,
+    int64_t start,
+    int64_t end
+);
 void zeus_bytes_to_list(ZeusValue* out, ZeusNativeBytes bytes);
 int64_t zeus_string_length(ZeusNativeString value);
 ZeusNativeString zeus_native_string_concat(

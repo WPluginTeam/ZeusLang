@@ -52,6 +52,7 @@ __pycache__/
 
 # Root-level ad-hoc compiler scratch artifacts
 /temp*.ll
+/*_dump.ll
 /test_decl.ll
 /test_mcu.ll
 /test_mcu.o

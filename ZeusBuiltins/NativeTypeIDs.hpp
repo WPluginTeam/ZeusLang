@@ -58,7 +58,7 @@ struct NativeTypeIDEntry {
 inline const std::array<NativeTypeIDEntry, 16>& nativeTypeIDs() {
     static const std::array<NativeTypeIDEntry, 16> types = {{
         {NativeTypeID::Double, "DOUBLE", "@native.double", "double", "double",
-            NativeValueABI::FloatingPoint, 64, {"f64"}, 1},
+            NativeValueABI::FloatingPoint, 64, {"f64", "double"}, 2},
         {NativeTypeID::LongLong, "LONGLONG", "@native.longlong", "int64_t", "i64",
             NativeValueABI::SignedInteger, 64, {"i64"}, 1},
         {NativeTypeID::Int32, "INT32", "@native.int32", "int32_t", "i32",
@@ -78,7 +78,7 @@ inline const std::array<NativeTypeIDEntry, 16>& nativeTypeIDs() {
         {NativeTypeID::RawBytesRange, "RAW_BYTES_RANGE", "&bytes", "ZeusRawBytesRange",
             "%ZeusRawBytesRange", NativeValueABI::RawBytesRange},
         {NativeTypeID::Float32, "FLOAT", "@native.float32", "float", "float",
-            NativeValueABI::FloatingPoint, 32, {"f32"}, 1},
+            NativeValueABI::FloatingPoint, 32, {"f32", "float32"}, 2},
         {NativeTypeID::Int16, "INT16", "@native.int16", "int16_t", "i16",
             NativeValueABI::SignedInteger, 16, {"i16"}, 1},
         {NativeTypeID::UInt8, "UINT8", "@native.uint8", "uint8_t", "i8",
